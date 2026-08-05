@@ -1,0 +1,5 @@
+# Reference repositories are local, shallow clones with their own .git directories.
+# Track only this manifest and the ignore policy in the parent repository.
+*
+!.gitignore
+!README.md
