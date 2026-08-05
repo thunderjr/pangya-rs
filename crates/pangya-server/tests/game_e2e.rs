@@ -8,9 +8,10 @@ use std::{
 
 use pangya_data::Catalog;
 use pangya_domain::{
-    AccountAggregate, AccountRepository as _, AccountStatus, CredentialHash,
-    HandoverRepository as _, ItemTypeId, NewAccount, Nickname, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, Username,
+    AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CredentialHash,
+    HandoverRepository as _, ItemTypeId, MemberSnapshot, NewAccount, Nickname, PlayerConnectionId,
+    RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, Username,
 };
 use pangya_game::{GameRuntimeConfig, GameRuntimeLimits, GameService, UnknownOpcodePolicy};
 use pangya_login::{
@@ -18,7 +19,13 @@ use pangya_login::{
     LoginRuntimeLimits, LoginService, generate_handover,
 };
 use pangya_observability::M2Metrics;
-use pangya_protocol::PacketWriter;
+use pangya_protocol::{
+    CompatibilityProfile, DecodePacket, EncodePacket, PacketWriter, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
+    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    ServiceKind as ProtocolServiceKind, decode_packet_payload, encode_packet_payload,
+};
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
 use tokio::{
@@ -111,10 +118,11 @@ fn catalog() -> Catalog {
     Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("catalog")
 }
 
-fn game_service(
+fn game_service_with_policy(
     pool: PgPool,
     limits: GameRuntimeLimits,
     metrics: Arc<M2Metrics>,
+    unknown_opcode_policy: UnknownOpcodePolicy,
 ) -> Arc<GameService<PgRepository>> {
     Arc::new(
         GameService::new(
@@ -122,13 +130,21 @@ fn game_service(
             catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
-                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                unknown_opcode_policy,
                 limits,
             },
             metrics,
         )
         .expect("game"),
     )
+}
+
+fn game_service(
+    pool: PgPool,
+    limits: GameRuntimeLimits,
+    metrics: Arc<M2Metrics>,
+) -> Arc<GameService<PgRepository>> {
+    game_service_with_policy(pool, limits, metrics, UnknownOpcodePolicy::Disconnect)
 }
 
 async fn start_service(
@@ -196,6 +212,61 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
         u16::from_le_bytes([plain[0], plain[1]]),
         plain[2..].to_vec(),
     )
+}
+
+async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
+    let payload = encode_packet_payload(packet, &CompatibilityProfile::US_852).expect("encode");
+    send_packet(stream, key, salt, T::OPCODE, &payload).await;
+}
+
+async fn flood_ready(mut stream: TcpStream, key: u8, count: usize) {
+    let mut plain = Vec::with_capacity(3);
+    plain.extend_from_slice(&pangya_protocol::SYNTHETIC_M4_C2S_READY.to_le_bytes());
+    plain.push(1);
+    let encrypted = pangya_crypto::client_encrypt(&plain, key, 77).expect("encrypt flood");
+    let (mut reader, mut writer) = stream.split();
+    let writes = async {
+        for _ in 0..count {
+            if writer.write_all(&encrypted).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::pin!(writes);
+    let mut discarded = [0_u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            () = &mut writes => break,
+            read = reader.read(&mut discarded) => {
+                if !matches!(read, Ok(bytes) if bytes > 0) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn receive_typed<T: DecodePacket>(stream: &mut TcpStream, key: u8) -> T {
+    let (opcode, body) = receive_packet(stream, key).await;
+    assert_eq!(opcode, T::OPCODE);
+    decode_packet_payload::<T>(
+        &body,
+        &CompatibilityProfile::US_852,
+        ProtocolServiceKind::Game,
+    )
+    .expect("typed response")
+}
+
+async fn receive_result(
+    stream: &mut TcpStream,
+    key: u8,
+    command: RoomCommand,
+    result: RoomCommandResult,
+) {
+    assert_eq!(
+        receive_typed::<RoomCommandResultResponse>(stream, key).await,
+        RoomCommandResultResponse { command, result }
+    );
 }
 
 async fn maybe_receive_opcode(stream: &mut TcpStream, key: u8) -> Option<u16> {
@@ -297,6 +368,97 @@ async fn read_bootstrap(stream: &mut TcpStream, key: u8, inventory_segments: usi
         assert!(usize::from(u16::from_le_bytes([body[4], body[5]])) <= 50);
     }
     assert_eq!(receive_packet(stream, key).await.0, 0x004d);
+}
+
+struct M4Client {
+    stream: TcpStream,
+    key: u8,
+    account_id: AccountId,
+    nickname: String,
+    token: String,
+}
+
+async fn connect_m4(pool: &PgPool, address: std::net::SocketAddr, username: &str) -> M4Client {
+    let account = create_account(pool, username, 1, 0x1000_0000).await;
+    let token = issue_token(
+        pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        2,
+        &auth_payload(account.account.id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut stream, key, 1).await;
+    send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    M4Client {
+        stream,
+        key,
+        account_id: account.account.id,
+        nickname: format!("N{username}"),
+        token,
+    }
+}
+
+fn member(client: &M4Client, connection_id: u64, owner: bool, ready: bool) -> MemberSnapshot {
+    MemberSnapshot::new(
+        PlayerConnectionId::new(connection_id).expect("connection ID"),
+        client.account_id,
+        client.nickname.clone(),
+        owner,
+        ready,
+    )
+}
+
+fn snapshot(
+    room_id: RoomId,
+    name: &str,
+    owner_nickname: &str,
+    capacity: u8,
+    protected: bool,
+    members: Vec<MemberSnapshot>,
+) -> RoomSnapshot {
+    RoomSnapshot::new(
+        RoomSummary::new(
+            room_id,
+            RoomName::parse(name).expect("room name"),
+            owner_nickname.to_owned(),
+            u8::try_from(members.len()).expect("member count"),
+            capacity,
+            protected,
+        ),
+        members,
+    )
+}
+
+async fn receive_state(stream: &mut TcpStream, key: u8, expected: &RoomSnapshot) {
+    assert_eq!(
+        receive_typed::<RoomStateResponse>(stream, key).await,
+        RoomStateResponse {
+            room: expected.clone()
+        }
+    );
+}
+
+async fn request_state(client: &mut M4Client, salt: u8, expected: &RoomSnapshot) {
+    send_typed(&mut client.stream, client.key, salt, &RoomStateRequest).await;
+    receive_state(&mut client.stream, client.key, expected).await;
+}
+
+async fn request_list(client: &mut M4Client, salt: u8, rooms: Vec<RoomSummary>) {
+    send_typed(&mut client.stream, client.key, salt, &RoomListRequest).await;
+    assert_eq!(
+        receive_typed::<RoomListResponse>(&mut client.stream, client.key).await,
+        RoomListResponse { rooms }
+    );
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -964,6 +1126,988 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
     read_bootstrap(&mut reconnect, reconnect_key, 1).await;
     shutdown.cancel();
     task.await.expect("join").expect("serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool: PgPool) {
+    let limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        ..GameRuntimeLimits::default()
+    };
+    let (address, shutdown, task, metrics) = start_game(pool.clone(), limits).await;
+    let mut owner = connect_m4(&pool, address, "M4Owner").await;
+    let mut second = connect_m4(&pool, address, "M4Second").await;
+    let mut third = connect_m4(&pool, address, "M4Third").await;
+    let mut fourth = connect_m4(&pool, address, "M4Fourth").await;
+    let sensitive_tokens = [
+        owner.token.clone(),
+        second.token.clone(),
+        third.token.clone(),
+        fourth.token.clone(),
+    ];
+
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        3,
+        &RoomCreateRequest {
+            name: RoomName::parse("M4 Open Room").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(4).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let open_id = RoomId::new(1).expect("room ID");
+    let open_one = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        4,
+        false,
+        vec![member(&owner, 1, true, false)],
+    );
+    receive_state(&mut owner.stream, owner.key, &open_one).await;
+    request_list(&mut second, 3, vec![open_one.summary().clone()]).await;
+
+    send_typed(
+        &mut second.stream,
+        second.key,
+        4,
+        &RoomJoinRequest {
+            room_id: open_id,
+            password: None,
+        },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let open_two = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        4,
+        false,
+        vec![
+            member(&owner, 1, true, false),
+            member(&second, 2, false, false),
+        ],
+    );
+    receive_state(&mut second.stream, second.key, &open_two).await;
+    receive_state(&mut owner.stream, owner.key, &open_two).await;
+    receive_state(&mut second.stream, second.key, &open_two).await;
+
+    send_typed(
+        &mut second.stream,
+        second.key,
+        5,
+        &RoomSettingsRequest {
+            settings: RoomSettings::new(3).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Settings,
+        RoomCommandResult::NotOwner,
+    )
+    .await;
+    request_state(&mut owner, 6, &open_two).await;
+    send_typed(
+        &mut second.stream,
+        second.key,
+        7,
+        &RoomKickRequest {
+            target: PlayerConnectionId::new(1).expect("owner connection"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Kick,
+        RoomCommandResult::NotOwner,
+    )
+    .await;
+    request_state(&mut owner, 8, &open_two).await;
+
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        9,
+        &RoomSettingsRequest {
+            settings: RoomSettings::new(3).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Settings,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let open_three_capacity = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        3,
+        false,
+        vec![
+            member(&owner, 1, true, false),
+            member(&second, 2, false, false),
+        ],
+    );
+    receive_state(&mut owner.stream, owner.key, &open_three_capacity).await;
+    receive_state(&mut owner.stream, owner.key, &open_three_capacity).await;
+    receive_state(&mut second.stream, second.key, &open_three_capacity).await;
+
+    send_typed(
+        &mut second.stream,
+        second.key,
+        10,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let second_ready = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        3,
+        false,
+        vec![
+            member(&owner, 1, true, false),
+            member(&second, 2, false, true),
+        ],
+    );
+    receive_state(&mut second.stream, second.key, &second_ready).await;
+    receive_state(&mut owner.stream, owner.key, &second_ready).await;
+    receive_state(&mut second.stream, second.key, &second_ready).await;
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        11,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let both_ready = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        3,
+        false,
+        vec![
+            member(&owner, 1, true, true),
+            member(&second, 2, false, true),
+        ],
+    );
+    receive_state(&mut owner.stream, owner.key, &both_ready).await;
+    receive_state(&mut owner.stream, owner.key, &both_ready).await;
+    receive_state(&mut second.stream, second.key, &both_ready).await;
+
+    let chat = ChatText::parse("authoritative hello").expect("chat");
+    send_typed(
+        &mut second.stream,
+        second.key,
+        12,
+        &RoomChatRequest { text: chat.clone() },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Chat,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let expected_chat = RoomChatEvent {
+        room_id: open_id,
+        sender: member(&second, 2, false, true),
+        text: chat,
+    };
+    assert_eq!(
+        receive_typed::<RoomChatEvent>(&mut owner.stream, owner.key).await,
+        expected_chat
+    );
+    assert_eq!(
+        receive_typed::<RoomChatEvent>(&mut second.stream, second.key).await,
+        expected_chat
+    );
+
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        13,
+        &RoomKickRequest {
+            target: PlayerConnectionId::new(2).expect("target connection"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Kick,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let after_kick = snapshot(
+        open_id,
+        "M4 Open Room",
+        &owner.nickname,
+        3,
+        false,
+        vec![member(&owner, 1, true, true)],
+    );
+    receive_state(&mut owner.stream, owner.key, &after_kick).await;
+    receive_state(&mut owner.stream, owner.key, &after_kick).await;
+    assert_eq!(
+        receive_typed::<RoomMembershipEvent>(&mut second.stream, second.key).await,
+        RoomMembershipEvent {
+            room_id: open_id,
+            kind: RoomMembershipKind::Kicked,
+            member: member(&owner, 1, true, true),
+        }
+    );
+    request_list(&mut second, 14, vec![after_kick.summary().clone()]).await;
+    send_typed(&mut owner.stream, owner.key, 15, &RoomLeaveRequest).await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Leave,
+        RoomCommandResult::Success,
+    )
+    .await;
+    request_list(&mut second, 16, Vec::new()).await;
+
+    send_typed(
+        &mut second.stream,
+        second.key,
+        17,
+        &RoomCreateRequest {
+            name: RoomName::parse("M4 Secret Room").expect("room name"),
+            password: Some(RoomPassword::parse("secret-pass").expect("password")),
+            settings: RoomSettings::new(3).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let protected_id = RoomId::new(2).expect("room ID");
+    let protected_one = snapshot(
+        protected_id,
+        "M4 Secret Room",
+        &second.nickname,
+        3,
+        true,
+        vec![member(&second, 2, true, false)],
+    );
+    receive_state(&mut second.stream, second.key, &protected_one).await;
+    for (salt, password) in [
+        (18, None),
+        (
+            19,
+            Some(RoomPassword::parse("wrong-pass").expect("password")),
+        ),
+    ] {
+        send_typed(
+            &mut third.stream,
+            third.key,
+            salt,
+            &RoomJoinRequest {
+                room_id: protected_id,
+                password,
+            },
+        )
+        .await;
+        receive_result(
+            &mut third.stream,
+            third.key,
+            RoomCommand::Join,
+            RoomCommandResult::InvalidPassword,
+        )
+        .await;
+    }
+    request_list(&mut third, 20, vec![protected_one.summary().clone()]).await;
+    send_typed(
+        &mut third.stream,
+        third.key,
+        21,
+        &RoomJoinRequest {
+            room_id: protected_id,
+            password: Some(RoomPassword::parse("secret-pass").expect("password")),
+        },
+    )
+    .await;
+    receive_result(
+        &mut third.stream,
+        third.key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let protected_two = snapshot(
+        protected_id,
+        "M4 Secret Room",
+        &second.nickname,
+        3,
+        true,
+        vec![
+            member(&second, 2, true, false),
+            member(&third, 3, false, false),
+        ],
+    );
+    receive_state(&mut third.stream, third.key, &protected_two).await;
+    receive_state(&mut second.stream, second.key, &protected_two).await;
+    receive_state(&mut third.stream, third.key, &protected_two).await;
+
+    let owner_join = RoomJoinRequest {
+        room_id: protected_id,
+        password: Some(RoomPassword::parse("secret-pass").expect("password")),
+    };
+    let fourth_join = RoomJoinRequest {
+        room_id: protected_id,
+        password: Some(RoomPassword::parse("secret-pass").expect("password")),
+    };
+    tokio::join!(
+        send_typed(&mut owner.stream, owner.key, 22, &owner_join),
+        send_typed(&mut fourth.stream, fourth.key, 22, &fourth_join)
+    );
+    let owner_result =
+        receive_typed::<RoomCommandResultResponse>(&mut owner.stream, owner.key).await;
+    let fourth_result =
+        receive_typed::<RoomCommandResultResponse>(&mut fourth.stream, fourth.key).await;
+    assert_eq!(owner_result.command, RoomCommand::Join);
+    assert_eq!(fourth_result.command, RoomCommand::Join);
+    assert!(matches!(
+        (owner_result.result, fourth_result.result),
+        (RoomCommandResult::Success, RoomCommandResult::Full)
+            | (RoomCommandResult::Full, RoomCommandResult::Success)
+    ));
+    let owner_won = owner_result.result == RoomCommandResult::Success;
+    let admitted_member = if owner_won {
+        member(&owner, 1, false, false)
+    } else {
+        member(&fourth, 4, false, false)
+    };
+    let protected_full = snapshot(
+        protected_id,
+        "M4 Secret Room",
+        &second.nickname,
+        3,
+        true,
+        vec![
+            member(&second, 2, true, false),
+            member(&third, 3, false, false),
+            admitted_member.clone(),
+        ],
+    );
+    if owner_won {
+        receive_state(&mut owner.stream, owner.key, &protected_full).await;
+        receive_state(&mut owner.stream, owner.key, &protected_full).await;
+    } else {
+        receive_state(&mut fourth.stream, fourth.key, &protected_full).await;
+        receive_state(&mut fourth.stream, fourth.key, &protected_full).await;
+    }
+    receive_state(&mut second.stream, second.key, &protected_full).await;
+    receive_state(&mut third.stream, third.key, &protected_full).await;
+
+    assert!(
+        metrics
+            .render()
+            .contains("pangya_game_rooms_active{service=\"game\"} 1")
+    );
+    send_typed(&mut second.stream, second.key, 23, &RoomLeaveRequest).await;
+    receive_result(
+        &mut second.stream,
+        second.key,
+        RoomCommand::Leave,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let transferred = snapshot(
+        protected_id,
+        "M4 Secret Room",
+        &third.nickname,
+        3,
+        true,
+        vec![member(&third, 3, true, false), admitted_member.clone()],
+    );
+    receive_state(&mut third.stream, third.key, &transferred).await;
+    if owner_won {
+        receive_state(&mut owner.stream, owner.key, &transferred).await;
+    } else {
+        receive_state(&mut fourth.stream, fourth.key, &transferred).await;
+    }
+    request_list(&mut second, 24, vec![transferred.summary().clone()]).await;
+
+    drop(third);
+    let admitted_owned = snapshot(
+        protected_id,
+        "M4 Secret Room",
+        if owner_won {
+            &owner.nickname
+        } else {
+            &fourth.nickname
+        },
+        3,
+        true,
+        vec![MemberSnapshot::new(
+            admitted_member.connection_id(),
+            admitted_member.account_id(),
+            admitted_member.nickname().to_owned(),
+            true,
+            false,
+        )],
+    );
+    if owner_won {
+        receive_state(&mut owner.stream, owner.key, &admitted_owned).await;
+        drop(owner);
+    } else {
+        receive_state(&mut fourth.stream, fourth.key, &admitted_owned).await;
+        drop(fourth);
+    }
+    assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
+    request_list(&mut second, 25, Vec::new()).await;
+
+    let rendered = metrics.render();
+    for fixed_label in [
+        "pangya_game_room_events_total{event=\"created\"}",
+        "pangya_game_queue_events_total{event=\"outbound_dropped\"}",
+        "pangya_game_chat_events_total{event=\"accepted\"}",
+        "pangya_game_unknown_opcode_actions_total{action=\"captured\"}",
+    ] {
+        assert!(rendered.contains(fixed_label), "missing {fixed_label}");
+    }
+    for secret in [
+        "M4 Open Room",
+        "M4 Secret Room",
+        "secret-pass",
+        "authoritative hello",
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+    for token in &sensitive_tokens {
+        assert!(!rendered.contains(token));
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("bounded shutdown")
+        .expect("join")
+        .expect("serve");
+    assert!(
+        metrics
+            .render()
+            .contains("pangya_game_rooms_active{service=\"game\"} 0")
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always_closes(
+    pool: PgPool,
+) {
+    let limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        unknown_opcode_strikes: 3,
+        ..GameRuntimeLimits::default()
+    };
+
+    let metrics = Arc::new(M2Metrics::default());
+    let disconnect_service = game_service_with_policy(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        UnknownOpcodePolicy::Disconnect,
+    );
+    let (address, shutdown, task) = start_service(disconnect_service).await;
+    let mut disconnected = connect_m4(&pool, address, "M4UnkDisc").await;
+    send_packet(
+        &mut disconnected.stream,
+        disconnected.key,
+        3,
+        0x7777,
+        b"unknown-disconnect-body",
+    )
+    .await;
+    assert_closed(&mut disconnected.stream).await;
+    assert_metric(
+        &metrics,
+        "pangya_game_unknown_opcode_actions_total{action=\"disconnected\"} 1",
+    )
+    .await;
+    let mut disconnect_wrong_state = connect_m4(&pool, address, "M4DiscState").await;
+    send_typed(
+        &mut disconnect_wrong_state.stream,
+        disconnect_wrong_state.key,
+        4,
+        &RoomStateRequest,
+    )
+    .await;
+    assert_closed(&mut disconnect_wrong_state.stream).await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+
+    let metrics = Arc::new(M2Metrics::default());
+    let ignore_service = game_service_with_policy(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        UnknownOpcodePolicy::Ignore,
+    );
+    let (address, shutdown, task) = start_service(ignore_service).await;
+    let mut ignored = connect_m4(&pool, address, "M4UnkIgnore").await;
+    send_packet(
+        &mut ignored.stream,
+        ignored.key,
+        3,
+        0x7778,
+        b"unknown-ignore-body",
+    )
+    .await;
+    request_list(&mut ignored, 4, Vec::new()).await;
+    assert_metric(
+        &metrics,
+        "pangya_game_unknown_opcode_actions_total{action=\"ignored\"} 1",
+    )
+    .await;
+    send_typed(
+        &mut ignored.stream,
+        ignored.key,
+        5,
+        &RoomCreateRequest {
+            name: RoomName::parse("Ignore First").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut ignored.stream,
+        ignored.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let ignore_room = snapshot(
+        RoomId::new(1).expect("room ID"),
+        "Ignore First",
+        &ignored.nickname,
+        2,
+        false,
+        vec![member(&ignored, 1, true, false)],
+    );
+    receive_state(&mut ignored.stream, ignored.key, &ignore_room).await;
+    let mut ignore_peer = connect_m4(&pool, address, "M4IgnPeer").await;
+    send_typed(
+        &mut ignore_peer.stream,
+        ignore_peer.key,
+        5,
+        &RoomCreateRequest {
+            name: RoomName::parse("Ignore Second").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut ignore_peer.stream,
+        ignore_peer.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let ignore_second = snapshot(
+        RoomId::new(2).expect("room ID"),
+        "Ignore Second",
+        &ignore_peer.nickname,
+        2,
+        false,
+        vec![member(&ignore_peer, 2, true, false)],
+    );
+    receive_state(&mut ignore_peer.stream, ignore_peer.key, &ignore_second).await;
+    send_typed(
+        &mut ignored.stream,
+        ignored.key,
+        6,
+        &RoomJoinRequest {
+            room_id: RoomId::new(2).expect("room ID"),
+            password: None,
+        },
+    )
+    .await;
+    assert_closed(&mut ignored.stream).await;
+    send_typed(
+        &mut ignore_peer.stream,
+        ignore_peer.key,
+        6,
+        &RoomLeaveRequest,
+    )
+    .await;
+    receive_result(
+        &mut ignore_peer.stream,
+        ignore_peer.key,
+        RoomCommand::Leave,
+        RoomCommandResult::Success,
+    )
+    .await;
+    assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+
+    let metrics = Arc::new(M2Metrics::default());
+    let capture_service = game_service_with_policy(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        UnknownOpcodePolicy::Capture,
+    );
+    let inspectable_service = Arc::clone(&capture_service);
+    let (address, shutdown, task) = start_service(capture_service).await;
+    let mut captured = connect_m4(&pool, address, "M4UnkCapture").await;
+    let capture_body = b"unknown-capture-private-body";
+    send_packet(&mut captured.stream, captured.key, 3, 0x7779, capture_body).await;
+    request_list(&mut captured, 4, Vec::new()).await;
+    let captures = inspectable_service.unknown_opcode_captures();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].state, pangya_game::GameState::InChannel);
+    assert_eq!(captures[0].opcode, 0x7779);
+    assert_eq!(captures[0].payload_len, capture_body.len());
+    let rendered = metrics.render();
+    assert!(rendered.contains("pangya_game_unknown_opcode_actions_total{action=\"captured\"} 1"));
+    assert!(!rendered.contains("unknown-capture-private-body"));
+    assert!(!rendered.contains(&captured.token));
+
+    send_typed(
+        &mut captured.stream,
+        captured.key,
+        5,
+        &RoomCreateRequest {
+            name: RoomName::parse("Single Membership").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut captured.stream,
+        captured.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let only_room = snapshot(
+        RoomId::new(1).expect("room ID"),
+        "Single Membership",
+        &captured.nickname,
+        2,
+        false,
+        vec![member(&captured, 1, true, false)],
+    );
+    receive_state(&mut captured.stream, captured.key, &only_room).await;
+    send_typed(
+        &mut captured.stream,
+        captured.key,
+        6,
+        &RoomCreateRequest {
+            name: RoomName::parse("Forbidden Second").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    assert_closed(&mut captured.stream).await;
+    assert_metric(
+        &metrics,
+        "pangya_connections_closed_total{service=\"game\",reason=\"protocol\"} 1",
+    )
+    .await;
+    assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m4_command_chat_and_outbound_queues_are_bounded(pool: PgPool) {
+    let limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        packets_per_window: 500,
+        room_commands_per_window: 3,
+        chat_messages_per_window: 1,
+        ..GameRuntimeLimits::default()
+    };
+    let (address, shutdown, task, metrics) = start_game(pool.clone(), limits).await;
+    let mut owner = connect_m4(&pool, address, "M4ChatOwner").await;
+    let mut member_client = connect_m4(&pool, address, "M4ChatMember").await;
+    let mut command_client = connect_m4(&pool, address, "M4CommandBound").await;
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        3,
+        &RoomCreateRequest {
+            name: RoomName::parse("Bounded Chat").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let room_id = RoomId::new(1).expect("room ID");
+    let one = snapshot(
+        room_id,
+        "Bounded Chat",
+        &owner.nickname,
+        2,
+        false,
+        vec![member(&owner, 1, true, false)],
+    );
+    receive_state(&mut owner.stream, owner.key, &one).await;
+    send_typed(
+        &mut member_client.stream,
+        member_client.key,
+        3,
+        &RoomJoinRequest {
+            room_id,
+            password: None,
+        },
+    )
+    .await;
+    receive_result(
+        &mut member_client.stream,
+        member_client.key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let two = snapshot(
+        room_id,
+        "Bounded Chat",
+        &owner.nickname,
+        2,
+        false,
+        vec![
+            member(&owner, 1, true, false),
+            member(&member_client, 2, false, false),
+        ],
+    );
+    receive_state(&mut member_client.stream, member_client.key, &two).await;
+    receive_state(&mut owner.stream, owner.key, &two).await;
+    receive_state(&mut member_client.stream, member_client.key, &two).await;
+    let first_chat = ChatText::parse("one bounded chat").expect("chat");
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        4,
+        &RoomChatRequest {
+            text: first_chat.clone(),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Chat,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let chat_event = RoomChatEvent {
+        room_id,
+        sender: member(&owner, 1, true, false),
+        text: first_chat,
+    };
+    assert_eq!(
+        receive_typed::<RoomChatEvent>(&mut owner.stream, owner.key).await,
+        chat_event
+    );
+    assert_eq!(
+        receive_typed::<RoomChatEvent>(&mut member_client.stream, member_client.key).await,
+        chat_event
+    );
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        5,
+        &RoomChatRequest {
+            text: ChatText::parse("rate limited chat").expect("chat"),
+        },
+    )
+    .await;
+    assert_closed(&mut owner.stream).await;
+    assert_metric(&metrics, "class=\"chat_connection\"} 1").await;
+    assert_metric(
+        &metrics,
+        "pangya_game_chat_events_total{event=\"rate_limited\"} 1",
+    )
+    .await;
+    let member_owned = snapshot(
+        room_id,
+        "Bounded Chat",
+        &member_client.nickname,
+        2,
+        false,
+        vec![member(&member_client, 2, true, false)],
+    );
+    receive_state(&mut member_client.stream, member_client.key, &member_owned).await;
+
+    for salt in [6, 7, 8] {
+        request_list(
+            &mut command_client,
+            salt,
+            vec![member_owned.summary().clone()],
+        )
+        .await;
+    }
+    send_typed(
+        &mut command_client.stream,
+        command_client.key,
+        9,
+        &RoomListRequest,
+    )
+    .await;
+    assert_closed(&mut command_client.stream).await;
+    assert_metric(&metrics, "class=\"room_commands_connection\"} 1").await;
+    send_typed(
+        &mut member_client.stream,
+        member_client.key,
+        10,
+        &RoomLeaveRequest,
+    )
+    .await;
+    receive_result(
+        &mut member_client.stream,
+        member_client.key,
+        RoomCommand::Leave,
+        RoomCommandResult::Success,
+    )
+    .await;
+    assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+
+    let queue_limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        global_packets_per_window: 1_000_000,
+        source_packets_per_window: 1_000_000,
+        packets_per_window: 1_000_000,
+        global_bytes_per_window: 1024 * 1024 * 1024,
+        source_bytes_per_window: 1024 * 1024 * 1024,
+        bytes_per_window: 1024 * 1024 * 1024,
+        room_commands_per_window: 1_000_000,
+        outbound_room_event_capacity: 1,
+        ..GameRuntimeLimits::default()
+    };
+    let (address, shutdown, task, metrics) = start_game(pool.clone(), queue_limits).await;
+    let mut queue_owner = connect_m4(&pool, address, "M4QueueOwner").await;
+    let mut queue_two = connect_m4(&pool, address, "M4QueueTwo").await;
+    let mut queue_three = connect_m4(&pool, address, "M4QueueThree").await;
+    let mut queue_four = connect_m4(&pool, address, "M4QueueFour").await;
+    send_typed(
+        &mut queue_owner.stream,
+        queue_owner.key,
+        3,
+        &RoomCreateRequest {
+            name: RoomName::parse("Queue Bound").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(4).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut queue_owner.stream,
+        queue_owner.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let queue_id = RoomId::new(1).expect("room ID");
+    let queue_join = RoomJoinRequest {
+        room_id: queue_id,
+        password: None,
+    };
+    tokio::join!(
+        send_typed(&mut queue_two.stream, queue_two.key, 4, &queue_join),
+        send_typed(&mut queue_three.stream, queue_three.key, 4, &queue_join),
+        send_typed(&mut queue_four.stream, queue_four.key, 4, &queue_join),
+    );
+    assert_counter_at_least(
+        &metrics,
+        "pangya_game_room_events_total{event=\"joined\"} ",
+        3,
+    )
+    .await;
+    let flood_two = tokio::spawn(flood_ready(queue_two.stream, queue_two.key, 20_000));
+    let flood_three = tokio::spawn(flood_ready(queue_three.stream, queue_three.key, 20_000));
+    let flood_four = tokio::spawn(flood_ready(queue_four.stream, queue_four.key, 20_000));
+    assert_counter_at_least(
+        &metrics,
+        "pangya_game_queue_events_total{event=\"outbound_dropped\"} ",
+        1,
+    )
+    .await;
+    assert_counter_at_least(
+        &metrics,
+        "pangya_connections_closed_total{service=\"game\",reason=\"limited\"} ",
+        1,
+    )
+    .await;
+    flood_two.abort();
+    flood_three.abort();
+    flood_four.abort();
+    drop(queue_owner);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("bounded shutdown")
+        .expect("join")
+        .expect("serve");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

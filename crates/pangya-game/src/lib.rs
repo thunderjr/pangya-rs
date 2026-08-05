@@ -923,9 +923,11 @@ where
             self.lobby.disconnect(connection_id),
         )
         .await;
-        if !matches!(
+        if matches!(cleanup, Ok(Ok(None))) {
+            self.observer.room(GameRoomObservation::Closed);
+        } else if !matches!(
             cleanup,
-            Ok(Ok(_)) | Ok(Err(RoomError::NotMember | RoomError::RoomNotFound))
+            Ok(Ok(Some(_))) | Ok(Err(RoomError::NotMember | RoomError::RoomNotFound))
         ) {
             self.observer.queue(GameQueueObservation::LobbyRejected);
         }
@@ -1147,9 +1149,12 @@ where
                     .lobby_call(self.lobby.leave(identity.connection_id))
                     .await;
                 match result {
-                    Ok(_) => {
+                    Ok(snapshot) => {
                         self.send_result(framed, RoomCommand::Leave, Ok(())).await?;
                         self.observer.room(GameRoomObservation::Left);
+                        if snapshot.is_none() {
+                            self.observer.room(GameRoomObservation::Closed);
+                        }
                         *room_id = None;
                         Ok(GameState::InChannel)
                     }
