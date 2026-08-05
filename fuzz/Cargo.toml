@@ -1,0 +1,49 @@
+[package]
+name = "pangya-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.93.0"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.11.1"
+libfuzzer-sys = "0.4"
+pangya-crypto = { version = "0.1.0", path = "../crates/pangya-crypto" }
+pangya-data = { version = "0.1.0", path = "../crates/pangya-data" }
+pangya-protocol = { version = "0.1.0", path = "../crates/pangya-protocol" }
+tokio-util = { version = "0.7.18", features = ["codec"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "client-codec"
+path = "fuzz_targets/client_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server-decompression"
+path = "fuzz_targets/server_decompression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet-reader"
+path = "fuzz_targets/packet_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iff-parser"
+path = "fuzz_targets/iff_parser.rs"
+test = false
+doc = false
+bench = false
