@@ -1450,6 +1450,120 @@ mod tests {
     }
 
     #[test]
+    fn game_m4_defaults_file_values_and_unknown_policy_are_typed() {
+        let defaults = test_load(None, &CliOverrides::default()).expect("default config");
+        assert_eq!(defaults.game_max_rooms, 1_024);
+        assert_eq!(defaults.game_lobby_command_capacity, 256);
+        assert_eq!(defaults.game_lobby_event_capacity, 256);
+        assert_eq!(defaults.game_room_normal_capacity, 64);
+        assert_eq!(defaults.game_room_control_capacity, 16);
+        assert_eq!(defaults.game_outbound_room_event_capacity, 64);
+        assert_eq!(defaults.game_room_commands_per_window, 30);
+        assert_eq!(defaults.game_chat_messages_per_window, 10);
+        assert_eq!(defaults.game_unknown_opcode_strikes, 3);
+        assert_eq!(defaults.game_unknown_capture_capacity, 256);
+        assert_eq!(defaults.game_command_timeout, Duration::from_secs(3));
+        assert_eq!(
+            defaults.unknown_opcode_policy,
+            UnknownOpcodePolicy::Disconnect
+        );
+
+        let path = file(
+            "[game]\nmax_rooms=4096\nlobby_command_capacity=8192\nlobby_event_capacity=8192\n\
+             room_normal_capacity=4096\nroom_control_capacity=64\noutbound_room_event_capacity=4096\n\
+             room_commands_per_window=10000\nchat_messages_per_window=1000\nunknown_opcode_strikes=32\n\
+             unknown_capture_capacity=4096\ncommand_timeout='10s'\n\
+             [protocol]\nunknown_opcode_policy='capture'\n",
+        );
+        let config = test_load(Some(&path), &CliOverrides::default()).expect("maximum config");
+        assert_eq!(config.game_max_rooms, 4_096);
+        assert_eq!(config.game_room_control_capacity, 64);
+        assert_eq!(config.game_room_commands_per_window, 10_000);
+        assert_eq!(config.game_command_timeout, config.shutdown_grace);
+        assert_eq!(config.unknown_opcode_policy, UnknownOpcodePolicy::Capture);
+        fs::remove_file(path).expect("remove");
+
+        let path = file("[protocol]\nunknown_opcode_policy='ignore'\n");
+        let config = test_load(Some(&path), &CliOverrides::default()).expect("ignore policy");
+        assert_eq!(config.unknown_opcode_policy, UnknownOpcodePolicy::Ignore);
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
+    fn game_m4_zero_limits_and_unknown_policy_errors_aggregate() {
+        let path = file(
+            "[game]\nmax_rooms=0\nlobby_command_capacity=0\nlobby_event_capacity=0\n\
+             room_normal_capacity=0\nroom_control_capacity=0\noutbound_room_event_capacity=0\n\
+             room_commands_per_window=0\nchat_messages_per_window=0\nunknown_opcode_strikes=0\n\
+             unknown_capture_capacity=0\ncommand_timeout='0s'\n\
+             [protocol]\nunknown_opcode_policy='retain-raw'\n",
+        );
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("zero limits")
+        else {
+            panic!("expected validation");
+        };
+        let fields = error
+            .issues
+            .iter()
+            .map(|issue| issue.field)
+            .collect::<HashSet<_>>();
+        for expected in [
+            "game.max_rooms",
+            "game.lobby_command_capacity",
+            "game.lobby_event_capacity",
+            "game.room_normal_capacity",
+            "game.room_control_capacity",
+            "game.outbound_room_event_capacity",
+            "game.room_commands_per_window",
+            "game.chat_messages_per_window",
+            "game.unknown_opcode_strikes",
+            "game.unknown_capture_capacity",
+            "game.command_timeout",
+            "protocol.unknown_opcode_policy",
+        ] {
+            assert!(fields.contains(expected), "missing {expected}: {fields:?}");
+        }
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
+    fn game_m4_hard_caps_and_command_shutdown_relation_aggregate() {
+        let path = file(
+            "[server]\nshutdown_grace='1s'\n[game]\nmax_rooms=4097\nlobby_command_capacity=8193\n\
+             lobby_event_capacity=8193\nroom_normal_capacity=4097\nroom_control_capacity=65\n\
+             outbound_room_event_capacity=4097\nroom_commands_per_window=10001\nchat_messages_per_window=1001\n\
+             unknown_opcode_strikes=33\nunknown_capture_capacity=4097\ncommand_timeout='2s'\n",
+        );
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("hard caps")
+        else {
+            panic!("expected validation");
+        };
+        let fields = error
+            .issues
+            .iter()
+            .map(|issue| issue.field)
+            .collect::<HashSet<_>>();
+        for expected in [
+            "game.max_rooms",
+            "game.lobby_command_capacity",
+            "game.lobby_event_capacity",
+            "game.room_normal_capacity",
+            "game.room_control_capacity",
+            "game.outbound_room_event_capacity",
+            "game.room_commands_per_window",
+            "game.chat_messages_per_window",
+            "game.unknown_opcode_strikes",
+            "game.unknown_capture_capacity",
+            "game.command_timeout",
+        ] {
+            assert!(fields.contains(expected), "missing {expected}: {fields:?}");
+        }
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
     fn starter_collection_caps_and_credential_shutdown_relation_aggregate() {
         let allowed = (0_u32..=64)
             .map(|value| value.to_string())
@@ -1581,7 +1695,7 @@ mod tests {
         assert!(config.game_enabled);
         assert_eq!(config.game_channel_id, 1);
         let login_limits = crate::runtime_limits(&config);
-        let game_limits = crate::game_runtime_limits(&config);
+        let game_limits = crate::game_runtime_limits(&config).expect("game limits");
         assert_eq!(
             login_limits.global_connections + game_limits.global_connections,
             config.security.global_connections
@@ -1730,6 +1844,8 @@ mod tests {
                 "configuration::tests::environment_child",
             ])
             .env("PANGYA__GAME__NAME", "From Environment")
+            .env("PANGYA__GAME__MAX_ROOMS", "2048")
+            .env("PANGYA__PROTOCOL__UNKNOWN_OPCODE_POLICY", "ignore")
             .env("PANGYA__LOGIN__BIND", "127.0.0.1:13333")
             .output()
             .expect("child");
@@ -1746,6 +1862,8 @@ mod tests {
         let path = file("[game]\nname='From File'\n[login]\nbind='127.0.0.1:11111'\n");
         let config = test_load(Some(&path), &CliOverrides::default()).expect("config");
         assert_eq!(config.game_name, "From Environment");
+        assert_eq!(config.game_max_rooms, 2_048);
+        assert_eq!(config.unknown_opcode_policy, UnknownOpcodePolicy::Ignore);
         assert_eq!(config.login_bind.port(), 13_333);
         fs::remove_file(path).expect("remove");
     }

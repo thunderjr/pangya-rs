@@ -18,6 +18,18 @@ id = 1
 name = "PangYa-RS Local"
 capacity = 200
 channel_id = 1
+max_rooms = 1024
+lobby_command_capacity = 256
+lobby_event_capacity = 256
+room_normal_capacity = 64
+room_control_capacity = 16
+outbound_room_event_capacity = 64
+room_commands_per_window = 30
+chat_messages_per_window = 10
+unknown_opcode_strikes = 3
+# Capture retains bounded opcode/state/length metadata plus a SHA-256 digest, never raw payloads.
+unknown_capture_capacity = 256
+command_timeout = "3s"
 
 [http]
 bind = "127.0.0.1:8080"

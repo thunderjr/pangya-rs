@@ -10,6 +10,7 @@ pub mod configuration;
 use std::{
     env, fs,
     io::{Read as _, Write as _},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -19,7 +20,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::Catalog;
 use pangya_domain::{NewAccount, Nickname, RepositoryError, Username};
-use pangya_game::{GameRuntimeConfig, GameRuntimeLimits, GameService};
+use pangya_game::{
+    GameRuntimeConfig, GameRuntimeLimits, GameService, LobbyLimits, RoomActorLimits,
+};
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
     LoginRuntimeConfig, LoginRuntimeLimits, LoginService,
@@ -277,7 +280,8 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 catalog,
                 GameRuntimeConfig {
                     channel_id: config.game_channel_id,
-                    limits: game_runtime_limits(&config),
+                    unknown_opcode_policy: config.unknown_opcode_policy,
+                    limits: game_runtime_limits(&config)?,
                 },
                 metrics.clone(),
             )
@@ -561,7 +565,7 @@ fn runtime_limits(config: &AppConfig) -> LoginRuntimeLimits {
     }
 }
 
-fn game_runtime_limits(config: &AppConfig) -> GameRuntimeLimits {
+fn game_runtime_limits(config: &AppConfig) -> Result<GameRuntimeLimits, ServerError> {
     let (_, global_connections) =
         partition_usize(config.security.global_connections, config.game_enabled);
     let (_, global_accepts_per_window) = partition_u32(
@@ -578,7 +582,20 @@ fn game_runtime_limits(config: &AppConfig) -> GameRuntimeLimits {
     );
     let (_, global_bytes_per_window) =
         partition_u64(config.security.global_bytes_per_window, config.game_enabled);
-    GameRuntimeLimits {
+    let nonzero = |value| NonZeroUsize::new(value).ok_or(ServerError::Runtime);
+    let room = RoomActorLimits::new(
+        nonzero(config.game_room_normal_capacity)?,
+        nonzero(config.game_room_control_capacity)?,
+        config.game_command_timeout,
+    );
+    let lobby = LobbyLimits::new(
+        nonzero(config.game_max_rooms)?,
+        nonzero(config.game_lobby_command_capacity)?,
+        nonzero(config.game_lobby_event_capacity)?,
+        config.shutdown_grace,
+        room,
+    );
+    Ok(GameRuntimeLimits {
         global_connections,
         connections_per_source: config
             .security
@@ -595,16 +612,23 @@ fn game_runtime_limits(config: &AppConfig) -> GameRuntimeLimits {
         source_bytes_per_window: config.security.source_bytes_per_window,
         packets_per_window: config.security.packets_per_window,
         bytes_per_window: config.security.bytes_per_window,
+        room_commands_per_window: config.game_room_commands_per_window,
+        chat_messages_per_window: config.game_chat_messages_per_window,
+        unknown_opcode_strikes: config.game_unknown_opcode_strikes,
+        unknown_capture_capacity: config.game_unknown_capture_capacity,
+        outbound_room_event_capacity: config.game_outbound_room_event_capacity,
+        lobby,
         rate_window: config.security.rate_window,
         authentication_timeout: config.security.login_timeout,
         idle_timeout: config.security.idle_timeout,
+        command_timeout: config.game_command_timeout,
         shutdown_grace: config.shutdown_grace,
         codec: CodecLimits {
             max_client_frame_bytes: config.max_client_frame_bytes,
             max_server_plaintext_bytes: config.max_plaintext_bytes,
             max_expansion_ratio: config.max_expansion_ratio,
         },
-    }
+    })
 }
 
 fn partition_usize(total: usize, game_enabled: bool) -> (usize, usize) {

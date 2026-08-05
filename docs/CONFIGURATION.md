@@ -22,7 +22,10 @@ explicit CLI flags`. Nested environment keys use `__`, for example
   still emits the advertised Game endpoint.
 - `login.auto_create_accounts` defaults false and validation rejects it outside
   `server.profile = "local"`.
-- `logging.packet_bodies = true` is rejected in M2.
+- `logging.packet_bodies = true` is rejected in M2. The GameService
+  `protocol.unknown_opcode_policy` accepts `disconnect`, `ignore`, or `capture`;
+  capture retains only bounded opcode/state/length metadata and a SHA-256 digest,
+  never the raw payload or a public audit record.
 
 ## Current readiness boundary
 
@@ -44,17 +47,24 @@ Validation reports all independently detected errors, including malformed or
 duplicate/zero-port binds, nonrepresentable advertised IPv4/fixed-width fields,
 any public bind without acknowledgement, nonlocal auto-create, zero/inconsistent
 limits, unknown client profiles, missing DB secret sources, and starter
-inconsistency. M2 intentionally requires `security.malformed_strike_cap = 1`:
+inconsistency. M2 transport still requires `security.malformed_strike_cap = 1`:
 encrypted client frames cannot be safely resynchronized after malformed input,
-so the first malformed/unknown/invalid-state strike is observed and closed.
-Global, masked-source, normalized-username, and per-connection count/weighted-byte
-budgets use fixed-capacity windows. All allocation, concurrency, retry, rate,
-frame, and duration values have hard upper bounds. The provisional character
-allowlist caps at 64 entries and starter items at 256; the starter-item cap is
-also enforced before allocation or SQL at every PostgreSQL create/grant boundary.
-Stable keys cap at 64 bytes. Credential operation timeout must not exceed process
-shutdown grace. LoginService and GameService use direct bounded framed writes, so
-no outbound-queue setting is exposed. When GameService is enabled, each configured
+so the first malformed or invalid-state transport strike is observed and closed.
+GameService unknown post-channel opcodes use the separately bounded policy,
+strike count, and metadata-digest capture capacity. Global, masked-source,
+normalized-username, and per-connection count/weighted-byte budgets use
+fixed-capacity windows. All allocation, concurrency, retry, rate, frame, actor
+queue, and duration values have hard upper bounds. Game-specific bounds include
+rooms (4096), lobby command/event queues (8192 each), normal room commands (4096),
+room control commands (64), per-connection outbound room events (4096), room
+commands per window (10000), chat messages per window (1000), unknown strikes
+(32), and unknown captures (4096). The nonzero GameService command timeout cannot
+exceed process shutdown grace. The provisional character allowlist caps at 64
+entries and starter items at 256; the starter-item cap is also enforced before
+allocation or SQL at every PostgreSQL create/grant boundary. Stable keys cap at
+64 bytes. Credential operation timeout must not exceed process shutdown grace.
+LoginService uses direct bounded framed writes; GameService additionally uses its
+bounded room actor and per-connection event queues. When GameService is enabled, each configured
 process-total `global_connections`, `global_accepts_per_window`,
 `global_logins_per_window` (Login login/Game handover auth),
 `global_packets_per_window`, and `global_bytes_per_window` must be at least two.

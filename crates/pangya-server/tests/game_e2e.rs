@@ -12,7 +12,7 @@ use pangya_domain::{
     HandoverRepository as _, ItemTypeId, NewAccount, Nickname, ServiceKind, SourceAddressPrefix,
     StarterCharacter, StarterGrant, StarterItem, StarterKey, Username,
 };
-use pangya_game::{GameRuntimeConfig, GameRuntimeLimits, GameService};
+use pangya_game::{GameRuntimeConfig, GameRuntimeLimits, GameService, UnknownOpcodePolicy};
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
     LoginRuntimeLimits, LoginService, generate_handover,
@@ -122,6 +122,7 @@ fn game_service(
             catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits,
             },
             metrics,
@@ -232,6 +233,25 @@ async fn assert_metric(metrics: &M2Metrics, needle: &str) {
     .unwrap_or_else(|_| panic!("missing metric {needle}: {}", metrics.render()));
 }
 
+async fn assert_counter_at_least(metrics: &M2Metrics, prefix: &str, minimum: u64) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rendered = metrics.render();
+            let reached = rendered.lines().any(|line| {
+                line.strip_prefix(prefix)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|value| value >= minimum)
+            });
+            if reached {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("counter below {minimum} for {prefix}: {}", metrics.render()));
+}
+
 fn auth_payload(account_id: i64, token: &str) -> Vec<u8> {
     let mut writer = PacketWriter::new();
     writer.u64_le(u64::try_from(account_id).expect("account"));
@@ -334,6 +354,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
             catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits::default(),
             },
             metrics.clone(),
@@ -586,10 +607,8 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
         &auth_payload(aggregate.account.id.get(), &second_token),
     )
     .await;
-    assert_eq!(
-        maybe_receive_opcode(&mut duplicate, duplicate_key).await,
-        None
-    );
+    read_bootstrap(&mut duplicate, duplicate_key, 1).await;
+    assert_closed(&mut duplicate).await;
     assert!(metrics.render().contains("outcome=\"duplicate\"} 1"));
     drop(first);
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -832,11 +851,12 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
     let limits = GameRuntimeLimits {
         authentication_timeout: Duration::from_secs(1),
         idle_timeout: Duration::from_millis(50),
+        command_timeout: Duration::from_millis(100),
         shutdown_grace: Duration::from_millis(200),
         ..GameRuntimeLimits::default()
     };
     let metrics = Arc::new(M2Metrics::default());
-    let service = game_service(pool.clone(), limits, metrics.clone());
+    let service = game_service(pool.clone(), limits.clone(), metrics.clone());
     let (address, shutdown, task) = start_service(Arc::clone(&service)).await;
 
     let (mut invalid_state, invalid_key) = connect_game(address).await;
@@ -886,7 +906,12 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
     send_packet(&mut idle, idle_key, 6, 4, &1_u32.to_le_bytes()).await;
     assert_eq!(receive_packet(&mut idle, idle_key).await.0, 0x004e);
     assert_closed(&mut idle).await;
-    assert_metric(&metrics, "service=\"game\",reason=\"timeout\"} 1").await;
+    assert_counter_at_least(
+        &metrics,
+        "pangya_connections_closed_total{service=\"game\",reason=\"timeout\"} ",
+        1,
+    )
+    .await;
 
     let cancellation_token = issue_token(
         &pool,
@@ -925,6 +950,7 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
         ServiceKind::Game,
     )
     .await;
+    let service = game_service(pool, limits, metrics);
     let (address, shutdown, task) = start_service(service).await;
     let (mut reconnect, reconnect_key) = connect_game(address).await;
     send_packet(
@@ -947,6 +973,7 @@ async fn game_connection_task_bound_and_shutdown_grace_are_enforced(pool: PgPool
         connections_per_source: 2,
         global_accepts_per_window: 10,
         accepts_per_window: 10,
+        command_timeout: Duration::from_millis(50),
         shutdown_grace: Duration::from_millis(100),
         ..GameRuntimeLimits::default()
     };
