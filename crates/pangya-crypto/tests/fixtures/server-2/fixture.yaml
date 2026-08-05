@@ -1,0 +1,14 @@
+source_project: pangbox/pangcrypt
+upstream_revision: 2bf7a1d36591
+upstream_url: https://github.com/pangbox/pangcrypt/tree/2bf7a1d36591
+upstream_path: server_test.go
+license: ISC
+client_version: US 852.00
+service: transport
+direction: server-to-client
+encryption_key: 7
+salt: 73
+expected_opcode: 1
+redaction_status: synthetic upstream test data; no real credential accepted
+expected_behavior: decrypt fixture.bin to expected.bin
+sha256_fixture: 9d865e6ee42d48baa5e8f2f1847bc4761420e0dcefff8dd307a8f222d9c8d4b4

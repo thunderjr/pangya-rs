@@ -1,0 +1,14 @@
+source_project: pangbox/pangcrypt
+upstream_revision: 2bf7a1d36591
+upstream_url: https://github.com/pangbox/pangcrypt/tree/2bf7a1d36591
+upstream_path: client_test.go
+license: ISC
+client_version: US 852.00
+service: transport
+direction: client-to-server
+encryption_key: 5
+salt: 7
+expected_opcode: 1
+redaction_status: exact published upstream dummy vector; john is not attested as a real account and the digest is MD5 of the known literal secret test (not irreversible)
+expected_behavior: decrypt fixture.bin to expected.bin
+sha256_fixture: e0382596ba122de701674cc6e2eaa095d78cf7b68694aaddd2ea595fb950408d
