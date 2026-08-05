@@ -1,0 +1,11 @@
+source_project: pangya-rs synthetic M3 fixture generator
+upstream_revision: local-synthetic-2026-08-05
+upstream_url: https://example.invalid/pangya-rs-synthetic
+upstream_path: crates/pangya-data/tests/fixtures/synthetic-catalog
+license: MIT OR Apache-2.0
+client_version: synthetic-not-client-derived
+service: data
+direction: operator-input
+redaction_status: generated-no-proprietary-content
+expected_behavior: three minimal generated catalog families with synthetic headers and opaque records
+sha256_fixture: per-file SHA-256 values are recorded in manifest.toml

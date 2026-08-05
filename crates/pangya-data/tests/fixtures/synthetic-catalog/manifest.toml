@@ -1,0 +1,29 @@
+manifest_version = 1
+
+[[files]]
+filename = "character.bin"
+sha256 = "8e634d84dbf7ba1d9c8b8515d6ca1a4e0e87e270df97e28427d58dd53fd5b5c4"
+kind = "character"
+count = 1
+binding = 1
+version = 1
+record_size = 8
+
+[[files]]
+filename = "club_set.bin"
+sha256 = "2bc63711f5c8e4abbda812fe5a413b49250830c6b1861fc7c2be39ac2ffb574e"
+kind = "club_set"
+count = 1
+binding = 2
+version = 1
+record_size = 8
+
+[[files]]
+filename = "ball.bin"
+sha256 = "7f270c607407c9fecedefa12ae5c69408a41badfd82c989d4cbc67ab4765045e"
+kind = "ball"
+count = 1
+binding = 3
+version = 1
+record_size = 8
+
