@@ -1,0 +1,12 @@
+source_project: pangya-rs synthetic layout derivative of pangbox/packetdoc
+upstream_revision: d61f583a3e67
+upstream_url: https://github.com/pangbox/packetdoc/tree/d61f583a3e67
+upstream_path: src/packets/loginservice/server/0010.ksy
+license: MIT OR Apache-2.0; layout source ISC
+client_version: US 852.00 layout target
+service: login
+direction: server-to-client
+expected_opcode: 0x0010
+redaction_status: synthetic values only; not a capture and not client-accepted evidence
+expected_behavior: exact typed packet byte layout including u16 opcode; synthetic derivative only
+sha256_fixture: 717e10a7cb41ca565b32b570b4003d6d28d8818c8340c0cf882f38c708ecec41

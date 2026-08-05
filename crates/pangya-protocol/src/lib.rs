@@ -1,0 +1,112 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
+//! Bounded U.S. 852 packet primitives, state registry, and Tokio codec.
+
+mod codec;
+mod error;
+mod game;
+mod login;
+mod m4_room;
+mod profile;
+mod reader;
+mod registry;
+mod writer;
+
+pub use codec::{CodecLimits, FrameCodec, FrameMetadata, InboundFrame, OutboundFrame};
+pub use error::{ErrorClass, PacketDecodeError, PacketEncodeError};
+pub use game::{
+    ChannelJoined, CharacterBootstrap, CharacterInfo, EquipmentInfo, GAME_INVENTORY_SEGMENT_ITEMS,
+    GameAuth, InventoryBootstrap, InventorySegment, MAX_GAME_HANDOVER_BYTES, PlayerInfo,
+    SelectChannel, synthetic_game_hello,
+};
+pub use login::{
+    ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList,
+    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey, LoginRequest,
+    LoginResult, LoginSuccess, NicknameCheckResult, SelectCharacter, SelectServer, SessionKey,
+    SetNickname, us852_login_hello,
+};
+pub use m4_room::{
+    MAX_ROOM_MEMBERS, MAX_ROOM_SUMMARIES, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
+    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M4_S2C_CHAT,
+    SYNTHETIC_M4_S2C_COMMAND_RESULT, SYNTHETIC_M4_S2C_LIST, SYNTHETIC_M4_S2C_MEMBERSHIP_EVENT,
+    SYNTHETIC_M4_S2C_STATE, synthetic_m4_registry,
+};
+pub use profile::{
+    ClientVersion, CompatibilityProfile, ConnectionState, Direction, ProfileError, Region,
+    ServiceKind,
+};
+pub use reader::PacketReader;
+pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
+pub use writer::PacketWriter;
+
+/// Explicit storage for fields whose meaning is not established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownBytes<const N: usize>(pub [u8; N]);
+
+/// Decodes one typed packet payload.
+pub trait DecodePacket: Sized {
+    /// Wire opcode.
+    const OPCODE: u16;
+    /// Decode using a selected compatibility profile.
+    ///
+    /// # Errors
+    /// Returns a contextual error for malformed or unsupported fields.
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError>;
+}
+
+/// Encodes one typed packet payload.
+pub trait EncodePacket {
+    /// Wire opcode.
+    const OPCODE: u16;
+    /// Encode using a selected compatibility profile.
+    ///
+    /// # Errors
+    /// Returns an error when a value cannot fit its wire representation.
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError>;
+}
+
+/// Encodes a typed packet body without its opcode.
+///
+/// This is the safe composition boundary used by the runtime before the bounded
+/// transport encoder adds the opcode, compression, and encryption.
+///
+/// # Errors
+/// Returns the packet model's checked encoding error.
+pub fn encode_packet_payload<T: EncodePacket>(
+    packet: &T,
+    profile: &CompatibilityProfile,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, PacketEncodeError> {
+    let mut writer = PacketWriter::new();
+    packet.encode(&mut writer, profile)?;
+    Ok(zeroize::Zeroizing::new(writer.into_inner()))
+}
+
+/// Decodes a typed packet body using redacted contextual errors.
+///
+/// # Errors
+/// Returns a checked packet decoding error. Packet implementations decide
+/// whether an unknown tail is part of their provisional layout.
+pub fn decode_packet_payload<T: DecodePacket>(
+    payload: &[u8],
+    profile: &CompatibilityProfile,
+    service: ServiceKind,
+) -> Result<T, PacketDecodeError> {
+    let mut reader =
+        PacketReader::new(payload, Direction::ClientToServer, service, Some(T::OPCODE));
+    T::decode(&mut reader, profile)
+}

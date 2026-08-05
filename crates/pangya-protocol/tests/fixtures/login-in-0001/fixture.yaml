@@ -1,0 +1,12 @@
+source_project: pangbox/packetdoc
+upstream_revision: d61f583a3e67
+upstream_url: https://github.com/pangbox/packetdoc/tree/d61f583a3e67
+upstream_path: examples/loginservice/client/GB.R7.852.00/0001-181018.1255-0000-7af0.bin
+license: ISC
+client_version: GB.R7.852.00
+service: login
+direction: client-to-server
+expected_opcode: 0x0001
+redaction_status: captured PacketDoc example; published dummy vector uses username john and known literal secret test; no real-account attestation
+expected_behavior: exact typed packet byte layout including u16 opcode
+sha256_fixture: 7af014f73a2aebdc35ee1456b2942233b738d5dfe09dee14a0543b1e265d4e5e

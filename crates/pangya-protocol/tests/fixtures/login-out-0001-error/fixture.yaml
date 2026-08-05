@@ -1,0 +1,12 @@
+source_project: pangbox/packetdoc
+upstream_revision: d61f583a3e67
+upstream_url: https://github.com/pangbox/packetdoc/tree/d61f583a3e67
+upstream_path: examples/loginservice/server/TH.R6.829.01/0001-190812.0136-0000-379a.bin
+license: ISC
+client_version: TH.R6.829.01
+service: login
+direction: server-to-client
+expected_opcode: 0x0001
+redaction_status: captured PacketDoc example; layout evidence only, not U.S. client acceptance
+expected_behavior: exact typed packet byte layout including u16 opcode
+sha256_fixture: 01d7d6ac17371d8e5b8987d9adfdd027482cc9937bf786f294a1c31811a215a1

@@ -1,0 +1,14 @@
+source_project: pangbox/server
+upstream_revision: 91d8a5a4f3be
+upstream_url: https://github.com/pangbox/server/tree/91d8a5a4f3be
+upstream_path: login/conn.go and login/msgserver.go
+license: ISC
+client_version: US 852.00
+service: login
+direction: server-to-client plaintext hello
+encryption_key: 5
+salt: not-applicable
+expected_opcode: not-applicable
+redaction_status: synthetic key-parametric fixture; no user data
+expected_behavior: exact 14-byte hello before encrypted frames
+sha256_fixture: d8b9dc00993681e1406c0cc591f636b1cabb17f3228ba076eca788c1e0cc2192

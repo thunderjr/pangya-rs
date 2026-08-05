@@ -1,0 +1,11 @@
+source_project: pangya-rs synthetic M3 model
+upstream_revision: local-synthetic-2026-08-05
+upstream_url: https://example.invalid/pangya-rs-synthetic
+upstream_path: crates/pangya-protocol/src/game.rs
+license: MIT OR Apache-2.0
+client_version: synthetic-us852-profile-not-client-accepted
+service: game
+direction: server-to-client
+redaction_status: generated-no-proprietary-content
+expected_behavior: synthetic four-byte hello with negotiated key in final byte
+sha256_fixture: 3b28a6c3766c6295adad976d349705ef49393fbfdebe4facb5862d2cdfa285d3

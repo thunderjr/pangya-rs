@@ -1,0 +1,12 @@
+source_project: pangya-rs synthetic provisional handover token
+upstream_revision: none
+upstream_url: none
+upstream_path: none
+license: MIT OR Apache-2.0
+client_version: US 852.00 layout target; external acceptance unproven
+service: login
+direction: server-to-client
+expected_opcode: 0x0003
+redaction_status: deterministic all-zero synthetic bearer component; not usable production evidence
+expected_behavior: exact typed encode of four unknown zero bytes then pstring bearer; field/order/length remain capture-gated
+sha256_fixture: 4d23514354a20d77899a467788a7c87a8fb06a6e033c4d88ab78b877828d8967

@@ -1,0 +1,12 @@
+source_project: pangya-rs synthetic derivative of attributed legacy U.S. behavior
+upstream_revision: behavior triangulated; no copied capture
+upstream_url: none
+upstream_path: none
+license: MIT OR Apache-2.0; behavior-only legacy observation
+client_version: US 852.00 layout target; external acceptance unproven
+service: login
+direction: server-to-client
+expected_opcode: 0x0001
+redaction_status: fully synthetic; fixed nonsecret candidate result code
+expected_behavior: exact typed encode of status 0xe3 and candidate duplicate-connection code 5100107; real-client acceptance remains capture-gated
+sha256_fixture: c26ce3bea901da55b32557200f2a299bf9b70319e5d15e018ef033f9650651ef
