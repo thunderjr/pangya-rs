@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, item_type_id, starter_key FROM characters WHERE account_id = $1 ORDER BY id FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "starter_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c1672cc3399b021280db61ebdf4c9b5b44f1db8e496c39055582a0aaf36ca1a4"
+}

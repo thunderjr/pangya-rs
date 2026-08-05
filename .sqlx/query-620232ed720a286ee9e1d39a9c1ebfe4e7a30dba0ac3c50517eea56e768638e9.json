@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO operator_audit_events (action, account_id, outcome) VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "620232ed720a286ee9e1d39a9c1ebfe4e7a30dba0ac3c50517eea56e768638e9"
+}

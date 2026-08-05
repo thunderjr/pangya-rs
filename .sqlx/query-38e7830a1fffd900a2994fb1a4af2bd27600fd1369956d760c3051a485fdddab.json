@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE handover_sessions SET revoked_at = $2 WHERE account_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38e7830a1fffd900a2994fb1a4af2bd27600fd1369956d760c3051a485fdddab"
+}

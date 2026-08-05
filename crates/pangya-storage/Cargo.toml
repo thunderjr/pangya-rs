@@ -1,0 +1,21 @@
+[package]
+name = "pangya-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+pangya-domain = { version = "0.1.0", path = "../pangya-domain" }
+sqlx.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pangya-login = { version = "0.1.0", path = "../pangya-login" }
+tokio.workspace = true
+
+[lints]
+workspace = true

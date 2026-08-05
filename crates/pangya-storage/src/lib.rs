@@ -1,0 +1,1307 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
+//! PostgreSQL 17 pool, migrations, and M2 account/handover repositories.
+
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+    time::{Duration, SystemTime},
+};
+
+use chrono::{DateTime, Utc};
+use pangya_domain::{
+    Account, AccountAggregate, AccountId, AccountRepository, AccountStatus, AuthenticatedSession,
+    AuthenticationRecord, Character, CharacterId, ConsumeHandover, CredentialHash, EquipmentSet,
+    EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository, InventoryItem,
+    InventoryItemId, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS,
+    NewAccount, NewHandover, Nickname, NormalizedNickname, NormalizedUsername, PlayerRepository,
+    PlayerSnapshot, Profile, RepositoryError, RepositoryFuture, ServiceKind, SetupState,
+    StarterGrant, StarterKey,
+};
+use sqlx::{
+    FromRow, PgPool, Postgres, Transaction,
+    migrate::Migrator,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+
+/// Embedded forward-only PostgreSQL migrations.
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// Redacted PostgreSQL pool configuration.
+#[derive(Clone)]
+pub struct PgStorageConfig {
+    database_url: String,
+    /// Maximum open connections.
+    pub max_connections: u32,
+    /// Minimum retained connections.
+    pub min_connections: u32,
+    /// Maximum wait to acquire a connection.
+    pub acquire_timeout: Duration,
+    /// Maximum idle duration before a connection is closed.
+    pub idle_timeout: Option<Duration>,
+    /// Maximum connection lifetime.
+    pub max_lifetime: Option<Duration>,
+}
+
+impl PgStorageConfig {
+    /// Creates a bounded pool configuration around a secret database URL.
+    #[must_use]
+    pub fn new(database_url: impl Into<String>) -> Self {
+        Self {
+            database_url: database_url.into(),
+            max_connections: 10,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(5),
+            idle_timeout: Some(Duration::from_secs(600)),
+            max_lifetime: Some(Duration::from_secs(1_800)),
+        }
+    }
+
+    /// Builds and connects the configured PostgreSQL pool.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration/connect error.
+    pub async fn connect(&self) -> Result<PgPool, StorageBootstrapError> {
+        if self.max_connections == 0
+            || self.max_connections > 256
+            || self.min_connections > self.max_connections
+            || self.acquire_timeout.is_zero()
+            || self.acquire_timeout > Duration::from_secs(60)
+        {
+            return Err(StorageBootstrapError::InvalidConfig);
+        }
+        let options: PgConnectOptions = self
+            .database_url
+            .parse()
+            .map_err(|_| StorageBootstrapError::InvalidConfig)?;
+        PgPoolOptions::new()
+            .max_connections(self.max_connections)
+            .min_connections(self.min_connections)
+            .acquire_timeout(self.acquire_timeout)
+            .idle_timeout(self.idle_timeout)
+            .max_lifetime(self.max_lifetime)
+            .connect_with(options)
+            .await
+            .map_err(|_| StorageBootstrapError::Connect)
+    }
+}
+
+impl fmt::Debug for PgStorageConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgStorageConfig")
+            .field("database_url", &"[REDACTED]")
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_lifetime", &self.max_lifetime)
+            .finish()
+    }
+}
+
+/// Pool/migration bootstrap error with connection secrets removed.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum StorageBootstrapError {
+    /// Pool bounds or URL syntax were invalid.
+    #[error("PostgreSQL storage configuration is invalid")]
+    InvalidConfig,
+    /// Pool connection failed.
+    #[error("PostgreSQL connection failed")]
+    Connect,
+    /// Embedded migration failed.
+    #[error("PostgreSQL migration failed")]
+    Migration,
+}
+
+/// Runs all embedded forward migrations.
+///
+/// # Errors
+/// Returns a redacted migration failure.
+pub async fn migrate(pool: &PgPool) -> Result<(), StorageBootstrapError> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .map_err(|_| StorageBootstrapError::Migration)
+}
+
+/// PostgreSQL implementation of the M2 repository contracts.
+#[derive(Clone)]
+pub struct PgRepository {
+    pool: PgPool,
+}
+
+impl PgRepository {
+    /// Wraps a configured pool.
+    #[must_use]
+    pub const fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Atomically creates an operator account aggregate and its success audit event.
+    ///
+    /// # Errors
+    /// Returns a friendly repository error; an audit failure rolls back the entire aggregate.
+    pub async fn create_operator_account(
+        &self,
+        request: NewAccount,
+    ) -> Result<AccountAggregate, RepositoryError> {
+        self.create_account_inner(request, true).await
+    }
+
+    /// Records a durable, nonsecret operator audit event after DB availability.
+    ///
+    /// # Errors
+    /// Returns a redacted storage failure.
+    pub async fn record_operator_audit(
+        &self,
+        action: &'static str,
+        account_id: Option<AccountId>,
+        outcome: &'static str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            "INSERT INTO operator_audit_events (action, account_id, outcome) \
+             VALUES ($1, $2, $3)",
+            action,
+            account_id.map(AccountId::get),
+            outcome
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        Ok(())
+    }
+
+    /// Returns the pool for readiness and transaction composition, never SQL rows.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    async fn create_account_inner(
+        &self,
+        request: NewAccount,
+        audit_success: bool,
+    ) -> Result<AccountAggregate, RepositoryError> {
+        ensure_starter_bounds(&request.starter)?;
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let account_id: i64 = sqlx::query_scalar!(
+            "INSERT INTO accounts (username_normalized, username_display) \
+             VALUES ($1, $2) RETURNING id",
+            request.username.normalized().as_str(),
+            request.username.display()
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let account_id = AccountId::new(account_id).map_err(|_| RepositoryError::CorruptData)?;
+
+        sqlx::query!(
+            "INSERT INTO credentials (account_id, scheme, password_hash) \
+             VALUES ($1, 'argon2id-client-md5-v1', $2)",
+            account_id.get(),
+            request.credential_hash.expose_phc()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+
+        let (nickname_display, nickname_normalized, setup_state) = match &request.nickname {
+            Some(nickname) => (
+                Some(nickname.display()),
+                Some(nickname.normalized().as_str()),
+                "needs_starter",
+            ),
+            None => (None, None, "needs_nickname"),
+        };
+        sqlx::query!(
+            "INSERT INTO profiles \
+             (account_id, nickname_display, nickname_normalized, setup_state) \
+             VALUES ($1, $2, $3, $4)",
+            account_id.get(),
+            nickname_display,
+            nickname_normalized,
+            setup_state
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+
+        apply_starter(&mut transaction, account_id, &request.starter).await?;
+        if audit_success {
+            sqlx::query!(
+                "INSERT INTO operator_audit_events (action, account_id, outcome) \
+                 VALUES ('account_create', $1, 'success')",
+                account_id.get()
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?;
+        }
+        let aggregate = load_aggregate_in_transaction(&mut transaction, account_id).await?;
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(aggregate)
+    }
+
+    async fn load_authentication_inner(
+        &self,
+        username: &NormalizedUsername,
+    ) -> Result<Option<AuthenticationRecord>, RepositoryError> {
+        let row = sqlx::query_as!(
+            AuthenticationRow,
+            "SELECT a.id, a.username_display, a.username_normalized, a.status, \
+                    c.password_hash, p.setup_state \
+             FROM accounts a \
+             JOIN credentials c ON c.account_id = a.id \
+             JOIN profiles p ON p.account_id = a.id \
+             WHERE a.username_normalized = $1",
+            username.as_str()
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        row.map(AuthenticationRow::into_domain).transpose()
+    }
+
+    async fn set_nickname_inner(
+        &self,
+        account_id: AccountId,
+        nickname: Nickname,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        lock_active_account(&mut transaction, account_id).await?;
+        let result = sqlx::query!(
+            "UPDATE profiles SET nickname_display = $2, nickname_normalized = $3, \
+                    setup_state = CASE WHEN setup_state = 'needs_nickname' \
+                        THEN 'complete' ELSE setup_state END, updated_at = now() \
+             WHERE account_id = $1",
+            account_id.get(),
+            nickname.display(),
+            nickname.normalized().as_str()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(())
+    }
+
+    async fn nickname_available_inner(
+        &self,
+        nickname: &NormalizedNickname,
+    ) -> Result<bool, RepositoryError> {
+        sqlx::query_scalar!(
+            r#"SELECT NOT EXISTS(
+                SELECT 1 FROM profiles WHERE nickname_normalized = $1
+            ) AS "available!""#,
+            nickname.as_str()
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(repository_db_error)
+    }
+
+    async fn grant_starter_inner(
+        &self,
+        account_id: AccountId,
+        grant: StarterGrant,
+    ) -> Result<AccountAggregate, RepositoryError> {
+        ensure_starter_bounds(&grant)?;
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        apply_starter(&mut transaction, account_id, &grant).await?;
+        let aggregate = load_aggregate_in_transaction(&mut transaction, account_id).await?;
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(aggregate)
+    }
+
+    async fn load_player_snapshot_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<PlayerSnapshot, RepositoryError> {
+        self.load_player_snapshot_with_checkpoint(account_id, std::future::ready(()))
+            .await
+    }
+
+    async fn load_player_snapshot_with_checkpoint<F>(
+        &self,
+        account_id: AccountId,
+        after_snapshot_begins: F,
+    ) -> Result<PlayerSnapshot, RepositoryError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        sqlx::query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?;
+        let account = sqlx::query_as!(
+            AccountRow,
+            "SELECT id, username_display, username_normalized, status FROM accounts WHERE id = $1",
+            account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        // The first SELECT establishes PostgreSQL's repeatable-read snapshot. Tests pause
+        // here so a committed mutation can be placed deterministically before later projections.
+        after_snapshot_begins.await;
+        let profile = sqlx::query_as!(
+            PlayerProfileRow,
+            "SELECT account_id, nickname_display, setup_state, pang, points, experience, \
+                    selected_character_id \
+             FROM profiles WHERE account_id = $1",
+            account_id.get()
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let character_limit =
+            i64::try_from(MAX_PLAYER_CHARACTERS + 1).map_err(|_| RepositoryError::CorruptData)?;
+        let characters = sqlx::query_as!(
+            CharacterRow,
+            "SELECT id, account_id, item_type_id, starter_key FROM characters \
+             WHERE account_id = $1 ORDER BY id LIMIT $2",
+            account_id.get(),
+            character_limit
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let inventory_limit =
+            i64::try_from(MAX_PLAYER_INVENTORY + 1).map_err(|_| RepositoryError::CorruptData)?;
+        let inventory = sqlx::query_as!(
+            InventoryRow,
+            "SELECT id, account_id, item_type_id, quantity, starter_key \
+             FROM inventory_items WHERE account_id = $1 ORDER BY id LIMIT $2",
+            account_id.get(),
+            inventory_limit
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let equipment = sqlx::query_as!(
+            EquipmentRow,
+            "SELECT id, account_id, character_id, club_item_id, ball_item_id, version \
+             FROM equipment_sets WHERE account_id = $1",
+            account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::CorruptData)?;
+        let snapshot = player_snapshot_from_rows(
+            account_id, account, profile, characters, inventory, equipment,
+        )?;
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(snapshot)
+    }
+
+    async fn set_status_inner(
+        &self,
+        account_id: AccountId,
+        status: AccountStatus,
+        now: SystemTime,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let status_text = account_status_text(status);
+        let now = system_time(now);
+        let result = sqlx::query!(
+            "UPDATE accounts SET status = $2, updated_at = $3 WHERE id = $1",
+            account_id.get(),
+            status_text,
+            now
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        if status != AccountStatus::Active {
+            sqlx::query!(
+                "UPDATE handover_sessions SET revoked_at = $2 \
+                 WHERE account_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+                account_id.get(),
+                now
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?;
+        }
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(())
+    }
+
+    async fn issue_handover_inner(&self, handover: NewHandover) -> Result<(), HandoverError> {
+        if handover.expires_at <= handover.issued_at {
+            return Err(HandoverError::Invalid);
+        }
+        let mut transaction = self.pool.begin().await.map_err(handover_db_error)?;
+        let status = sqlx::query_scalar!(
+            "SELECT status FROM accounts WHERE id = $1 FOR UPDATE",
+            handover.account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?
+        .ok_or(HandoverError::Invalid)?;
+        if parse_account_status(&status).map_err(|_| HandoverError::Storage)?
+            != AccountStatus::Active
+        {
+            return Err(HandoverError::AccountInactive);
+        }
+        let issued_at = system_time(handover.issued_at);
+        let expires_at = system_time(handover.expires_at);
+        sqlx::query!(
+            "INSERT INTO handover_sessions \
+             (id, account_id, token_digest, target, source_address_prefix, issued_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            handover.id.get(),
+            handover.account_id.get(),
+            handover.digest.as_bytes().as_slice(),
+            service_kind_text(handover.target),
+            handover.source_address_prefix.as_str(),
+            issued_at,
+            expires_at
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?;
+        transaction.commit().await.map_err(handover_db_error)?;
+        Ok(())
+    }
+
+    async fn consume_handover_inner(
+        &self,
+        request: ConsumeHandover,
+    ) -> Result<AuthenticatedSession, HandoverError> {
+        let mut transaction = self.pool.begin().await.map_err(handover_db_error)?;
+        let row = sqlx::query_as!(
+            HandoverRow,
+            "SELECT h.account_id, h.token_digest, h.target, h.issued_at, h.expires_at, \
+                    h.consumed_at, h.revoked_at, a.status \
+             FROM handover_sessions h JOIN accounts a ON a.id = h.account_id \
+             WHERE h.id = $1 FOR UPDATE OF h",
+            request.id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?
+        .ok_or(HandoverError::Invalid)?;
+
+        let expected =
+            HandoverDigest::from_slice(&row.token_digest).map_err(|_| HandoverError::Storage)?;
+        if !bool::from(expected.as_bytes().ct_eq(request.digest.as_bytes())) {
+            return Err(HandoverError::Invalid);
+        }
+        let target = parse_service_kind(&row.target).map_err(|_| HandoverError::Storage)?;
+        if target != request.target {
+            return Err(HandoverError::WrongTarget);
+        }
+        let now = system_time(request.now);
+        if now < row.issued_at || now >= row.expires_at {
+            return Err(HandoverError::Expired);
+        }
+        if parse_account_status(&row.status).map_err(|_| HandoverError::Storage)?
+            != AccountStatus::Active
+        {
+            return Err(HandoverError::AccountInactive);
+        }
+        if row.consumed_at.is_some() || row.revoked_at.is_some() {
+            return Err(HandoverError::AlreadyConsumed);
+        }
+        sqlx::query!(
+            "UPDATE handover_sessions SET consumed_at = $2 WHERE id = $1",
+            request.id.get(),
+            now
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?;
+        transaction.commit().await.map_err(handover_db_error)?;
+        Ok(AuthenticatedSession {
+            account_id: AccountId::new(row.account_id).map_err(|_| HandoverError::Storage)?,
+            handover_id: request.id,
+        })
+    }
+}
+
+impl AccountRepository for PgRepository {
+    fn create_account(
+        &self,
+        request: NewAccount,
+    ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>> {
+        Box::pin(self.create_account_inner(request, false))
+    }
+
+    fn load_authentication<'a>(
+        &'a self,
+        username: &'a NormalizedUsername,
+    ) -> RepositoryFuture<'a, Result<Option<AuthenticationRecord>, RepositoryError>> {
+        Box::pin(self.load_authentication_inner(username))
+    }
+
+    fn set_nickname(
+        &self,
+        account_id: AccountId,
+        nickname: Nickname,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.set_nickname_inner(account_id, nickname))
+    }
+
+    fn nickname_available<'a>(
+        &'a self,
+        nickname: &'a NormalizedNickname,
+    ) -> RepositoryFuture<'a, Result<bool, RepositoryError>> {
+        Box::pin(self.nickname_available_inner(nickname))
+    }
+
+    fn grant_starter(
+        &self,
+        account_id: AccountId,
+        grant: StarterGrant,
+    ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>> {
+        Box::pin(self.grant_starter_inner(account_id, grant))
+    }
+
+    fn set_status(
+        &self,
+        account_id: AccountId,
+        status: AccountStatus,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.set_status_inner(account_id, status, now))
+    }
+}
+
+impl PlayerRepository for PgRepository {
+    fn load_player_snapshot(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
+        Box::pin(self.load_player_snapshot_inner(account_id))
+    }
+}
+
+impl HandoverRepository for PgRepository {
+    fn issue(&self, handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
+        Box::pin(self.issue_handover_inner(handover))
+    }
+
+    fn consume(
+        &self,
+        request: ConsumeHandover,
+    ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
+        Box::pin(self.consume_handover_inner(request))
+    }
+}
+
+#[derive(FromRow)]
+struct AuthenticationRow {
+    id: i64,
+    username_display: String,
+    username_normalized: String,
+    status: String,
+    password_hash: String,
+    setup_state: String,
+}
+
+impl AuthenticationRow {
+    fn into_domain(self) -> Result<AuthenticationRecord, RepositoryError> {
+        Ok(AuthenticationRecord {
+            account: Account {
+                id: AccountId::new(self.id).map_err(|_| RepositoryError::CorruptData)?,
+                username_display: self.username_display,
+                username_normalized: NormalizedUsername::parse(&self.username_normalized)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                status: parse_account_status(&self.status)?,
+            },
+            credential_hash: CredentialHash::new(self.password_hash),
+            setup_state: parse_setup_state(&self.setup_state)?,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct AccountRow {
+    id: i64,
+    username_display: String,
+    username_normalized: String,
+    status: String,
+}
+
+#[derive(FromRow)]
+struct ProfileRow {
+    account_id: i64,
+    nickname_display: Option<String>,
+    setup_state: String,
+    pang: i64,
+    points: i64,
+    experience: i64,
+}
+
+#[derive(FromRow)]
+struct PlayerProfileRow {
+    account_id: i64,
+    nickname_display: Option<String>,
+    setup_state: String,
+    pang: i64,
+    points: i64,
+    experience: i64,
+    selected_character_id: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct CharacterRow {
+    id: i64,
+    account_id: i64,
+    item_type_id: i64,
+    starter_key: String,
+}
+
+#[derive(FromRow)]
+struct InventoryRow {
+    id: i64,
+    account_id: i64,
+    item_type_id: i64,
+    quantity: i64,
+    starter_key: String,
+}
+
+#[derive(FromRow)]
+struct EquipmentRow {
+    id: i64,
+    account_id: i64,
+    character_id: i64,
+    club_item_id: Option<i64>,
+    ball_item_id: Option<i64>,
+    version: i64,
+}
+
+#[derive(FromRow)]
+struct HandoverRow {
+    account_id: i64,
+    token_digest: Vec<u8>,
+    target: String,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    consumed_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    status: String,
+}
+
+async fn lock_active_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+) -> Result<(), RepositoryError> {
+    let status = sqlx::query_scalar!(
+        "SELECT status FROM accounts WHERE id = $1 FOR UPDATE",
+        account_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?
+    .ok_or(RepositoryError::NotFound)?;
+    if parse_account_status(&status)? != AccountStatus::Active {
+        return Err(RepositoryError::AccountInactive);
+    }
+    Ok(())
+}
+
+fn ensure_starter_bounds(grant: &StarterGrant) -> Result<(), RepositoryError> {
+    if grant.items.len() > MAX_STARTER_ITEMS {
+        return Err(RepositoryError::InvalidStarterGrant);
+    }
+    Ok(())
+}
+
+async fn apply_starter(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+    grant: &StarterGrant,
+) -> Result<(), RepositoryError> {
+    ensure_starter_bounds(grant)?;
+    lock_active_account(transaction, account_id).await?;
+    let mut configured_keys = HashSet::with_capacity(grant.items.len());
+    if grant
+        .items
+        .iter()
+        .any(|item| item.quantity == 0 || !configured_keys.insert(item.key.as_str()))
+    {
+        return Err(RepositoryError::InvalidStarterGrant);
+    }
+    for equipped_key in [
+        grant.equipped_club_key.as_ref(),
+        grant.equipped_ball_key.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !configured_keys.contains(equipped_key.as_str()) {
+            return Err(RepositoryError::InvalidStarterGrant);
+        }
+    }
+
+    let profile = sqlx::query!(
+        "SELECT nickname_normalized, selected_character_id, setup_state \
+         FROM profiles WHERE account_id = $1 FOR UPDATE",
+        account_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?
+    .ok_or(RepositoryError::NotFound)?;
+    let characters = sqlx::query!(
+        "SELECT id, item_type_id, starter_key FROM characters \
+         WHERE account_id = $1 ORDER BY id FOR UPDATE",
+        account_id.get()
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let items = sqlx::query!(
+        "SELECT id, item_type_id, starter_key, quantity FROM inventory_items \
+         WHERE account_id = $1 ORDER BY id FOR UPDATE",
+        account_id.get()
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let equipment = sqlx::query!(
+        "SELECT id, character_id, club_item_id, ball_item_id, version, updated_at \
+         FROM equipment_sets WHERE account_id = $1 FOR UPDATE",
+        account_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+
+    let has_existing_state = !characters.is_empty()
+        || !items.is_empty()
+        || equipment.is_some()
+        || profile.selected_character_id.is_some();
+    let expected_setup = if profile.nickname_normalized.is_some() {
+        "complete"
+    } else {
+        "needs_nickname"
+    };
+
+    if has_existing_state {
+        let [character] = characters.as_slice() else {
+            return Err(RepositoryError::InvalidStarterGrant);
+        };
+        if character.item_type_id != i64::from(grant.character.item_type_id.get())
+            || character.starter_key != grant.character.key.as_str()
+            || profile.selected_character_id != Some(character.id)
+            || profile.setup_state != expected_setup
+            || items.len() != grant.items.len()
+        {
+            return Err(RepositoryError::InvalidStarterGrant);
+        }
+        let persisted_items: HashMap<&str, (i64, i64, i64)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.starter_key.as_str(),
+                    (item.id, item.item_type_id, item.quantity),
+                )
+            })
+            .collect();
+        for configured in &grant.items {
+            let Some((_, item_type_id, quantity)) = persisted_items.get(configured.key.as_str())
+            else {
+                return Err(RepositoryError::InvalidStarterGrant);
+            };
+            if *item_type_id != i64::from(configured.item_type_id.get())
+                || *quantity != i64::from(configured.quantity)
+            {
+                return Err(RepositoryError::InvalidStarterGrant);
+            }
+        }
+        let equipment = equipment.ok_or(RepositoryError::InvalidStarterGrant)?;
+        let club_item_id =
+            configured_equipment_id(&persisted_items, grant.equipped_club_key.as_ref())?;
+        let ball_item_id =
+            configured_equipment_id(&persisted_items, grant.equipped_ball_key.as_ref())?;
+        if equipment.character_id != character.id
+            || equipment.club_item_id != club_item_id
+            || equipment.ball_item_id != ball_item_id
+        {
+            return Err(RepositoryError::InvalidStarterGrant);
+        }
+        return Ok(());
+    }
+
+    let character_id: i64 = sqlx::query_scalar!(
+        "INSERT INTO characters (account_id, item_type_id, starter_key) \
+         VALUES ($1, $2, $3) RETURNING id",
+        account_id.get(),
+        i64::from(grant.character.item_type_id.get()),
+        grant.character.key.as_str()
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let mut inserted_items = HashMap::with_capacity(grant.items.len());
+    for item in &grant.items {
+        let item_id: i64 = sqlx::query_scalar!(
+            "INSERT INTO inventory_items \
+             (account_id, item_type_id, starter_key, quantity) VALUES ($1, $2, $3, $4) \
+             RETURNING id",
+            account_id.get(),
+            i64::from(item.item_type_id.get()),
+            item.key.as_str(),
+            i64::from(item.quantity)
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(repository_db_error)?;
+        inserted_items.insert(
+            item.key.as_str(),
+            (
+                item_id,
+                i64::from(item.item_type_id.get()),
+                i64::from(item.quantity),
+            ),
+        );
+    }
+    let club_item_id = configured_equipment_id(&inserted_items, grant.equipped_club_key.as_ref())?;
+    let ball_item_id = configured_equipment_id(&inserted_items, grant.equipped_ball_key.as_ref())?;
+    sqlx::query!(
+        "INSERT INTO equipment_sets \
+         (account_id, character_id, club_item_id, ball_item_id) VALUES ($1, $2, $3, $4)",
+        account_id.get(),
+        character_id,
+        club_item_id,
+        ball_item_id
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    sqlx::query!(
+        "UPDATE profiles SET selected_character_id = $2, setup_state = $3, updated_at = now() \
+         WHERE account_id = $1",
+        account_id.get(),
+        character_id,
+        expected_setup
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    Ok(())
+}
+
+fn configured_equipment_id(
+    items: &HashMap<&str, (i64, i64, i64)>,
+    key: Option<&StarterKey>,
+) -> Result<Option<i64>, RepositoryError> {
+    key.map(|key| {
+        items
+            .get(key.as_str())
+            .map(|(id, _, _)| *id)
+            .ok_or(RepositoryError::InvalidStarterGrant)
+    })
+    .transpose()
+}
+
+fn player_snapshot_from_rows(
+    requested: AccountId,
+    account: AccountRow,
+    profile: PlayerProfileRow,
+    character_rows: Vec<CharacterRow>,
+    inventory_rows: Vec<InventoryRow>,
+    equipment: EquipmentRow,
+) -> Result<PlayerSnapshot, RepositoryError> {
+    let account_id = AccountId::new(account.id).map_err(|_| RepositoryError::CorruptData)?;
+    let status = parse_account_status(&account.status)?;
+    if account_id != requested
+        || AccountId::new(profile.account_id).map_err(|_| RepositoryError::CorruptData)?
+            != requested
+        || AccountId::new(equipment.account_id).map_err(|_| RepositoryError::CorruptData)?
+            != requested
+    {
+        return Err(RepositoryError::CorruptData);
+    }
+    if status != AccountStatus::Active {
+        return Err(RepositoryError::AccountInactive);
+    }
+    if parse_setup_state(&profile.setup_state)? != SetupState::Complete
+        || profile.nickname_display.is_none()
+        || character_rows.is_empty()
+        || character_rows.len() > MAX_PLAYER_CHARACTERS
+        || inventory_rows.len() > MAX_PLAYER_INVENTORY
+    {
+        return Err(RepositoryError::CorruptData);
+    }
+    let selected_id = profile
+        .selected_character_id
+        .ok_or(RepositoryError::CorruptData)
+        .and_then(|value| CharacterId::new(value).map_err(|_| RepositoryError::CorruptData))?;
+    let mut character_ids = BTreeSet::new();
+    let characters = character_rows
+        .into_iter()
+        .map(|row| {
+            let owner = AccountId::new(row.account_id).map_err(|_| RepositoryError::CorruptData)?;
+            let id = CharacterId::new(row.id).map_err(|_| RepositoryError::CorruptData)?;
+            if owner != requested || !character_ids.insert(id) {
+                return Err(RepositoryError::CorruptData);
+            }
+            Ok(Character {
+                id,
+                account_id: owner,
+                item_type_id: ItemTypeId::try_from(row.item_type_id)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                starter_key: StarterKey::parse(&row.starter_key)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut inventory_ids = BTreeSet::new();
+    let inventory = inventory_rows
+        .into_iter()
+        .map(|row| {
+            let item = inventory_row_into_domain(row)?;
+            if item.account_id != requested || !inventory_ids.insert(item.id) {
+                return Err(RepositoryError::CorruptData);
+            }
+            Ok(item)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let equipment_character =
+        CharacterId::new(equipment.character_id).map_err(|_| RepositoryError::CorruptData)?;
+    let club_item_id = equipment
+        .club_item_id
+        .map(InventoryItemId::new)
+        .transpose()
+        .map_err(|_| RepositoryError::CorruptData)?;
+    let ball_item_id = equipment
+        .ball_item_id
+        .map(InventoryItemId::new)
+        .transpose()
+        .map_err(|_| RepositoryError::CorruptData)?;
+    if selected_id != equipment_character
+        || !character_ids.contains(&selected_id)
+        || club_item_id.is_some_and(|id| !inventory_ids.contains(&id))
+        || ball_item_id.is_some_and(|id| !inventory_ids.contains(&id))
+    {
+        return Err(RepositoryError::CorruptData);
+    }
+    Ok(PlayerSnapshot {
+        account: Account {
+            id: account_id,
+            username_display: account.username_display,
+            username_normalized: NormalizedUsername::parse(&account.username_normalized)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            status,
+        },
+        profile: Profile {
+            account_id: requested,
+            nickname: profile.nickname_display,
+            setup_state: SetupState::Complete,
+            pang: checked_u64(profile.pang)?,
+            points: checked_u64(profile.points)?,
+            experience: checked_u64(profile.experience)?,
+        },
+        characters,
+        inventory,
+        equipment: EquipmentSet {
+            id: EquipmentSetId::new(equipment.id).map_err(|_| RepositoryError::CorruptData)?,
+            account_id: requested,
+            character_id: equipment_character,
+            club_item_id,
+            ball_item_id,
+            version: u32::try_from(equipment.version).map_err(|_| RepositoryError::CorruptData)?,
+        },
+    })
+}
+
+async fn load_aggregate_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+) -> Result<AccountAggregate, RepositoryError> {
+    let account = sqlx::query_as!(
+        AccountRow,
+        "SELECT id, username_display, username_normalized, status FROM accounts WHERE id = $1",
+        account_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?
+    .ok_or(RepositoryError::NotFound)?;
+    let profile = sqlx::query_as!(
+        ProfileRow,
+        "SELECT account_id, nickname_display, setup_state, pang, points, experience \
+         FROM profiles WHERE account_id = $1",
+        account_id.get()
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let character = sqlx::query_as!(
+        CharacterRow,
+        "SELECT c.id, c.account_id, c.item_type_id, c.starter_key \
+         FROM characters c JOIN profiles p ON p.selected_character_id = c.id \
+         WHERE p.account_id = $1",
+        account_id.get()
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let inventory = sqlx::query_as!(
+        InventoryRow,
+        "SELECT id, account_id, item_type_id, quantity, starter_key \
+         FROM inventory_items WHERE account_id = $1 ORDER BY id",
+        account_id.get()
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+    let equipment = sqlx::query_as!(
+        EquipmentRow,
+        "SELECT id, account_id, character_id, club_item_id, ball_item_id, version \
+         FROM equipment_sets WHERE account_id = $1",
+        account_id.get()
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?;
+
+    Ok(AccountAggregate {
+        account: Account {
+            id: AccountId::new(account.id).map_err(|_| RepositoryError::CorruptData)?,
+            username_display: account.username_display,
+            username_normalized: NormalizedUsername::parse(&account.username_normalized)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            status: parse_account_status(&account.status)?,
+        },
+        profile: Profile {
+            account_id: AccountId::new(profile.account_id)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            nickname: profile.nickname_display,
+            setup_state: parse_setup_state(&profile.setup_state)?,
+            pang: checked_u64(profile.pang)?,
+            points: checked_u64(profile.points)?,
+            experience: checked_u64(profile.experience)?,
+        },
+        character: Character {
+            id: CharacterId::new(character.id).map_err(|_| RepositoryError::CorruptData)?,
+            account_id: AccountId::new(character.account_id)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            item_type_id: ItemTypeId::try_from(character.item_type_id)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            starter_key: StarterKey::parse(&character.starter_key)
+                .map_err(|_| RepositoryError::CorruptData)?,
+        },
+        inventory: inventory
+            .into_iter()
+            .map(inventory_row_into_domain)
+            .collect::<Result<Vec<_>, _>>()?,
+        equipment: EquipmentSet {
+            id: EquipmentSetId::new(equipment.id).map_err(|_| RepositoryError::CorruptData)?,
+            account_id: AccountId::new(equipment.account_id)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            character_id: CharacterId::new(equipment.character_id)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            club_item_id: equipment
+                .club_item_id
+                .map(InventoryItemId::new)
+                .transpose()
+                .map_err(|_| RepositoryError::CorruptData)?,
+            ball_item_id: equipment
+                .ball_item_id
+                .map(InventoryItemId::new)
+                .transpose()
+                .map_err(|_| RepositoryError::CorruptData)?,
+            version: u32::try_from(equipment.version).map_err(|_| RepositoryError::CorruptData)?,
+        },
+    })
+}
+
+fn inventory_row_into_domain(row: InventoryRow) -> Result<InventoryItem, RepositoryError> {
+    Ok(InventoryItem {
+        id: InventoryItemId::new(row.id).map_err(|_| RepositoryError::CorruptData)?,
+        account_id: AccountId::new(row.account_id).map_err(|_| RepositoryError::CorruptData)?,
+        item_type_id: ItemTypeId::try_from(row.item_type_id)
+            .map_err(|_| RepositoryError::CorruptData)?,
+        quantity: u32::try_from(row.quantity).map_err(|_| RepositoryError::CorruptData)?,
+        starter_key: StarterKey::parse(&row.starter_key)
+            .map_err(|_| RepositoryError::CorruptData)?,
+    })
+}
+
+fn checked_u64(value: i64) -> Result<u64, RepositoryError> {
+    u64::try_from(value).map_err(|_| RepositoryError::CorruptData)
+}
+
+fn system_time(value: SystemTime) -> DateTime<Utc> {
+    value.into()
+}
+
+fn account_status_text(value: AccountStatus) -> &'static str {
+    match value {
+        AccountStatus::Active => "active",
+        AccountStatus::Banned => "banned",
+        AccountStatus::Disabled => "disabled",
+    }
+}
+
+fn parse_account_status(value: &str) -> Result<AccountStatus, RepositoryError> {
+    match value {
+        "active" => Ok(AccountStatus::Active),
+        "banned" => Ok(AccountStatus::Banned),
+        "disabled" => Ok(AccountStatus::Disabled),
+        _ => Err(RepositoryError::CorruptData),
+    }
+}
+
+fn parse_setup_state(value: &str) -> Result<SetupState, RepositoryError> {
+    match value {
+        "needs_nickname" => Ok(SetupState::NeedsNickname),
+        "needs_starter" => Ok(SetupState::NeedsStarter),
+        "complete" => Ok(SetupState::Complete),
+        _ => Err(RepositoryError::CorruptData),
+    }
+}
+
+fn service_kind_text(value: ServiceKind) -> &'static str {
+    match value {
+        ServiceKind::Game => "game",
+        ServiceKind::Message => "message",
+    }
+}
+
+fn parse_service_kind(value: &str) -> Result<ServiceKind, RepositoryError> {
+    match value {
+        "game" => Ok(ServiceKind::Game),
+        "message" => Ok(ServiceKind::Message),
+        _ => Err(RepositoryError::CorruptData),
+    }
+}
+
+fn repository_db_error(error: sqlx::Error) -> RepositoryError {
+    let constraint = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::constraint);
+    match constraint {
+        Some("uq_accounts_username_normalized") => RepositoryError::DuplicateUsername,
+        Some("uq_profiles_nickname_normalized") => RepositoryError::DuplicateNickname,
+        Some("uq_characters_starter_key" | "uq_inventory_starter_key") => {
+            RepositoryError::InvalidStarterGrant
+        }
+        _ => RepositoryError::Storage,
+    }
+}
+
+fn handover_db_error(_error: sqlx::Error) -> HandoverError {
+    HandoverError::Storage
+}
+
+/// Marker retained for the M1 crate-boundary test.
+#[must_use]
+pub const fn crate_boundary() -> &'static str {
+    "storage"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_url() {
+        let config = PgStorageConfig::new("postgres://user:secret@example/database");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn config_bounds_are_nonzero_by_default() {
+        let config = PgStorageConfig::new("postgres://localhost/db");
+        assert_eq!(
+            NonZeroU32::new(config.max_connections).map(NonZeroU32::get),
+            Some(10)
+        );
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    async fn repeatable_read_snapshot_keeps_one_generation_across_later_projections(pool: PgPool) {
+        let repository = PgRepository::new(pool.clone());
+        let aggregate = repository
+            .create_account_inner(
+                NewAccount {
+                    username: pangya_domain::Username::parse("SnapshotBarrier").expect("username"),
+                    credential_hash: CredentialHash::new("synthetic-test-hash".to_owned()),
+                    nickname: Some(Nickname::parse("SnapshotNick").expect("nickname")),
+                    starter: StarterGrant {
+                        character: pangya_domain::StarterCharacter {
+                            key: StarterKey::parse("snapshot.character").expect("character key"),
+                            item_type_id: ItemTypeId::new(0x0400_0000),
+                        },
+                        items: vec![pangya_domain::StarterItem {
+                            key: StarterKey::parse("snapshot.club").expect("item key"),
+                            item_type_id: ItemTypeId::new(0x1000_0000),
+                            quantity: 1,
+                        }],
+                        equipped_club_key: Some(
+                            StarterKey::parse("snapshot.club").expect("equipment key"),
+                        ),
+                        equipped_ball_key: None,
+                    },
+                },
+                false,
+            )
+            .await
+            .expect("account");
+        let account_id = aggregate.account.id;
+        let (snapshot_started_tx, snapshot_started_rx) = tokio::sync::oneshot::channel();
+        let (mutation_committed_tx, mutation_committed_rx) = tokio::sync::oneshot::channel();
+        let loading_repository = repository.clone();
+        let loading = tokio::spawn(async move {
+            loading_repository
+                .load_player_snapshot_with_checkpoint(account_id, async move {
+                    let _ = snapshot_started_tx.send(());
+                    let _ = mutation_committed_rx.await;
+                })
+                .await
+        });
+
+        snapshot_started_rx.await.expect("snapshot established");
+        let mut mutation = pool.begin().await.expect("mutation transaction");
+        sqlx::query!(
+            "UPDATE profiles SET pang = 123 WHERE account_id = $1",
+            account_id.get()
+        )
+        .execute(&mut *mutation)
+        .await
+        .expect("profile mutation");
+        sqlx::query!(
+            "UPDATE equipment_sets SET version = 1 WHERE account_id = $1",
+            account_id.get()
+        )
+        .execute(&mut *mutation)
+        .await
+        .expect("equipment mutation");
+        mutation.commit().await.expect("mutation commit");
+        let _ = mutation_committed_tx.send(());
+
+        let during = loading.await.expect("snapshot task").expect("snapshot");
+        assert_eq!((during.profile.pang, during.equipment.version), (0, 0));
+        let after = repository
+            .load_player_snapshot(account_id)
+            .await
+            .expect("later snapshot");
+        assert_eq!((after.profile.pang, after.equipment.version), (123, 1));
+    }
+}

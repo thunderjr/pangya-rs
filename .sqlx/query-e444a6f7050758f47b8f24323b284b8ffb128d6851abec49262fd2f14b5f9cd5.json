@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO profiles (account_id, nickname_display, nickname_normalized, setup_state) VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e444a6f7050758f47b8f24323b284b8ffb128d6851abec49262fd2f14b5f9cd5"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE profiles SET selected_character_id = $2, setup_state = $3, updated_at = now() WHERE account_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c99f7ae67993b8645a5c0317cb641e5ca974b4052b20f00598e6358e53f516ae"
+}

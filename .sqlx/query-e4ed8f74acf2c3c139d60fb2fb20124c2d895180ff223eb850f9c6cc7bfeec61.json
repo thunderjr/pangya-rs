@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE profiles SET nickname_display = $2, nickname_normalized = $3, setup_state = CASE WHEN setup_state = 'needs_nickname' THEN 'complete' ELSE setup_state END, updated_at = now() WHERE account_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e4ed8f74acf2c3c139d60fb2fb20124c2d895180ff223eb850f9c6cc7bfeec61"
+}

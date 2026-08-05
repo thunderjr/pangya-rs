@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id, nickname_display, setup_state, pang, points, experience, selected_character_id FROM profiles WHERE account_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "nickname_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "setup_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "pang",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "points",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "experience",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "selected_character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "edab5752210ebd5b079612632f6da550cb5825da0e9f2f9696a5d7720f150922"
+}

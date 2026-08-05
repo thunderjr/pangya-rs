@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO credentials (account_id, scheme, password_hash) VALUES ($1, 'argon2id-client-md5-v1', $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "114b463fb72a656969bca1bc0631de66d9d2d6e46cf5e0a6c4f3cc71531cb72d"
+}

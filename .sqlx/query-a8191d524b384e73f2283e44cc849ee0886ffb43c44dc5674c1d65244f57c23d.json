@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.username_display, a.username_normalized, a.status, c.password_hash, p.setup_state FROM accounts a JOIN credentials c ON c.account_id = a.id JOIN profiles p ON p.account_id = a.id WHERE a.username_normalized = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "username_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "username_normalized",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "setup_state",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a8191d524b384e73f2283e44cc849ee0886ffb43c44dc5674c1d65244f57c23d"
+}

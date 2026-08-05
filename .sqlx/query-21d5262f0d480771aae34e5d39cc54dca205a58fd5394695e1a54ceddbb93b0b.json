@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, account_id, character_id, club_item_id, ball_item_id, version FROM equipment_sets WHERE account_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "club_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "ball_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "21d5262f0d480771aae34e5d39cc54dca205a58fd5394695e1a54ceddbb93b0b"
+}

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT nickname_normalized, selected_character_id, setup_state FROM profiles WHERE account_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "nickname_normalized",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "selected_character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "setup_state",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "7557c13f89333b46008302614523bffd6a5eedd2c967c9ea03b02c5a5ffaed75"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT NOT EXISTS(\n                SELECT 1 FROM profiles WHERE nickname_normalized = $1\n            ) AS \"available!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "available!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6d232e7a5d565eae0142d219f2a6e54fe1d4ce2f1b30b901f78bbdc34154d1ee"
+}
