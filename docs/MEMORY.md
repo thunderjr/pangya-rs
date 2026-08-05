@@ -8,13 +8,13 @@
 
 ## One-paragraph state
 
-This repository is still in **planning only**. There is no `Cargo.toml`, Rust source, migration, Docker stack, or test suite. The original TypeScript-oriented research was replaced with a Rust/U.S.-852 plan. Sixteen upstream repositories are locally cloned as shallow, ignored reference checkouts under `opensource-references/`; their exact revisions and license boundaries are in `opensource-references/README.md`. The next implementation work is M1 protocol foundation: license ADR, Cargo workspace, attributed PangCrypt vectors/oracle tables, permissive LZO compatibility spike, and a bounded Tokio codec. Do not start gameplay or persistence breadth before those wire proofs.
+M1 and M2 remain intact. M3's **opt-in local synthetic handover/player-bootstrap exit is complete**: immutable bounded manifest catalog, opaque minimum Character/ClubSet/Ball records, coherent repeatable-read PlayerSnapshot, authoritative single-use Game handover, catalog validation, segmented bootstrap, channel state, pre-spawn/rate/deadline/presence bounds, optional readiness, redacted metrics/tracing, generated fuzz fixtures, and real-PostgreSQL Login-to-Game evidence. This is not real-client or real-IFF compatibility: U.S. 852 login order, token field, Game hello/opcode layouts/order, channel semantics, and all IFF headers/record sizes remain open. Evidence is in [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md).
 
 ---
 
 ## Durable decisions in the proposed baseline
 
-These are proposed in the spec and should be changed only deliberately (prefer an ADR):
+These are accepted in ADR-0001 through ADR-0005 and should change only through a superseding ADR:
 
 - First client target: **PangYa U.S. 852.00 / GB.852**.
 - Project type: **clean-room Rust rewrite**, not a mechanical translation.
@@ -25,21 +25,28 @@ These are proposed in the spec and should be changed only deliberately (prefer a
 - Deployment: one **modular-monolith** binary with separate Login/Game TCP listeners; preserve crate boundaries for later process split.
 - Concurrency: one bounded task/actor owns each room/match; avoid shared `Arc<Mutex<Room>>` hot state.
 - Packet strategy: hand-reviewed, state-aware Rust packet types with a fixture per implemented opcode; PacketDoc is evidence, not blindly generated truth.
-- Data strategy: safe explicit little-endian IFF parser; operator mounts proprietary game data read-only.
+- Data strategy: safe explicit little-endian IFF parser; operator mounts proprietary game data read-only. Local M3 uses ADR-0010's versioned synthetic header and interprets only `u32 type_id`; real layouts remain externally gated.
 - Shot model: client computes trajectory/result; server owns identity, membership, ordering, score, validation, inventory, currency, rewards and persistence.
-- LZO candidate: **`lzokay` 2.x** (pure Rust, MIT), still gated on PangCrypt vectors and real-client acceptance.
+- LZO implementation: **`lzokay` 2.0.1** (pure Rust, MIT), proven for known PangCrypt vectors, generated round trips, and one independent go-lzo decode; real-client acceptance remains open.
 - Error policy: `thiserror` in libraries, `anyhow` only at binary composition boundary, no production `unwrap`/`expect`.
+- Persistence: PostgreSQL 17 through SQLx 0.8.6, embedded forward-only migrations, named constraints, explicit transactions, and committed offline metadata (ADR-0006).
+- M2 names: ASCII edge trim + lowercase normalized key; usernames `[a-z0-9_]{3,32}`, nicknames `[a-z0-9_-]{3,16}`; store display/key separately pending client validation.
+- Credentials: exactly 32 ASCII hex transport bytes canonicalized lowercase, then Argon2id v19 (`m=19456,t=2,p=1`, canonical 16-byte salt, 32-byte output) in PHC form; verification rejects every extension/downgrade/malformed shape; never hash inside DB transactions (ADR-0007).
+- Handovers: UUID selector plus 256 random bits, SHA-256 digest only at rest, 60-second default, row lock and constant-time digest comparison, single use, revoke on ban/disable; persist only canonical IPv4 `/24` or IPv6 `/56` source prefixes, never raw peer IPs.
+- Starter grants serialize on the profile row, insert the aggregate only when wholly absent, perform no writes on exact replay, and reject stable-key/type/quantity/equipment drift; full IFF validation remains M3.
+- All static production repository SQL uses checked SQLx macros and committed offline metadata; dynamic SQL is test-only failure injection/assertion DDL.
 - Implementation must remain safe Rust initially (`unsafe_code = "forbid"`).
 
 ---
 
 ## Important unresolved decisions
 
-1. **Final project license** — decide MIT, Apache-2.0, dual MIT/Apache-2.0, or another intentional option before adapting upstream code. This is ADR-0001 and the main blocker.
-2. **Exact U.S. 852 client package/hash** — operator must identify it privately before captures; never commit the client.
-3. **LZO result** — prove `lzokay`; do not assume compatible solely from format name.
-4. **Account provisioning** — spec recommends CLI plus local-profile-only auto-create.
-5. **Exact advertised ports/packet order** — verify with the chosen U.S. 852 client/capture during M1/M2.
+1. **Exact U.S. 852 client package/hash** — operator must identify it privately before captures; never commit the client.
+2. **Real-client acceptance** — validate generated server packets through U.S. 852 login/channel entry; do not infer this from local or independent decoder evidence.
+3. **Exact login ordering** — record the legally held U.S. 852 client packet order without committing proprietary captures or secrets.
+4. **Name limits** — M2 ASCII normalization/limits are provisional until the chosen client validates input behavior.
+5. **Exact advertised ports/packet order/token field** — verify with the chosen client/capture before claiming compatibility.
+6. **Real IFF and GameService layouts** — validate legally held Character/ClubSet/Ball headers, record sizes, Game hello/auth/bootstrap/channel fields and ordering; never infer them from local synthetic M3.
 
 ---
 
@@ -113,7 +120,7 @@ Primary code: `opensource-references/pangbox--pangcrypt/server.go`.
 
 - `cryptTable` is `[2][0x1000]u8` (two 4,096-byte tables).
 - PangCrypt says it was extracted from U.S. 852 `ProjectG.exe`.
-- Port with ISC attribution and add a hash assertion.
+- Ported with ISC attribution. Locked SHA-256: combined `003d0b42f9fc1e2fb3b9dc37d23bbe1ff018669ea81bf0068abfaea4942b7133`; table 0 `6eee0700c7096c57a992b1cf787e06d2b661cfb0fd8871c481e089c3a55fabfe`; table 1 `89a66b67ca44457bc782c85cffff41abb45930c723983fd03bd9f2bc20b331d7`.
 
 ### PacketDoc counts
 
@@ -198,23 +205,11 @@ Never persist client-claimed Pang/EXP directly. Simplified Tier-B rewards are ac
 
 ## Next-session checklist
 
-When asked to start implementation, do this order:
-
-1. Read `docs/PROGRESS.md` and this file.
-2. Check `git status --short --branch`; do not stage nested clones.
-3. Ask/confirm the final project license if still unresolved.
-4. Create ADR-0001 through ADR-0005 skeletons.
-5. Initialize Rust 2024 workspace and lint policy.
-6. Add `THIRD_PARTY_NOTICES.md` and `docs/PROVENANCE.md`.
-7. Create only `pangya-crypto` and `pangya-protocol` first.
-8. Port PangCrypt fixtures with attribution before algorithm code.
-9. Port oracle tables and verify their hash.
-10. Implement client crypto and pass vectors.
-11. Spike `lzokay` decompression of known server vectors.
-12. Implement the bounded Tokio codec and fragmentation/property/fuzz tests.
-13. Update `PROGRESS.md` immediately after each evidence gate.
-
-Do **not** begin with a full schema, IFF breadth, room UI, shop, guild, or all opcodes.
+1. Read `docs/PROGRESS.md`, the M2 evidence file, and this file; check unstaged status.
+2. Preserve the fixture/provenance, SQLx offline, real-PostgreSQL, and no-proprietary-assets boundaries.
+3. Preserve the completed synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL evidence; do not infer external compatibility from it.
+4. Obtain the exact U.S. 852 build/hash privately and validate order, `0x000e`, name limits, server-list acceptance, and token field/length without committing it.
+5. Begin GameService/bootstrap only as M3 scope.
 
 ---
 
