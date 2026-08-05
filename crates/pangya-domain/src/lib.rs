@@ -1,0 +1,1300 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
+//! Technology-neutral domain types and repository contracts for account storage.
+
+use std::{
+    fmt,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    pin::Pin,
+    str::FromStr,
+    time::SystemTime,
+};
+
+use thiserror::Error;
+use uuid::Uuid;
+use zeroize::Zeroize as _;
+
+/// Failure converting a database or external identifier into a domain ID.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum IdError {
+    /// A signed identifier was zero or negative.
+    #[error("identifier must be positive")]
+    NotPositive,
+    /// An integer cannot be represented by the destination ID type.
+    #[error("identifier is outside its supported range")]
+    OutOfRange,
+}
+
+macro_rules! positive_id {
+    ($name:ident, $docs:literal) => {
+        #[doc = $docs]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(i64);
+
+        impl $name {
+            /// Creates an ID after checking that it is positive.
+            ///
+            /// # Errors
+            /// Returns [`IdError::NotPositive`] for zero or negative values.
+            pub const fn new(value: i64) -> Result<Self, IdError> {
+                if value > 0 {
+                    Ok(Self(value))
+                } else {
+                    Err(IdError::NotPositive)
+                }
+            }
+
+            /// Returns the checked database representation.
+            #[must_use]
+            pub const fn get(self) -> i64 {
+                self.0
+            }
+        }
+
+        impl TryFrom<i64> for $name {
+            type Error = IdError;
+
+            fn try_from(value: i64) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+positive_id!(AccountId, "A durable account identifier.");
+positive_id!(CharacterId, "An owned character identifier.");
+positive_id!(InventoryItemId, "An owned inventory-row identifier.");
+positive_id!(EquipmentSetId, "An equipment aggregate identifier.");
+
+/// A static catalog item type represented on the wire as an unsigned 32-bit value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ItemTypeId(u32);
+
+impl ItemTypeId {
+    /// Creates an item type ID from its full supported range.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the unsigned catalog representation.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for ItemTypeId {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<i64> for ItemTypeId {
+    type Error = IdError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        u32::try_from(value)
+            .map(Self)
+            .map_err(|_| IdError::OutOfRange)
+    }
+}
+
+/// The nonsecret selector for a login-to-service handover.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HandoverId(Uuid);
+
+impl HandoverId {
+    /// Creates a selector from a UUID.
+    #[must_use]
+    pub const fn new(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Returns the UUID representation.
+    #[must_use]
+    pub const fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl From<Uuid> for HandoverId {
+    fn from(value: Uuid) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Validation failure for a display/normalized account name.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum NameError {
+    /// The trimmed value is outside the policy's byte length.
+    #[error("name length is outside policy")]
+    InvalidLength,
+    /// The value contains a character outside the ASCII policy.
+    #[error("name contains an unsupported character")]
+    InvalidCharacter,
+}
+
+macro_rules! normalized_name {
+    ($name:ident, $min:expr, $max:expr, $valid:expr, $docs:literal) => {
+        #[doc = $docs]
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Applies ASCII trim/lowercase normalization and validates the M2 policy.
+            ///
+            /// # Errors
+            /// Returns [`NameError`] when length or characters violate policy.
+            pub fn parse(value: &str) -> Result<Self, NameError> {
+                let trimmed = value.trim_matches(|character: char| character.is_ascii_whitespace());
+                if !($min..=$max).contains(&trimmed.len()) {
+                    return Err(NameError::InvalidLength);
+                }
+                if !trimmed.bytes().all($valid) {
+                    return Err(NameError::InvalidCharacter);
+                }
+                Ok(Self(trimmed.to_ascii_lowercase()))
+            }
+
+            /// Returns the canonical normalized value.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_tuple(stringify!($name))
+                    .field(&self.0)
+                    .finish()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = NameError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value)
+            }
+        }
+    };
+}
+
+normalized_name!(
+    NormalizedUsername,
+    3,
+    32,
+    |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_',
+    "A username normalized by ASCII trim and lowercase."
+);
+normalized_name!(
+    NormalizedNickname,
+    3,
+    16,
+    |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'),
+    "A nickname normalized by ASCII trim and lowercase."
+);
+
+/// A validated display username retained separately from its normalized key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Username {
+    display: String,
+    normalized: NormalizedUsername,
+}
+
+impl Username {
+    /// Validates a display username and derives its normalized key.
+    ///
+    /// # Errors
+    /// Returns [`NameError`] when the value violates username policy.
+    pub fn parse(value: &str) -> Result<Self, NameError> {
+        let display = value
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .to_owned();
+        let normalized = NormalizedUsername::parse(&display)?;
+        Ok(Self {
+            display,
+            normalized,
+        })
+    }
+
+    /// Returns the display spelling.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Returns the normalized uniqueness key.
+    #[must_use]
+    pub const fn normalized(&self) -> &NormalizedUsername {
+        &self.normalized
+    }
+}
+
+/// A validated display nickname retained separately from its normalized key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nickname {
+    display: String,
+    normalized: NormalizedNickname,
+}
+
+impl Nickname {
+    /// Validates a display nickname and derives its normalized key.
+    ///
+    /// # Errors
+    /// Returns [`NameError`] when the value violates nickname policy.
+    pub fn parse(value: &str) -> Result<Self, NameError> {
+        let display = value
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .to_owned();
+        let normalized = NormalizedNickname::parse(&display)?;
+        Ok(Self {
+            display,
+            normalized,
+        })
+    }
+
+    /// Returns the display spelling.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Returns the normalized uniqueness key.
+    #[must_use]
+    pub const fn normalized(&self) -> &NormalizedNickname {
+        &self.normalized
+    }
+}
+
+/// Account access status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountStatus {
+    /// Normal login and handover are permitted.
+    Active,
+    /// Access is administratively banned.
+    Banned,
+    /// Access is administratively disabled.
+    Disabled,
+}
+
+/// Progress through first-login setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupState {
+    /// A nickname must still be selected.
+    NeedsNickname,
+    /// Starter identity and equipment must still be granted.
+    NeedsStarter,
+    /// The minimum account aggregate is ready.
+    Complete,
+}
+
+/// Service eligible to consume a handover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceKind {
+    /// Game service.
+    Game,
+    /// Message service.
+    Message,
+}
+
+/// A PHC credential hash whose formatting is always redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CredentialHash(String);
+
+impl CredentialHash {
+    /// Wraps a PHC string after a security service has validated/generated it.
+    #[must_use]
+    pub fn new(phc: String) -> Self {
+        Self(phc)
+    }
+
+    /// Exposes the PHC string only for persistence or verification.
+    #[must_use]
+    pub fn expose_phc(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CredentialHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialHash([REDACTED])")
+    }
+}
+
+/// The fixed-size digest stored for a handover bearer secret.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HandoverDigest([u8; 32]);
+
+impl HandoverDigest {
+    /// Creates a digest from exactly 32 bytes.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns digest bytes for persistence and constant-time comparison.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Parses database bytes without truncation.
+    ///
+    /// # Errors
+    /// Returns [`IdError::OutOfRange`] unless the slice is exactly 32 bytes.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, IdError> {
+        bytes.try_into().map(Self).map_err(|_| IdError::OutOfRange)
+    }
+}
+
+impl fmt::Debug for HandoverDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HandoverDigest([REDACTED])")
+    }
+}
+
+/// Stable idempotency key for a configured starter object.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct StarterKey(String);
+
+impl StarterKey {
+    /// Validates a stable lowercase ASCII key.
+    ///
+    /// # Errors
+    /// Returns [`NameError`] for an empty/long or unsupported key.
+    pub fn parse(value: &str) -> Result<Self, NameError> {
+        if !(1..=64).contains(&value.len()) {
+            return Err(NameError::InvalidLength);
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        }) {
+            return Err(NameError::InvalidCharacter);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the stable key.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Configured starter character.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StarterCharacter {
+    /// Stable replay key.
+    pub key: StarterKey,
+    /// Catalog type ID, validated against IFF in M3.
+    pub item_type_id: ItemTypeId,
+}
+
+/// Configured starter inventory row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StarterItem {
+    /// Stable replay key.
+    pub key: StarterKey,
+    /// Catalog type ID, validated against IFF in M3.
+    pub item_type_id: ItemTypeId,
+    /// Positive quantity.
+    pub quantity: u32,
+}
+
+/// Maximum starter inventory rows accepted at every public composition/storage boundary.
+pub const MAX_STARTER_ITEMS: usize = 256;
+
+/// Minimum idempotent starter aggregate configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StarterGrant {
+    /// Stable starter character.
+    pub character: StarterCharacter,
+    /// Stable starter inventory rows.
+    pub items: Vec<StarterItem>,
+    /// Optional stable key of the equipped club inventory row.
+    pub equipped_club_key: Option<StarterKey>,
+    /// Optional stable key of the equipped ball inventory row.
+    pub equipped_ball_key: Option<StarterKey>,
+}
+
+/// Input for atomic account aggregate creation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAccount {
+    /// Display and normalized username.
+    pub username: Username,
+    /// Versioned PHC hash.
+    pub credential_hash: CredentialHash,
+    /// Optional initial nickname.
+    pub nickname: Option<Nickname>,
+    /// Idempotent minimum starter grant.
+    pub starter: StarterGrant,
+}
+
+/// Persisted account identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Account {
+    /// Identifier.
+    pub id: AccountId,
+    /// Display username.
+    pub username_display: String,
+    /// Normalized username.
+    pub username_normalized: NormalizedUsername,
+    /// Access status.
+    pub status: AccountStatus,
+}
+
+/// Persisted profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Profile {
+    /// Owning account.
+    pub account_id: AccountId,
+    /// Optional display nickname.
+    pub nickname: Option<String>,
+    /// Setup progress.
+    pub setup_state: SetupState,
+    /// Nonnegative Pang balance.
+    pub pang: u64,
+    /// Nonnegative point balance.
+    pub points: u64,
+    /// Nonnegative experience.
+    pub experience: u64,
+}
+
+/// Authentication projection loaded by normalized username.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticationRecord {
+    /// Account identity.
+    pub account: Account,
+    /// Stored PHC credential.
+    pub credential_hash: CredentialHash,
+    /// Current setup state.
+    pub setup_state: SetupState,
+}
+
+/// Persisted starter character projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Character {
+    /// Identifier.
+    pub id: CharacterId,
+    /// Owner.
+    pub account_id: AccountId,
+    /// Catalog type ID.
+    pub item_type_id: ItemTypeId,
+    /// Stable grant key.
+    pub starter_key: StarterKey,
+}
+
+/// Persisted starter inventory projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventoryItem {
+    /// Identifier.
+    pub id: InventoryItemId,
+    /// Owner.
+    pub account_id: AccountId,
+    /// Catalog type ID.
+    pub item_type_id: ItemTypeId,
+    /// Quantity.
+    pub quantity: u32,
+    /// Stable grant key.
+    pub starter_key: StarterKey,
+}
+
+/// Persisted minimum equipment aggregate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EquipmentSet {
+    /// Identifier.
+    pub id: EquipmentSetId,
+    /// Owner.
+    pub account_id: AccountId,
+    /// Selected owned character.
+    pub character_id: CharacterId,
+    /// Optional equipped owned club.
+    pub club_item_id: Option<InventoryItemId>,
+    /// Optional equipped owned ball.
+    pub ball_item_id: Option<InventoryItemId>,
+    /// Optimistic version.
+    pub version: u32,
+}
+
+/// Coherent minimum persisted account aggregate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountAggregate {
+    /// Identity.
+    pub account: Account,
+    /// Profile.
+    pub profile: Profile,
+    /// Starter character.
+    pub character: Character,
+    /// Starter inventory.
+    pub inventory: Vec<InventoryItem>,
+    /// Equipment selection.
+    pub equipment: EquipmentSet,
+}
+
+/// Maximum characters loaded into one bounded player bootstrap snapshot.
+pub const MAX_PLAYER_CHARACTERS: usize = 64;
+/// Maximum inventory rows loaded into one bounded player bootstrap snapshot.
+pub const MAX_PLAYER_INVENTORY: usize = 10_000;
+
+/// Coherent active, fully configured player projection used by GameService bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerSnapshot {
+    /// Active account identity.
+    pub account: Account,
+    /// Complete profile and balances.
+    pub profile: Profile,
+    /// Bounded owned characters, including the selected character.
+    pub characters: Vec<Character>,
+    /// Bounded owned inventory rows.
+    pub inventory: Vec<InventoryItem>,
+    /// Owned equipment references.
+    pub equipment: EquipmentSet,
+}
+
+/// Failure parsing a canonical privacy-minimized source prefix.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SourceAddressError {
+    /// The prefix was malformed, used the wrong mask, or retained host bits.
+    #[error("source address prefix is invalid")]
+    Invalid,
+}
+
+/// Privacy-minimized source address: IPv4 `/24` or IPv6 `/56`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceAddressPrefix(String);
+
+impl SourceAddressPrefix {
+    /// Masks a raw peer address immediately, before it crosses the domain/storage boundary.
+    #[must_use]
+    pub fn from_ip(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(address) => {
+                let [first, second, third, _] = address.octets();
+                Self(format!("{}/24", Ipv4Addr::new(first, second, third, 0)))
+            }
+            IpAddr::V6(address) => {
+                let mut octets = address.octets();
+                octets[7..].fill(0);
+                Self(format!("{}/56", Ipv6Addr::from(octets)))
+            }
+        }
+    }
+
+    /// Parses only the canonical masked representation produced by [`Self::from_ip`].
+    ///
+    /// # Errors
+    /// Returns [`SourceAddressError::Invalid`] for raw addresses, wrong masks, host bits,
+    /// noncanonical textual forms, or malformed input.
+    pub fn parse(value: &str) -> Result<Self, SourceAddressError> {
+        let (address, mask) = value.split_once('/').ok_or(SourceAddressError::Invalid)?;
+        let address: IpAddr = address.parse().map_err(|_| SourceAddressError::Invalid)?;
+        let expected_mask = match address {
+            IpAddr::V4(_) => "24",
+            IpAddr::V6(_) => "56",
+        };
+        if mask != expected_mask {
+            return Err(SourceAddressError::Invalid);
+        }
+        let canonical = Self::from_ip(address);
+        if canonical.0 != value {
+            return Err(SourceAddressError::Invalid);
+        }
+        Ok(canonical)
+    }
+
+    /// Returns canonical prefix text safe for privacy-minimized persistence.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SourceAddressPrefix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for SourceAddressPrefix {
+    type Err = SourceAddressError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// Persistable handover generated by the security boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewHandover {
+    /// Nonsecret selector.
+    pub id: HandoverId,
+    /// Account being handed over.
+    pub account_id: AccountId,
+    /// Stored bearer digest.
+    pub digest: HandoverDigest,
+    /// Intended consumer service.
+    pub target: ServiceKind,
+    /// Privacy-minimized source network; a raw peer address is never persisted.
+    pub source_address_prefix: SourceAddressPrefix,
+    /// Creation time supplied by the application clock.
+    pub issued_at: SystemTime,
+    /// Strict expiry time.
+    pub expires_at: SystemTime,
+}
+
+/// Request to atomically consume a handover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumeHandover {
+    /// Nonsecret selector.
+    pub id: HandoverId,
+    /// Digest derived from the presented bearer.
+    pub digest: HandoverDigest,
+    /// Actual consuming service.
+    pub target: ServiceKind,
+    /// Current time supplied by the application clock.
+    pub now: SystemTime,
+}
+
+/// Session identity returned after successful handover consumption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedSession {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Consumed selector for audit correlation.
+    pub handover_id: HandoverId,
+}
+
+/// Typed repository failures safe to map to user-facing outcomes.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RepositoryError {
+    /// Normalized username already exists.
+    #[error("username is already in use")]
+    DuplicateUsername,
+    /// Normalized nickname already exists.
+    #[error("nickname is already in use")]
+    DuplicateNickname,
+    /// Requested aggregate was not found.
+    #[error("record was not found")]
+    NotFound,
+    /// An account was not active.
+    #[error("account is not active")]
+    AccountInactive,
+    /// Starter request was internally inconsistent.
+    #[error("starter grant is invalid")]
+    InvalidStarterGrant,
+    /// Persisted data violated domain range/invariant checks.
+    #[error("persisted data is invalid")]
+    CorruptData,
+    /// Storage is temporarily or permanently unavailable.
+    #[error("storage operation failed")]
+    Storage,
+}
+
+/// Typed handover consumption failures that do not reveal bearer material.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum HandoverError {
+    /// Selector or digest did not identify a valid handover.
+    #[error("handover is invalid")]
+    Invalid,
+    /// Handover was already consumed or revoked.
+    #[error("handover is no longer available")]
+    AlreadyConsumed,
+    /// Handover expired.
+    #[error("handover has expired")]
+    Expired,
+    /// Handover was presented to the wrong service.
+    #[error("handover target does not match")]
+    WrongTarget,
+    /// Account is banned or disabled.
+    #[error("account is not active")]
+    AccountInactive,
+    /// Storage failure.
+    #[error("handover storage operation failed")]
+    Storage,
+}
+
+/// Heap-allocated repository future used to keep domain contracts runtime-neutral.
+pub type RepositoryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Technology-neutral account aggregate repository contract.
+pub trait AccountRepository: Send + Sync {
+    /// Creates identity, credential, profile, and starter aggregate atomically.
+    fn create_account(
+        &self,
+        request: NewAccount,
+    ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>>;
+
+    /// Loads the minimum authentication projection.
+    fn load_authentication<'a>(
+        &'a self,
+        username: &'a NormalizedUsername,
+    ) -> RepositoryFuture<'a, Result<Option<AuthenticationRecord>, RepositoryError>>;
+
+    /// Sets a nickname under database-enforced normalized uniqueness.
+    fn set_nickname(
+        &self,
+        account_id: AccountId,
+        nickname: Nickname,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Returns whether a normalized nickname is currently unused.
+    fn nickname_available<'a>(
+        &'a self,
+        nickname: &'a NormalizedNickname,
+    ) -> RepositoryFuture<'a, Result<bool, RepositoryError>>;
+
+    /// Applies/replays the configured starter grant without duplication.
+    fn grant_starter(
+        &self,
+        account_id: AccountId,
+        grant: StarterGrant,
+    ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>>;
+
+    /// Changes account status and revokes outstanding handovers when inactive.
+    fn set_status(
+        &self,
+        account_id: AccountId,
+        status: AccountStatus,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+}
+
+/// Technology-neutral coherent player-bootstrap repository contract.
+pub trait PlayerRepository: Send + Sync {
+    /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
+    fn load_player_snapshot(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>>;
+}
+
+/// Technology-neutral single-use handover repository contract.
+pub trait HandoverRepository: Send + Sync {
+    /// Persists a generated digest after verifying that the account is active.
+    fn issue(&self, handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>>;
+
+    /// Locks, validates, consumes, and commits one handover atomically.
+    fn consume(
+        &self,
+        request: ConsumeHandover,
+    ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>>;
+}
+
+/// Validation failure for bounded room input.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RoomValueError {
+    /// The UTF-8 byte length is outside the accepted range.
+    #[error("room value length is outside policy")]
+    InvalidLength,
+    /// The value contains NUL or a control character.
+    #[error("room value contains a control character")]
+    ControlCharacter,
+    /// The room member capacity is outside `2..=30`.
+    #[error("room capacity is outside policy")]
+    InvalidCapacity,
+}
+
+/// A checked, nonzero process-local room identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RoomId(std::num::NonZeroU32);
+
+impl RoomId {
+    /// Creates a nonzero room identifier.
+    ///
+    /// # Errors
+    /// Returns [`IdError::NotPositive`] for zero.
+    pub const fn new(value: u32) -> Result<Self, IdError> {
+        match std::num::NonZeroU32::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(IdError::NotPositive),
+        }
+    }
+
+    /// Returns the unsigned identifier.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u32> for RoomId {
+    type Error = IdError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// A checked, nonzero process-local player connection identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlayerConnectionId(std::num::NonZeroU64);
+
+impl PlayerConnectionId {
+    /// Creates a nonzero connection identifier.
+    ///
+    /// # Errors
+    /// Returns [`IdError::NotPositive`] for zero.
+    pub const fn new(value: u64) -> Result<Self, IdError> {
+        match std::num::NonZeroU64::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(IdError::NotPositive),
+        }
+    }
+
+    /// Returns the unsigned identifier.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u64> for PlayerConnectionId {
+    type Error = IdError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// A trimmed, bounded room display name.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RoomName(String);
+
+impl RoomName {
+    /// Trims Unicode whitespace and validates `1..=32` UTF-8 bytes without controls.
+    ///
+    /// # Errors
+    /// Returns [`RoomValueError`] when the input violates policy.
+    pub fn parse(value: &str) -> Result<Self, RoomValueError> {
+        let value = value.trim();
+        validate_room_text(value, 32)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the validated display name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RoomName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for RoomName {
+    type Err = RoomValueError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// A bounded chat message preserved exactly as entered.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ChatText(String);
+
+impl ChatText {
+    /// Validates `1..=128` UTF-8 bytes without NUL or control characters.
+    ///
+    /// # Errors
+    /// Returns [`RoomValueError`] when the input violates policy.
+    pub fn parse(value: &str) -> Result<Self, RoomValueError> {
+        validate_room_text(value, 128)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the validated message.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for ChatText {
+    type Err = RoomValueError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+fn validate_room_text(value: &str, maximum: usize) -> Result<(), RoomValueError> {
+    if !(1..=maximum).contains(&value.len()) {
+        return Err(RoomValueError::InvalidLength);
+    }
+    if value.chars().any(char::is_control) {
+        return Err(RoomValueError::ControlCharacter);
+    }
+    Ok(())
+}
+
+/// Ephemeral room password input that redacts formatting and zeroes its allocation on drop.
+#[derive(Eq, PartialEq)]
+pub struct RoomPassword(Vec<u8>);
+
+impl RoomPassword {
+    /// Copies a `1..=16` byte password into zeroizing storage.
+    ///
+    /// # Errors
+    /// Returns [`RoomValueError::InvalidLength`] outside the byte bound.
+    pub fn parse(value: &str) -> Result<Self, RoomValueError> {
+        if !(1..=16).contains(&value.len()) {
+            return Err(RoomValueError::InvalidLength);
+        }
+        Ok(Self(value.as_bytes().to_vec()))
+    }
+
+    /// Borrows password bytes only for immediate digesting or verification.
+    #[must_use]
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for RoomPassword {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for RoomPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RoomPassword([REDACTED])")
+    }
+}
+
+/// Validated mutable room settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoomSettings {
+    max_members: u8,
+}
+
+impl RoomSettings {
+    /// Creates settings with a member capacity in `2..=30`.
+    ///
+    /// # Errors
+    /// Returns [`RoomValueError::InvalidCapacity`] outside the range.
+    pub const fn new(max_members: u8) -> Result<Self, RoomValueError> {
+        if max_members >= 2 && max_members <= 30 {
+            Ok(Self { max_members })
+        } else {
+            Err(RoomValueError::InvalidCapacity)
+        }
+    }
+
+    /// Returns the maximum room membership.
+    #[must_use]
+    pub const fn max_members(self) -> u8 {
+        self.max_members
+    }
+}
+
+/// Immutable public member projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberSnapshot {
+    connection_id: PlayerConnectionId,
+    account_id: AccountId,
+    nickname: String,
+    owner: bool,
+    ready: bool,
+}
+
+impl MemberSnapshot {
+    /// Constructs a projection at the owning room boundary.
+    #[must_use]
+    pub fn new(
+        connection_id: PlayerConnectionId,
+        account_id: AccountId,
+        nickname: String,
+        owner: bool,
+        ready: bool,
+    ) -> Self {
+        Self {
+            connection_id,
+            account_id,
+            nickname,
+            owner,
+            ready,
+        }
+    }
+
+    /// Connection identity.
+    #[must_use]
+    pub const fn connection_id(&self) -> PlayerConnectionId {
+        self.connection_id
+    }
+    /// Durable account identity.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+    /// Display nickname.
+    #[must_use]
+    pub fn nickname(&self) -> &str {
+        &self.nickname
+    }
+    /// Whether this member owns the room.
+    #[must_use]
+    pub const fn is_owner(&self) -> bool {
+        self.owner
+    }
+    /// Whether this member is ready.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+}
+
+/// Immutable lobby projection of a room.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomSummary {
+    id: RoomId,
+    name: RoomName,
+    owner_nickname: String,
+    members: u8,
+    max_members: u8,
+    password_protected: bool,
+}
+
+impl RoomSummary {
+    /// Constructs a summary at the owning room boundary.
+    #[must_use]
+    pub fn new(
+        id: RoomId,
+        name: RoomName,
+        owner_nickname: String,
+        members: u8,
+        max_members: u8,
+        password_protected: bool,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            owner_nickname,
+            members,
+            max_members,
+            password_protected,
+        }
+    }
+    /// Room identity.
+    #[must_use]
+    pub const fn id(&self) -> RoomId {
+        self.id
+    }
+    /// Display name.
+    #[must_use]
+    pub const fn name(&self) -> &RoomName {
+        &self.name
+    }
+    /// Current owner's display nickname.
+    #[must_use]
+    pub fn owner_nickname(&self) -> &str {
+        &self.owner_nickname
+    }
+    /// Current membership count.
+    #[must_use]
+    pub const fn members(&self) -> u8 {
+        self.members
+    }
+    /// Current capacity.
+    #[must_use]
+    pub const fn max_members(&self) -> u8 {
+        self.max_members
+    }
+    /// Whether joining requires a password.
+    #[must_use]
+    pub const fn password_protected(&self) -> bool {
+        self.password_protected
+    }
+}
+
+/// Immutable full room projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomSnapshot {
+    summary: RoomSummary,
+    members: Vec<MemberSnapshot>,
+}
+
+impl RoomSnapshot {
+    /// Constructs a room projection at the owning room boundary.
+    #[must_use]
+    pub fn new(summary: RoomSummary, members: Vec<MemberSnapshot>) -> Self {
+        Self { summary, members }
+    }
+    /// Public room summary.
+    #[must_use]
+    pub const fn summary(&self) -> &RoomSummary {
+        &self.summary
+    }
+    /// Members in deterministic join order.
+    #[must_use]
+    pub fn members(&self) -> &[MemberSnapshot] {
+        &self.members
+    }
+}
+
+/// Stable room/lobby operation failure safe for application mapping.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RoomError {
+    /// A bounded command queue has no remaining capacity.
+    #[error("room command queue is full")]
+    QueueFull,
+    /// The room or registry actor is no longer available.
+    #[error("room is closed")]
+    Closed,
+    /// The connection already belongs to this or another room.
+    #[error("connection already belongs to a room")]
+    AlreadyMember,
+    /// The room has reached capacity.
+    #[error("room is full")]
+    Full,
+    /// The supplied password did not authenticate.
+    #[error("room password is invalid")]
+    InvalidPassword,
+    /// The connection is not a room member.
+    #[error("connection is not a room member")]
+    NotMember,
+    /// The operation requires the current owner.
+    #[error("operation requires room owner")]
+    NotOwner,
+    /// An owner cannot kick itself.
+    #[error("room owner cannot kick itself")]
+    CannotKickSelf,
+    /// The requested member was not found.
+    #[error("room member was not found")]
+    MemberNotFound,
+    /// Capacity cannot be lowered below current occupancy.
+    #[error("room capacity is below current occupancy")]
+    CapacityBelowOccupancy,
+    /// The lobby room limit has been reached.
+    #[error("lobby room limit reached")]
+    MaxRooms,
+    /// The requested room does not exist.
+    #[error("room was not found")]
+    RoomNotFound,
+    /// No unused room identifier can be allocated.
+    #[error("room identifier space exhausted")]
+    IdExhausted,
+    /// A bounded control or shutdown deadline elapsed.
+    #[error("room operation timed out")]
+    Timeout,
+}
+
+/// Marker retained for the M1 crate-boundary test.
+#[must_use]
+pub const fn crate_boundary() -> &'static str {
+    "domain"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_keeps_display_separate() {
+        let username = Username::parse("  Player_One\t").expect("valid username");
+        assert_eq!(username.display(), "Player_One");
+        assert_eq!(username.normalized().as_str(), "player_one");
+
+        let nickname = Nickname::parse(" Pang-Ya ").expect("valid nickname");
+        assert_eq!(nickname.display(), "Pang-Ya");
+        assert_eq!(nickname.normalized().as_str(), "pang-ya");
+    }
+
+    #[test]
+    fn identifiers_check_database_ranges() {
+        assert_eq!(AccountId::new(0), Err(IdError::NotPositive));
+        assert_eq!(ItemTypeId::try_from(-1_i64), Err(IdError::OutOfRange));
+        assert_eq!(
+            ItemTypeId::try_from(i64::from(u32::MAX) + 1),
+            Err(IdError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn sensitive_values_are_redacted() {
+        let credential = CredentialHash::new("secret-phc".to_owned());
+        let digest = HandoverDigest::new([7; 32]);
+        assert!(!format!("{credential:?}").contains("secret-phc"));
+        assert!(!format!("{digest:?}").contains('7'));
+    }
+
+    #[test]
+    fn source_addresses_are_masked_and_only_canonical_prefixes_parse() {
+        let ipv4 = SourceAddressPrefix::from_ip("192.0.2.199".parse().expect("IPv4"));
+        assert_eq!(ipv4.as_str(), "192.0.2.0/24");
+        assert_eq!(SourceAddressPrefix::parse(ipv4.as_str()), Ok(ipv4));
+
+        let ipv6 = SourceAddressPrefix::from_ip("2001:db8:1234:56ff::1".parse().expect("IPv6"));
+        assert_eq!(ipv6.as_str(), "2001:db8:1234:5600::/56");
+        assert_eq!(SourceAddressPrefix::parse(ipv6.as_str()), Ok(ipv6));
+        assert_eq!(
+            SourceAddressPrefix::parse("192.0.2.199/24"),
+            Err(SourceAddressError::Invalid)
+        );
+        assert_eq!(
+            SourceAddressPrefix::parse("2001:db8:1234:5600::/64"),
+            Err(SourceAddressError::Invalid)
+        );
+    }
+
+    #[test]
+    fn room_ids_are_checked_nonzero() {
+        assert_eq!(RoomId::new(0), Err(IdError::NotPositive));
+        assert_eq!(PlayerConnectionId::new(0), Err(IdError::NotPositive));
+        assert_eq!(RoomId::new(7).map(RoomId::get), Ok(7));
+        assert_eq!(
+            PlayerConnectionId::new(9).map(PlayerConnectionId::get),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn room_text_is_utf8_byte_bounded_and_control_free() {
+        assert_eq!(
+            RoomName::parse("  Pangya  ").map(|name| name.0),
+            Ok("Pangya".into())
+        );
+        assert_eq!(RoomName::parse("\0"), Err(RoomValueError::ControlCharacter));
+        assert_eq!(
+            RoomName::parse(&"é".repeat(17)),
+            Err(RoomValueError::InvalidLength)
+        );
+        assert_eq!(
+            ChatText::parse("hello\n"),
+            Err(RoomValueError::ControlCharacter)
+        );
+        assert!(ChatText::parse(&"é".repeat(64)).is_ok());
+        assert_eq!(
+            ChatText::parse(&"é".repeat(65)),
+            Err(RoomValueError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn password_is_redacted_and_settings_are_bounded() {
+        let password = RoomPassword::parse("secret").expect("valid password");
+        assert_eq!(password.expose_bytes(), b"secret");
+        assert_eq!(format!("{password:?}"), "RoomPassword([REDACTED])");
+        assert_eq!(RoomPassword::parse(""), Err(RoomValueError::InvalidLength));
+        assert_eq!(RoomSettings::new(1), Err(RoomValueError::InvalidCapacity));
+        assert_eq!(RoomSettings::new(30).map(RoomSettings::max_members), Ok(30));
+    }
+}
