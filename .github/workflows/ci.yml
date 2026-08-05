@@ -1,0 +1,65 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: pangya
+          POSTGRES_PASSWORD: pangya-ci-test
+          POSTGRES_DB: pangya_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pangya -d pangya_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://pangya:pangya-ci-test@127.0.0.1:5432/pangya_test
+    strategy:
+      matrix:
+        toolchain: ["1.93.0", stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features rustls,postgres
+      - run: ./scripts/check-proprietary-assets.sh
+      - run: cargo sqlx migrate run --source crates/pangya-storage/migrations
+      - run: cargo sqlx prepare --workspace --check -- --all-targets --all-features
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        env:
+          SQLX_OFFLINE: "true"
+      - run: cargo test --workspace --all-features --locked
+        env:
+          SQLX_OFFLINE: "true"
+      - run: cargo test --doc --workspace --locked
+        env:
+          SQLX_OFFLINE: "true"
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny --locked check
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --locked check
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo fuzz build
+      - run: cargo fuzz run client-codec -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run server-decompression -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run packet-reader -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run iff-parser -- -seed=1 -max_total_time=5
