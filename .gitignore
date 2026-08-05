@@ -1,0 +1,12 @@
+/target/
+/.pi-subagents/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+*.pcap
+*.pcapng
+*.iff
+*.pak
+local-data/
+.env
+.DS_Store
