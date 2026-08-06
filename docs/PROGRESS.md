@@ -2,9 +2,9 @@
 
 > Last updated: **2026-08-05**
 >
-> Current stage: **M3 — local synthetic GameService bootstrap complete; external client/data gates remain**
+> Current stage: **M4 — local synthetic lobby/room checkpoint complete; real U.S. 852 room exit remains open**
 >
-> Next gate: **legally held U.S. 852 IFF/packet validation; no M4 until reviewed**
+> Next gate: **legally held U.S. 852 room opcode/layout/order and create/enter acceptance; no M5**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -35,7 +35,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | Protocol/crypto | 🟡 | All local M1 vectors, fixtures, transport boundaries, audits, and bounded fuzz checks pass; real-client acceptance remains |
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
-| Rooms/gameplay | ⬜ | M4–M6 |
+| Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
+| Gameplay | ⬜ | No M5 start/loading/hole/shot/scoring/persistence/reward behavior |
 | Economy/social/parity | ⬜ | M7+ |
 
 ---
@@ -120,7 +121,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 |---|---:|---|
 | M2 — LoginService | 🟡 | Local synthetic exit reaches server selection and consumes one handover; external U.S. 852 validation remains |
 | M3 — Game bootstrap | 🟡 | Local synthetic flow reaches one channel with catalog-validated snapshot; real U.S. 852 exit remains external |
-| M4 — Lobby and rooms | ⬜ | Real client creates and enters a room; concurrent synthetic state tests pass |
+| M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
 | M5 — Solo first playable | ⬜ | One real-client hole finishes and persists exactly one reward |
 | M6 — Multiplayer stroke | ⬜ | Two real clients finish with consistent standings and durable records |
 | M7 — Inventory/shop depth | ⬜ | Catalog-derived transactional purchases and equipment validation |
@@ -162,6 +163,25 @@ Evidence: [`evidence/M2_STORAGE_FOUNDATION_2026-08-05.md`](evidence/M2_STORAGE_F
 
 Evidence: [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md).
 
+## M4 — local synthetic lobby and rooms
+
+**Status: 🟡 local synthetic exit complete; real U.S. 852 create/enter exit remains open**
+
+- [x] ADR-0011 reserves the generated local-only `0x7f00`/`0x7f80` families and explicitly excludes U.S. 852 and M5 claims.
+- [x] Add bounded room values/projections/errors and strict generated layouts for list, create, join, leave, settings, ready, chat, kick, state, command results, membership events, and chat events.
+- [x] Add one bounded lobby registry plus one sole-owner actor per room, separate priority disconnect/shutdown control, deterministic room IDs/listing/owner transfer, and one-room-per-connection authority.
+- [x] Prove capacity serialization, password-gated admission, owner-only mutation/kick, ready/chat broadcast, disconnect cleanup, actor failure isolation, queue/rate limits, and bounded shutdown.
+- [x] Keep password input redacted/zeroized; retain only random-salted SHA-256 with constant-time verification and expose only a protected boolean.
+- [x] Add state-aware GameService dispatch, fixed low-cardinality observations, and bounded unknown-opcode disconnect/ignore/metadata-digest capture. Known wrong-state opcodes always close.
+- [x] Add four generated fixture/provenance pairs, 11 protocol M4 tests, 18 game actor/runtime tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests.
+- [x] Complete the local synthetic TCP room lifecycle through create, list, join, settings, ready, chat, kick, leave, owner transfer, capacity race, and disconnect removal.
+- [ ] Rerun the complete final format/Clippy/workspace/doc/deny/asset/fuzz validation matrix.
+- [ ] Validate exact room opcodes, layouts, limits, ordering, and successful create/enter behavior with a legally held U.S. 852 client.
+
+No M5 room start, loading, gameplay, scoring, persistence, finish, or reward behavior is implemented.
+
+Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md) and [`protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md`](protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md).
+
 ## Research proof ledger
 
 | Claim | Evidence |
@@ -186,17 +206,25 @@ Evidence: [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYN
 2. **Exact LoginService order** — capture and record that client's login/channel packet order without committing proprietary captures or secrets.
 3. **Legally supplied IFF layouts** — validate real header/count/binding/version/record sizes outside the repository; committed fixtures remain generated only.
 4. **Exact Game bootstrap** — validate hello, auth, bootstrap segmentation, channel packet layouts/order, and acceptance with the selected client.
+5. **Exact lobby/room flow** — validate real U.S. 852 lobby/room opcodes, fields, limits, ordering, password/failure behavior, and client create/enter acceptance; never identify the provisional `0x7f00` family as retail protocol.
 
 ---
 
 ## Immediate next actions
 
-1. Obtain a legally held U.S. 852 client build/hash privately and validate exact login ordering, nickname limits, server-list acceptance, and handover field/length without committing proprietary artifacts.
-2. Preserve the synthetic M2/M3 exits and perform independent review; do not begin M4 until local findings and external compatibility gates are recorded.
+1. Rerun the complete final validation matrix and record its command output without weakening the external compatibility boundary.
+2. Obtain a legally held U.S. 852 client build/hash privately and validate login/Game bootstrap plus exact lobby/room opcodes, layouts, ordering, limits, and create/enter acceptance without committing proprietary artifacts.
+3. Preserve the synthetic M2/M3/M4 exits; do not begin M5 start/loading/gameplay/reward work until the real M4 gate is reviewed.
 
 ---
 
 ## Change log
+
+### 2026-08-05 — local synthetic M4 lobby and room checkpoint
+
+- Added generated `0x7f00`/`0x7f80` room contracts, a bounded lobby registry and sole-owner room actors, authoritative membership/settings/ready/chat/kick/transfer/cleanup, and metadata-digest unknown capture.
+- Recorded 18 game actor/runtime tests, 11 protocol M4 tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the complete final validation rerun remains pending.
+- Kept the real U.S. 852 M4 exit open for exact opcodes/layout/order and create/enter acceptance, and added no M5 start/loading/gameplay/reward behavior.
 
 ### 2026-08-05 — local synthetic M3 GameService bootstrap
 

@@ -8,13 +8,13 @@
 
 ## One-paragraph state
 
-M1 and M2 remain intact. M3's **opt-in local synthetic handover/player-bootstrap exit is complete**: immutable bounded manifest catalog, opaque minimum Character/ClubSet/Ball records, coherent repeatable-read PlayerSnapshot, authoritative single-use Game handover, catalog validation, segmented bootstrap, channel state, pre-spawn/rate/deadline/presence bounds, optional readiness, redacted metrics/tracing, generated fuzz fixtures, and real-PostgreSQL Login-to-Game evidence. This is not real-client or real-IFF compatibility: U.S. 852 login order, token field, Game hello/opcode layouts/order, channel semantics, and all IFF headers/record sizes remain open. Evidence is in [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md).
+M1–M3 remain intact. M4's **local synthetic lobby/room checkpoint is complete**: generated `0x7f00`/`0x7f80` contracts, one bounded lobby registry and sole-owner actor per room, authoritative create/list/join/leave/settings/ready/chat/kick/transfer/disconnect behavior, redacted salted password digests, state-aware dispatch, bounded queues/rates/shutdown, and metadata-digest-only unknown capture. Test inventory is 18 game actor/runtime, 11 protocol M4, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the full final validation matrix still needs its final rerun. This is not real U.S. 852 room compatibility: exact room opcodes/layouts/order/limits and real-client create/enter acceptance remain external. There is no M5 start/loading/gameplay/scoring/persistence/reward behavior. Evidence is in [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md).
 
 ---
 
 ## Durable decisions in the proposed baseline
 
-These are accepted in ADR-0001 through ADR-0005 and should change only through a superseding ADR:
+These include accepted baseline decisions from ADR-0001 through ADR-0011 and should change only through a superseding ADR:
 
 - First client target: **PangYa U.S. 852.00 / GB.852**.
 - Project type: **clean-room Rust rewrite**, not a mechanical translation.
@@ -27,6 +27,9 @@ These are accepted in ADR-0001 through ADR-0005 and should change only through a
 - Packet strategy: hand-reviewed, state-aware Rust packet types with a fixture per implemented opcode; PacketDoc is evidence, not blindly generated truth.
 - Data strategy: safe explicit little-endian IFF parser; operator mounts proprietary game data read-only. Local M3 uses ADR-0010's versioned synthetic header and interprets only `u32 type_id`; real layouts remain externally gated.
 - Shot model: client computes trajectory/result; server owns identity, membership, ordering, score, validation, inventory, currency, rewards and persistence.
+- M4 room model: provisional local-only C->S `0x7f00..=0x7f08` and S->C `0x7f80..=0x7f84`; one bounded lobby registry, one sole-owner actor per room, priority disconnect/shutdown control, and no durability or M5 behavior (ADR-0011).
+- M4 authority: authenticated connection supplies caller/sender; one room per connection; capacity `2..=30`; owner transfer is longest-present then lowest connection ID; passwords retain only random-salted SHA-256 and use constant-time verification.
+- Unknown post-channel capture: fixed-capacity oldest-evicted process-local records of state/opcode/body length/SHA-256 only; no raw body. Known room opcodes in the wrong state always close regardless of policy.
 - LZO implementation: **`lzokay` 2.0.1** (pure Rust, MIT), proven for known PangCrypt vectors, generated round trips, and one independent go-lzo decode; real-client acceptance remains open.
 - Error policy: `thiserror` in libraries, `anyhow` only at binary composition boundary, no production `unwrap`/`expect`.
 - Persistence: PostgreSQL 17 through SQLx 0.8.6, embedded forward-only migrations, named constraints, explicit transactions, and committed offline metadata (ADR-0006).
@@ -47,6 +50,8 @@ These are accepted in ADR-0001 through ADR-0005 and should change only through a
 4. **Name limits** — M2 ASCII normalization/limits are provisional until the chosen client validates input behavior.
 5. **Exact advertised ports/packet order/token field** — verify with the chosen client/capture before claiming compatibility.
 6. **Real IFF and GameService layouts** — validate legally held Character/ClubSet/Ball headers, record sizes, Game hello/auth/bootstrap/channel fields and ordering; never infer them from local synthetic M3.
+7. **Real M4 room exit** — validate exact U.S. 852 lobby/room opcodes, fields, limits, order, password/failure semantics, and real-client create/enter acceptance; never label `0x7f00` as U.S. 852.
+8. **Next M5 gate** — do not begin room start/loading/gameplay/scoring/persistence/rewards until real M4 evidence is reviewed.
 
 ---
 
@@ -207,9 +212,10 @@ Never persist client-claimed Pang/EXP directly. Simplified Tier-B rewards are ac
 
 1. Read `docs/PROGRESS.md`, the M2 evidence file, and this file; check unstaged status.
 2. Preserve the fixture/provenance, SQLx offline, real-PostgreSQL, and no-proprietary-assets boundaries.
-3. Preserve the completed synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL evidence; do not infer external compatibility from it.
-4. Obtain the exact U.S. 852 build/hash privately and validate order, `0x000e`, name limits, server-list acceptance, and token field/length without committing it.
-5. Begin GameService/bootstrap only as M3 scope.
+3. Preserve the completed synthetic M2/M3/M4 evidence; do not infer external compatibility from it.
+4. Rerun and record the complete final format/Clippy/workspace/doc/deny/asset/fuzz validation matrix.
+5. Obtain the exact U.S. 852 build/hash privately and validate login/Game plus real lobby/room opcode/layout/order/create-enter behavior without committing it.
+6. Do not begin M5 start/loading/gameplay/scoring/persistence/reward work before the real M4 review gate.
 
 ---
 
