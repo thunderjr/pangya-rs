@@ -22,7 +22,7 @@ use pangya_domain::{
     MatchRepositoryError, MatchResultKey, NewAccount, NewHandover, Nickname, NormalizedNickname,
     NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile, RepositoryError,
     RepositoryFuture, ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey,
-    StrokeCount, Weather, synthetic_solo_reward_v1,
+    StrokeCount, Weather, WindConditions, synthetic_solo_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -560,15 +560,20 @@ impl PgRepository {
         let seed = request.seed();
         let inserted = sqlx::query!(
             "INSERT INTO matches \
-             (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather) \
-             VALUES ($1, $2, $3, 1, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+             (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather, \
+              wind_speed_tenths, wind_angle_degrees) \
+             VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
             request.match_id().get(),
             request.result_key().get(),
             i64::from(request.config().course_id().get()),
             i16::from(request.config().par()),
             catalog_fingerprint.as_bytes().as_slice(),
             seed.as_bytes().as_slice(),
-            weather_text(request.weather())
+            weather_text(request.weather()),
+            i16::try_from(request.wind().speed_tenths())
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+            i16::try_from(request.wind().angle_degrees())
+                .map_err(|_| MatchRepositoryError::CorruptData)?
         )
         .execute(&mut *transaction)
         .await
@@ -601,8 +606,11 @@ impl PgRepository {
             r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
                       m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
                       m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
-                      m.weather AS "weather!", m.reward_formula AS "reward_formula!",
-                      m.status AS "status!", mp.account_id AS "account_id!",
+                      m.weather AS "weather!",
+                      m.wind_speed_tenths AS "wind_speed_tenths!",
+                      m.wind_angle_degrees AS "wind_angle_degrees!",
+                      m.reward_formula AS "reward_formula!", m.status AS "status!",
+                      mp.account_id AS "account_id!",
                       mp.strokes AS "strokes?", mp.score AS "score?",
                       mp.pang_reward AS "pang_reward?",
                       mp.experience_reward AS "experience_reward?",
@@ -1088,6 +1096,8 @@ struct MatchPersistenceRow {
     catalog_sha256: Vec<u8>,
     seed: Vec<u8>,
     weather: String,
+    wind_speed_tenths: i16,
+    wind_angle_degrees: i16,
     reward_formula: String,
     status: String,
     account_id: i64,
@@ -1109,6 +1119,12 @@ impl MatchPersistenceRow {
         let seed = pangya_domain::MatchSeed::from_slice(&self.seed)
             .map_err(|_| MatchRepositoryError::CorruptData)?;
         let weather = parse_weather(&self.weather)?;
+        let wind = WindConditions::new(
+            u16::try_from(self.wind_speed_tenths).map_err(|_| MatchRepositoryError::CorruptData)?,
+            u16::try_from(self.wind_angle_degrees)
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+        )
+        .map_err(|_| MatchRepositoryError::CorruptData)?;
         Ok(self.id == request.match_id().get()
             && self.result_commit_key == request.result_key().get()
             && self.account_id == request.account_id().get()
@@ -1116,7 +1132,8 @@ impl MatchPersistenceRow {
             && self.par == i16::from(request.config().par())
             && fingerprint == request.catalog_fingerprint()
             && seed == request.seed()
-            && weather == request.weather())
+            && weather == request.weather()
+            && wind == request.wind())
     }
 
     fn persisted_result(&self) -> Result<SoloMatchResult, MatchRepositoryError> {
@@ -1168,8 +1185,11 @@ async fn lock_match(
         r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
                   m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
                   m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
-                  m.weather AS "weather!", m.reward_formula AS "reward_formula!",
-                  m.status AS "status!", mp.account_id AS "account_id!",
+                  m.weather AS "weather!",
+                  m.wind_speed_tenths AS "wind_speed_tenths!",
+                  m.wind_angle_degrees AS "wind_angle_degrees!",
+                  m.reward_formula AS "reward_formula!", m.status AS "status!",
+                  mp.account_id AS "account_id!",
                   mp.strokes AS "strokes?", mp.score AS "score?",
                   mp.pang_reward AS "pang_reward?",
                   mp.experience_reward AS "experience_reward?",

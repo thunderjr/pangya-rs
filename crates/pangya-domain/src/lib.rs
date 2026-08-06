@@ -724,6 +724,12 @@ pub enum MatchValueError {
     /// A stroke count must fit the persisted positive `SMALLINT` range.
     #[error("stroke count is outside policy")]
     InvalidStrokes,
+    /// Wind speed must be in `0..=150` tenths.
+    #[error("wind speed is outside policy")]
+    InvalidWindSpeed,
+    /// Wind angle must be in `0..=359` degrees.
+    #[error("wind angle is outside policy")]
+    InvalidWindAngle,
     /// A catalog fingerprint or deterministic seed had the wrong byte length.
     #[error("fixed-size match bytes have the wrong length")]
     InvalidBytes,
@@ -782,6 +788,45 @@ pub enum Weather {
     Cloudy,
     /// Rain.
     Rain,
+}
+
+/// Checked deterministic wind selected by the server for one match.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WindConditions {
+    speed_tenths: u16,
+    angle_degrees: u16,
+}
+
+impl WindConditions {
+    /// Validates persisted wind bounds.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidWindSpeed`] above 150 tenths or
+    /// [`MatchValueError::InvalidWindAngle`] above 359 degrees.
+    pub const fn new(speed_tenths: u16, angle_degrees: u16) -> Result<Self, MatchValueError> {
+        if speed_tenths > 150 {
+            Err(MatchValueError::InvalidWindSpeed)
+        } else if angle_degrees > 359 {
+            Err(MatchValueError::InvalidWindAngle)
+        } else {
+            Ok(Self {
+                speed_tenths,
+                angle_degrees,
+            })
+        }
+    }
+
+    /// Wind speed in tenths of the local gameplay unit.
+    #[must_use]
+    pub const fn speed_tenths(self) -> u16 {
+        self.speed_tenths
+    }
+
+    /// Wind direction in degrees in `0..=359`.
+    #[must_use]
+    pub const fn angle_degrees(self) -> u16 {
+        self.angle_degrees
+    }
 }
 
 /// Immutable one-hole synthetic course configuration. Hole number is always one.
@@ -921,11 +966,13 @@ pub struct BeginSoloMatch {
     catalog_fingerprint: CatalogFingerprint,
     seed: MatchSeed,
     weather: Weather,
+    wind: WindConditions,
 }
 
 impl BeginSoloMatch {
     /// Constructs a server-owned begin request from already checked values.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         match_id: MatchId,
         result_key: MatchResultKey,
@@ -934,6 +981,7 @@ impl BeginSoloMatch {
         catalog_fingerprint: CatalogFingerprint,
         seed: MatchSeed,
         weather: Weather,
+        wind: WindConditions,
     ) -> Self {
         Self {
             match_id,
@@ -943,6 +991,7 @@ impl BeginSoloMatch {
             catalog_fingerprint,
             seed,
             weather,
+            wind,
         }
     }
 
@@ -980,6 +1029,11 @@ impl BeginSoloMatch {
     #[must_use]
     pub const fn weather(&self) -> Weather {
         self.weather
+    }
+    /// Persisted deterministic wind.
+    #[must_use]
+    pub const fn wind(&self) -> WindConditions {
+        self.wind
     }
 }
 
@@ -1956,10 +2010,13 @@ mod tests {
             CatalogFingerprint::new([0; 32]),
             seed,
             Weather::Clear,
+            WindConditions::new(87, 231).expect("wind"),
         );
         let debug = format!("{begin:?}");
         assert!(debug.contains("MatchSeed([REDACTED])"));
-        assert!(!debug.contains("231"));
+        assert!(debug.contains("speed_tenths: 87"));
+        assert!(debug.contains("angle_degrees: 231"));
+        assert!(!debug.contains("[231, 231"));
     }
 
     #[test]
@@ -2033,6 +2090,17 @@ mod tests {
             Err(MatchValueError::InvalidPar)
         );
         assert_eq!(StrokeCount::new(0), Err(MatchValueError::InvalidStrokes));
+        assert_eq!(
+            WindConditions::new(151, 0),
+            Err(MatchValueError::InvalidWindSpeed)
+        );
+        assert_eq!(
+            WindConditions::new(0, 360),
+            Err(MatchValueError::InvalidWindAngle)
+        );
+        let wind = WindConditions::new(150, 359).expect("maximum wind");
+        assert_eq!(wind.speed_tenths(), 150);
+        assert_eq!(wind.angle_degrees(), 359);
     }
 
     #[test]

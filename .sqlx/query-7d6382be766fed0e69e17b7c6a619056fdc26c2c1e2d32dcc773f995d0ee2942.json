@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                  m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.par AS \"par!\",\n                  m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                  m.weather AS \"weather!\", m.reward_formula AS \"reward_formula!\",\n                  m.status AS \"status!\", mp.account_id AS \"account_id!\",\n                  mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                  mp.pang_reward AS \"pang_reward?\",\n                  mp.experience_reward AS \"experience_reward?\",\n                  mp.pang_balance_after AS \"pang_balance_after?\",\n                  mp.experience_balance_after AS \"experience_balance_after?\"\n           FROM matches m JOIN match_players mp ON mp.match_id = m.id\n           WHERE m.id = $1 FOR UPDATE OF m, mp",
+  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                  m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.par AS \"par!\",\n                  m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                  m.weather AS \"weather!\",\n                  m.wind_speed_tenths AS \"wind_speed_tenths!\",\n                  m.wind_angle_degrees AS \"wind_angle_degrees!\",\n                  m.reward_formula AS \"reward_formula!\", m.status AS \"status!\",\n                  mp.account_id AS \"account_id!\",\n                  mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                  mp.pang_reward AS \"pang_reward?\",\n                  mp.experience_reward AS \"experience_reward?\",\n                  mp.pang_balance_after AS \"pang_balance_after?\",\n                  mp.experience_balance_after AS \"experience_balance_after?\"\n           FROM matches m JOIN match_players mp ON mp.match_id = m.id\n           WHERE m.id = $1 FOR UPDATE OF m, mp",
   "describe": {
     "columns": [
       {
@@ -45,46 +45,56 @@
       },
       {
         "ordinal": 8,
+        "name": "wind_speed_tenths!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 9,
+        "name": "wind_angle_degrees!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 10,
         "name": "reward_formula!",
         "type_info": "Text"
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "status!",
         "type_info": "Text"
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "account_id!",
         "type_info": "Int8"
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "strokes?",
         "type_info": "Int2"
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "score?",
         "type_info": "Int2"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "pang_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "experience_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 15,
+        "ordinal": 17,
         "name": "pang_balance_after?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 16,
+        "ordinal": 18,
         "name": "experience_balance_after?",
         "type_info": "Int8"
       }
@@ -106,6 +116,8 @@
       false,
       false,
       false,
+      false,
+      false,
       true,
       true,
       true,
@@ -114,5 +126,5 @@
       true
     ]
   },
-  "hash": "6ae8567d0799b6e608c4051664c099341d91bbd11c8274e7c5da0a7d0b8dc1db"
+  "hash": "7d6382be766fed0e69e17b7c6a619056fdc26c2c1e2d32dcc773f995d0ee2942"
 }

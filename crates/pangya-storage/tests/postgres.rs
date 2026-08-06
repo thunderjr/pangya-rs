@@ -11,6 +11,7 @@ use pangya_domain::{
     MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
     OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind, SourceAddressPrefix,
     StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCount, Username, Weather,
+    WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -804,6 +805,7 @@ fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
         CatalogFingerprint::new([0x42; 32]),
         MatchSeed::new([0x24; 32]),
         Weather::Clear,
+        WindConditions::new(87, 231).expect("wind"),
     )
 }
 
@@ -815,6 +817,73 @@ fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
         begin.config(),
         StrokeCount::new(strokes).expect("strokes"),
     )
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn match_wind_columns_are_required_bounded_and_store_authoritative_input(pool: PgPool) {
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable, column_default \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'matches' \
+           AND column_name IN ('wind_speed_tenths', 'wind_angle_degrees') \
+         ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("wind column schema");
+    assert_eq!(
+        columns,
+        vec![
+            (
+                "wind_angle_degrees".to_owned(),
+                "smallint".to_owned(),
+                "NO".to_owned(),
+                None,
+            ),
+            (
+                "wind_speed_tenths".to_owned(),
+                "smallint".to_owned(),
+                "NO".to_owned(),
+                None,
+            ),
+        ]
+    );
+
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("SoloWindSchema", Some("SoloWindNick")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    repository
+        .begin_solo(begin.clone())
+        .await
+        .expect("begin with wind");
+    let stored: (i16, i16) =
+        sqlx::query_as("SELECT wind_speed_tenths, wind_angle_degrees FROM matches WHERE id = $1")
+            .bind(begin.match_id().get())
+            .fetch_one(&pool)
+            .await
+            .expect("stored wind");
+    assert_eq!(stored, (87, 231));
+
+    for (column, value) in [
+        ("wind_speed_tenths", -1_i16),
+        ("wind_speed_tenths", 151_i16),
+        ("wind_angle_degrees", -1_i16),
+        ("wind_angle_degrees", 360_i16),
+    ] {
+        let statement = format!("UPDATE matches SET {column} = $2 WHERE id = $1");
+        assert!(
+            sqlx::query(&statement)
+                .bind(begin.match_id().get())
+                .bind(value)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "{column} accepted out-of-range value {value}"
+        );
+    }
 }
 
 async fn match_counts(pool: &PgPool, match_id: MatchId) -> (i64, i64, i64, i64) {
@@ -1018,9 +1087,14 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
         begin.result_key(),
         begin.account_id(),
         begin.config(),
-        CatalogFingerprint::new([9; 32]),
+        begin.catalog_fingerprint(),
         begin.seed(),
         begin.weather(),
+        WindConditions::new(
+            begin.wind().speed_tenths() + 1,
+            begin.wind().angle_degrees(),
+        )
+        .expect("drift wind"),
     );
     assert_eq!(
         repository.begin_solo(drift).await,
