@@ -736,6 +736,15 @@ pub enum MatchValueError {
     /// Checked score or reward arithmetic overflowed.
     #[error("match result arithmetic overflowed")]
     ArithmeticOverflow,
+    /// A two-player roster did not contain exactly one distinct participant in each order.
+    #[error("stroke roster is invalid")]
+    InvalidStrokeRoster,
+    /// A two-player settlement had invalid strokes, places, or completion consistency.
+    #[error("stroke settlement is invalid")]
+    InvalidStrokeSettlement,
+    /// A persisted course record violated its count or score invariants.
+    #[error("course record is invalid")]
+    InvalidCourseRecord,
 }
 
 /// A checked, nonzero synthetic course identifier.
@@ -1384,6 +1393,725 @@ pub fn synthetic_solo_reward_v1(
     Ok(SoloReward::from_persisted(score, pang, 5))
 }
 
+/// Stable captured position in an exactly-two stroke roster.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StrokeRosterOrder {
+    /// Captured roster order zero.
+    First,
+    /// Captured roster order one.
+    Second,
+}
+
+impl StrokeRosterOrder {
+    /// Database representation constrained to `0..=1`.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+
+    /// Parses the constrained database representation.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidStrokeRoster`] outside `0..=1`.
+    pub const fn from_persisted(value: i16) -> Result<Self, MatchValueError> {
+        match value {
+            0 => Ok(Self::First),
+            1 => Ok(Self::Second),
+            _ => Err(MatchValueError::InvalidStrokeRoster),
+        }
+    }
+}
+
+/// Captured authoritative identity for one stroke participant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrokeParticipant {
+    account_id: AccountId,
+    roster_order: StrokeRosterOrder,
+    player_result_key: MatchResultKey,
+}
+
+impl StrokeParticipant {
+    /// Constructs one server-owned roster entry.
+    #[must_use]
+    pub const fn new(
+        account_id: AccountId,
+        roster_order: StrokeRosterOrder,
+        player_result_key: MatchResultKey,
+    ) -> Self {
+        Self {
+            account_id,
+            roster_order,
+            player_result_key,
+        }
+    }
+
+    /// Participant account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+    /// Stable roster order.
+    #[must_use]
+    pub const fn roster_order(self) -> StrokeRosterOrder {
+        self.roster_order
+    }
+    /// Per-player settlement idempotency key.
+    #[must_use]
+    pub const fn player_result_key(self) -> MatchResultKey {
+        self.player_result_key
+    }
+}
+
+fn validate_stroke_roster(participants: &[StrokeParticipant; 2]) -> Result<(), MatchValueError> {
+    if participants[0].roster_order != StrokeRosterOrder::First
+        || participants[1].roster_order != StrokeRosterOrder::Second
+        || participants[0].account_id == participants[1].account_id
+        || participants[0].player_result_key == participants[1].player_result_key
+    {
+        Err(MatchValueError::InvalidStrokeRoster)
+    } else {
+        Ok(())
+    }
+}
+
+/// Immutable request to reserve one exactly-two synthetic stroke match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginStrokeMatch {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    participants: [StrokeParticipant; 2],
+    config: OneHoleConfig,
+    catalog_fingerprint: CatalogFingerprint,
+    seed: MatchSeed,
+    weather: Weather,
+    wind: WindConditions,
+}
+
+impl BeginStrokeMatch {
+    /// Validates and constructs a complete authoritative begin request.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidStrokeRoster`] for duplicate identities/keys or
+    /// missing/reordered roster positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        participants: [StrokeParticipant; 2],
+        config: OneHoleConfig,
+        catalog_fingerprint: CatalogFingerprint,
+        seed: MatchSeed,
+        weather: Weather,
+        wind: WindConditions,
+    ) -> Result<Self, MatchValueError> {
+        validate_stroke_roster(&participants)?;
+        if participants
+            .iter()
+            .any(|participant| participant.player_result_key == result_key)
+        {
+            return Err(MatchValueError::InvalidStrokeRoster);
+        }
+        Ok(Self {
+            match_id,
+            result_key,
+            participants,
+            config,
+            catalog_fingerprint,
+            seed,
+            weather,
+            wind,
+        })
+    }
+
+    /// Durable aggregate ID.
+    #[must_use]
+    pub const fn match_id(&self) -> MatchId {
+        self.match_id
+    }
+    /// Aggregate commit idempotency key.
+    #[must_use]
+    pub const fn result_key(&self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Exact captured roster in order zero then one.
+    #[must_use]
+    pub const fn participants(&self) -> &[StrokeParticipant; 2] {
+        &self.participants
+    }
+    /// Persisted course configuration.
+    #[must_use]
+    pub const fn config(&self) -> OneHoleConfig {
+        self.config
+    }
+    /// Persisted catalog fingerprint.
+    #[must_use]
+    pub const fn catalog_fingerprint(&self) -> CatalogFingerprint {
+        self.catalog_fingerprint
+    }
+    /// Persisted deterministic seed.
+    #[must_use]
+    pub const fn seed(&self) -> MatchSeed {
+        self.seed
+    }
+    /// Persisted weather.
+    #[must_use]
+    pub const fn weather(&self) -> Weather {
+        self.weather
+    }
+    /// Persisted wind.
+    #[must_use]
+    pub const fn wind(&self) -> WindConditions {
+        self.wind
+    }
+}
+
+/// Result of an idempotent exactly-two begin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginStrokeMatchOutcome {
+    /// Aggregate, roster, and started audit were inserted atomically.
+    Begun,
+    /// Exact immutable input was already present.
+    Existing,
+}
+
+/// Authoritative aggregate identity for loading-to-in-game transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkStrokeInGame {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+}
+
+impl MarkStrokeInGame {
+    /// Constructs a server-owned transition request.
+    #[must_use]
+    pub const fn new(match_id: MatchId, result_key: MatchResultKey) -> Self {
+        Self {
+            match_id,
+            result_key,
+        }
+    }
+    /// Durable aggregate ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Aggregate result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+}
+
+/// Result of an idempotent stroke loading transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkStrokeInGameOutcome {
+    /// Loading changed to in-game.
+    Marked,
+    /// Exact aggregate was already in-game.
+    Existing,
+}
+
+/// Aggregate abort request; participant authority is loaded from the captured roster.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbortStrokeMatch {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    reason: MatchAbortReason,
+}
+
+impl AbortStrokeMatch {
+    /// Constructs a no-reward abort request.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        reason: MatchAbortReason,
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            reason,
+        }
+    }
+    /// Durable aggregate ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Aggregate result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Durable reason.
+    #[must_use]
+    pub const fn reason(self) -> MatchAbortReason {
+        self.reason
+    }
+}
+
+/// Authoritative completion class for one stroke participant.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StrokeCompletion {
+    /// Ball was holed and is course-record eligible.
+    Holed,
+    /// Configured stroke cap was reached.
+    StrokeCap,
+    /// Participant voluntarily gave up.
+    GiveUp,
+    /// Participant disconnected in game.
+    Disconnect,
+    /// Participant exceeded the active-turn deadline.
+    TurnTimeout,
+    /// Participant remained unfinished at the game deadline.
+    GameTimeout,
+}
+
+impl StrokeCompletion {
+    /// Whether this completion receives the non-forfeit formula.
+    #[must_use]
+    pub const fn is_forfeit(self) -> bool {
+        !matches!(self, Self::Holed | Self::StrokeCap)
+    }
+
+    /// Whether this completion may update a course record.
+    #[must_use]
+    pub const fn is_record_eligible(self) -> bool {
+        matches!(self, Self::Holed)
+    }
+}
+
+/// Unique synthetic standing assigned within the exactly-two aggregate.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StrokePlace {
+    /// First place.
+    First,
+    /// Second place.
+    Second,
+}
+
+impl StrokePlace {
+    /// Database place representation.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        match self {
+            Self::First => 1,
+            Self::Second => 2,
+        }
+    }
+
+    /// Parses the constrained database representation.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidStrokeSettlement`] outside `1..=2`.
+    pub const fn from_persisted(value: i16) -> Result<Self, MatchValueError> {
+        match value {
+            1 => Ok(Self::First),
+            2 => Ok(Self::Second),
+            _ => Err(MatchValueError::InvalidStrokeSettlement),
+        }
+    }
+}
+
+/// One authoritative participant input to an aggregate commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrokePlayerCommit {
+    participant: StrokeParticipant,
+    strokes: u16,
+    place: StrokePlace,
+    completion: StrokeCompletion,
+}
+
+impl StrokePlayerCommit {
+    /// Validates completion/stroke consistency.
+    ///
+    /// # Errors
+    /// Non-forfeits require a positive persisted `SMALLINT`; forfeits permit zero.
+    pub const fn new(
+        participant: StrokeParticipant,
+        strokes: u16,
+        place: StrokePlace,
+        completion: StrokeCompletion,
+    ) -> Result<Self, MatchValueError> {
+        if strokes > i16::MAX as u16 || (!completion.is_forfeit() && strokes == 0) {
+            Err(MatchValueError::InvalidStrokeSettlement)
+        } else {
+            Ok(Self {
+                participant,
+                strokes,
+                place,
+                completion,
+            })
+        }
+    }
+    /// Captured participant authority.
+    #[must_use]
+    pub const fn participant(self) -> StrokeParticipant {
+        self.participant
+    }
+    /// Authoritative strokes; zero is allowed only for forfeits.
+    #[must_use]
+    pub const fn strokes(self) -> u16 {
+        self.strokes
+    }
+    /// Unique place.
+    #[must_use]
+    pub const fn place(self) -> StrokePlace {
+        self.place
+    }
+    /// Completion reason.
+    #[must_use]
+    pub const fn completion(self) -> StrokeCompletion {
+        self.completion
+    }
+}
+
+/// Request to settle exactly two authoritative player outcomes atomically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitStrokeMatch {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    config: OneHoleConfig,
+    players: [StrokePlayerCommit; 2],
+}
+
+impl CommitStrokeMatch {
+    /// Validates roster order, distinct keys/accounts, and unique places.
+    ///
+    /// # Errors
+    /// Returns a typed value error for any aggregate cardinality/standing drift.
+    pub fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        config: OneHoleConfig,
+        players: [StrokePlayerCommit; 2],
+    ) -> Result<Self, MatchValueError> {
+        let participants = [players[0].participant, players[1].participant];
+        validate_stroke_roster(&participants)?;
+        if players[0].place == players[1].place
+            || participants
+                .iter()
+                .any(|participant| participant.player_result_key == result_key)
+        {
+            return Err(MatchValueError::InvalidStrokeSettlement);
+        }
+        Ok(Self {
+            match_id,
+            result_key,
+            config,
+            players,
+        })
+    }
+    /// Durable aggregate ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Aggregate commit key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Authoritative one-hole configuration.
+    #[must_use]
+    pub const fn config(self) -> OneHoleConfig {
+        self.config
+    }
+    /// Exact roster-ordered player inputs.
+    #[must_use]
+    pub const fn players(&self) -> &[StrokePlayerCommit; 2] {
+        &self.players
+    }
+}
+
+/// Checked score and server-calculated reward for one stroke participant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrokeReward {
+    score: Option<i16>,
+    pang: u64,
+    experience: u64,
+}
+
+impl StrokeReward {
+    /// Reconstructs trusted persisted values.
+    #[must_use]
+    pub const fn from_persisted(score: Option<i16>, pang: u64, experience: u64) -> Self {
+        Self {
+            score,
+            pang,
+            experience,
+        }
+    }
+    /// Golf score, absent for forfeits.
+    #[must_use]
+    pub const fn score(self) -> Option<i16> {
+        self.score
+    }
+    /// Pang reward.
+    #[must_use]
+    pub const fn pang(self) -> u64 {
+        self.pang
+    }
+    /// Experience reward.
+    #[must_use]
+    pub const fn experience(self) -> u64 {
+        self.experience
+    }
+}
+
+/// Computes the server-only `stroke-two-v1` formula.
+///
+/// Non-forfeits reuse checked `solo-v1`; forfeits have no score and zero reward.
+///
+/// # Errors
+/// Returns [`MatchValueError::ArithmeticOverflow`] from checked non-forfeit math.
+pub fn synthetic_stroke_reward_v1(
+    config: OneHoleConfig,
+    strokes: u16,
+    completion: StrokeCompletion,
+) -> Result<StrokeReward, MatchValueError> {
+    if completion.is_forfeit() {
+        if strokes > i16::MAX as u16 {
+            return Err(MatchValueError::InvalidStrokeSettlement);
+        }
+        return Ok(StrokeReward::from_persisted(None, 0, 0));
+    }
+    let strokes = StrokeCount::new(strokes)?;
+    let reward = synthetic_solo_reward_v1(config, strokes)?;
+    Ok(StrokeReward::from_persisted(
+        Some(reward.score()),
+        reward.pang(),
+        reward.experience(),
+    ))
+}
+
+/// Exact persisted result for one participant, including its own post-commit balances.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrokePlayerResult {
+    participant: StrokeParticipant,
+    strokes: u16,
+    place: StrokePlace,
+    completion: StrokeCompletion,
+    score: Option<i16>,
+    pang_reward: u64,
+    experience_reward: u64,
+    pang_balance: u64,
+    experience_balance: u64,
+}
+
+impl StrokePlayerResult {
+    /// Constructs a result at the trusted persistence boundary.
+    #[must_use]
+    pub const fn new(
+        input: StrokePlayerCommit,
+        reward: StrokeReward,
+        balances: ServerBalances,
+    ) -> Self {
+        Self {
+            participant: input.participant,
+            strokes: input.strokes,
+            place: input.place,
+            completion: input.completion,
+            score: reward.score,
+            pang_reward: reward.pang,
+            experience_reward: reward.experience,
+            pang_balance: balances.pang,
+            experience_balance: balances.experience,
+        }
+    }
+    /// Participant authority.
+    #[must_use]
+    pub const fn participant(self) -> StrokeParticipant {
+        self.participant
+    }
+    /// Final authoritative strokes.
+    #[must_use]
+    pub const fn strokes(self) -> u16 {
+        self.strokes
+    }
+    /// Final unique place.
+    #[must_use]
+    pub const fn place(self) -> StrokePlace {
+        self.place
+    }
+    /// Final completion.
+    #[must_use]
+    pub const fn completion(self) -> StrokeCompletion {
+        self.completion
+    }
+    /// Golf score, absent for forfeits.
+    #[must_use]
+    pub const fn score(self) -> Option<i16> {
+        self.score
+    }
+    /// Pang reward.
+    #[must_use]
+    pub const fn pang_reward(self) -> u64 {
+        self.pang_reward
+    }
+    /// Experience reward.
+    #[must_use]
+    pub const fn experience_reward(self) -> u64 {
+        self.experience_reward
+    }
+    /// Pang balance after aggregate commit.
+    #[must_use]
+    pub const fn pang_balance(self) -> u64 {
+        self.pang_balance
+    }
+    /// Experience balance after aggregate commit.
+    #[must_use]
+    pub const fn experience_balance(self) -> u64 {
+        self.experience_balance
+    }
+}
+
+/// Exact persisted exactly-two aggregate result in captured roster order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrokeMatchResult {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    players: [StrokePlayerResult; 2],
+}
+
+impl StrokeMatchResult {
+    /// Constructs an already validated persisted aggregate result.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        players: [StrokePlayerResult; 2],
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            players,
+        }
+    }
+    /// Durable aggregate ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Aggregate result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Exact roster-ordered participant results.
+    #[must_use]
+    pub const fn players(&self) -> &[StrokePlayerResult; 2] {
+        &self.players
+    }
+}
+
+/// Rebuildable best-round projection for one account/course in stroke-two mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CourseRecord {
+    account_id: AccountId,
+    course_id: CourseId,
+    best_score: i16,
+    best_strokes: StrokeCount,
+    rounds_completed: u64,
+    best_match_id: MatchId,
+    best_player_result_key: MatchResultKey,
+    first_achieved_at: SystemTime,
+    updated_at: SystemTime,
+}
+
+impl CourseRecord {
+    /// Validates and reconstructs a persisted projection row.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidCourseRecord`] for a zero round count or inverted time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted(
+        account_id: AccountId,
+        course_id: CourseId,
+        best_score: i16,
+        best_strokes: StrokeCount,
+        rounds_completed: u64,
+        best_match_id: MatchId,
+        best_player_result_key: MatchResultKey,
+        first_achieved_at: SystemTime,
+        updated_at: SystemTime,
+    ) -> Result<Self, MatchValueError> {
+        if rounds_completed == 0 || updated_at.duration_since(first_achieved_at).is_err() {
+            return Err(MatchValueError::InvalidCourseRecord);
+        }
+        Ok(Self {
+            account_id,
+            course_id,
+            best_score,
+            best_strokes,
+            rounds_completed,
+            best_match_id,
+            best_player_result_key,
+            first_achieved_at,
+            updated_at,
+        })
+    }
+    /// Record owner.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+    /// Course identity.
+    #[must_use]
+    pub const fn course_id(self) -> CourseId {
+        self.course_id
+    }
+    /// Lowest score, with strokes as deterministic secondary ordering.
+    #[must_use]
+    pub const fn best_score(self) -> i16 {
+        self.best_score
+    }
+    /// Best strokes.
+    #[must_use]
+    pub const fn best_strokes(self) -> StrokeCount {
+        self.best_strokes
+    }
+    /// Count of eligible holed rounds.
+    #[must_use]
+    pub const fn rounds_completed(self) -> u64 {
+        self.rounds_completed
+    }
+    /// Match currently establishing the best.
+    #[must_use]
+    pub const fn best_match_id(self) -> MatchId {
+        self.best_match_id
+    }
+    /// Player settlement currently establishing the best.
+    #[must_use]
+    pub const fn best_player_result_key(self) -> MatchResultKey {
+        self.best_player_result_key
+    }
+    /// First time the current best was achieved.
+    #[must_use]
+    pub const fn first_achieved_at(self) -> SystemTime {
+        self.first_achieved_at
+    }
+    /// Last eligible projection update.
+    #[must_use]
+    pub const fn updated_at(self) -> SystemTime {
+        self.updated_at
+    }
+}
+
+/// Outcome of an idempotent stroke abort request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbortStrokeMatchOutcome {
+    /// Nonterminal aggregate and all participants were aborted without reward.
+    Aborted,
+    /// Aggregate was already aborted.
+    AlreadyAborted,
+    /// A committed aggregate wins the abort race.
+    AlreadyCommitted(StrokeMatchResult),
+}
+
 /// Outcome of an idempotent abort request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbortMatchOutcome {
@@ -1437,6 +2165,9 @@ pub enum MatchRepositoryError {
     /// Result idempotency key does not match.
     #[error("match result key does not match")]
     WrongResultKey,
+    /// The requested lifecycle API does not match the persisted match mode/formula.
+    #[error("match mode does not match the requested lifecycle API")]
+    WrongMode,
     /// Course or one-hole configuration does not match.
     #[error("match configuration does not match")]
     WrongConfig,
@@ -1462,6 +2193,38 @@ pub enum MatchRepositoryError {
 
 /// Technology-neutral match persistence contract.
 pub trait MatchRepository: Send + Sync {
+    /// Starts or exactly replays immutable exactly-two stroke input.
+    fn begin_stroke(
+        &self,
+        _request: BeginStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<BeginStrokeMatchOutcome, MatchRepositoryError>> {
+        Box::pin(async { Err(MatchRepositoryError::Storage) })
+    }
+
+    /// Marks an exact loaded stroke aggregate in-game, idempotently.
+    fn mark_stroke_in_game(
+        &self,
+        _request: MarkStrokeInGame,
+    ) -> RepositoryFuture<'_, Result<MarkStrokeInGameOutcome, MatchRepositoryError>> {
+        Box::pin(async { Err(MatchRepositoryError::Storage) })
+    }
+
+    /// Aborts a noncommitted stroke aggregate and every captured participant.
+    fn abort_stroke(
+        &self,
+        _request: AbortStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<AbortStrokeMatchOutcome, MatchRepositoryError>> {
+        Box::pin(async { Err(MatchRepositoryError::Storage) })
+    }
+
+    /// Atomically settles both authoritative stroke participants.
+    fn commit_stroke_match(
+        &self,
+        _request: CommitStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<StrokeMatchResult, MatchRepositoryError>> {
+        Box::pin(async { Err(MatchRepositoryError::Storage) })
+    }
+
     /// Starts or exactly replays immutable solo-match input.
     fn begin_solo(
         &self,
@@ -2159,6 +2922,74 @@ mod tests {
         let wind = WindConditions::new(150, 359).expect("maximum wind");
         assert_eq!(wind.speed_tenths(), 150);
         assert_eq!(wind.angle_degrees(), 359);
+        assert_eq!(
+            synthetic_stroke_reward_v1(config, 2, StrokeCompletion::Holed),
+            Ok(StrokeReward::from_persisted(Some(-1), 12, 5))
+        );
+        assert_eq!(
+            synthetic_stroke_reward_v1(config, 0, StrokeCompletion::Disconnect),
+            Ok(StrokeReward::from_persisted(None, 0, 0))
+        );
+    }
+
+    #[test]
+    fn stroke_aggregate_values_enforce_exact_roster_and_unique_places() {
+        let account_a = AccountId::new(1).expect("account");
+        let account_b = AccountId::new(2).expect("account");
+        let aggregate_key = MatchResultKey::new(Uuid::from_u128(1));
+        let first = StrokeParticipant::new(
+            account_a,
+            StrokeRosterOrder::First,
+            MatchResultKey::new(Uuid::from_u128(2)),
+        );
+        let second = StrokeParticipant::new(
+            account_b,
+            StrokeRosterOrder::Second,
+            MatchResultKey::new(Uuid::from_u128(3)),
+        );
+        let config =
+            OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration");
+        assert!(
+            BeginStrokeMatch::new(
+                MatchId::new(Uuid::from_u128(4)),
+                aggregate_key,
+                [first, second],
+                config,
+                CatalogFingerprint::new([1; 32]),
+                MatchSeed::new([2; 32]),
+                Weather::Clear,
+                WindConditions::new(0, 0).expect("wind"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            BeginStrokeMatch::new(
+                MatchId::new(Uuid::from_u128(4)),
+                aggregate_key,
+                [first, first],
+                config,
+                CatalogFingerprint::new([1; 32]),
+                MatchSeed::new([2; 32]),
+                Weather::Clear,
+                WindConditions::new(0, 0).expect("wind"),
+            ),
+            Err(MatchValueError::InvalidStrokeRoster)
+        );
+        let first_commit =
+            StrokePlayerCommit::new(first, 2, StrokePlace::First, StrokeCompletion::Holed)
+                .expect("first result");
+        let duplicate_place =
+            StrokePlayerCommit::new(second, 0, StrokePlace::First, StrokeCompletion::GiveUp)
+                .expect("forfeit result");
+        assert_eq!(
+            CommitStrokeMatch::new(
+                MatchId::new(Uuid::from_u128(4)),
+                aggregate_key,
+                config,
+                [first_commit, duplicate_place],
+            ),
+            Err(MatchValueError::InvalidStrokeSettlement)
+        );
     }
 
     #[test]

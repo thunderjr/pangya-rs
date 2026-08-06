@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE match_players SET quit = TRUE WHERE match_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "463fb56bdf664371a62a1f7f2f10aaefff9c8823e8f4555c9563179475f3f9d6"
+}

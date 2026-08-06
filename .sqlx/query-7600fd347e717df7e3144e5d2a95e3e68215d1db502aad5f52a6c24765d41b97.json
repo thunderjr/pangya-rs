@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"match_id!\" FROM matches\n               WHERE status IN ('loading', 'in_game', 'results_pending')\n               ORDER BY created_at, id LIMIT $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "match_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7600fd347e717df7e3144e5d2a95e3e68215d1db502aad5f52a6c24765d41b97"
+}

@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id AS \"account_id!\", participant_order AS \"participant_order!\",\n                  player_result_key AS \"player_result_key!\", strokes AS \"strokes?\",\n                  score AS \"score?\", quit AS \"quit!\", place AS \"place?\",\n                  completion AS \"completion?\", pang_reward AS \"pang_reward?\",\n                  experience_reward AS \"experience_reward?\",\n                  pang_balance_after AS \"pang_balance_after?\",\n                  experience_balance_after AS \"experience_balance_after?\"\n           FROM match_players WHERE match_id = $1 ORDER BY participant_order FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "participant_order!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_result_key!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "strokes?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "score?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "quit!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "place?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "completion?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "pang_reward?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "experience_reward?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "pang_balance_after?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "experience_balance_after?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "18a87995c77a3a2a1e2909fd2dc80c761f376bd6fbc2f597442af07dcecdfa3d"
+}

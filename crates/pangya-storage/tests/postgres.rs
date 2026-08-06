@@ -4,14 +4,17 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use pangya_domain::{
-    AbortMatch, AbortMatchOutcome, AccountRepository, AccountStatus, BeginSoloMatch,
-    BeginSoloMatchOutcome, CatalogFingerprint, CommitSoloHole, ConsumeHandover, CourseId,
-    CredentialHash, HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
-    ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MatchAbortReason,
-    MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
-    Nickname, NormalizedUsername, OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCount,
-    Username, Weather, WindConditions,
+    AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
+    AccountRepository, AccountStatus, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
+    BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole, CommitStrokeMatch,
+    ConsumeHandover, CourseId, CredentialHash, HandoverDigest, HandoverError, HandoverRepository,
+    IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame,
+    MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MatchAbortReason, MatchId,
+    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
+    NormalizedUsername, OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCompletion,
+    StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
+    WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -149,6 +152,165 @@ async fn empty_database_runs_embedded_migration(pool: PgPool) {
     .await
     .expect("catalog query");
     assert!(table_exists);
+}
+
+#[sqlx::test(migrations = false)]
+async fn m6_forward_migration_preserves_committed_and_incomplete_m5_rows(pool: PgPool) {
+    for migration in [
+        include_str!("../migrations/0001_m2_account_foundation.sql"),
+        include_str!("../migrations/0002_operator_audit.sql"),
+        include_str!("../migrations/0003_m5_solo_matches.sql"),
+        include_str!("../migrations/0004_m5_match_wind.sql"),
+        include_str!("../migrations/0005_m5_persistence_failure_abort.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("released migration");
+    }
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username_normalized, username_display) \
+         VALUES ('upgrade_m5', 'UpgradeM5') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO profiles (account_id, nickname_display, nickname_normalized, setup_state, pang, experience) \
+         VALUES ($1, 'UpgradeNick', 'upgradenick', 'complete', 12, 5)",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("profile");
+    let committed_id = Uuid::new_v4();
+    let committed_key = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO matches \
+         (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather, \
+          reward_formula, status, committed_at, wind_speed_tenths, wind_angle_degrees) \
+         VALUES ($1, $2, 7, 1, 3, decode(repeat('42', 32), 'hex'), \
+          decode(repeat('24', 32), 'hex'), 'clear', 'solo-v1', 'committed', now(), 87, 231)",
+    )
+    .bind(committed_id)
+    .bind(committed_key)
+    .execute(&pool)
+    .await
+    .expect("committed match");
+    sqlx::query(
+        "INSERT INTO match_players \
+         (match_id, account_id, strokes, score, pang_reward, experience_reward, \
+          pang_balance_after, experience_balance_after) \
+         VALUES ($1, $2, 2, -1, 12, 5, 12, 5)",
+    )
+    .bind(committed_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("committed player");
+    sqlx::query(
+        "INSERT INTO currency_ledger \
+         (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) \
+         VALUES ($1, $2, $3, 'pang', 12, 'solo-v1', 12)",
+    )
+    .bind(account_id)
+    .bind(committed_id)
+    .bind(committed_key)
+    .execute(&pool)
+    .await
+    .expect("currency ledger");
+    sqlx::query(
+        "INSERT INTO progression_ledger \
+         (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) \
+         VALUES ($1, $2, $3, 'experience', 5, 'solo-v1', 5)",
+    )
+    .bind(account_id)
+    .bind(committed_id)
+    .bind(committed_key)
+    .execute(&pool)
+    .await
+    .expect("progression ledger");
+    for event in ["started", "committed"] {
+        sqlx::query(
+            "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+             VALUES ($1, $2, $3, 'success')",
+        )
+        .bind(committed_id)
+        .bind(account_id)
+        .bind(event)
+        .execute(&pool)
+        .await
+        .expect("audit");
+    }
+    let incomplete_id = Uuid::new_v4();
+    let incomplete_key = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO matches \
+         (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather, \
+          reward_formula, status, wind_speed_tenths, wind_angle_degrees) \
+         VALUES ($1, $2, 7, 1, 3, decode(repeat('42', 32), 'hex'), \
+          decode(repeat('24', 32), 'hex'), 'clear', 'solo-v1', 'loading', 87, 231)",
+    )
+    .bind(incomplete_id)
+    .bind(incomplete_key)
+    .execute(&pool)
+    .await
+    .expect("incomplete match");
+    sqlx::query("INSERT INTO match_players (match_id, account_id) VALUES ($1, $2)")
+        .bind(incomplete_id)
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("incomplete player");
+    sqlx::query(
+        "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+         VALUES ($1, $2, 'started', 'success')",
+    )
+    .bind(incomplete_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("incomplete audit");
+
+    sqlx::raw_sql(include_str!("../migrations/0006_m6_stroke_records.sql"))
+        .execute(&pool)
+        .await
+        .expect("M6 migration");
+
+    type PreservedM5Row = (Uuid, String, i16, Uuid, Option<i16>, Option<String>);
+    let preserved: Vec<PreservedM5Row> = sqlx::query_as(
+        "SELECT m.id, m.status, mp.participant_order, mp.player_result_key, mp.place, mp.completion \
+         FROM matches m JOIN match_players mp ON mp.match_id = m.id ORDER BY m.status",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("preserved rows");
+    assert_eq!(preserved.len(), 2);
+    assert!(preserved.iter().any(|row| {
+        row.0 == committed_id
+            && row.1 == "committed"
+            && row.2 == 0
+            && row.3 == committed_key
+            && row.4 == Some(1)
+            && row.5.as_deref() == Some("holed")
+    }));
+    assert!(preserved.iter().any(|row| {
+        row.0 == incomplete_id
+            && row.1 == "loading"
+            && row.2 == 0
+            && row.3 == incomplete_key
+            && row.4.is_none()
+            && row.5.is_none()
+    }));
+    let history: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM currency_ledger), \
+                (SELECT count(*) FROM progression_ledger), \
+                (SELECT count(*) FROM match_audit_events)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("history");
+    assert_eq!(history, (1, 1, 3));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -823,6 +985,62 @@ fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
     )
 }
 
+fn stroke_begin_with_config(
+    first: AccountId,
+    second: AccountId,
+    config: OneHoleConfig,
+) -> BeginStrokeMatch {
+    BeginStrokeMatch::new(
+        MatchId::new(Uuid::new_v4()),
+        MatchResultKey::new(Uuid::new_v4()),
+        [
+            pangya_domain::StrokeParticipant::new(
+                first,
+                StrokeRosterOrder::First,
+                MatchResultKey::new(Uuid::new_v4()),
+            ),
+            pangya_domain::StrokeParticipant::new(
+                second,
+                StrokeRosterOrder::Second,
+                MatchResultKey::new(Uuid::new_v4()),
+            ),
+        ],
+        config,
+        CatalogFingerprint::new([0x62; 32]),
+        MatchSeed::new([0x26; 32]),
+        Weather::Cloudy,
+        WindConditions::new(51, 180).expect("wind"),
+    )
+    .expect("stroke begin")
+}
+
+fn stroke_begin(first: AccountId, second: AccountId) -> BeginStrokeMatch {
+    stroke_begin_with_config(
+        first,
+        second,
+        OneHoleConfig::new(CourseId::new(17).expect("course"), 3).expect("configuration"),
+    )
+}
+
+fn stroke_commit(
+    begin: &BeginStrokeMatch,
+    first: (u16, StrokePlace, StrokeCompletion),
+    second: (u16, StrokePlace, StrokeCompletion),
+) -> CommitStrokeMatch {
+    CommitStrokeMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        begin.config(),
+        [
+            StrokePlayerCommit::new(begin.participants()[0], first.0, first.1, first.2)
+                .expect("first settlement"),
+            StrokePlayerCommit::new(begin.participants()[1], second.0, second.1, second.2)
+                .expect("second settlement"),
+        ],
+    )
+    .expect("stroke commit")
+}
+
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn match_wind_columns_are_required_bounded_and_store_authoritative_input(pool: PgPool) {
     let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
@@ -993,6 +1211,11 @@ async fn solo_in_game_transition_is_checked_idempotent_and_atomic(pool: PgPool) 
         .begin_solo(wrong_status.clone())
         .await
         .expect("begin wrong status");
+    sqlx::query("UPDATE matches SET status = 'in_game' WHERE id = $1")
+        .bind(wrong_status.match_id().get())
+        .execute(&pool)
+        .await
+        .expect("set in-game status");
     sqlx::query("UPDATE matches SET status = 'results_pending' WHERE id = $1")
         .bind(wrong_status.match_id().get())
         .execute(&pool)
@@ -1734,6 +1957,1012 @@ async fn ledgers_and_match_audit_reject_updates_and_deletes(pool: PgPool) {
         );
     }
     assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 1, 1, 2));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn solo_lifecycle_apis_reject_stroke_authority_without_mutation(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("CrossApiStrokeA", Some("CrossApiStrokeA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("CrossApiStrokeB", Some("CrossApiStrokeB")))
+        .await
+        .expect("second account");
+    let stroke = stroke_begin(first.account.id, second.account.id);
+    repository
+        .begin_stroke(stroke.clone())
+        .await
+        .expect("stroke begin");
+    let solo = BeginSoloMatch::new(
+        stroke.match_id(),
+        stroke.result_key(),
+        first.account.id,
+        stroke.config(),
+        stroke.catalog_fingerprint(),
+        stroke.seed(),
+        stroke.weather(),
+        stroke.wind(),
+    );
+    let snapshot = || async {
+        sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT m.status, \
+               (SELECT count(*) FROM match_players WHERE match_id = m.id AND quit), \
+               (SELECT count(*) FROM match_players WHERE match_id = m.id AND strokes IS NOT NULL), \
+               (SELECT count(*) FROM match_audit_events WHERE match_id = m.id) \
+             FROM matches m WHERE m.id = $1",
+        )
+        .bind(stroke.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("stroke snapshot")
+    };
+    let before = snapshot().await;
+    assert_eq!(
+        repository.begin_solo(solo.clone()).await,
+        Err(MatchRepositoryError::WrongMode)
+    );
+    assert_eq!(
+        repository
+            .mark_solo_in_game(MarkSoloInGame::new(
+                stroke.match_id(),
+                stroke.result_key(),
+                first.account.id,
+            ))
+            .await,
+        Err(MatchRepositoryError::WrongMode)
+    );
+    assert_eq!(
+        repository
+            .abort(AbortMatch::new(
+                stroke.match_id(),
+                stroke.result_key(),
+                first.account.id,
+                MatchAbortReason::Disconnect,
+            ))
+            .await,
+        Err(MatchRepositoryError::WrongMode)
+    );
+    assert_eq!(
+        repository
+            .commit_solo_hole(CommitSoloHole::new(
+                stroke.match_id(),
+                stroke.result_key(),
+                first.account.id,
+                stroke.config(),
+                StrokeCount::new(2).expect("strokes"),
+            ))
+            .await,
+        Err(MatchRepositoryError::WrongMode)
+    );
+    assert_eq!(snapshot().await, before);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn schema_rejects_cross_mode_history_unsettled_records_and_invalid_solo_shape(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let solo_account = repository
+        .create_account(account("ConditionalSolo", Some("ConditionalSolo")))
+        .await
+        .expect("solo account");
+    let first = repository
+        .create_account(account("ConditionalStrokeA", Some("ConditionalStA")))
+        .await
+        .expect("first stroke account");
+    let second = repository
+        .create_account(account("ConditionalStrokeB", Some("ConditionalStB")))
+        .await
+        .expect("second stroke account");
+    let solo = solo_begin(solo_account.account.id);
+    let stroke = stroke_begin(first.account.id, second.account.id);
+    repository
+        .begin_solo(solo.clone())
+        .await
+        .expect("solo begin");
+    repository
+        .begin_stroke(stroke.clone())
+        .await
+        .expect("stroke begin");
+
+    for (match_id, account_id, player_key, reason) in [
+        (
+            solo.match_id().get(),
+            solo.account_id().get(),
+            solo.result_key().get(),
+            "stroke-two-v1",
+        ),
+        (
+            stroke.match_id().get(),
+            stroke.participants()[0].account_id().get(),
+            stroke.participants()[0].player_result_key().get(),
+            "solo-v1",
+        ),
+    ] {
+        assert!(
+            sqlx::query(
+                "INSERT INTO currency_ledger \
+                 (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) \
+                 VALUES ($1, $2, $3, 'pang', 1, $4, 1)",
+            )
+            .bind(account_id)
+            .bind(match_id)
+            .bind(player_key)
+            .bind(reason)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "cross-mode currency ledger was accepted"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO progression_ledger \
+                 (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) \
+                 VALUES ($1, $2, $3, 'experience', 1, $4, 1)",
+            )
+            .bind(account_id)
+            .bind(match_id)
+            .bind(player_key)
+            .bind(reason)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "cross-mode progression ledger was accepted"
+        );
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO match_players \
+             (match_id, account_id, participant_order, player_result_key) \
+             VALUES ($1, $2, 1, $3)",
+        )
+        .bind(solo.match_id().get())
+        .bind(first.account.id.get())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "solo parent accepted a second participant/order one"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE match_players SET strokes = 0, score = NULL, quit = TRUE, place = 1, \
+             completion = 'give_up', pang_reward = 0, experience_reward = 0, \
+             pang_balance_after = 0, experience_balance_after = 0 WHERE match_id = $1",
+        )
+        .bind(solo.match_id().get())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "stroke-forfeit settlement shape was accepted for solo"
+    );
+
+    sqlx::query("UPDATE matches SET status = 'in_game' WHERE id = $1")
+        .bind(stroke.match_id().get())
+        .execute(&pool)
+        .await
+        .expect("in game");
+    sqlx::query("UPDATE matches SET status = 'results_pending' WHERE id = $1")
+        .bind(stroke.match_id().get())
+        .execute(&pool)
+        .await
+        .expect("results pending");
+    assert!(
+        sqlx::query(
+            "INSERT INTO course_records \
+             (account_id, course_id, mode, best_score, best_strokes, rounds_completed, \
+              best_match_id, best_player_result_key, first_achieved_at, updated_at) \
+             VALUES ($1, 17, 'stroke_two', -1, 2, 1, $2, $3, now(), now())",
+        )
+        .bind(first.account.id.get())
+        .bind(stroke.match_id().get())
+        .bind(stroke.participants()[0].player_result_key().get())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "unsettled results-pending player established a course record"
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn nonterminal_match_identity_and_invalid_lifecycle_transitions_are_immutable(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("MatchIdentity", Some("MatchIdentity")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+    let mutations = [
+        "UPDATE matches SET id = gen_random_uuid() WHERE id = $1",
+        "UPDATE matches SET result_commit_key = gen_random_uuid() WHERE id = $1",
+        "UPDATE matches SET mode = 'stroke_two' WHERE id = $1",
+        "UPDATE matches SET course_id = course_id + 1 WHERE id = $1",
+        "UPDATE matches SET hole = 2 WHERE id = $1",
+        "UPDATE matches SET par = par + 1 WHERE id = $1",
+        "UPDATE matches SET catalog_sha256 = seed WHERE id = $1",
+        "UPDATE matches SET seed = catalog_sha256 WHERE id = $1",
+        "UPDATE matches SET weather = 'rain' WHERE id = $1",
+        "UPDATE matches SET wind_speed_tenths = wind_speed_tenths + 1 WHERE id = $1",
+        "UPDATE matches SET wind_angle_degrees = wind_angle_degrees + 1 WHERE id = $1",
+        "UPDATE matches SET reward_formula = 'stroke-two-v1' WHERE id = $1",
+        "UPDATE matches SET created_at = created_at - interval '1 second' WHERE id = $1",
+        "UPDATE matches SET status = 'results_pending' WHERE id = $1",
+    ];
+    for mutation in mutations {
+        assert!(
+            sqlx::query(mutation)
+                .bind(begin.match_id().get())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "nonterminal match mutation succeeded: {mutation}"
+        );
+    }
+    let state: (String, String, i64, i16) =
+        sqlx::query_as("SELECT mode, reward_formula, course_id, par FROM matches WHERE id = $1")
+            .bind(begin.match_id().get())
+            .fetch_one(&pool)
+            .await
+            .expect("identity state");
+    assert_eq!(
+        state,
+        ("solo_practice".to_owned(), "solo-v1".to_owned(), 7, 3)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn exact_begin_replays_concurrent_with_settlement_are_bounded_and_deadlock_free(
+    pool: PgPool,
+) {
+    let repository = PgRepository::new(pool.clone());
+
+    let solo_commit_account = repository
+        .create_account(account("SoloDeadlockCommit", Some("SoloDeadCommit")))
+        .await
+        .expect("solo commit account");
+    let solo_commit_begin = solo_begin(solo_commit_account.account.id);
+    repository
+        .begin_solo(solo_commit_begin.clone())
+        .await
+        .expect("solo commit begin");
+    repository
+        .mark_solo_in_game(solo_mark(&solo_commit_begin))
+        .await
+        .expect("solo commit mark");
+    let (replay, commit) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            repository.begin_solo(solo_commit_begin.clone()),
+            repository.commit_solo_hole(solo_commit(&solo_commit_begin, 2))
+        )
+    })
+    .await
+    .expect("solo replay/commit deadlocked");
+    assert_eq!(replay, Ok(BeginSoloMatchOutcome::Existing));
+    commit.expect("solo commit");
+
+    let solo_abort_account = repository
+        .create_account(account("SoloDeadlockAbort", Some("SoloDeadAbort")))
+        .await
+        .expect("solo abort account");
+    let solo_abort_begin = solo_begin(solo_abort_account.account.id);
+    repository
+        .begin_solo(solo_abort_begin.clone())
+        .await
+        .expect("solo abort begin");
+    let (replay, abort) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            repository.begin_solo(solo_abort_begin.clone()),
+            repository.abort(AbortMatch::new(
+                solo_abort_begin.match_id(),
+                solo_abort_begin.result_key(),
+                solo_abort_begin.account_id(),
+                MatchAbortReason::Shutdown,
+            ))
+        )
+    })
+    .await
+    .expect("solo replay/abort deadlocked");
+    assert_eq!(replay, Ok(BeginSoloMatchOutcome::Existing));
+    assert_eq!(abort, Ok(AbortMatchOutcome::Aborted));
+
+    let stroke_commit_first = repository
+        .create_account(account("StrokeDeadCommitA", Some("StrokeDeadComA")))
+        .await
+        .expect("stroke commit first");
+    let stroke_commit_second = repository
+        .create_account(account("StrokeDeadCommitB", Some("StrokeDeadComB")))
+        .await
+        .expect("stroke commit second");
+    let stroke_commit_begin = stroke_begin(
+        stroke_commit_first.account.id,
+        stroke_commit_second.account.id,
+    );
+    repository
+        .begin_stroke(stroke_commit_begin.clone())
+        .await
+        .expect("stroke commit begin");
+    repository
+        .mark_stroke_in_game(MarkStrokeInGame::new(
+            stroke_commit_begin.match_id(),
+            stroke_commit_begin.result_key(),
+        ))
+        .await
+        .expect("stroke commit mark");
+    let (replay, commit) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            repository.begin_stroke(stroke_commit_begin.clone()),
+            repository.commit_stroke_match(stroke_commit(
+                &stroke_commit_begin,
+                (2, StrokePlace::First, StrokeCompletion::Holed),
+                (4, StrokePlace::Second, StrokeCompletion::StrokeCap),
+            ))
+        )
+    })
+    .await
+    .expect("stroke replay/commit deadlocked");
+    assert_eq!(replay, Ok(BeginStrokeMatchOutcome::Existing));
+    commit.expect("stroke commit");
+
+    let stroke_abort_first = repository
+        .create_account(account("StrokeDeadAbortA", Some("StrokeDeadAbA")))
+        .await
+        .expect("stroke abort first");
+    let stroke_abort_second = repository
+        .create_account(account("StrokeDeadAbortB", Some("StrokeDeadAbB")))
+        .await
+        .expect("stroke abort second");
+    let stroke_abort_begin = stroke_begin(
+        stroke_abort_first.account.id,
+        stroke_abort_second.account.id,
+    );
+    repository
+        .begin_stroke(stroke_abort_begin.clone())
+        .await
+        .expect("stroke abort begin");
+    let (replay, abort) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            repository.begin_stroke(stroke_abort_begin.clone()),
+            repository.abort_stroke(AbortStrokeMatch::new(
+                stroke_abort_begin.match_id(),
+                stroke_abort_begin.result_key(),
+                MatchAbortReason::Shutdown,
+            ))
+        )
+    })
+    .await
+    .expect("stroke replay/abort deadlocked");
+    assert_eq!(replay, Ok(BeginStrokeMatchOutcome::Existing));
+    assert_eq!(abort, Ok(AbortStrokeMatchOutcome::Aborted));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_begin_mark_and_normal_commit_are_atomic_and_exactly_once(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeNormalA", Some("StrokeNormA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeNormalB", Some("StrokeNormB")))
+        .await
+        .expect("second account");
+    let begin = stroke_begin(first.account.id, second.account.id);
+    assert_eq!(
+        repository.begin_stroke(begin.clone()).await,
+        Ok(BeginStrokeMatchOutcome::Begun)
+    );
+    assert_eq!(
+        repository.begin_stroke(begin.clone()).await,
+        Ok(BeginStrokeMatchOutcome::Existing)
+    );
+    assert_eq!(
+        repository
+            .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+            .await,
+        Ok(MarkStrokeInGameOutcome::Marked)
+    );
+    assert_eq!(
+        repository
+            .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+            .await,
+        Ok(MarkStrokeInGameOutcome::Existing)
+    );
+    let commit = stroke_commit(
+        &begin,
+        (2, StrokePlace::First, StrokeCompletion::Holed),
+        (4, StrokePlace::Second, StrokeCompletion::StrokeCap),
+    );
+    let (left, right) = tokio::join!(
+        repository.commit_stroke_match(commit),
+        repository.commit_stroke_match(commit)
+    );
+    let left = left.expect("first commit");
+    let right = right.expect("replayed commit");
+    assert_eq!(left, right);
+    assert_eq!(repository.commit_stroke_match(commit).await, Ok(left));
+    assert_eq!(
+        left.players()
+            .iter()
+            .map(|player| (
+                player.place(),
+                player.score(),
+                player.pang_reward(),
+                player.experience_reward(),
+                player.pang_balance(),
+                player.experience_balance(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (StrokePlace::First, Some(-1), 12, 5, 12, 5),
+            (StrokePlace::Second, Some(1), 10, 5, 10, 5),
+        ]
+    );
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (2, 2, 2, 2));
+    assert!(
+        sqlx::query("UPDATE match_players SET strokes = 9 WHERE match_id = $1")
+            .bind(begin.match_id().get())
+            .execute(&pool)
+            .await
+            .is_err(),
+        "terminal player settlement must be immutable"
+    );
+    assert!(
+        sqlx::query("UPDATE matches SET course_id = 99 WHERE id = $1")
+            .bind(begin.match_id().get())
+            .execute(&pool)
+            .await
+            .is_err(),
+        "terminal aggregate history must be immutable"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO course_records \
+             (account_id, course_id, mode, best_score, best_strokes, rounds_completed, \
+              best_match_id, best_player_result_key, first_achieved_at, updated_at) \
+             VALUES ($1, 17, 'stroke_two', 1, 4, 1, $2, $3, now(), now())",
+        )
+        .bind(second.account.id.get())
+        .bind(begin.match_id().get())
+        .bind(begin.participants()[1].player_result_key().get())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "stroke-cap settlement must not establish a course record"
+    );
+    assert_eq!(
+        repository
+            .abort_stroke(AbortStrokeMatch::new(
+                begin.match_id(),
+                begin.result_key(),
+                MatchAbortReason::Disconnect,
+            ))
+            .await,
+        Ok(AbortStrokeMatchOutcome::AlreadyCommitted(left))
+    );
+
+    let drifted = BeginStrokeMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        *begin.participants(),
+        begin.config(),
+        begin.catalog_fingerprint(),
+        begin.seed(),
+        Weather::Rain,
+        begin.wind(),
+    )
+    .expect("drift request");
+    assert_eq!(
+        repository.begin_stroke(drifted).await,
+        Err(MatchRepositoryError::InputDrift)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_begin_rejects_player_key_reuse_and_schema_rejects_third_participant(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeKeysA", Some("StrokeKeysA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeKeysB", Some("StrokeKeysB")))
+        .await
+        .expect("second account");
+    let third = repository
+        .create_account(account("StrokeKeysC", Some("StrokeKeysC")))
+        .await
+        .expect("third account");
+    let begin = stroke_begin(first.account.id, second.account.id);
+    repository
+        .begin_stroke(begin.clone())
+        .await
+        .expect("first begin");
+    let reused = BeginStrokeMatch::new(
+        MatchId::new(Uuid::new_v4()),
+        MatchResultKey::new(Uuid::new_v4()),
+        [
+            pangya_domain::StrokeParticipant::new(
+                first.account.id,
+                StrokeRosterOrder::First,
+                begin.participants()[0].player_result_key(),
+            ),
+            pangya_domain::StrokeParticipant::new(
+                third.account.id,
+                StrokeRosterOrder::Second,
+                MatchResultKey::new(Uuid::new_v4()),
+            ),
+        ],
+        begin.config(),
+        begin.catalog_fingerprint(),
+        begin.seed(),
+        begin.weather(),
+        begin.wind(),
+    )
+    .expect("reused-key request");
+    assert_eq!(
+        repository.begin_stroke(reused).await,
+        Err(MatchRepositoryError::InputDrift)
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO match_players \
+             (match_id, account_id, participant_order, player_result_key) VALUES ($1, $2, 2, $3)",
+        )
+        .bind(begin.match_id().get())
+        .bind(third.account.id.get())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "unique constrained orders must cap a match at two participants"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO match_players \
+             (match_id, account_id, participant_order, player_result_key) VALUES ($1, $2, 0, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(third.account.id.get())
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .is_err(),
+        "participant rows must reference an aggregate"
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_forfeit_is_zero_reward_without_ledger_or_balance_change(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeForfeitA", Some("StrokeForfeitA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeForfeitB", Some("StrokeForfeitB")))
+        .await
+        .expect("second account");
+    let begin = stroke_begin(first.account.id, second.account.id);
+    repository.begin_stroke(begin.clone()).await.expect("begin");
+    repository
+        .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+        .await
+        .expect("in game");
+    let result = repository
+        .commit_stroke_match(stroke_commit(
+            &begin,
+            (2, StrokePlace::First, StrokeCompletion::Holed),
+            (0, StrokePlace::Second, StrokeCompletion::GiveUp),
+        ))
+        .await
+        .expect("commit");
+    let forfeited = result.players()[1];
+    assert_eq!(
+        (
+            forfeited.score(),
+            forfeited.pang_reward(),
+            forfeited.experience_reward(),
+            forfeited.pang_balance(),
+            forfeited.experience_balance(),
+        ),
+        (None, 0, 0, 0, 0)
+    );
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (2, 1, 1, 2));
+    let forfeited_ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE account_id = $1) + \
+                (SELECT count(*) FROM progression_ledger WHERE account_id = $1)",
+    )
+    .bind(second.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("forfeit ledgers");
+    assert_eq!(forfeited_ledgers, 0);
+    let records: i64 = sqlx::query_scalar("SELECT count(*) FROM course_records")
+        .fetch_one(&pool)
+        .await
+        .expect("record count");
+    assert_eq!(records, 1, "only the holed participant is eligible");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_course_records_keep_deterministic_best_and_count_only_holed(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeRecordA", Some("StrokeRecordA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeRecordB", Some("StrokeRecordB")))
+        .await
+        .expect("second account");
+    let course = CourseId::new(29).expect("course");
+    for (index, (par, strokes, completion)) in [
+        (4, 4, StrokeCompletion::Holed),
+        (4, 5, StrokeCompletion::Holed),
+        (4, 4, StrokeCompletion::Holed),
+        (3, 3, StrokeCompletion::Holed),
+        (5, 2, StrokeCompletion::Holed),
+        (5, 1, StrokeCompletion::StrokeCap),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let begin = stroke_begin_with_config(
+            first.account.id,
+            second.account.id,
+            OneHoleConfig::new(course, par).expect("configuration"),
+        );
+        repository.begin_stroke(begin.clone()).await.expect("begin");
+        repository
+            .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+            .await
+            .expect("in game");
+        repository
+            .commit_stroke_match(stroke_commit(
+                &begin,
+                (strokes, StrokePlace::First, completion),
+                (
+                    u16::try_from(8 + index).expect("strokes"),
+                    StrokePlace::Second,
+                    StrokeCompletion::StrokeCap,
+                ),
+            ))
+            .await
+            .expect("commit");
+    }
+    let record: (i16, i16, i64, Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT best_score, best_strokes, rounds_completed, best_match_id, \
+                best_player_result_key, first_achieved_at <= updated_at \
+         FROM course_records WHERE account_id = $1 AND course_id = $2 AND mode = 'stroke_two'",
+    )
+    .bind(first.account.id.get())
+    .bind(i64::from(course.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("course record");
+    assert_eq!((record.0, record.1, record.2, record.5), (-3, 2, 5, true));
+    let authority: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM match_players WHERE match_id = $1 AND account_id = $2 \
+         AND player_result_key = $3 AND completion = 'holed'",
+    )
+    .bind(record.3)
+    .bind(first.account.id.get())
+    .bind(record.4)
+    .fetch_one(&pool)
+    .await
+    .expect("record authority");
+    assert_eq!(authority, 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn concurrent_stroke_matches_with_shared_accounts_are_deadlock_free(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let shared = repository
+        .create_account(account("StrokeShared", Some("StrokeShared")))
+        .await
+        .expect("shared account");
+    let second = repository
+        .create_account(account("StrokePeerB", Some("StrokePeerB")))
+        .await
+        .expect("second account");
+    let third = repository
+        .create_account(account("StrokePeerC", Some("StrokePeerC")))
+        .await
+        .expect("third account");
+    let left = stroke_begin(shared.account.id, second.account.id);
+    let right = stroke_begin(shared.account.id, third.account.id);
+    for begin in [&left, &right] {
+        repository.begin_stroke(begin.clone()).await.expect("begin");
+        repository
+            .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+            .await
+            .expect("in game");
+    }
+    let (left_result, right_result) = tokio::join!(
+        repository.commit_stroke_match(stroke_commit(
+            &left,
+            (2, StrokePlace::First, StrokeCompletion::Holed),
+            (4, StrokePlace::Second, StrokeCompletion::StrokeCap),
+        )),
+        repository.commit_stroke_match(stroke_commit(
+            &right,
+            (2, StrokePlace::First, StrokeCompletion::Holed),
+            (4, StrokePlace::Second, StrokeCompletion::StrokeCap),
+        ))
+    );
+    left_result.expect("left commit");
+    right_result.expect("right commit");
+    let balances: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, pang, experience FROM profiles \
+         WHERE account_id = ANY($1) ORDER BY account_id",
+    )
+    .bind(
+        &[
+            shared.account.id.get(),
+            second.account.id.get(),
+            third.account.id.get(),
+        ][..],
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("balances");
+    let total_pang: i64 = balances.iter().map(|row| row.1).sum();
+    let total_experience: i64 = balances.iter().map(|row| row.2).sum();
+    assert_eq!((total_pang, total_experience), (44, 20));
+    let shared_record_rounds: i64 = sqlx::query_scalar(
+        "SELECT rounds_completed FROM course_records WHERE account_id = $1 AND course_id = 17",
+    )
+    .bind(shared.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("concurrent record");
+    assert_eq!(shared_record_rounds, 2);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn every_stroke_commit_stage_failure_rolls_back_both_players(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    sqlx::query(
+        "CREATE FUNCTION test_fail_stroke_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected stroke commit failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+    let stages = [
+        (
+            "pending",
+            "matches",
+            "UPDATE",
+            "WHEN (NEW.status = 'results_pending')",
+        ),
+        ("profile", "profiles", "UPDATE", ""),
+        ("pang ledger", "currency_ledger", "INSERT", ""),
+        ("experience ledger", "progression_ledger", "INSERT", ""),
+        ("player settlement", "match_players", "UPDATE", ""),
+        (
+            "second participant after first settlement",
+            "match_players",
+            "UPDATE",
+            "WHEN (NEW.participant_order = 1)",
+        ),
+        ("course record", "course_records", "INSERT", ""),
+        (
+            "commit audit",
+            "match_audit_events",
+            "INSERT",
+            "WHEN (NEW.event = 'committed')",
+        ),
+        (
+            "terminal",
+            "matches",
+            "UPDATE",
+            "WHEN (NEW.status = 'committed')",
+        ),
+    ];
+    for (index, (stage, table, operation, condition)) in stages.into_iter().enumerate() {
+        let first = repository
+            .create_account(account(
+                &format!("StrokeRollA{index}"),
+                Some(&format!("StrokeRA{index}")),
+            ))
+            .await
+            .expect("first account");
+        let second = repository
+            .create_account(account(
+                &format!("StrokeRollB{index}"),
+                Some(&format!("StrokeRB{index}")),
+            ))
+            .await
+            .expect("second account");
+        let begin = stroke_begin(first.account.id, second.account.id);
+        repository.begin_stroke(begin.clone()).await.expect("begin");
+        repository
+            .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+            .await
+            .expect("in game");
+        let trigger = format!(
+            "CREATE TRIGGER test_fail_stroke_stage BEFORE {operation} ON {table} \
+             FOR EACH ROW {condition} EXECUTE FUNCTION test_fail_stroke_commit()"
+        );
+        sqlx::query(&trigger)
+            .execute(&pool)
+            .await
+            .expect("failure trigger");
+        assert_eq!(
+            repository
+                .commit_stroke_match(stroke_commit(
+                    &begin,
+                    (2, StrokePlace::First, StrokeCompletion::Holed),
+                    (4, StrokePlace::Second, StrokeCompletion::Holed),
+                ))
+                .await,
+            Err(MatchRepositoryError::Storage),
+            "stage {stage}"
+        );
+        sqlx::query(&format!("DROP TRIGGER test_fail_stroke_stage ON {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        let state: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT m.status, \
+               (SELECT count(*) FROM match_players WHERE match_id = m.id AND strokes IS NOT NULL), \
+               (SELECT count(*) FROM currency_ledger WHERE match_id = m.id), \
+               (SELECT count(*) FROM progression_ledger WHERE match_id = m.id), \
+               (SELECT count(*) FROM course_records WHERE best_match_id = m.id), \
+               (SELECT sum(p.pang + p.experience)::BIGINT FROM profiles p JOIN match_players mp \
+                 ON mp.account_id = p.account_id WHERE mp.match_id = m.id) \
+             FROM matches m WHERE m.id = $1",
+        )
+        .bind(begin.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("rollback state");
+        assert_eq!(
+            state,
+            ("in_game".to_owned(), 0, 0, 0, 0, 0),
+            "stage {stage}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_begin_and_abort_failures_leave_no_partial_aggregate(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeLifeA", Some("StrokeLifeA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeLifeB", Some("StrokeLifeB")))
+        .await
+        .expect("second account");
+    sqlx::query(
+        "CREATE FUNCTION test_fail_stroke_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected stroke lifecycle failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+
+    let failed_begin = stroke_begin(first.account.id, second.account.id);
+    sqlx::query(
+        "CREATE TRIGGER test_fail_stroke_begin_second BEFORE INSERT ON match_players \
+         FOR EACH ROW WHEN (NEW.participant_order = 1) \
+         EXECUTE FUNCTION test_fail_stroke_lifecycle()",
+    )
+    .execute(&pool)
+    .await
+    .expect("begin failure trigger");
+    assert_eq!(
+        repository.begin_stroke(failed_begin.clone()).await,
+        Err(MatchRepositoryError::Storage)
+    );
+    let failed_begin_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM matches WHERE id = $1) + \
+                (SELECT count(*) FROM match_players WHERE match_id = $1) + \
+                (SELECT count(*) FROM match_audit_events WHERE match_id = $1)",
+    )
+    .bind(failed_begin.match_id().get())
+    .fetch_one(&pool)
+    .await
+    .expect("failed begin rows");
+    assert_eq!(failed_begin_rows, 0);
+    sqlx::query("DROP TRIGGER test_fail_stroke_begin_second ON match_players")
+        .execute(&pool)
+        .await
+        .expect("drop begin trigger");
+
+    let failed_abort = stroke_begin(first.account.id, second.account.id);
+    repository
+        .begin_stroke(failed_abort.clone())
+        .await
+        .expect("begin abort candidate");
+    sqlx::query(
+        "CREATE TRIGGER test_fail_stroke_abort_audit BEFORE INSERT ON match_audit_events \
+         FOR EACH ROW WHEN (NEW.event = 'aborted') \
+         EXECUTE FUNCTION test_fail_stroke_lifecycle()",
+    )
+    .execute(&pool)
+    .await
+    .expect("abort failure trigger");
+    assert_eq!(
+        repository
+            .abort_stroke(AbortStrokeMatch::new(
+                failed_abort.match_id(),
+                failed_abort.result_key(),
+                MatchAbortReason::Shutdown,
+            ))
+            .await,
+        Err(MatchRepositoryError::Storage)
+    );
+    let failed_abort_state: (String, i64, i64) = sqlx::query_as(
+        "SELECT m.status, \
+           (SELECT count(*) FROM match_players WHERE match_id = m.id AND quit), \
+           (SELECT count(*) FROM match_audit_events WHERE match_id = m.id AND event = 'aborted') \
+         FROM matches m WHERE id = $1",
+    )
+    .bind(failed_abort.match_id().get())
+    .fetch_one(&pool)
+    .await
+    .expect("failed abort state");
+    assert_eq!(failed_abort_state, ("loading".to_owned(), 0, 0));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_abort_and_generic_recovery_cover_all_players_once_per_match(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokeRecoveryA", Some("StrokeRecoverA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeRecoveryB", Some("StrokeRecoverB")))
+        .await
+        .expect("second account");
+    let explicit = stroke_begin(first.account.id, second.account.id);
+    repository
+        .begin_stroke(explicit.clone())
+        .await
+        .expect("explicit begin");
+    let abort = AbortStrokeMatch::new(
+        explicit.match_id(),
+        explicit.result_key(),
+        MatchAbortReason::LoadingTimeout,
+    );
+    assert_eq!(
+        repository.abort_stroke(abort).await,
+        Ok(AbortStrokeMatchOutcome::Aborted)
+    );
+    assert_eq!(
+        repository.abort_stroke(abort).await,
+        Ok(AbortStrokeMatchOutcome::AlreadyAborted)
+    );
+
+    for _ in 0..2 {
+        repository
+            .begin_stroke(stroke_begin(first.account.id, second.account.id))
+            .await
+            .expect("stale begin");
+    }
+    assert_eq!(
+        repository
+            .abort_incomplete_matches(IncompleteMatchAbortLimit::new(2).expect("limit"))
+            .await,
+        Ok(2)
+    );
+    let recovered: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM matches WHERE abort_reason = 'startup_recovery'), \
+           (SELECT count(*) FROM match_players mp JOIN matches m ON m.id = mp.match_id \
+             WHERE m.abort_reason = 'startup_recovery' AND mp.quit), \
+           (SELECT count(*) FROM match_audit_events WHERE reason = 'startup_recovery')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("recovery state");
+    assert_eq!(recovered, (2, 4, 2));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

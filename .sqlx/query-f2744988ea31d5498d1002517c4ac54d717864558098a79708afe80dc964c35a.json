@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT m.id FROM matches m LEFT JOIN match_players mp ON mp.match_id = m.id WHERE m.id = $1 OR m.result_commit_key = $2 OR mp.player_result_key = ANY($3)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f2744988ea31d5498d1002517c4ac54d717864558098a79708afe80dc964c35a"
+}

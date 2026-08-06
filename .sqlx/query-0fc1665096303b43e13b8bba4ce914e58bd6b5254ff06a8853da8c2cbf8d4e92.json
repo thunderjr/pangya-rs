@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id, pang AS \"pang!\", experience AS \"experience!\"\n               FROM profiles WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pang!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "experience!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0fc1665096303b43e13b8bba4ce914e58bd6b5254ff06a8853da8c2cbf8d4e92"
+}

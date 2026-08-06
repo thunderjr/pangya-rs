@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                  m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.par AS \"par!\",\n                  m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                  m.weather AS \"weather!\",\n                  m.wind_speed_tenths AS \"wind_speed_tenths!\",\n                  m.wind_angle_degrees AS \"wind_angle_degrees!\",\n                  m.reward_formula AS \"reward_formula!\", m.status AS \"status!\",\n                  mp.account_id AS \"account_id!\",\n                  mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                  mp.pang_reward AS \"pang_reward?\",\n                  mp.experience_reward AS \"experience_reward?\",\n                  mp.pang_balance_after AS \"pang_balance_after?\",\n                  mp.experience_balance_after AS \"experience_balance_after?\"\n           FROM matches m JOIN match_players mp ON mp.match_id = m.id\n           WHERE m.id = $1 FOR UPDATE OF m, mp",
+  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                      m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.par AS \"par!\",\n                      m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                      m.weather AS \"weather!\",\n                      m.wind_speed_tenths AS \"wind_speed_tenths!\",\n                      m.wind_angle_degrees AS \"wind_angle_degrees!\",\n                      m.mode AS \"mode!\", m.reward_formula AS \"reward_formula!\",\n                      m.status AS \"status!\", mp.account_id AS \"account_id!\",\n                      mp.participant_order AS \"participant_order!\",\n                      mp.player_result_key AS \"player_result_key!\",\n                      mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                      mp.pang_reward AS \"pang_reward?\",\n                      mp.experience_reward AS \"experience_reward?\",\n                      mp.pang_balance_after AS \"pang_balance_after?\",\n                      mp.experience_balance_after AS \"experience_balance_after?\"\n               FROM matches m JOIN match_players mp ON mp.match_id = m.id\n               WHERE m.id = $1 OR m.result_commit_key = $2 FOR UPDATE OF m, mp",
   "describe": {
     "columns": [
       {
@@ -55,56 +55,75 @@
       },
       {
         "ordinal": 10,
-        "name": "reward_formula!",
+        "name": "mode!",
         "type_info": "Text"
       },
       {
         "ordinal": 11,
-        "name": "status!",
+        "name": "reward_formula!",
         "type_info": "Text"
       },
       {
         "ordinal": 12,
+        "name": "status!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
         "name": "account_id!",
         "type_info": "Int8"
       },
       {
-        "ordinal": 13,
-        "name": "strokes?",
-        "type_info": "Int2"
-      },
-      {
         "ordinal": 14,
-        "name": "score?",
+        "name": "participant_order!",
         "type_info": "Int2"
       },
       {
         "ordinal": 15,
+        "name": "player_result_key!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "strokes?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 17,
+        "name": "score?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 18,
         "name": "pang_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 16,
+        "ordinal": 19,
         "name": "experience_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 17,
+        "ordinal": 20,
         "name": "pang_balance_after?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 18,
+        "ordinal": 21,
         "name": "experience_balance_after?",
         "type_info": "Int8"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
     "nullable": [
+      false,
+      false,
+      false,
       false,
       false,
       false,
@@ -126,5 +145,5 @@
       true
     ]
   },
-  "hash": "7d6382be766fed0e69e17b7c6a619056fdc26c2c1e2d32dcc773f995d0ee2942"
+  "hash": "27e88e062f9fde185a3525330eb53effd44dbad967d58ddddd85ea9e38970c0a"
 }

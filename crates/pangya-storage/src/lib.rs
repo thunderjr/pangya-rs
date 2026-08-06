@@ -6,24 +6,27 @@
 //! PostgreSQL 17 pool, migrations, and M2 account/handover repositories.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     time::{Duration, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
 use pangya_domain::{
-    AbortMatch, AbortMatchOutcome, Account, AccountAggregate, AccountId, AccountRepository,
-    AccountStatus, AuthenticatedSession, AuthenticationRecord, BeginSoloMatch,
-    BeginSoloMatchOutcome, Character, CharacterId, CommitSoloHole, ConsumeHandover, CredentialHash,
-    EquipmentSet, EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository,
-    IncompleteMatchAbortLimit, InventoryItem, InventoryItemId, ItemTypeId, MAX_PLAYER_CHARACTERS,
-    MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
-    MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
-    NewHandover, Nickname, NormalizedNickname, NormalizedUsername, PlayerRepository,
-    PlayerSnapshot, Profile, RepositoryError, RepositoryFuture, ServiceKind, SetupState,
-    SoloMatchResult, StarterGrant, StarterKey, StrokeCount, Weather, WindConditions,
-    synthetic_solo_reward_v1,
+    AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, Account,
+    AccountAggregate, AccountId, AccountRepository, AccountStatus, AuthenticatedSession,
+    AuthenticationRecord, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
+    BeginStrokeMatchOutcome, Character, CharacterId, CommitSoloHole, CommitStrokeMatch,
+    ConsumeHandover, CredentialHash, EquipmentSet, EquipmentSetId, HandoverDigest, HandoverError,
+    HandoverRepository, IncompleteMatchAbortLimit, InventoryItem, InventoryItemId, ItemTypeId,
+    MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MarkSoloInGame,
+    MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MatchAbortReason, MatchId,
+    MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount, NewHandover, Nickname,
+    NormalizedNickname, NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile,
+    RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState, SoloMatchResult,
+    StarterGrant, StarterKey, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
+    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -546,7 +549,7 @@ impl PgRepository {
     ) -> Result<BeginSoloMatchOutcome, MatchRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
         let account_status = sqlx::query_scalar!(
-            "SELECT status FROM accounts WHERE id = $1 FOR UPDATE",
+            "SELECT status FROM accounts WHERE id = $1 FOR NO KEY UPDATE",
             request.account_id().get()
         )
         .fetch_optional(&mut *transaction)
@@ -582,9 +585,12 @@ impl PgRepository {
 
         if inserted.rows_affected() == 1 {
             sqlx::query!(
-                "INSERT INTO match_players (match_id, account_id) VALUES ($1, $2)",
+                "INSERT INTO match_players \
+                 (match_id, account_id, participant_order, player_result_key) \
+                 VALUES ($1, $2, 0, $3)",
                 request.match_id().get(),
-                request.account_id().get()
+                request.account_id().get(),
+                request.result_key().get()
             )
             .execute(&mut *transaction)
             .await
@@ -610,8 +616,10 @@ impl PgRepository {
                       m.weather AS "weather!",
                       m.wind_speed_tenths AS "wind_speed_tenths!",
                       m.wind_angle_degrees AS "wind_angle_degrees!",
-                      m.reward_formula AS "reward_formula!", m.status AS "status!",
-                      mp.account_id AS "account_id!",
+                      m.mode AS "mode!", m.reward_formula AS "reward_formula!",
+                      m.status AS "status!", mp.account_id AS "account_id!",
+                      mp.participant_order AS "participant_order!",
+                      mp.player_result_key AS "player_result_key!",
                       mp.strokes AS "strokes?", mp.score AS "score?",
                       mp.pang_reward AS "pang_reward?",
                       mp.experience_reward AS "experience_reward?",
@@ -625,6 +633,9 @@ impl PgRepository {
         .fetch_all(&mut *transaction)
         .await
         .map_err(match_db_error)?;
+        if rows.iter().any(|row| row.mode != "solo_practice") {
+            return Err(MatchRepositoryError::WrongMode);
+        }
         let [row] = rows.as_slice() else {
             return Err(MatchRepositoryError::InputDrift);
         };
@@ -818,9 +829,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         sqlx::query!(
-            "UPDATE match_players SET strokes = $3, score = $4, pang_reward = $5, \
-                    experience_reward = $6, pang_balance_after = $7, \
-                    experience_balance_after = $8 \
+            "UPDATE match_players SET strokes = $3, score = $4, place = 1, \
+                    completion = 'holed', pang_reward = $5, experience_reward = $6, \
+                    pang_balance_after = $7, experience_balance_after = $8 \
              WHERE match_id = $1 AND account_id = $2",
             request.match_id().get(),
             request.account_id().get(),
@@ -877,6 +888,426 @@ impl PgRepository {
         Ok(result)
     }
 
+    async fn begin_stroke_inner(
+        &self,
+        request: BeginStrokeMatch,
+    ) -> Result<BeginStrokeMatchOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let mut account_ids = request
+            .participants()
+            .map(|participant| participant.account_id().get());
+        account_ids.sort_unstable();
+        let accounts = sqlx::query!(
+            "SELECT id, status FROM accounts WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE",
+            &account_ids[..]
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if accounts.len() != 2
+            || accounts
+                .iter()
+                .zip(account_ids)
+                .any(|(row, expected)| row.id != expected)
+        {
+            return Err(MatchRepositoryError::WrongAccount);
+        }
+        if accounts.iter().any(|row| row.status != "active") {
+            return Err(MatchRepositoryError::InvalidStatus);
+        }
+
+        let fingerprint = request.catalog_fingerprint();
+        let seed = request.seed();
+        let inserted = sqlx::query!(
+            "INSERT INTO matches \
+             (id, result_commit_key, mode, course_id, hole, par, catalog_sha256, seed, weather, \
+              wind_speed_tenths, wind_angle_degrees, reward_formula) \
+             VALUES ($1, $2, 'stroke_two', $3, 1, $4, $5, $6, $7, $8, $9, 'stroke-two-v1') \
+             ON CONFLICT DO NOTHING",
+            request.match_id().get(),
+            request.result_key().get(),
+            i64::from(request.config().course_id().get()),
+            i16::from(request.config().par()),
+            fingerprint.as_bytes().as_slice(),
+            seed.as_bytes().as_slice(),
+            weather_text(request.weather()),
+            i16::try_from(request.wind().speed_tenths())
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+            i16::try_from(request.wind().angle_degrees())
+                .map_err(|_| MatchRepositoryError::CorruptData)?
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+
+        if inserted.rows_affected() == 1 {
+            for participant in request.participants() {
+                sqlx::query!(
+                    "INSERT INTO match_players \
+                     (match_id, account_id, participant_order, player_result_key) \
+                     VALUES ($1, $2, $3, $4)",
+                    request.match_id().get(),
+                    participant.account_id().get(),
+                    i16::from(participant.roster_order().get()),
+                    participant.player_result_key().get()
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(stroke_begin_db_error)?;
+            }
+            sqlx::query!(
+                "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+                 VALUES ($1, $2, 'started', 'success')",
+                request.match_id().get(),
+                request.participants()[0].account_id().get()
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            transaction.commit().await.map_err(match_db_error)?;
+            return Ok(BeginStrokeMatchOutcome::Begun);
+        }
+
+        let player_keys = request
+            .participants()
+            .map(|participant| participant.player_result_key().get());
+        let candidate_ids = sqlx::query_scalar!(
+            "SELECT DISTINCT m.id FROM matches m \
+             LEFT JOIN match_players mp ON mp.match_id = m.id \
+             WHERE m.id = $1 OR m.result_commit_key = $2 OR mp.player_result_key = ANY($3)",
+            request.match_id().get(),
+            request.result_key().get(),
+            &player_keys[..]
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        let [candidate_id] = candidate_ids.as_slice() else {
+            return Err(MatchRepositoryError::InputDrift);
+        };
+        let (row, players) =
+            lock_stroke_match(&mut transaction, MatchId::new(*candidate_id)).await?;
+        if !matches!(row.matches_stroke_begin(&request, &players), Ok(true)) {
+            return Err(MatchRepositoryError::InputDrift);
+        }
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(BeginStrokeMatchOutcome::Existing)
+    }
+
+    async fn mark_stroke_in_game_inner(
+        &self,
+        request: MarkStrokeInGame,
+    ) -> Result<MarkStrokeInGameOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let (row, players) = lock_stroke_match(&mut transaction, request.match_id()).await?;
+        validate_stroke_aggregate(&row, &players, request.result_key())?;
+        let outcome = match row.status.as_str() {
+            "loading" => {
+                let updated = sqlx::query!(
+                    "UPDATE matches SET status = 'in_game' WHERE id = $1 AND status = 'loading'",
+                    request.match_id().get()
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+                if updated.rows_affected() != 1 {
+                    return Err(MatchRepositoryError::Storage);
+                }
+                MarkStrokeInGameOutcome::Marked
+            }
+            "in_game" => MarkStrokeInGameOutcome::Existing,
+            "results_pending" | "committed" | "aborted" => {
+                return Err(MatchRepositoryError::InvalidStatus);
+            }
+            _ => return Err(MatchRepositoryError::CorruptData),
+        };
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(outcome)
+    }
+
+    async fn abort_stroke_inner(
+        &self,
+        request: AbortStrokeMatch,
+    ) -> Result<AbortStrokeMatchOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let (row, players) = lock_stroke_match(&mut transaction, request.match_id()).await?;
+        validate_stroke_aggregate(&row, &players, request.result_key())?;
+        match row.status.as_str() {
+            "committed" => {
+                let result = persisted_stroke_result(&row, &players)?;
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(AbortStrokeMatchOutcome::AlreadyCommitted(result));
+            }
+            "aborted" => {
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(AbortStrokeMatchOutcome::AlreadyAborted);
+            }
+            "loading" | "in_game" | "results_pending" => {}
+            _ => return Err(MatchRepositoryError::CorruptData),
+        }
+        let updated_players = sqlx::query!(
+            "UPDATE match_players SET quit = TRUE WHERE match_id = $1",
+            request.match_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if updated_players.rows_affected() != 2 {
+            return Err(MatchRepositoryError::CorruptData);
+        }
+        let updated_match = sqlx::query!(
+            "UPDATE matches SET status = 'aborted', abort_reason = $2, aborted_at = now() \
+             WHERE id = $1",
+            request.match_id().get(),
+            abort_reason_text(request.reason())
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if updated_match.rows_affected() != 1 {
+            return Err(MatchRepositoryError::Storage);
+        }
+        sqlx::query!(
+            "INSERT INTO match_audit_events \
+             (match_id, account_id, event, outcome, reason) \
+             VALUES ($1, $2, 'aborted', 'success', $3)",
+            request.match_id().get(),
+            players[0].account_id,
+            abort_reason_text(request.reason())
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(AbortStrokeMatchOutcome::Aborted)
+    }
+
+    async fn commit_stroke_match_inner(
+        &self,
+        request: CommitStrokeMatch,
+    ) -> Result<StrokeMatchResult, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let (row, persisted_players) =
+            lock_stroke_match(&mut transaction, request.match_id()).await?;
+        validate_stroke_commit(&row, &persisted_players, &request)?;
+        match row.status.as_str() {
+            "committed" => {
+                let result = persisted_stroke_result(&row, &persisted_players)?;
+                validate_stroke_replay(&result, &request)?;
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(result);
+            }
+            "aborted" => return Err(MatchRepositoryError::Aborted),
+            "in_game" => {}
+            "loading" | "results_pending" => return Err(MatchRepositoryError::InvalidStatus),
+            _ => return Err(MatchRepositoryError::CorruptData),
+        }
+
+        let pending = sqlx::query!(
+            "UPDATE matches SET status = 'results_pending' WHERE id = $1 AND status = 'in_game'",
+            request.match_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if pending.rows_affected() != 1 {
+            return Err(MatchRepositoryError::Storage);
+        }
+
+        let mut account_ids = request
+            .players()
+            .map(|player| player.participant().account_id().get());
+        account_ids.sort_unstable();
+        let profiles = sqlx::query!(
+            r#"SELECT account_id, pang AS "pang!", experience AS "experience!"
+               FROM profiles WHERE account_id = ANY($1) ORDER BY account_id FOR UPDATE"#,
+            &account_ids[..]
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if profiles.len() != 2
+            || profiles
+                .iter()
+                .zip(account_ids)
+                .any(|(profile, expected)| profile.account_id != expected)
+        {
+            return Err(MatchRepositoryError::WrongAccount);
+        }
+        let balances_by_account: BTreeMap<i64, (i64, i64)> = profiles
+            .into_iter()
+            .map(|profile| (profile.account_id, (profile.pang, profile.experience)))
+            .collect();
+
+        let mut results = Vec::with_capacity(2);
+        for player in request.players() {
+            let account_id = player.participant().account_id().get();
+            let (old_pang, old_experience) = balances_by_account
+                .get(&account_id)
+                .copied()
+                .ok_or(MatchRepositoryError::CorruptData)?;
+            let reward =
+                synthetic_stroke_reward_v1(request.config(), player.strokes(), player.completion())
+                    .map_err(|_| MatchRepositoryError::CorruptData)?;
+            let new_pang = checked_balance_add(old_pang, reward.pang())?;
+            let new_experience = checked_balance_add(old_experience, reward.experience())?;
+            let pang_delta =
+                i64::try_from(reward.pang()).map_err(|_| MatchRepositoryError::BalanceOverflow)?;
+            let experience_delta = i64::try_from(reward.experience())
+                .map_err(|_| MatchRepositoryError::BalanceOverflow)?;
+
+            if reward.pang() != 0 || reward.experience() != 0 {
+                let updated = sqlx::query!(
+                    "UPDATE profiles SET pang = $2, experience = $3, updated_at = now() \
+                     WHERE account_id = $1 AND pang = $4 AND experience = $5",
+                    account_id,
+                    new_pang,
+                    new_experience,
+                    old_pang,
+                    old_experience
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+                if updated.rows_affected() != 1 {
+                    return Err(MatchRepositoryError::Storage);
+                }
+                sqlx::query!(
+                    "INSERT INTO currency_ledger \
+                     (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) \
+                     VALUES ($1, $2, $3, 'pang', $4, 'stroke-two-v1', $5)",
+                    account_id,
+                    request.match_id().get(),
+                    player.participant().player_result_key().get(),
+                    pang_delta,
+                    new_pang
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+                sqlx::query!(
+                    "INSERT INTO progression_ledger \
+                     (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) \
+                     VALUES ($1, $2, $3, 'experience', $4, 'stroke-two-v1', $5)",
+                    account_id,
+                    request.match_id().get(),
+                    player.participant().player_result_key().get(),
+                    experience_delta,
+                    new_experience
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+            }
+
+            let settled = sqlx::query!(
+                "UPDATE match_players SET strokes = $3, score = $4, quit = $5, place = $6, \
+                 completion = $7, pang_reward = $8, experience_reward = $9, \
+                 pang_balance_after = $10, experience_balance_after = $11 \
+                 WHERE match_id = $1 AND account_id = $2 AND player_result_key = $12",
+                request.match_id().get(),
+                account_id,
+                i16::try_from(player.strokes()).map_err(|_| MatchRepositoryError::CorruptData)?,
+                reward.score(),
+                player.completion().is_forfeit(),
+                i16::from(player.place().get()),
+                stroke_completion_text(player.completion()),
+                pang_delta,
+                experience_delta,
+                new_pang,
+                new_experience,
+                player.participant().player_result_key().get()
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            if settled.rows_affected() != 1 {
+                return Err(MatchRepositoryError::CorruptData);
+            }
+
+            if player.completion().is_record_eligible() {
+                let score = reward.score().ok_or(MatchRepositoryError::CorruptData)?;
+                sqlx::query!(
+                    "INSERT INTO course_records \
+                     (account_id, course_id, mode, best_score, best_strokes, rounds_completed, \
+                      best_match_id, best_player_result_key, first_achieved_at, updated_at) \
+                     VALUES ($1, $2, 'stroke_two', $3, $4, 1, $5, $6, now(), now()) \
+                     ON CONFLICT (account_id, course_id, mode) DO UPDATE SET \
+                       rounds_completed = course_records.rounds_completed + 1, \
+                       best_score = CASE WHEN EXCLUDED.best_score < course_records.best_score \
+                         OR (EXCLUDED.best_score = course_records.best_score \
+                           AND EXCLUDED.best_strokes < course_records.best_strokes) \
+                         THEN EXCLUDED.best_score ELSE course_records.best_score END, \
+                       best_strokes = CASE WHEN EXCLUDED.best_score < course_records.best_score \
+                         OR (EXCLUDED.best_score = course_records.best_score \
+                           AND EXCLUDED.best_strokes < course_records.best_strokes) \
+                         THEN EXCLUDED.best_strokes ELSE course_records.best_strokes END, \
+                       best_match_id = CASE WHEN EXCLUDED.best_score < course_records.best_score \
+                         OR (EXCLUDED.best_score = course_records.best_score \
+                           AND EXCLUDED.best_strokes < course_records.best_strokes) \
+                         THEN EXCLUDED.best_match_id ELSE course_records.best_match_id END, \
+                       best_player_result_key = CASE WHEN EXCLUDED.best_score < course_records.best_score \
+                         OR (EXCLUDED.best_score = course_records.best_score \
+                           AND EXCLUDED.best_strokes < course_records.best_strokes) \
+                         THEN EXCLUDED.best_player_result_key \
+                         ELSE course_records.best_player_result_key END, \
+                       first_achieved_at = CASE WHEN EXCLUDED.best_score < course_records.best_score \
+                         OR (EXCLUDED.best_score = course_records.best_score \
+                           AND EXCLUDED.best_strokes < course_records.best_strokes) \
+                         THEN EXCLUDED.first_achieved_at ELSE course_records.first_achieved_at END, \
+                       updated_at = now()",
+                    account_id,
+                    i64::from(request.config().course_id().get()),
+                    score,
+                    i16::try_from(player.strokes())
+                        .map_err(|_| MatchRepositoryError::CorruptData)?,
+                    request.match_id().get(),
+                    player.participant().player_result_key().get()
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+            }
+
+            results.push(StrokePlayerResult::new(
+                *player,
+                reward,
+                ServerBalances::from_persisted(
+                    checked_match_u64(new_pang)?,
+                    checked_match_u64(new_experience)?,
+                ),
+            ));
+        }
+
+        sqlx::query!(
+            "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+             VALUES ($1, $2, 'committed', 'success')",
+            request.match_id().get(),
+            request.players()[0].participant().account_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        let committed = sqlx::query!(
+            "UPDATE matches SET status = 'committed', committed_at = now() \
+             WHERE id = $1 AND status = 'results_pending'",
+            request.match_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if committed.rows_affected() != 1 {
+            return Err(MatchRepositoryError::Storage);
+        }
+        let [first, second] = results.as_slice() else {
+            return Err(MatchRepositoryError::CorruptData);
+        };
+        let result =
+            StrokeMatchResult::new(request.match_id(), request.result_key(), [*first, *second]);
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(result)
+    }
+
     async fn abort_incomplete_matches_inner(
         &self,
         limit: IncompleteMatchAbortLimit,
@@ -886,10 +1317,9 @@ impl PgRepository {
             .checked_add(1)
             .ok_or(MatchRepositoryError::RecoveryLimitExceeded)?;
         let rows = sqlx::query!(
-            r#"SELECT m.id AS "match_id!", mp.account_id AS "account_id!"
-               FROM matches m JOIN match_players mp ON mp.match_id = m.id
-               WHERE m.status IN ('loading', 'in_game', 'results_pending')
-               ORDER BY m.created_at, m.id FOR UPDATE OF m, mp LIMIT $1"#,
+            r#"SELECT id AS "match_id!" FROM matches
+               WHERE status IN ('loading', 'in_game', 'results_pending')
+               ORDER BY created_at, id LIMIT $1 FOR UPDATE"#,
             fetch_limit
         )
         .fetch_all(&mut *transaction)
@@ -902,14 +1332,30 @@ impl PgRepository {
             return Err(MatchRepositoryError::RecoveryLimitExceeded);
         }
         for row in &rows {
-            sqlx::query!(
-                "UPDATE match_players SET quit = TRUE WHERE match_id = $1 AND account_id = $2",
-                row.match_id,
-                row.account_id
+            let players = sqlx::query!(
+                "SELECT account_id, participant_order FROM match_players \
+                 WHERE match_id = $1 ORDER BY participant_order FOR UPDATE",
+                row.match_id
+            )
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            let starter_account = players
+                .first()
+                .map(|player| player.account_id)
+                .ok_or(MatchRepositoryError::CorruptData)?;
+            let updated_players = sqlx::query!(
+                "UPDATE match_players SET quit = TRUE WHERE match_id = $1",
+                row.match_id
             )
             .execute(&mut *transaction)
             .await
             .map_err(match_db_error)?;
+            if updated_players.rows_affected()
+                != u64::try_from(players.len()).map_err(|_| MatchRepositoryError::CorruptData)?
+            {
+                return Err(MatchRepositoryError::Storage);
+            }
             sqlx::query!(
                 "UPDATE matches SET status = 'aborted', abort_reason = 'startup_recovery', \
                         aborted_at = now() WHERE id = $1",
@@ -923,7 +1369,7 @@ impl PgRepository {
                  (match_id, account_id, event, outcome, reason) \
                  VALUES ($1, $2, 'aborted', 'success', 'startup_recovery')",
                 row.match_id,
-                row.account_id
+                starter_account
             )
             .execute(&mut *transaction)
             .await
@@ -1007,6 +1453,34 @@ impl HandoverRepository for PgRepository {
 }
 
 impl MatchRepository for PgRepository {
+    fn begin_stroke(
+        &self,
+        request: BeginStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<BeginStrokeMatchOutcome, MatchRepositoryError>> {
+        Box::pin(self.begin_stroke_inner(request))
+    }
+
+    fn mark_stroke_in_game(
+        &self,
+        request: MarkStrokeInGame,
+    ) -> RepositoryFuture<'_, Result<MarkStrokeInGameOutcome, MatchRepositoryError>> {
+        Box::pin(self.mark_stroke_in_game_inner(request))
+    }
+
+    fn abort_stroke(
+        &self,
+        request: AbortStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<AbortStrokeMatchOutcome, MatchRepositoryError>> {
+        Box::pin(self.abort_stroke_inner(request))
+    }
+
+    fn commit_stroke_match(
+        &self,
+        request: CommitStrokeMatch,
+    ) -> RepositoryFuture<'_, Result<StrokeMatchResult, MatchRepositoryError>> {
+        Box::pin(self.commit_stroke_match_inner(request))
+    }
+
     fn begin_solo(
         &self,
         request: BeginSoloMatch,
@@ -1141,6 +1615,7 @@ struct HandoverRow {
 struct MatchPersistenceRow {
     id: Uuid,
     result_commit_key: Uuid,
+    mode: String,
     course_id: i64,
     hole: i16,
     par: i16,
@@ -1152,6 +1627,8 @@ struct MatchPersistenceRow {
     reward_formula: String,
     status: String,
     account_id: i64,
+    participant_order: i16,
+    player_result_key: Uuid,
     strokes: Option<i16>,
     score: Option<i16>,
     pang_reward: Option<i64>,
@@ -1162,7 +1639,13 @@ struct MatchPersistenceRow {
 
 impl MatchPersistenceRow {
     fn matches_begin(&self, request: &BeginSoloMatch) -> Result<bool, MatchRepositoryError> {
-        if self.hole != 1 || self.reward_formula != "solo-v1" {
+        if self.mode != "solo_practice" || self.reward_formula != "solo-v1" {
+            return Err(MatchRepositoryError::WrongMode);
+        }
+        if self.hole != 1
+            || self.participant_order != 0
+            || self.player_result_key != self.result_commit_key
+        {
             return Err(MatchRepositoryError::CorruptData);
         }
         let fingerprint = pangya_domain::CatalogFingerprint::from_slice(&self.catalog_sha256)
@@ -1188,7 +1671,13 @@ impl MatchPersistenceRow {
     }
 
     fn persisted_result(&self) -> Result<SoloMatchResult, MatchRepositoryError> {
-        if self.status != "committed" || self.hole != 1 || self.reward_formula != "solo-v1" {
+        if self.status != "committed"
+            || self.mode != "solo_practice"
+            || self.hole != 1
+            || self.reward_formula != "solo-v1"
+            || self.participant_order != 0
+            || self.player_result_key != self.result_commit_key
+        {
             return Err(MatchRepositoryError::CorruptData);
         }
         let strokes = self
@@ -1227,6 +1716,265 @@ impl MatchPersistenceRow {
     }
 }
 
+#[derive(Clone, FromRow)]
+struct StrokeMatchPersistenceRow {
+    id: Uuid,
+    result_commit_key: Uuid,
+    mode: String,
+    course_id: i64,
+    hole: i16,
+    par: i16,
+    catalog_sha256: Vec<u8>,
+    seed: Vec<u8>,
+    weather: String,
+    wind_speed_tenths: i16,
+    wind_angle_degrees: i16,
+    reward_formula: String,
+    status: String,
+}
+
+#[derive(Clone, FromRow)]
+struct StrokePlayerPersistenceRow {
+    account_id: i64,
+    participant_order: i16,
+    player_result_key: Uuid,
+    strokes: Option<i16>,
+    score: Option<i16>,
+    quit: bool,
+    place: Option<i16>,
+    completion: Option<String>,
+    pang_reward: Option<i64>,
+    experience_reward: Option<i64>,
+    pang_balance_after: Option<i64>,
+    experience_balance_after: Option<i64>,
+}
+
+impl StrokeMatchPersistenceRow {
+    fn matches_stroke_begin(
+        &self,
+        request: &BeginStrokeMatch,
+        players: &[StrokePlayerPersistenceRow],
+    ) -> Result<bool, MatchRepositoryError> {
+        validate_stroke_aggregate(self, players, request.result_key())?;
+        let fingerprint = pangya_domain::CatalogFingerprint::from_slice(&self.catalog_sha256)
+            .map_err(|_| MatchRepositoryError::CorruptData)?;
+        let seed = pangya_domain::MatchSeed::from_slice(&self.seed)
+            .map_err(|_| MatchRepositoryError::CorruptData)?;
+        let wind = WindConditions::new(
+            u16::try_from(self.wind_speed_tenths).map_err(|_| MatchRepositoryError::CorruptData)?,
+            u16::try_from(self.wind_angle_degrees)
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+        )
+        .map_err(|_| MatchRepositoryError::CorruptData)?;
+        Ok(self.id == request.match_id().get()
+            && self.course_id == i64::from(request.config().course_id().get())
+            && self.par == i16::from(request.config().par())
+            && fingerprint == request.catalog_fingerprint()
+            && seed == request.seed()
+            && parse_weather(&self.weather)? == request.weather()
+            && wind == request.wind()
+            && players
+                .iter()
+                .zip(request.participants())
+                .all(|(row, input)| {
+                    row.account_id == input.account_id().get()
+                        && row.participant_order == i16::from(input.roster_order().get())
+                        && row.player_result_key == input.player_result_key().get()
+                }))
+    }
+}
+
+async fn lock_stroke_match(
+    transaction: &mut Transaction<'_, Postgres>,
+    match_id: MatchId,
+) -> Result<(StrokeMatchPersistenceRow, Vec<StrokePlayerPersistenceRow>), MatchRepositoryError> {
+    let row = sqlx::query_as!(
+        StrokeMatchPersistenceRow,
+        r#"SELECT id AS "id!", result_commit_key AS "result_commit_key!", mode AS "mode!",
+                  course_id AS "course_id!", hole AS "hole!", par AS "par!",
+                  catalog_sha256 AS "catalog_sha256!", seed AS "seed!", weather AS "weather!",
+                  wind_speed_tenths AS "wind_speed_tenths!",
+                  wind_angle_degrees AS "wind_angle_degrees!",
+                  reward_formula AS "reward_formula!", status AS "status!"
+           FROM matches WHERE id = $1 FOR UPDATE"#,
+        match_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(match_db_error)?
+    .ok_or(MatchRepositoryError::NotFound)?;
+    let players = sqlx::query_as!(
+        StrokePlayerPersistenceRow,
+        r#"SELECT account_id AS "account_id!", participant_order AS "participant_order!",
+                  player_result_key AS "player_result_key!", strokes AS "strokes?",
+                  score AS "score?", quit AS "quit!", place AS "place?",
+                  completion AS "completion?", pang_reward AS "pang_reward?",
+                  experience_reward AS "experience_reward?",
+                  pang_balance_after AS "pang_balance_after?",
+                  experience_balance_after AS "experience_balance_after?"
+           FROM match_players WHERE match_id = $1 ORDER BY participant_order FOR UPDATE"#,
+        match_id.get()
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(match_db_error)?;
+    Ok((row, players))
+}
+
+fn validate_stroke_aggregate(
+    row: &StrokeMatchPersistenceRow,
+    players: &[StrokePlayerPersistenceRow],
+    result_key: MatchResultKey,
+) -> Result<(), MatchRepositoryError> {
+    if row.result_commit_key != result_key.get() {
+        return Err(MatchRepositoryError::WrongResultKey);
+    }
+    let [first, second] = players else {
+        return Err(MatchRepositoryError::CorruptData);
+    };
+    if row.mode != "stroke_two"
+        || row.reward_formula != "stroke-two-v1"
+        || row.hole != 1
+        || first.participant_order != 0
+        || second.participant_order != 1
+        || first.account_id == second.account_id
+        || first.player_result_key == second.player_result_key
+        || first.player_result_key == row.result_commit_key
+        || second.player_result_key == row.result_commit_key
+    {
+        return Err(MatchRepositoryError::CorruptData);
+    }
+    Ok(())
+}
+
+fn validate_stroke_commit(
+    row: &StrokeMatchPersistenceRow,
+    persisted: &[StrokePlayerPersistenceRow],
+    request: &CommitStrokeMatch,
+) -> Result<(), MatchRepositoryError> {
+    validate_stroke_aggregate(row, persisted, request.result_key())?;
+    if row.course_id != i64::from(request.config().course_id().get())
+        || row.par != i16::from(request.config().par())
+    {
+        return Err(MatchRepositoryError::WrongConfig);
+    }
+    if persisted.iter().zip(request.players()).any(|(row, input)| {
+        row.account_id != input.participant().account_id().get()
+            || row.participant_order != i16::from(input.participant().roster_order().get())
+            || row.player_result_key != input.participant().player_result_key().get()
+    }) {
+        return Err(MatchRepositoryError::InputDrift);
+    }
+    Ok(())
+}
+
+fn persisted_stroke_result(
+    row: &StrokeMatchPersistenceRow,
+    players: &[StrokePlayerPersistenceRow],
+) -> Result<StrokeMatchResult, MatchRepositoryError> {
+    validate_stroke_aggregate(row, players, MatchResultKey::new(row.result_commit_key))?;
+    if row.status != "committed" {
+        return Err(MatchRepositoryError::CorruptData);
+    }
+    let config = pangya_domain::OneHoleConfig::new(
+        pangya_domain::CourseId::try_from(row.course_id)
+            .map_err(|_| MatchRepositoryError::CorruptData)?,
+        u8::try_from(row.par).map_err(|_| MatchRepositoryError::CorruptData)?,
+    )
+    .map_err(|_| MatchRepositoryError::CorruptData)?;
+    let mut results = Vec::with_capacity(2);
+    for persisted in players {
+        let participant = pangya_domain::StrokeParticipant::new(
+            AccountId::new(persisted.account_id).map_err(|_| MatchRepositoryError::CorruptData)?,
+            StrokeRosterOrder::from_persisted(persisted.participant_order)
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+            MatchResultKey::new(persisted.player_result_key),
+        );
+        let completion = parse_stroke_completion(
+            persisted
+                .completion
+                .as_deref()
+                .ok_or(MatchRepositoryError::CorruptData)?,
+        )?;
+        let input = StrokePlayerCommit::new(
+            participant,
+            persisted
+                .strokes
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or(MatchRepositoryError::CorruptData)?,
+            StrokePlace::from_persisted(persisted.place.ok_or(MatchRepositoryError::CorruptData)?)
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+            completion,
+        )
+        .map_err(|_| MatchRepositoryError::CorruptData)?;
+        if persisted.quit != completion.is_forfeit() {
+            return Err(MatchRepositoryError::CorruptData);
+        }
+        let reward = StrokeReward::from_persisted(
+            persisted.score,
+            checked_match_u64(
+                persisted
+                    .pang_reward
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+            checked_match_u64(
+                persisted
+                    .experience_reward
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+        );
+        if reward
+            != synthetic_stroke_reward_v1(config, input.strokes(), completion)
+                .map_err(|_| MatchRepositoryError::CorruptData)?
+        {
+            return Err(MatchRepositoryError::CorruptData);
+        }
+        let balances = ServerBalances::from_persisted(
+            checked_match_u64(
+                persisted
+                    .pang_balance_after
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+            checked_match_u64(
+                persisted
+                    .experience_balance_after
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+        );
+        results.push(StrokePlayerResult::new(input, reward, balances));
+    }
+    let [first, second] = results.as_slice() else {
+        return Err(MatchRepositoryError::CorruptData);
+    };
+    Ok(StrokeMatchResult::new(
+        MatchId::new(row.id),
+        MatchResultKey::new(row.result_commit_key),
+        [*first, *second],
+    ))
+}
+
+fn validate_stroke_replay(
+    result: &StrokeMatchResult,
+    request: &CommitStrokeMatch,
+) -> Result<(), MatchRepositoryError> {
+    if result.match_id() != request.match_id()
+        || result.result_key() != request.result_key()
+        || result
+            .players()
+            .iter()
+            .zip(request.players())
+            .any(|(persisted, input)| {
+                persisted.participant() != input.participant()
+                    || persisted.strokes() != input.strokes()
+                    || persisted.place() != input.place()
+                    || persisted.completion() != input.completion()
+            })
+    {
+        return Err(MatchRepositoryError::InputDrift);
+    }
+    Ok(())
+}
+
 async fn lock_match(
     transaction: &mut Transaction<'_, Postgres>,
     match_id: MatchId,
@@ -1239,8 +1987,10 @@ async fn lock_match(
                   m.weather AS "weather!",
                   m.wind_speed_tenths AS "wind_speed_tenths!",
                   m.wind_angle_degrees AS "wind_angle_degrees!",
-                  m.reward_formula AS "reward_formula!", m.status AS "status!",
-                  mp.account_id AS "account_id!",
+                  m.mode AS "mode!", m.reward_formula AS "reward_formula!",
+                  m.status AS "status!", mp.account_id AS "account_id!",
+                  mp.participant_order AS "participant_order!",
+                  mp.player_result_key AS "player_result_key!",
                   mp.strokes AS "strokes?", mp.score AS "score?",
                   mp.pang_reward AS "pang_reward?",
                   mp.experience_reward AS "experience_reward?",
@@ -1250,10 +2000,21 @@ async fn lock_match(
            WHERE m.id = $1 FOR UPDATE OF m, mp"#,
         match_id.get()
     )
-    .fetch_optional(&mut **transaction)
+    .fetch_all(&mut **transaction)
     .await
-    .map_err(match_db_error)?
-    .ok_or(MatchRepositoryError::NotFound)
+    .map_err(match_db_error)
+    .and_then(|rows| {
+        if rows.is_empty() {
+            return Err(MatchRepositoryError::NotFound);
+        }
+        if rows.iter().any(|row| row.mode != "solo_practice") {
+            return Err(MatchRepositoryError::WrongMode);
+        }
+        let [row] = rows.as_slice() else {
+            return Err(MatchRepositoryError::CorruptData);
+        };
+        Ok(row.clone())
+    })
 }
 
 fn validate_authority(
@@ -1261,10 +2022,16 @@ fn validate_authority(
     account_id: AccountId,
     result_key: MatchResultKey,
 ) -> Result<(), MatchRepositoryError> {
+    if row.mode != "solo_practice" || row.reward_formula != "solo-v1" {
+        return Err(MatchRepositoryError::WrongMode);
+    }
+    if row.participant_order != 0 || row.player_result_key != row.result_commit_key {
+        return Err(MatchRepositoryError::CorruptData);
+    }
     if row.account_id != account_id.get() {
         return Err(MatchRepositoryError::WrongAccount);
     }
-    if row.result_commit_key != result_key.get() {
+    if row.result_commit_key != result_key.get() || row.player_result_key != result_key.get() {
         return Err(MatchRepositoryError::WrongResultKey);
     }
     Ok(())
@@ -1295,6 +2062,29 @@ fn parse_weather(value: &str) -> Result<Weather, MatchRepositoryError> {
         "clear" => Ok(Weather::Clear),
         "cloudy" => Ok(Weather::Cloudy),
         "rain" => Ok(Weather::Rain),
+        _ => Err(MatchRepositoryError::CorruptData),
+    }
+}
+
+const fn stroke_completion_text(completion: StrokeCompletion) -> &'static str {
+    match completion {
+        StrokeCompletion::Holed => "holed",
+        StrokeCompletion::StrokeCap => "stroke_cap",
+        StrokeCompletion::GiveUp => "give_up",
+        StrokeCompletion::Disconnect => "disconnect",
+        StrokeCompletion::TurnTimeout => "turn_timeout",
+        StrokeCompletion::GameTimeout => "game_timeout",
+    }
+}
+
+fn parse_stroke_completion(value: &str) -> Result<StrokeCompletion, MatchRepositoryError> {
+    match value {
+        "holed" => Ok(StrokeCompletion::Holed),
+        "stroke_cap" => Ok(StrokeCompletion::StrokeCap),
+        "give_up" => Ok(StrokeCompletion::GiveUp),
+        "disconnect" => Ok(StrokeCompletion::Disconnect),
+        "turn_timeout" => Ok(StrokeCompletion::TurnTimeout),
+        "game_timeout" => Ok(StrokeCompletion::GameTimeout),
         _ => Err(MatchRepositoryError::CorruptData),
     }
 }
@@ -1817,6 +2607,18 @@ fn handover_db_error(_error: sqlx::Error) -> HandoverError {
 
 fn match_db_error(_error: sqlx::Error) -> MatchRepositoryError {
     MatchRepositoryError::Storage
+}
+
+fn stroke_begin_db_error(error: sqlx::Error) -> MatchRepositoryError {
+    if error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "23505")
+    {
+        MatchRepositoryError::InputDrift
+    } else {
+        MatchRepositoryError::Storage
+    }
 }
 
 /// Marker retained for the M1 crate-boundary test.

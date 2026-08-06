@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO progression_ledger (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) VALUES ($1, $2, $3, 'experience', $4, 'stroke-two-v1', $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5ff4473ca3c89457975f7e493a4b5e83e3f4b1d3e8d73e20e1762f1329304f10"
+}

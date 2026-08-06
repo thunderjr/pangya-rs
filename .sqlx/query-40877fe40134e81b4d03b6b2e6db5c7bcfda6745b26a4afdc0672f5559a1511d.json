@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO course_records (account_id, course_id, mode, best_score, best_strokes, rounds_completed, best_match_id, best_player_result_key, first_achieved_at, updated_at) VALUES ($1, $2, 'stroke_two', $3, $4, 1, $5, $6, now(), now()) ON CONFLICT (account_id, course_id, mode) DO UPDATE SET rounds_completed = course_records.rounds_completed + 1, best_score = CASE WHEN EXCLUDED.best_score < course_records.best_score OR (EXCLUDED.best_score = course_records.best_score AND EXCLUDED.best_strokes < course_records.best_strokes) THEN EXCLUDED.best_score ELSE course_records.best_score END, best_strokes = CASE WHEN EXCLUDED.best_score < course_records.best_score OR (EXCLUDED.best_score = course_records.best_score AND EXCLUDED.best_strokes < course_records.best_strokes) THEN EXCLUDED.best_strokes ELSE course_records.best_strokes END, best_match_id = CASE WHEN EXCLUDED.best_score < course_records.best_score OR (EXCLUDED.best_score = course_records.best_score AND EXCLUDED.best_strokes < course_records.best_strokes) THEN EXCLUDED.best_match_id ELSE course_records.best_match_id END, best_player_result_key = CASE WHEN EXCLUDED.best_score < course_records.best_score OR (EXCLUDED.best_score = course_records.best_score AND EXCLUDED.best_strokes < course_records.best_strokes) THEN EXCLUDED.best_player_result_key ELSE course_records.best_player_result_key END, first_achieved_at = CASE WHEN EXCLUDED.best_score < course_records.best_score OR (EXCLUDED.best_score = course_records.best_score AND EXCLUDED.best_strokes < course_records.best_strokes) THEN EXCLUDED.first_achieved_at ELSE course_records.first_achieved_at END, updated_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int2",
+        "Int2",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "40877fe40134e81b4d03b6b2e6db5c7bcfda6745b26a4afdc0672f5559a1511d"
+}

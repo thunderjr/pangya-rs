@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE match_players SET strokes = $3, score = $4, quit = $5, place = $6, completion = $7, pang_reward = $8, experience_reward = $9, pang_balance_after = $10, experience_balance_after = $11 WHERE match_id = $1 AND account_id = $2 AND player_result_key = $12",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int2",
+        "Int2",
+        "Bool",
+        "Int2",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6522ede6b95d813bf822b76b645369664b956f083936e4fee1179c7c2cd451a4"
+}

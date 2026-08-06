@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!\", result_commit_key AS \"result_commit_key!\", mode AS \"mode!\",\n                  course_id AS \"course_id!\", hole AS \"hole!\", par AS \"par!\",\n                  catalog_sha256 AS \"catalog_sha256!\", seed AS \"seed!\", weather AS \"weather!\",\n                  wind_speed_tenths AS \"wind_speed_tenths!\",\n                  wind_angle_degrees AS \"wind_angle_degrees!\",\n                  reward_formula AS \"reward_formula!\", status AS \"status!\"\n           FROM matches WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "result_commit_key!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "mode!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "course_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "hole!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "par!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "catalog_sha256!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "seed!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 8,
+        "name": "weather!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "wind_speed_tenths!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 10,
+        "name": "wind_angle_degrees!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 11,
+        "name": "reward_formula!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "status!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "779ba96432be712dd37439a62b768795076adf46ef97fdc7c11f52914b07a921"
+}

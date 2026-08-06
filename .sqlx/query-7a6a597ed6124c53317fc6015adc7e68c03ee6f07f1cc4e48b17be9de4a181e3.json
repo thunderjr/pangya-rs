@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO currency_ledger (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) VALUES ($1, $2, $3, 'pang', $4, 'stroke-two-v1', $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a6a597ed6124c53317fc6015adc7e68c03ee6f07f1cc4e48b17be9de4a181e3"
+}

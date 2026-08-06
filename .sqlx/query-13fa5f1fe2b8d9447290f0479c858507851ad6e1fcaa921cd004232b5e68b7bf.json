@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT account_id, participant_order FROM match_players WHERE match_id = $1 ORDER BY participant_order FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "participant_order",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "13fa5f1fe2b8d9447290f0479c858507851ad6e1fcaa921cd004232b5e68b7bf"
+}
