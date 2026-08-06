@@ -1055,6 +1055,8 @@ pub enum StrokeCompletion {
     TurnTimeout = 4,
     /// Aggregate game deadline expired.
     GameTimeout = 5,
+    /// Opponent forfeited; no golf score is fabricated.
+    WinnerByForfeit = 6,
 }
 impl StrokeCompletion {
     fn decode(reader: &mut PacketReader<'_>) -> Result<Self, PacketDecodeError> {
@@ -1065,11 +1067,22 @@ impl StrokeCompletion {
             3 => Ok(Self::Disconnect),
             4 => Ok(Self::TurnTimeout),
             5 => Ok(Self::GameTimeout),
+            6 => Ok(Self::WinnerByForfeit),
             _ => Err(reader.invalid("unknown stroke completion discriminator")),
         }
     }
     const fn has_golf_score(self) -> bool {
         matches!(self, Self::Holed | Self::StrokeCap)
+    }
+
+    const fn rewards_valid(self, pang: u64, experience: u64) -> bool {
+        match self {
+            Self::WinnerByForfeit => pang == 10 && experience == 5,
+            Self::GiveUp | Self::Disconnect | Self::TurnTimeout | Self::GameTimeout => {
+                pang == 0 && experience == 0
+            }
+            Self::Holed | Self::StrokeCap => true,
+        }
     }
 }
 
@@ -1116,9 +1129,9 @@ impl StrokeStandingEntry {
         if completion.has_golf_score() && strokes == 0 {
             return Err(PacketEncodeError::Invalid { field: "strokes" });
         }
-        if !completion.has_golf_score() && (pang != 0 || experience != 0) {
+        if !completion.rewards_valid(pang, experience) {
             return Err(PacketEncodeError::Invalid {
-                field: "forfeit rewards",
+                field: "completion rewards",
             });
         }
         if player_result_id.is_nil() {
@@ -1203,8 +1216,8 @@ impl StrokeStandingEntry {
         }
         let pang = reader.u64_le()?;
         let experience = reader.u64_le()?;
-        if !completion.has_golf_score() && (pang != 0 || experience != 0) {
-            return Err(reader.invalid("forfeit rewards must be zero"));
+        if !completion.rewards_valid(pang, experience) {
+            return Err(reader.invalid("completion rewards are not canonical"));
         }
         let player_result_id = decode_non_nil_uuid(reader, "player result ID")?;
         Ok(Self {
@@ -1230,9 +1243,9 @@ impl StrokeStandingEntry {
         if self.completion.has_golf_score() && self.strokes == 0 {
             return Err(PacketEncodeError::Invalid { field: "strokes" });
         }
-        if !self.completion.has_golf_score() && (self.pang != 0 || self.experience != 0) {
+        if !self.completion.rewards_valid(self.pang, self.experience) {
             return Err(PacketEncodeError::Invalid {
-                field: "forfeit rewards",
+                field: "completion rewards",
             });
         }
         if self.player_result_id.is_nil() {
@@ -1260,7 +1273,35 @@ pub struct StrokeStandings {
     entries: [StrokeStandingEntry; 2],
 }
 impl StrokeStandings {
-    /// Constructs standings with place 1 then 2 and distinct identities.
+    fn has_valid_forfeit_pair(entries: &[StrokeStandingEntry; 2]) -> bool {
+        let winner_count = entries
+            .iter()
+            .filter(|entry| entry.completion == StrokeCompletion::WinnerByForfeit)
+            .count();
+        let direct_forfeit_count = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.completion,
+                    StrokeCompletion::GiveUp
+                        | StrokeCompletion::Disconnect
+                        | StrokeCompletion::TurnTimeout
+                )
+            })
+            .count();
+        (winner_count, direct_forfeit_count) == (0, 0)
+            || (winner_count == 1
+                && direct_forfeit_count == 1
+                && entries[0].completion == StrokeCompletion::WinnerByForfeit
+                && matches!(
+                    entries[1].completion,
+                    StrokeCompletion::GiveUp
+                        | StrokeCompletion::Disconnect
+                        | StrokeCompletion::TurnTimeout
+                ))
+    }
+
+    /// Constructs standings with place 1 then 2, distinct identities, and canonical forfeits.
     ///
     /// # Errors
     /// Rejects wrong place order or repeated connection/result identity.
@@ -1281,6 +1322,11 @@ impl StrokeStandings {
         if entries[0].player_result_id == entries[1].player_result_id {
             return Err(PacketEncodeError::Invalid {
                 field: "player result IDs",
+            });
+        }
+        if !Self::has_valid_forfeit_pair(&entries) {
+            return Err(PacketEncodeError::Invalid {
+                field: "standing forfeit pair",
             });
         }
         Ok(Self { match_id, entries })
@@ -1319,6 +1365,9 @@ impl DecodePacket for StrokeStandings {
         if entries[0].player_result_id == entries[1].player_result_id {
             return Err(reader.invalid("player result IDs must be distinct"));
         }
+        if !Self::has_valid_forfeit_pair(&entries) {
+            return Err(reader.invalid("standings forfeit pair is invalid"));
+        }
         require_end(reader)?;
         Ok(Self { match_id, entries })
     }
@@ -1343,6 +1392,11 @@ impl EncodePacket for StrokeStandings {
         if self.entries[0].player_result_id == self.entries[1].player_result_id {
             return Err(PacketEncodeError::Invalid {
                 field: "player result IDs",
+            });
+        }
+        if !Self::has_valid_forfeit_pair(&self.entries) {
+            return Err(PacketEncodeError::Invalid {
+                field: "standing forfeit pair",
             });
         }
         encode_uuid(writer, self.match_id);

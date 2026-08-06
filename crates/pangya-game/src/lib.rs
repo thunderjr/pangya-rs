@@ -8,6 +8,7 @@
 pub mod lobby;
 pub mod match_state;
 pub mod room;
+pub mod stroke_state;
 
 pub use lobby::{
     LobbyHandle, LobbyLimits, LobbyRoomCommand, LobbyRouteResult, LobbyShutdownError,
@@ -2005,6 +2006,16 @@ where
                 self.send_committed_result(framed, result).await?;
                 Ok(RoomEventEffect::EnterRoom)
             }
+            // M6 network/repository composition is deliberately deferred to the next checkpoint.
+            RoomEvent::StrokeStarted(_)
+            | RoomEvent::StrokePhase { .. }
+            | RoomEvent::StrokeTurn(_)
+            | RoomEvent::StrokeActionRelay { .. }
+            | RoomEvent::StrokeResultRelay { .. }
+            | RoomEvent::StrokeSettlementRequested(_)
+            | RoomEvent::StrokeAbortRequested(_)
+            | RoomEvent::StrokeCommitted(_)
+            | RoomEvent::StrokeAborted(_) => Ok(RoomEventEffect::Remain),
         }
     }
 

@@ -86,7 +86,7 @@ fn standings() -> StrokeStandings {
             StrokeStandingEntry::new(
                 22,
                 2,
-                StrokeCompletion::GiveUp,
+                StrokeCompletion::GameTimeout,
                 0,
                 None,
                 0,
@@ -293,7 +293,7 @@ fn generated_started_and_standings_fixture_semantics_are_exact() {
         (
             22,
             2,
-            StrokeCompletion::GiveUp,
+            StrokeCompletion::GameTimeout,
             0,
             None,
             0,
@@ -338,6 +338,17 @@ fn constructors_enforce_all_finite_bounds_and_authority_invariants() {
     assert!(StrokeLoadingComplete::new(99).is_err());
     assert!(StrokeLoadingComplete::new(100).is_ok());
     assert!(StrokeLoadingComplete::new(101).is_err());
+    for impossible in [0, 1, 99, 101, u8::MAX] {
+        assert!(
+            decode_only(
+                SYNTHETIC_M6_C2S_LOADING_COMPLETE,
+                Direction::ClientToServer,
+                &[impossible],
+            )
+            .is_err(),
+            "impossible loading progress {impossible}"
+        );
+    }
 
     assert!(StrokeShotAction::new(0, 0, 0.0, 0.0, 0.0, 0.0).is_err());
     assert!(StrokeShotAction::new(1, 0, 0.0, -360.0, -1.0, -1.0).is_ok());
@@ -449,6 +460,172 @@ fn constructors_enforce_all_finite_bounds_and_authority_invariants() {
     )
     .expect("duplicate result entry");
     assert!(StrokeStandings::new(id, [first, duplicate_result]).is_err());
+}
+
+#[test]
+fn standings_require_exact_winner_by_forfeit_pair_on_construct_and_decode() {
+    let id = Uuid::from_bytes(MATCH_BYTES);
+    let entry = |connection_id, place, completion, result_id| {
+        let scored = matches!(
+            completion,
+            StrokeCompletion::Holed | StrokeCompletion::StrokeCap
+        );
+        StrokeStandingEntry::new(
+            connection_id,
+            place,
+            completion,
+            u16::from(scored),
+            scored.then_some(0),
+            u64::from(completion == StrokeCompletion::WinnerByForfeit) * 10,
+            u64::from(completion == StrokeCompletion::WinnerByForfeit) * 5,
+            result_id,
+        )
+        .expect("entry")
+    };
+    for direct in [
+        StrokeCompletion::GiveUp,
+        StrokeCompletion::Disconnect,
+        StrokeCompletion::TurnTimeout,
+    ] {
+        assert!(
+            StrokeStandings::new(
+                id,
+                [
+                    entry(
+                        1,
+                        1,
+                        StrokeCompletion::WinnerByForfeit,
+                        Uuid::from_bytes(RESULT_1_BYTES)
+                    ),
+                    entry(2, 2, direct, Uuid::from_bytes(RESULT_2_BYTES)),
+                ],
+            )
+            .is_ok()
+        );
+    }
+    for malformed in [
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::GiveUp,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::GameTimeout,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::GameTimeout,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::Holed,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::GiveUp,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+    ] {
+        assert!(StrokeStandings::new(id, malformed).is_err());
+    }
+    assert!(
+        StrokeStandings::new(
+            id,
+            [
+                entry(
+                    1,
+                    1,
+                    StrokeCompletion::GameTimeout,
+                    Uuid::from_bytes(RESULT_1_BYTES)
+                ),
+                entry(
+                    2,
+                    2,
+                    StrokeCompletion::GameTimeout,
+                    Uuid::from_bytes(RESULT_2_BYTES)
+                ),
+            ],
+        )
+        .is_ok()
+    );
+
+    let valid = StrokeStandings::new(
+        id,
+        [
+            entry(
+                1,
+                1,
+                StrokeCompletion::WinnerByForfeit,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            ),
+            entry(
+                2,
+                2,
+                StrokeCompletion::GiveUp,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            ),
+        ],
+    )
+    .expect("valid pair");
+    let mut invalid_wire = body(&valid);
+    invalid_wire[73] = StrokeCompletion::GameTimeout as u8;
+    assert!(
+        decode_only(
+            SYNTHETIC_M6_S2C_STANDINGS,
+            Direction::ServerToClient,
+            &invalid_wire,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -638,40 +815,72 @@ fn every_closed_discriminator_round_trips_and_unknowns_reject() {
         StrokeCompletion::Disconnect,
         StrokeCompletion::TurnTimeout,
         StrokeCompletion::GameTimeout,
+        StrokeCompletion::WinnerByForfeit,
     ]
     .into_iter()
     .enumerate()
     {
+        let direct_forfeit = matches!(
+            completion,
+            StrokeCompletion::GiveUp | StrokeCompletion::Disconnect | StrokeCompletion::TurnTimeout
+        );
+        let target_place = if direct_forfeit { 2 } else { 1 };
         let score = matches!(
             completion,
             StrokeCompletion::Holed | StrokeCompletion::StrokeCap
         )
         .then_some(0);
-        let strokes = u16::from(score.is_some());
-        let entry = StrokeStandingEntry::new(
-            1,
-            1,
+        let target = StrokeStandingEntry::new(
+            if direct_forfeit { 2 } else { 1 },
+            target_place,
             completion,
-            strokes,
+            u16::from(score.is_some()),
             score,
-            0,
-            0,
-            Uuid::from_bytes(RESULT_1_BYTES),
+            u64::from(completion == StrokeCompletion::WinnerByForfeit) * 10,
+            u64::from(completion == StrokeCompletion::WinnerByForfeit) * 5,
+            Uuid::from_bytes(if direct_forfeit {
+                RESULT_2_BYTES
+            } else {
+                RESULT_1_BYTES
+            }),
         )
-        .expect("entry");
-        let other = StrokeStandingEntry::new(
-            2,
-            2,
-            StrokeCompletion::GiveUp,
-            0,
-            None,
-            0,
-            0,
-            Uuid::from_bytes(RESULT_2_BYTES),
-        )
-        .expect("other");
+        .expect("target entry");
+        let counterpart = if direct_forfeit {
+            StrokeStandingEntry::new(
+                1,
+                1,
+                StrokeCompletion::WinnerByForfeit,
+                0,
+                None,
+                10,
+                5,
+                Uuid::from_bytes(RESULT_1_BYTES),
+            )
+        } else {
+            StrokeStandingEntry::new(
+                2,
+                2,
+                if completion == StrokeCompletion::WinnerByForfeit {
+                    StrokeCompletion::GiveUp
+                } else {
+                    StrokeCompletion::GameTimeout
+                },
+                0,
+                None,
+                0,
+                0,
+                Uuid::from_bytes(RESULT_2_BYTES),
+            )
+        }
+        .expect("counterpart entry");
+        let entries = if direct_forfeit {
+            [counterpart, target]
+        } else {
+            [target, counterpart]
+        };
+        let completion_offset = if direct_forfeit { 75 } else { 28 };
         assert_eq!(
-            encoded(&StrokeStandings::new(id, [entry, other]).expect("standings"))[28],
+            encoded(&StrokeStandings::new(id, entries).expect("standings"))[completion_offset],
             wire as u8
         );
     }

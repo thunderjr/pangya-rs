@@ -1660,6 +1660,8 @@ pub enum StrokeCompletion {
     Holed,
     /// Configured stroke cap was reached.
     StrokeCap,
+    /// The opponent forfeited; no golf score or course record is fabricated.
+    WinnerByForfeit,
     /// Participant voluntarily gave up.
     GiveUp,
     /// Participant disconnected in game.
@@ -1674,7 +1676,10 @@ impl StrokeCompletion {
     /// Whether this completion receives the non-forfeit formula.
     #[must_use]
     pub const fn is_forfeit(self) -> bool {
-        !matches!(self, Self::Holed | Self::StrokeCap)
+        matches!(
+            self,
+            Self::GiveUp | Self::Disconnect | Self::TurnTimeout | Self::GameTimeout
+        )
     }
 
     /// Whether this completion may update a course record.
@@ -1729,14 +1734,20 @@ impl StrokePlayerCommit {
     /// Validates completion/stroke consistency.
     ///
     /// # Errors
-    /// Non-forfeits require a positive persisted `SMALLINT`; forfeits permit zero.
+    /// Holed/stroke-cap finishes require a positive persisted `SMALLINT`; forfeits and a
+    /// truthful winner-by-forfeit permit zero authoritative strokes.
     pub const fn new(
         participant: StrokeParticipant,
         strokes: u16,
         place: StrokePlace,
         completion: StrokeCompletion,
     ) -> Result<Self, MatchValueError> {
-        if strokes > i16::MAX as u16 || (!completion.is_forfeit() && strokes == 0) {
+        if strokes > i16::MAX as u16
+            || (matches!(
+                completion,
+                StrokeCompletion::Holed | StrokeCompletion::StrokeCap
+            ) && strokes == 0)
+        {
             Err(MatchValueError::InvalidStrokeSettlement)
         } else {
             Ok(Self {
@@ -1752,7 +1763,7 @@ impl StrokePlayerCommit {
     pub const fn participant(self) -> StrokeParticipant {
         self.participant
     }
-    /// Authoritative strokes; zero is allowed only for forfeits.
+    /// Authoritative strokes; zero is allowed for forfeits and winner-by-forfeit.
     #[must_use]
     pub const fn strokes(self) -> u16 {
         self.strokes
@@ -1779,7 +1790,7 @@ pub struct CommitStrokeMatch {
 }
 
 impl CommitStrokeMatch {
-    /// Validates roster order, distinct keys/accounts, and unique places.
+    /// Validates roster order, distinct keys/accounts, unique places, and forfeit pairing.
     ///
     /// # Errors
     /// Returns a typed value error for any aggregate cardinality/standing drift.
@@ -1795,6 +1806,43 @@ impl CommitStrokeMatch {
             || participants
                 .iter()
                 .any(|participant| participant.player_result_key == result_key)
+        {
+            return Err(MatchValueError::InvalidStrokeSettlement);
+        }
+        let winner_by_forfeit = players.iter().filter(|player| {
+            player.completion == StrokeCompletion::WinnerByForfeit
+                && player.place == StrokePlace::First
+        });
+        let direct_forfeit = players.iter().filter(|player| {
+            matches!(
+                player.completion,
+                StrokeCompletion::GiveUp
+                    | StrokeCompletion::Disconnect
+                    | StrokeCompletion::TurnTimeout
+            ) && player.place == StrokePlace::Second
+        });
+        let winner_count = players
+            .iter()
+            .filter(|player| player.completion == StrokeCompletion::WinnerByForfeit)
+            .count();
+        let direct_forfeit_count = players
+            .iter()
+            .filter(|player| {
+                matches!(
+                    player.completion,
+                    StrokeCompletion::GiveUp
+                        | StrokeCompletion::Disconnect
+                        | StrokeCompletion::TurnTimeout
+                )
+            })
+            .count();
+        if (winner_count, direct_forfeit_count) != (0, 0)
+            && (
+                winner_by_forfeit.count(),
+                direct_forfeit.count(),
+                winner_count,
+                direct_forfeit_count,
+            ) != (1, 1, 1, 1)
         {
             return Err(MatchValueError::InvalidStrokeSettlement);
         }
@@ -1864,7 +1912,8 @@ impl StrokeReward {
 
 /// Computes the server-only `stroke-two-v1` formula.
 ///
-/// Non-forfeits reuse checked `solo-v1`; forfeits have no score and zero reward.
+/// Holed/stroke-cap finishes reuse checked `solo-v1`; a truthful winner-by-forfeit has no
+/// score and fixed Pang 10/EXP 5; forfeits have no score and zero reward.
 ///
 /// # Errors
 /// Returns [`MatchValueError::ArithmeticOverflow`] from checked non-forfeit math.
@@ -1878,6 +1927,12 @@ pub fn synthetic_stroke_reward_v1(
             return Err(MatchValueError::InvalidStrokeSettlement);
         }
         return Ok(StrokeReward::from_persisted(None, 0, 0));
+    }
+    if completion == StrokeCompletion::WinnerByForfeit {
+        if strokes > i16::MAX as u16 {
+            return Err(MatchValueError::InvalidStrokeSettlement);
+        }
+        return Ok(StrokeReward::from_persisted(None, 10, 5));
     }
     let strokes = StrokeCount::new(strokes)?;
     let reward = synthetic_solo_reward_v1(config, strokes)?;
@@ -2930,6 +2985,10 @@ mod tests {
             synthetic_stroke_reward_v1(config, 0, StrokeCompletion::Disconnect),
             Ok(StrokeReward::from_persisted(None, 0, 0))
         );
+        assert_eq!(
+            synthetic_stroke_reward_v1(config, 0, StrokeCompletion::WinnerByForfeit),
+            Ok(StrokeReward::from_persisted(None, 10, 5))
+        );
     }
 
     #[test]
@@ -2989,6 +3048,94 @@ mod tests {
                 [first_commit, duplicate_place],
             ),
             Err(MatchValueError::InvalidStrokeSettlement)
+        );
+    }
+
+    #[test]
+    fn stroke_winner_by_forfeit_requires_exact_direct_forfeit_pair() {
+        let aggregate_key = MatchResultKey::new(Uuid::from_u128(10));
+        let participants = [
+            StrokeParticipant::new(
+                AccountId::new(10).expect("account"),
+                StrokeRosterOrder::First,
+                MatchResultKey::new(Uuid::from_u128(11)),
+            ),
+            StrokeParticipant::new(
+                AccountId::new(20).expect("account"),
+                StrokeRosterOrder::Second,
+                MatchResultKey::new(Uuid::from_u128(12)),
+            ),
+        ];
+        let config =
+            OneHoleConfig::new(CourseId::new(7).expect("course"), 4).expect("configuration");
+        let commit = |left: (StrokePlace, StrokeCompletion),
+                      right: (StrokePlace, StrokeCompletion)| {
+            let strokes = |completion| {
+                u16::from(matches!(
+                    completion,
+                    StrokeCompletion::Holed | StrokeCompletion::StrokeCap
+                ))
+            };
+            let players = [
+                StrokePlayerCommit::new(participants[0], strokes(left.1), left.0, left.1)
+                    .expect("left"),
+                StrokePlayerCommit::new(participants[1], strokes(right.1), right.0, right.1)
+                    .expect("right"),
+            ];
+            CommitStrokeMatch::new(
+                MatchId::new(Uuid::from_u128(13)),
+                aggregate_key,
+                config,
+                players,
+            )
+        };
+        for direct in [
+            StrokeCompletion::GiveUp,
+            StrokeCompletion::Disconnect,
+            StrokeCompletion::TurnTimeout,
+        ] {
+            assert!(
+                commit(
+                    (StrokePlace::First, StrokeCompletion::WinnerByForfeit),
+                    (StrokePlace::Second, direct),
+                )
+                .is_ok()
+            );
+        }
+        for malformed in [
+            (
+                (StrokePlace::First, StrokeCompletion::WinnerByForfeit),
+                (StrokePlace::Second, StrokeCompletion::WinnerByForfeit),
+            ),
+            (
+                (StrokePlace::First, StrokeCompletion::GiveUp),
+                (StrokePlace::Second, StrokeCompletion::WinnerByForfeit),
+            ),
+            (
+                (StrokePlace::First, StrokeCompletion::WinnerByForfeit),
+                (StrokePlace::Second, StrokeCompletion::GameTimeout),
+            ),
+            (
+                (StrokePlace::First, StrokeCompletion::GameTimeout),
+                (StrokePlace::Second, StrokeCompletion::WinnerByForfeit),
+            ),
+            (
+                (StrokePlace::First, StrokeCompletion::Holed),
+                (StrokePlace::Second, StrokeCompletion::GiveUp),
+            ),
+        ] {
+            assert_eq!(
+                commit(malformed.0, malformed.1),
+                Err(MatchValueError::InvalidStrokeSettlement)
+            );
+        }
+        assert!(
+            commit(
+                (StrokePlace::First, StrokeCompletion::GameTimeout),
+                (StrokePlace::Second, StrokeCompletion::GameTimeout),
+            )
+            .is_ok(),
+            "normal no-winner standings remain valid"
         );
     }
 

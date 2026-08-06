@@ -9,4 +9,4 @@ direction: server-to-client
 expected_opcode: 0x7fb5
 redaction_status: generated-no-source; no proprietary, credential, bearer, personal, or client data
 expected_behavior: closed committed two-entry standings with canonical optional scores
-sha256_fixture: 2f85872375d82a6b98082d5446f2f6640b1401a34304d02d902743c03231a55d
+sha256_fixture: 77b698d85ca7362aab75d2c1bf41232ede16855b4e55bc69b1411f5974653359

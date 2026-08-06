@@ -3,12 +3,15 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use pangya_domain::{
-    AbortMatch, AccountId, BeginSoloMatch, ChatText, CommitSoloHole, MarkSoloInGame,
-    MatchAbortReason, MatchId, MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId,
-    RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
-    SoloMatchResult,
+    AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, ChatText,
+    CommitSoloHole, CommitStrokeMatch, MarkSoloInGame, MarkStrokeInGame, MatchAbortReason, MatchId,
+    MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId, RoomError, RoomId, RoomName,
+    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, SoloMatchResult, StrokeMatchResult,
 };
-use pangya_protocol::{LoadingComplete, ShotAction, ShotResult};
+use pangya_protocol::{
+    LoadingComplete, ShotAction, ShotResult, StrokeLoadingComplete, StrokeShotAction,
+    StrokeShotResult,
+};
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -18,8 +21,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::match_state::{
-    RelayDisposition, SoloMatchError, SoloMatchPhase, SoloMatchState, SoloStartPlan,
+use crate::{
+    match_state::{
+        RelayDisposition, SoloMatchError, SoloMatchPhase, SoloMatchState, SoloStartPlan,
+    },
+    stroke_state::{
+        StrokeDeadline, StrokeDeadlineOutcome, StrokeLoadingOutcome, StrokeMatchError,
+        StrokeMatchPhase, StrokeMatchState, StrokeRelayOutcome, StrokeStartPlan,
+    },
 };
 
 /// Identity established by the connection/authentication boundary.
@@ -77,6 +86,39 @@ pub enum RoomEvent {
     AbortRequested(AbortMatch),
     /// Trusted persisted result committed and the room returned to open.
     SoloCommitted(SoloMatchResult),
+    /// Persisted checked stroke plan confirmed for both captured participants.
+    StrokeStarted(StrokeStartPlan),
+    /// Authoritative stroke phase changed.
+    StrokePhase {
+        /// Durable match identity.
+        match_id: MatchId,
+        /// Pure authoritative phase.
+        phase: StrokeMatchPhase,
+    },
+    /// A new turn started; broadcast identically to both participants.
+    StrokeTurn(StrokeMatchPhase),
+    /// Newly accepted validated stroke action.
+    StrokeActionRelay {
+        /// Captured sender connection.
+        from: PlayerConnectionId,
+        /// Validated protocol value.
+        action: StrokeShotAction,
+    },
+    /// Newly accepted validated stroke result.
+    StrokeResultRelay {
+        /// Captured sender connection.
+        from: PlayerConnectionId,
+        /// Validated protocol value.
+        result: StrokeShotResult,
+    },
+    /// Exactly one connected coordinator must persist this aggregate settlement.
+    StrokeSettlementRequested(CommitStrokeMatch),
+    /// Exactly one connected coordinator must persist this no-reward abort.
+    StrokeAbortRequested(AbortStrokeMatch),
+    /// Trusted persisted aggregate committed and room returned open.
+    StrokeCommitted(StrokeMatchResult),
+    /// Exact durable stroke abort was acknowledged.
+    StrokeAborted(AbortStrokeMatch),
     /// The room shut down.
     Closed,
 }
@@ -182,6 +224,110 @@ impl Member {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatchDeadlineKind {
+    SoloLoading,
+    StrokeLoading,
+    StrokeTurn(u64),
+    StrokeGame(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScheduledDeadline {
+    at: Instant,
+    kind: MatchDeadlineKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingStrokePersistence {
+    Abort(AbortStrokeMatch),
+    Settlement(CommitStrokeMatch),
+}
+
+impl PendingStrokePersistence {
+    fn outcome(self, room_id: RoomId) -> RoomCloseOutcome {
+        match self {
+            Self::Abort(request) => RoomCloseOutcome::M6Abort { room_id, request },
+            Self::Settlement(request) => RoomCloseOutcome::M6Settlement { room_id, request },
+        }
+    }
+
+    fn event(self) -> RoomEvent {
+        match self {
+            Self::Abort(request) => RoomEvent::StrokeAbortRequested(request),
+            Self::Settlement(request) => RoomEvent::StrokeSettlementRequested(request),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeadlineScheduler {
+    solo_loading: Option<Instant>,
+    stroke_loading: Option<Instant>,
+    stroke_turn: Option<(Instant, u64)>,
+    stroke_game: Option<(Instant, u64)>,
+}
+
+impl DeadlineScheduler {
+    fn next(&self) -> Option<ScheduledDeadline> {
+        let candidates = [
+            self.solo_loading.map(|at| ScheduledDeadline {
+                at,
+                kind: MatchDeadlineKind::SoloLoading,
+            }),
+            self.stroke_loading.map(|at| ScheduledDeadline {
+                at,
+                kind: MatchDeadlineKind::StrokeLoading,
+            }),
+            // The whole-game cap wins an exact tie with a turn cap.
+            self.stroke_game.map(|(at, generation)| ScheduledDeadline {
+                at,
+                kind: MatchDeadlineKind::StrokeGame(generation),
+            }),
+            self.stroke_turn.map(|(at, generation)| ScheduledDeadline {
+                at,
+                kind: MatchDeadlineKind::StrokeTurn(generation),
+            }),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .min_by_key(|deadline| deadline.at)
+    }
+
+    fn clear_kind(&mut self, kind: MatchDeadlineKind) {
+        match kind {
+            MatchDeadlineKind::SoloLoading => self.solo_loading = None,
+            MatchDeadlineKind::StrokeLoading => self.stroke_loading = None,
+            MatchDeadlineKind::StrokeTurn(generation) => {
+                if self
+                    .stroke_turn
+                    .is_some_and(|(_, current)| current == generation)
+                {
+                    self.stroke_turn = None;
+                }
+            }
+            MatchDeadlineKind::StrokeGame(generation) => {
+                if self
+                    .stroke_game
+                    .is_some_and(|(_, current)| current == generation)
+                {
+                    self.stroke_game = None;
+                }
+            }
+        }
+    }
+
+    fn clear_solo(&mut self) {
+        self.solo_loading = None;
+    }
+    fn clear_stroke(&mut self) {
+        self.stroke_loading = None;
+        self.stroke_turn = None;
+        self.stroke_game = None;
+    }
+}
+
 struct RoomState {
     id: RoomId,
     name: RoomName,
@@ -190,7 +336,11 @@ struct RoomState {
     members: Vec<Member>,
     next_join_order: u64,
     solo: SoloMatchState,
-    loading_deadline: Option<Instant>,
+    stroke: StrokeMatchState,
+    pending_stroke_persistence: Option<PendingStrokePersistence>,
+    stroke_persistence_event_delivered: bool,
+    stroke_persistence_control_delivered: bool,
+    deadlines: DeadlineScheduler,
 }
 
 impl RoomState {
@@ -218,13 +368,23 @@ impl RoomState {
             }],
             next_join_order: 1,
             solo: SoloMatchState::new(),
-            loading_deadline: None,
+            stroke: StrokeMatchState::new(),
+            pending_stroke_persistence: None,
+            stroke_persistence_event_delivered: false,
+            stroke_persistence_control_delivered: false,
+            deadlines: DeadlineScheduler::default(),
         }
     }
 
-    fn deliver(&self, member: &Member, event: RoomEvent) {
-        if member.outbound.try_send(event).is_err() {
+    fn deliver(&self, member: &Member, event: RoomEvent) -> bool {
+        if member.cancellation.is_cancelled() {
+            return false;
+        }
+        if member.outbound.try_send(event).is_ok() {
+            true
+        } else {
             member.cancellation.cancel();
+            false
         }
     }
 
@@ -232,6 +392,10 @@ impl RoomState {
         self.members
             .iter()
             .position(|member| member.identity.connection_id == connection_id)
+    }
+
+    fn match_active(&self) -> bool {
+        self.solo.is_active() || self.stroke.is_active()
     }
 
     fn summary(&self) -> RoomSummary {
@@ -276,7 +440,7 @@ impl RoomState {
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
-        if self.solo.is_active() {
+        if self.match_active() {
             return Err(RoomError::MatchActive);
         }
         if self.member_index(identity.connection_id).is_some() {
@@ -336,7 +500,7 @@ impl RoomState {
         caller: PlayerConnectionId,
         settings: RoomSettings,
     ) -> Result<RoomSnapshot, RoomError> {
-        if self.solo.is_active() {
+        if self.match_active() {
             return Err(RoomError::MatchActive);
         }
         let caller = self.member_index(caller).ok_or(RoomError::NotMember)?;
@@ -355,7 +519,7 @@ impl RoomState {
         caller: PlayerConnectionId,
         ready: bool,
     ) -> Result<RoomSnapshot, RoomError> {
-        if self.solo.is_active() {
+        if self.match_active() {
             return Err(RoomError::MatchActive);
         }
         let caller = self.member_index(caller).ok_or(RoomError::NotMember)?;
@@ -364,7 +528,7 @@ impl RoomState {
     }
 
     fn chat(&self, caller: PlayerConnectionId, text: ChatText) -> Result<(), RoomError> {
-        if self.solo.is_active() {
+        if self.match_active() {
             return Err(RoomError::MatchActive);
         }
         let caller = self.member_index(caller).ok_or(RoomError::NotMember)?;
@@ -373,7 +537,7 @@ impl RoomState {
             text,
         };
         for member in &self.members {
-            self.deliver(member, event.clone());
+            let _delivered = self.deliver(member, event.clone());
         }
         Ok(())
     }
@@ -383,7 +547,7 @@ impl RoomState {
         caller: PlayerConnectionId,
         target: PlayerConnectionId,
     ) -> Result<RoomSnapshot, RoomError> {
-        if self.solo.is_active() {
+        if self.match_active() {
             return Err(RoomError::MatchActive);
         }
         let caller_index = self.member_index(caller).ok_or(RoomError::NotMember)?;
@@ -396,7 +560,7 @@ impl RoomState {
         let target_index = self.member_index(target).ok_or(RoomError::MemberNotFound)?;
         let owner = self.members[caller_index].snapshot();
         let target = self.members.remove(target_index);
-        self.deliver(&target, RoomEvent::Kicked { by: owner });
+        let _delivered = self.deliver(&target, RoomEvent::Kicked { by: owner });
         Ok(self.snapshot())
     }
 
@@ -417,6 +581,9 @@ impl RoomState {
         plan: SoloStartPlan,
     ) -> Result<BeginSoloMatch, SoloMatchError> {
         let owner = self.solo_owner(caller)?;
+        if self.stroke.is_active() {
+            return Err(SoloMatchError::InvalidPhase);
+        }
         if self.members.len() != 1 {
             return Err(SoloMatchError::NotSolo);
         }
@@ -438,7 +605,7 @@ impl RoomState {
             .solo
             .loading_timeout()
             .ok_or(SoloMatchError::InvalidPhase)?;
-        self.loading_deadline = Some(Instant::now() + timeout);
+        self.deadlines.solo_loading = Some(Instant::now() + timeout);
         let plan = self
             .solo
             .start_plan()
@@ -471,7 +638,7 @@ impl RoomState {
         let begin = self.solo.begin().ok_or(SoloMatchError::InvalidPhase)?;
         let mark = MarkSoloInGame::new(begin.match_id(), begin.result_key(), begin.account_id());
         self.solo.loading_complete(loading.progress())?;
-        self.loading_deadline = None;
+        self.deadlines.clear_solo();
         self.deliver_solo(RoomEvent::SoloPhase {
             match_id: mark.match_id(),
             phase: self.solo.phase(),
@@ -559,7 +726,7 @@ impl RoomState {
         reason: MatchAbortReason,
     ) -> Result<Option<AbortMatch>, SoloMatchError> {
         self.solo_owner(caller)?;
-        self.loading_deadline = None;
+        self.deadlines.clear_solo();
         Ok(self.solo.abort(reason))
     }
 
@@ -577,8 +744,451 @@ impl RoomState {
         Ok(())
     }
 
+    fn stroke_participant(&self, caller: PlayerConnectionId) -> Result<&Member, StrokeMatchError> {
+        let member = self
+            .member_index(caller)
+            .and_then(|index| self.members.get(index))
+            .ok_or(StrokeMatchError::NotMember)?;
+        let rostered = self
+            .stroke
+            .start_plan()
+            .is_some_and(|plan| plan.roster().contains(&caller));
+        if self.stroke.is_active() && !rostered {
+            return Err(StrokeMatchError::NotParticipant);
+        }
+        Ok(member)
+    }
+
+    fn prepare_stroke_start(
+        &mut self,
+        caller: PlayerConnectionId,
+        plan: StrokeStartPlan,
+    ) -> Result<BeginStrokeMatch, StrokeMatchError> {
+        if self.solo.is_active() || self.stroke.is_active() {
+            return Err(StrokeMatchError::InvalidPhase);
+        }
+        let caller_index = self
+            .member_index(caller)
+            .ok_or(StrokeMatchError::NotMember)?;
+        if !self.members[caller_index].owner {
+            return Err(StrokeMatchError::NotOwner);
+        }
+        if self.members.len() != 2 {
+            return Err(StrokeMatchError::NotExactlyTwo);
+        }
+        if self.members.iter().any(|member| !member.ready) {
+            return Err(StrokeMatchError::NotReady);
+        }
+        let mut order = [0_usize, 1_usize];
+        order.sort_by_key(|index| {
+            let member = &self.members[*index];
+            (member.joined_order, member.identity.connection_id)
+        });
+        let roster = [
+            self.members[order[0]].identity.connection_id,
+            self.members[order[1]].identity.connection_id,
+        ];
+        let accounts = [
+            self.members[order[0]].identity.account_id,
+            self.members[order[1]].identity.account_id,
+        ];
+        let participants = plan.begin().participants();
+        if accounts[0] == accounts[1]
+            || *plan.roster() != roster
+            || participants[0].account_id() != accounts[0]
+            || participants[1].account_id() != accounts[1]
+        {
+            return Err(StrokeMatchError::RosterMismatch);
+        }
+        let begin = self.stroke.prepare_start(plan)?;
+        self.pending_stroke_persistence = None;
+        self.stroke_persistence_event_delivered = false;
+        self.stroke_persistence_control_delivered = false;
+        Ok(begin)
+    }
+
+    fn confirm_stroke_begin(
+        &mut self,
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+    ) -> Result<(), StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        self.stroke.confirm_begin(match_id, result_key)?;
+        let plan = self
+            .stroke
+            .start_plan()
+            .cloned()
+            .ok_or(StrokeMatchError::InvalidPhase)?;
+        self.deadlines.stroke_loading = Some(Instant::now() + plan.loading_timeout());
+        self.broadcast_match(RoomEvent::StrokeStarted(plan));
+        self.broadcast_match(RoomEvent::StrokePhase {
+            match_id,
+            phase: self.stroke.phase(),
+        });
+        Ok(())
+    }
+
+    fn cancel_stroke_begin(
+        &mut self,
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+    ) -> Result<(), StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        self.stroke.cancel_begin(match_id, result_key)
+    }
+
+    fn stroke_loading_complete(
+        &mut self,
+        caller: PlayerConnectionId,
+        loading: StrokeLoadingComplete,
+    ) -> Result<StrokeLoadingOutcome, StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        let outcome = self.stroke.loading_complete(caller, loading.progress())?;
+        if matches!(outcome, StrokeLoadingOutcome::PersistenceRequired(_)) {
+            self.deadlines.stroke_loading = None;
+        }
+        if outcome != StrokeLoadingOutcome::Duplicate {
+            let match_id = self
+                .stroke
+                .start_plan()
+                .map(|plan| plan.begin().match_id())
+                .ok_or(StrokeMatchError::InvalidPhase)?;
+            self.broadcast_match(RoomEvent::StrokePhase {
+                match_id,
+                phase: self.stroke.phase(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    fn confirm_stroke_in_game(&mut self, mark: MarkStrokeInGame) -> Result<(), StrokeMatchError> {
+        self.stroke.confirm_in_game(mark)?;
+        let plan = self
+            .stroke
+            .start_plan()
+            .ok_or(StrokeMatchError::InvalidPhase)?;
+        let now = Instant::now();
+        let turn_generation = self
+            .stroke
+            .turn_generation()
+            .ok_or(StrokeMatchError::Invariant)?;
+        let game_generation = self
+            .stroke
+            .game_generation()
+            .ok_or(StrokeMatchError::Invariant)?;
+        self.deadlines.stroke_turn = Some((now + plan.turn_timeout(), turn_generation));
+        self.deadlines.stroke_game = Some((now + plan.game_timeout(), game_generation));
+        self.broadcast_match(RoomEvent::StrokePhase {
+            match_id: mark.match_id(),
+            phase: self.stroke.phase(),
+        });
+        self.broadcast_match(RoomEvent::StrokeTurn(self.stroke.phase()));
+        Ok(())
+    }
+
+    fn stroke_action(
+        &mut self,
+        caller: PlayerConnectionId,
+        action: StrokeShotAction,
+    ) -> Result<RelayDisposition, StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        let disposition = self.stroke.accept_action(caller, action)?;
+        if disposition == RelayDisposition::Accepted {
+            self.broadcast_match(RoomEvent::StrokeActionRelay {
+                from: caller,
+                action,
+            });
+        }
+        Ok(disposition)
+    }
+
+    fn stroke_result(
+        &mut self,
+        caller: PlayerConnectionId,
+        result: StrokeShotResult,
+    ) -> Result<StrokeRelayOutcome, StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        let outcome = self.stroke.accept_result(caller, result)?;
+        if outcome.disposition() == RelayDisposition::Accepted {
+            self.broadcast_match(RoomEvent::StrokeResultRelay {
+                from: caller,
+                result,
+            });
+            if let Some(commit) = outcome.settlement() {
+                self.deadlines.clear_stroke();
+                self.broadcast_match(RoomEvent::StrokePhase {
+                    match_id: commit.match_id(),
+                    phase: self.stroke.phase(),
+                });
+                let _delivered = self.request_stroke_settlement(commit, None);
+            } else {
+                let plan = self
+                    .stroke
+                    .start_plan()
+                    .ok_or(StrokeMatchError::InvalidPhase)?;
+                let generation = self
+                    .stroke
+                    .turn_generation()
+                    .ok_or(StrokeMatchError::Invariant)?;
+                self.deadlines.stroke_turn =
+                    Some((Instant::now() + plan.turn_timeout(), generation));
+                self.broadcast_match(RoomEvent::StrokeTurn(self.stroke.phase()));
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn stroke_give_up(
+        &mut self,
+        caller: PlayerConnectionId,
+    ) -> Result<CommitStrokeMatch, StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        let commit = self.stroke.give_up(caller)?;
+        self.deadlines.clear_stroke();
+        self.broadcast_match(RoomEvent::StrokePhase {
+            match_id: commit.match_id(),
+            phase: self.stroke.phase(),
+        });
+        let _delivered = self.request_stroke_settlement(commit, None);
+        Ok(commit)
+    }
+
+    fn apply_stroke_commit(
+        &mut self,
+        result: StrokeMatchResult,
+    ) -> Result<StrokeMatchResult, StrokeMatchError> {
+        let roster = self
+            .stroke
+            .roster()
+            .copied()
+            .ok_or(StrokeMatchError::InvalidPhase)?;
+        let committed = self.stroke.apply_commit(result)?;
+        self.pending_stroke_persistence = None;
+        self.stroke_persistence_event_delivered = false;
+        self.stroke_persistence_control_delivered = false;
+        self.deadlines.clear_stroke();
+        self.broadcast_connections(&roster, RoomEvent::StrokeCommitted(committed));
+        Ok(committed)
+    }
+
+    fn abort_stroke(&mut self, reason: MatchAbortReason) -> Option<AbortStrokeMatch> {
+        self.deadlines.clear_stroke();
+        if let Some(pending) = self.pending_stroke_persistence {
+            return match pending {
+                PendingStrokePersistence::Abort(abort) => Some(abort),
+                PendingStrokePersistence::Settlement(_) => None,
+            };
+        }
+        let abort = self.stroke.abort(reason);
+        if let Some(abort) = abort {
+            let _delivered = self.request_stroke_abort(abort, None);
+        }
+        abort
+    }
+
+    fn acknowledge_stroke_abort(
+        &mut self,
+        abort: AbortStrokeMatch,
+    ) -> Result<(), StrokeMatchError> {
+        let roster = self
+            .stroke
+            .roster()
+            .copied()
+            .ok_or(StrokeMatchError::InvalidPhase)?;
+        self.stroke.acknowledge_abort(abort)?;
+        self.pending_stroke_persistence = None;
+        self.stroke_persistence_event_delivered = false;
+        self.stroke_persistence_control_delivered = false;
+        self.broadcast_connections(&roster, RoomEvent::StrokeAborted(abort));
+        Ok(())
+    }
+
+    fn request_stroke_settlement(
+        &mut self,
+        commit: CommitStrokeMatch,
+        excluded: Option<PlayerConnectionId>,
+    ) -> bool {
+        self.request_stroke_persistence(PendingStrokePersistence::Settlement(commit), excluded)
+    }
+
+    fn request_stroke_abort(
+        &mut self,
+        abort: AbortStrokeMatch,
+        excluded: Option<PlayerConnectionId>,
+    ) -> bool {
+        self.request_stroke_persistence(PendingStrokePersistence::Abort(abort), excluded)
+    }
+
+    fn request_stroke_persistence(
+        &mut self,
+        work: PendingStrokePersistence,
+        excluded: Option<PlayerConnectionId>,
+    ) -> bool {
+        match self.pending_stroke_persistence {
+            Some(current) if current != work => return false,
+            Some(_) => {}
+            None => {
+                self.pending_stroke_persistence = Some(work);
+                self.stroke_persistence_event_delivered = false;
+                self.stroke_persistence_control_delivered = false;
+            }
+        }
+        if self.stroke_persistence_event_delivered {
+            return true;
+        }
+
+        let mut candidates: Vec<_> = self
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| {
+                Some(member.identity.connection_id) != excluded
+                    && !member.cancellation.is_cancelled()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        candidates.sort_by_key(|index| {
+            let member = &self.members[*index];
+            (
+                !member.owner,
+                member.joined_order,
+                member.identity.connection_id,
+            )
+        });
+        for index in candidates {
+            let Some(member) = self.members.get(index) else {
+                continue;
+            };
+            if self.deliver(member, work.event()) {
+                self.stroke_persistence_event_delivered = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn claim_stroke_persistence(&mut self) -> RoomCloseOutcome {
+        if self.stroke_persistence_control_delivered {
+            return RoomCloseOutcome::None;
+        }
+        let Some(work) = self.pending_stroke_persistence else {
+            return RoomCloseOutcome::None;
+        };
+        self.stroke_persistence_control_delivered = true;
+        work.outcome(self.id)
+    }
+
+    fn disconnect_outcome(
+        &mut self,
+        caller: PlayerConnectionId,
+        solo_reason: MatchAbortReason,
+    ) -> RoomCloseOutcome {
+        if self.stroke.is_active() {
+            if self.pending_stroke_persistence.is_some() {
+                return self.claim_stroke_persistence();
+            }
+            match self.stroke.disconnect(caller) {
+                Ok(StrokeDeadlineOutcome::Aborted(abort)) => {
+                    self.deadlines.clear_stroke();
+                    let _delivered = self.request_stroke_abort(abort, Some(caller));
+                    self.claim_stroke_persistence()
+                }
+                Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
+                    self.deadlines.clear_stroke();
+                    self.broadcast_match(RoomEvent::StrokePhase {
+                        match_id: commit.match_id(),
+                        phase: self.stroke.phase(),
+                    });
+                    let _delivered = self.request_stroke_settlement(commit, Some(caller));
+                    self.claim_stroke_persistence()
+                }
+                Ok(StrokeDeadlineOutcome::Stale) | Err(_) => RoomCloseOutcome::None,
+            }
+        } else {
+            self.mark_aborted(solo_reason)
+                .map_or(RoomCloseOutcome::None, |abort| RoomCloseOutcome::M5Abort {
+                    room_id: self.id,
+                    request: abort,
+                })
+        }
+    }
+
+    fn shutdown_outcome(&mut self) -> RoomCloseOutcome {
+        if self.stroke.is_active() {
+            if self.pending_stroke_persistence.is_some() {
+                return self.claim_stroke_persistence();
+            }
+            let _abort = self.abort_stroke(MatchAbortReason::Shutdown);
+            self.claim_stroke_persistence()
+        } else {
+            self.mark_aborted(MatchAbortReason::Shutdown)
+                .map_or(RoomCloseOutcome::None, |abort| RoomCloseOutcome::M5Abort {
+                    room_id: self.id,
+                    request: abort,
+                })
+        }
+    }
+
+    fn handle_deadline(&mut self, kind: MatchDeadlineKind) -> RoomCloseOutcome {
+        self.deadlines.clear_kind(kind);
+        match kind {
+            MatchDeadlineKind::SoloLoading => self
+                .mark_aborted(MatchAbortReason::LoadingTimeout)
+                .map_or(RoomCloseOutcome::None, |abort| RoomCloseOutcome::M5Abort {
+                    room_id: self.id,
+                    request: abort,
+                }),
+            MatchDeadlineKind::StrokeLoading => {
+                match self.stroke.deadline_expired(StrokeDeadline::Loading) {
+                    Ok(StrokeDeadlineOutcome::Aborted(abort)) => {
+                        let _delivered = self.request_stroke_abort(abort, None);
+                        RoomCloseOutcome::M6Abort {
+                            room_id: self.id,
+                            request: abort,
+                        }
+                    }
+                    _ => RoomCloseOutcome::None,
+                }
+            }
+            MatchDeadlineKind::StrokeTurn(generation) => {
+                self.handle_stroke_deadline(StrokeDeadline::Turn { generation })
+            }
+            MatchDeadlineKind::StrokeGame(generation) => {
+                self.handle_stroke_deadline(StrokeDeadline::Game { generation })
+            }
+        }
+    }
+
+    fn handle_stroke_deadline(&mut self, deadline: StrokeDeadline) -> RoomCloseOutcome {
+        match self.stroke.deadline_expired(deadline) {
+            Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
+                self.deadlines.clear_stroke();
+                self.broadcast_match(RoomEvent::StrokePhase {
+                    match_id: commit.match_id(),
+                    phase: self.stroke.phase(),
+                });
+                let _delivered = self.request_stroke_settlement(commit, None);
+                RoomCloseOutcome::M6Settlement {
+                    room_id: self.id,
+                    request: commit,
+                }
+            }
+            Ok(StrokeDeadlineOutcome::Aborted(abort)) => {
+                self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_abort(abort, None);
+                RoomCloseOutcome::M6Abort {
+                    room_id: self.id,
+                    request: abort,
+                }
+            }
+            Ok(StrokeDeadlineOutcome::Stale) | Err(_) => RoomCloseOutcome::None,
+        }
+    }
+
     fn mark_aborted(&mut self, reason: MatchAbortReason) -> Option<AbortMatch> {
-        self.loading_deadline = None;
+        self.deadlines.clear_solo();
         let abort = self.solo.abort(reason);
         if let Some(abort) = abort {
             self.deliver_solo(RoomEvent::AbortRequested(abort));
@@ -588,13 +1198,29 @@ impl RoomState {
 
     fn deliver_solo(&self, event: RoomEvent) {
         if let Some(member) = self.members.first() {
-            self.deliver(member, event);
+            let _delivered = self.deliver(member, event);
+        }
+    }
+
+    fn broadcast_match(&self, event: RoomEvent) {
+        if let Some(roster) = self.stroke.roster() {
+            self.broadcast_connections(roster, event);
+        }
+    }
+
+    fn broadcast_connections(&self, roster: &[PlayerConnectionId; 2], event: RoomEvent) {
+        for connection_id in roster {
+            if let Some(index) = self.member_index(*connection_id)
+                && let Some(member) = self.members.get(index)
+            {
+                let _delivered = self.deliver(member, event.clone());
+            }
         }
     }
 
     fn broadcast_snapshot(&self, snapshot: &RoomSnapshot) {
         for member in &self.members {
-            self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
+            let _delivered = self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
         }
     }
 }
@@ -685,6 +1311,110 @@ enum RoomCommand {
         abort: AbortMatch,
         reply: oneshot::Sender<Result<(), SoloMatchError>>,
     },
+    PrepareStrokeStart {
+        caller: PlayerConnectionId,
+        plan: StrokeStartPlan,
+        reply: oneshot::Sender<Result<BeginStrokeMatch, StrokeMatchError>>,
+    },
+    ConfirmStrokeBegin {
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
+    },
+    CancelStrokeBegin {
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
+    },
+    StrokeLoading {
+        caller: PlayerConnectionId,
+        loading: StrokeLoadingComplete,
+        reply: oneshot::Sender<Result<StrokeLoadingOutcome, StrokeMatchError>>,
+    },
+    ConfirmStrokeInGame {
+        mark: MarkStrokeInGame,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
+    },
+    StrokeAction {
+        caller: PlayerConnectionId,
+        action: StrokeShotAction,
+        reply: oneshot::Sender<Result<RelayDisposition, StrokeMatchError>>,
+    },
+    StrokeResult {
+        caller: PlayerConnectionId,
+        result: StrokeShotResult,
+        reply: oneshot::Sender<Result<StrokeRelayOutcome, StrokeMatchError>>,
+    },
+    StrokeGiveUp {
+        caller: PlayerConnectionId,
+        reply: oneshot::Sender<Result<CommitStrokeMatch, StrokeMatchError>>,
+    },
+    ApplyStrokeCommit {
+        result: StrokeMatchResult,
+        reply: oneshot::Sender<Result<StrokeMatchResult, StrokeMatchError>>,
+    },
+    AbortStroke {
+        reason: MatchAbortReason,
+        reply: oneshot::Sender<Option<AbortStrokeMatch>>,
+    },
+    AcknowledgeStrokeAbort {
+        abort: AbortStrokeMatch,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
+    },
+}
+
+/// Persistence work retained by a room closure/control transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomCloseOutcome {
+    /// No active persistence work.
+    None,
+    /// M5 no-reward abort.
+    M5Abort {
+        /// Authoritative room identity.
+        room_id: RoomId,
+        /// Exact solo abort request.
+        request: AbortMatch,
+    },
+    /// M6 no-reward aggregate abort.
+    M6Abort {
+        /// Authoritative room identity.
+        room_id: RoomId,
+        /// Exact aggregate abort request.
+        request: AbortStrokeMatch,
+    },
+    /// M6 aggregate settlement after an in-game forfeit/deadline.
+    M6Settlement {
+        /// Authoritative room identity.
+        room_id: RoomId,
+        /// Exact aggregate settlement request.
+        request: CommitStrokeMatch,
+    },
+}
+
+impl RoomCloseOutcome {
+    /// Authoritative room identity when work exists.
+    #[must_use]
+    pub const fn room_id(self) -> Option<RoomId> {
+        match self {
+            Self::None => None,
+            Self::M5Abort { room_id, .. }
+            | Self::M6Abort { room_id, .. }
+            | Self::M6Settlement { room_id, .. } => Some(room_id),
+        }
+    }
+
+    /// Durable match identity when work exists.
+    #[must_use]
+    pub const fn match_id(self) -> Option<MatchId> {
+        match self {
+            Self::None => None,
+            Self::M5Abort { request, .. } => Some(request.match_id()),
+            Self::M6Abort { request, .. } => Some(request.match_id()),
+            Self::M6Settlement { request, .. } => Some(request.match_id()),
+        }
+    }
 }
 
 /// Atomic priority-disconnect output used by the lobby registry.
@@ -692,7 +1422,9 @@ enum RoomCommand {
 pub struct RoomDisconnect {
     /// Post-removal room projection, or `None` when the room closed.
     pub snapshot: Option<RoomSnapshot>,
-    /// Idempotent no-reward abort produced before member removal.
+    /// Closed persistence work with room/match authority.
+    pub outcome: RoomCloseOutcome,
+    /// Compatibility M5 abort projection.
     pub abort: Option<AbortMatch>,
 }
 
@@ -703,7 +1435,7 @@ enum ControlCommand {
         reply: oneshot::Sender<Result<RoomDisconnect, RoomError>>,
     },
     Shutdown {
-        reply: oneshot::Sender<Option<AbortMatch>>,
+        reply: oneshot::Sender<RoomCloseOutcome>,
     },
 }
 
@@ -995,6 +1727,154 @@ impl RoomHandle {
         receive.await.map_err(|_| SoloMatchError::Closed)?
     }
 
+    fn send_stroke(&self, command: RoomCommand) -> Result<(), StrokeMatchError> {
+        self.send_normal(command).map_err(map_room_to_stroke)
+    }
+
+    /// Reserves an exact checked two-player stroke plan.
+    pub async fn prepare_stroke_start(
+        &self,
+        caller: PlayerConnectionId,
+        plan: StrokeStartPlan,
+    ) -> Result<BeginStrokeMatch, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::PrepareStrokeStart {
+            caller,
+            plan,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Confirms begin persistence and starts loading deadline.
+    pub async fn confirm_stroke_begin(
+        &self,
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::ConfirmStrokeBegin {
+            caller,
+            match_id,
+            result_key,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Cancels an exact unpersisted stroke reservation.
+    pub async fn cancel_stroke_begin(
+        &self,
+        caller: PlayerConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::CancelStrokeBegin {
+            caller,
+            match_id,
+            result_key,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies one canonical per-member loading completion.
+    pub async fn stroke_loading_complete(
+        &self,
+        caller: PlayerConnectionId,
+        loading: StrokeLoadingComplete,
+    ) -> Result<StrokeLoadingOutcome, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::StrokeLoading {
+            caller,
+            loading,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies the durable loading-to-in-game confirmation by room/match authority.
+    pub async fn confirm_stroke_in_game(
+        &self,
+        mark: MarkStrokeInGame,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::ConfirmStrokeInGame { mark, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies one validated stroke action.
+    pub async fn stroke_action(
+        &self,
+        caller: PlayerConnectionId,
+        action: StrokeShotAction,
+    ) -> Result<RelayDisposition, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::StrokeAction {
+            caller,
+            action,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies one validated stroke result.
+    pub async fn stroke_result(
+        &self,
+        caller: PlayerConnectionId,
+        result: StrokeShotResult,
+    ) -> Result<StrokeRelayOutcome, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::StrokeResult {
+            caller,
+            result,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies any participant's give-up and returns automatic settlement.
+    pub async fn stroke_give_up(
+        &self,
+        caller: PlayerConnectionId,
+    ) -> Result<CommitStrokeMatch, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::StrokeGiveUp { caller, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Applies trusted aggregate persistence output without requiring a connection mapping.
+    pub async fn apply_stroke_commit(
+        &self,
+        result: StrokeMatchResult,
+    ) -> Result<StrokeMatchResult, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::ApplyStrokeCommit { result, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Converts any active stroke state to an exact no-reward abort.
+    pub async fn abort_stroke(
+        &self,
+        reason: MatchAbortReason,
+    ) -> Result<Option<AbortStrokeMatch>, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::AbortStroke { reason, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)
+    }
+
+    /// Acknowledges an exact stroke abort by room/match authority.
+    pub async fn acknowledge_stroke_abort(
+        &self,
+        abort: AbortStrokeMatch,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::AcknowledgeStrokeAbort { abort, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
     async fn send_control(&self, command: ControlCommand) -> Result<(), RoomError> {
         timeout(self.control_timeout, self.control.send(command))
             .await
@@ -1035,7 +1915,7 @@ impl RoomHandle {
     ///
     /// Returns the retained idempotent abort for any noncommitted match even when member event
     /// delivery is saturated.
-    pub async fn shutdown(&self) -> Result<Option<AbortMatch>, RoomError> {
+    pub async fn shutdown(&self) -> Result<RoomCloseOutcome, RoomError> {
         let (reply, receive) = oneshot::channel();
         self.send_control(ControlCommand::Shutdown { reply })
             .await?;
@@ -1045,6 +1925,15 @@ impl RoomHandle {
     #[cfg(test)]
     pub(crate) fn abort_actor_for_test(&self) {
         self._actor_abort.abort();
+    }
+}
+
+fn map_room_to_stroke(error: RoomError) -> StrokeMatchError {
+    match error {
+        RoomError::NotMember => StrokeMatchError::NotMember,
+        RoomError::QueueFull => StrokeMatchError::QueueFull,
+        RoomError::Timeout => StrokeMatchError::Timeout,
+        _ => StrokeMatchError::Closed,
     }
 }
 
@@ -1129,21 +2018,28 @@ async fn run_room(
 ) {
     let mut open = true;
     while open {
-        let deadline = state.loading_deadline.unwrap_or_else(Instant::now);
+        let scheduled = state.deadlines.next();
+        let deadline = scheduled.map_or_else(Instant::now, |deadline| deadline.at);
         let sleeper = sleep_until(deadline);
         tokio::pin!(sleeper);
         tokio::select! {
             biased;
-            () = &mut sleeper, if state.loading_deadline.is_some() => {
-                let _abort = state.mark_aborted(MatchAbortReason::LoadingTimeout);
+            () = &mut sleeper, if scheduled.is_some() => {
+                if let Some(deadline) = scheduled {
+                    let _work = state.handle_deadline(deadline.kind);
+                }
             }
             command = control.recv() => match command {
                 Some(ControlCommand::Disconnect { caller, reason, reply }) => {
                     let result = if state.member_index(caller).is_none() {
                         Err(RoomError::NotMember)
                     } else {
-                        let abort = state.mark_aborted(reason);
-                        state.remove(caller).map(|snapshot| RoomDisconnect { snapshot, abort })
+                        let outcome = state.disconnect_outcome(caller, reason);
+                        let abort = match outcome {
+                            RoomCloseOutcome::M5Abort { request, .. } => Some(request),
+                            _ => None,
+                        };
+                        state.remove(caller).map(|snapshot| RoomDisconnect { snapshot, outcome, abort })
                     };
                     if let Ok(outcome) = &result {
                         open = outcome.snapshot.is_some();
@@ -1152,11 +2048,11 @@ async fn run_room(
                     let _ignored = reply.send(result);
                 }
                 Some(ControlCommand::Shutdown { reply }) => {
-                    let abort = state.mark_aborted(MatchAbortReason::Shutdown);
+                    let outcome = state.shutdown_outcome();
                     for member in &state.members {
-                        state.deliver(member, RoomEvent::Closed);
+                        let _delivered = state.deliver(member, RoomEvent::Closed);
                     }
-                    let _ignored = reply.send(abort);
+                    let _ignored = reply.send(outcome);
                     open = false;
                 }
                 None => {
@@ -1195,7 +2091,7 @@ fn handle_normal(
             true
         }
         RoomCommand::Leave { caller, reply } => {
-            let result = if state.solo.is_active() {
+            let result = if state.match_active() {
                 Err(RoomError::MatchActive)
             } else {
                 state.remove(caller)
@@ -1334,6 +2230,76 @@ fn handle_normal(
             let _ignored = reply.send(state.acknowledge_solo_abort(caller, abort));
             true
         }
+        RoomCommand::PrepareStrokeStart {
+            caller,
+            plan,
+            reply,
+        } => {
+            let _ignored = reply.send(state.prepare_stroke_start(caller, plan));
+            true
+        }
+        RoomCommand::ConfirmStrokeBegin {
+            caller,
+            match_id,
+            result_key,
+            reply,
+        } => {
+            let _ignored = reply.send(state.confirm_stroke_begin(caller, match_id, result_key));
+            true
+        }
+        RoomCommand::CancelStrokeBegin {
+            caller,
+            match_id,
+            result_key,
+            reply,
+        } => {
+            let _ignored = reply.send(state.cancel_stroke_begin(caller, match_id, result_key));
+            true
+        }
+        RoomCommand::StrokeLoading {
+            caller,
+            loading,
+            reply,
+        } => {
+            let _ignored = reply.send(state.stroke_loading_complete(caller, loading));
+            true
+        }
+        RoomCommand::ConfirmStrokeInGame { mark, reply } => {
+            let _ignored = reply.send(state.confirm_stroke_in_game(mark));
+            true
+        }
+        RoomCommand::StrokeAction {
+            caller,
+            action,
+            reply,
+        } => {
+            let _ignored = reply.send(state.stroke_action(caller, action));
+            true
+        }
+        RoomCommand::StrokeResult {
+            caller,
+            result,
+            reply,
+        } => {
+            let _ignored = reply.send(state.stroke_result(caller, result));
+            true
+        }
+        RoomCommand::StrokeGiveUp { caller, reply } => {
+            let _ignored = reply.send(state.stroke_give_up(caller));
+            true
+        }
+        RoomCommand::ApplyStrokeCommit { result, reply } => {
+            let _ignored = reply.send(state.apply_stroke_commit(result));
+            true
+        }
+        RoomCommand::AbortStroke { reason, reply } => {
+            let _ignored = reply.send(state.abort_stroke(reason));
+            true
+        }
+        RoomCommand::AcknowledgeStrokeAbort { abort, reply } => {
+            let _ignored = reply.send(state.acknowledge_stroke_abort(abort));
+            true
+        }
     }
 }
 
@@ -1356,7 +2322,8 @@ mod tests {
 
     use pangya_domain::{
         CatalogFingerprint, CourseId, MatchSeed, OneHoleConfig, ServerBalances, SoloReward,
-        StrokeCount,
+        StrokeCount, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
+        synthetic_stroke_reward_v1,
     };
     use pangya_protocol::Lie;
     use proptest::prelude::*;
@@ -1397,6 +2364,86 @@ mod tests {
             max_strokes,
         )
         .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn stroke_plan(
+        first: &RoomIdentity,
+        second: &RoomIdentity,
+        loading: Duration,
+        turn: Duration,
+        game: Duration,
+        max_strokes: u8,
+    ) -> StrokeStartPlan {
+        let seed = MatchSeed::new([0; 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        let begin = BeginStrokeMatch::new(
+            MatchId::new(Uuid::from_u128(201)),
+            MatchResultKey::new(Uuid::from_u128(202)),
+            [
+                StrokeParticipant::new(
+                    first.account_id,
+                    StrokeRosterOrder::First,
+                    MatchResultKey::new(Uuid::from_u128(203)),
+                ),
+                StrokeParticipant::new(
+                    second.account_id,
+                    StrokeRosterOrder::Second,
+                    MatchResultKey::new(Uuid::from_u128(204)),
+                ),
+            ],
+            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                .unwrap_or_else(|_| unreachable!()),
+            CatalogFingerprint::new([3; 32]),
+            seed,
+            weather,
+            wind,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        StrokeStartPlan::new(
+            begin,
+            [first.connection_id, second.connection_id],
+            loading,
+            turn,
+            game,
+            max_strokes,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn persisted_stroke(commit: CommitStrokeMatch) -> StrokeMatchResult {
+        let players = [0_usize, 1_usize].map(|index| {
+            let input = commit.players()[index];
+            let reward =
+                synthetic_stroke_reward_v1(commit.config(), input.strokes(), input.completion())
+                    .expect("reward");
+            StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
+        });
+        StrokeMatchResult::new(commit.match_id(), commit.result_key(), players)
+    }
+
+    fn playing_stroke_room(state: &mut RoomState, plan: &StrokeStartPlan) {
+        let roster = *plan.roster();
+        state
+            .prepare_stroke_start(roster[0], plan.clone())
+            .expect("prepare stroke");
+        state
+            .confirm_stroke_begin(
+                roster[0],
+                plan.begin().match_id(),
+                plan.begin().result_key(),
+            )
+            .expect("confirm stroke");
+        let loading = StrokeLoadingComplete::new(100).expect("loading");
+        state
+            .stroke_loading_complete(roster[0], loading)
+            .expect("first load");
+        let StrokeLoadingOutcome::PersistenceRequired(mark) = state
+            .stroke_loading_complete(roster[1], loading)
+            .expect("second load")
+        else {
+            unreachable!()
+        };
+        state.confirm_stroke_in_game(mark).expect("in game");
     }
 
     fn state(
@@ -1879,11 +2926,11 @@ mod tests {
                 .is_ok()
         );
         assert!(cancellation.is_cancelled());
-        let abort = handle
-            .shutdown()
-            .await
-            .unwrap_or_else(|_| unreachable!())
-            .unwrap_or_else(|| unreachable!());
+        let RoomCloseOutcome::M5Abort { request: abort, .. } =
+            handle.shutdown().await.unwrap_or_else(|_| unreachable!())
+        else {
+            unreachable!()
+        };
         assert_eq!(
             abort,
             AbortMatch::new(
@@ -1895,6 +2942,363 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(handle.state().await, Err(RoomError::Closed));
+    }
+
+    #[test]
+    fn stroke_start_is_exact_two_ready_owner_and_mutually_exclusive() {
+        let first = identity(1);
+        let second = identity(2);
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        let (mut state, _owner_rx) = state(3, None);
+        assert_eq!(
+            state.prepare_stroke_start(first.connection_id, plan.clone()),
+            Err(StrokeMatchError::NotExactlyTwo)
+        );
+        let (second_tx, _second_rx) = mpsc::channel(16);
+        assert!(state.join(second.clone(), None, second_tx).is_ok());
+        assert_eq!(
+            state.prepare_stroke_start(first.connection_id, plan.clone()),
+            Err(StrokeMatchError::NotReady)
+        );
+        assert!(state.set_ready(first.connection_id, true).is_ok());
+        assert!(state.set_ready(second.connection_id, true).is_ok());
+        assert_eq!(
+            state.prepare_stroke_start(second.connection_id, plan.clone()),
+            Err(StrokeMatchError::NotOwner)
+        );
+        assert!(
+            state
+                .prepare_stroke_start(first.connection_id, plan)
+                .is_ok()
+        );
+        assert_eq!(
+            state.set_ready(first.connection_id, false),
+            Err(RoomError::MatchActive)
+        );
+        assert_eq!(
+            state.chat(
+                first.connection_id,
+                ChatText::parse("x").unwrap_or_else(|_| unreachable!())
+            ),
+            Err(RoomError::MatchActive)
+        );
+        let solo = solo_plan(first.account_id, Duration::from_secs(5), 3);
+        assert_eq!(
+            state.prepare_solo_start(first.connection_id, solo),
+            Err(SoloMatchError::InvalidPhase)
+        );
+    }
+
+    #[tokio::test]
+    async fn stroke_common_events_broadcast_and_settlement_has_one_owner_coordinator() {
+        let first = identity(1);
+        let second = identity(2);
+        let (owner_tx, mut owner_rx) = mpsc::channel(64);
+        let (second_tx, mut second_rx) = mpsc::channel(64);
+        let (handle, _) = spawn_room(
+            RoomId::new(20).unwrap_or_else(|_| unreachable!()),
+            RoomName::parse("stroke").unwrap_or_else(|_| unreachable!()),
+            None,
+            RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+            first.clone(),
+            owner_tx,
+            RoomActorLimits::default(),
+        );
+        assert!(handle.join(second.clone(), None, second_tx).await.is_ok());
+        assert!(handle.set_ready(first.connection_id, true).await.is_ok());
+        assert!(handle.set_ready(second.connection_id, true).await.is_ok());
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        assert!(
+            handle
+                .prepare_stroke_start(first.connection_id, plan.clone())
+                .await
+                .is_ok()
+        );
+        assert!(
+            handle
+                .confirm_stroke_begin(
+                    first.connection_id,
+                    plan.begin().match_id(),
+                    plan.begin().result_key()
+                )
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            owner_rx.recv().await,
+            Some(RoomEvent::StrokeStarted(_))
+        ));
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(RoomEvent::StrokeStarted(_))
+        ));
+        assert!(matches!(
+            owner_rx.recv().await,
+            Some(RoomEvent::StrokePhase { .. })
+        ));
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(RoomEvent::StrokePhase { .. })
+        ));
+        let loading = StrokeLoadingComplete::new(100).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            handle
+                .stroke_loading_complete(second.connection_id, loading)
+                .await,
+            Ok(StrokeLoadingOutcome::Waiting)
+        );
+        let mark = match handle
+            .stroke_loading_complete(first.connection_id, loading)
+            .await
+        {
+            Ok(StrokeLoadingOutcome::PersistenceRequired(mark)) => mark,
+            _ => unreachable!(),
+        };
+        assert!(handle.confirm_stroke_in_game(mark).await.is_ok());
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        let commit = handle
+            .stroke_give_up(first.connection_id)
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let owner_events: Vec<_> = std::iter::from_fn(|| owner_rx.try_recv().ok()).collect();
+        let second_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
+        assert!(
+            owner_events
+                .iter()
+                .any(|event| matches!(event, RoomEvent::StrokePhase { .. }))
+        );
+        assert!(
+            second_events
+                .iter()
+                .any(|event| matches!(event, RoomEvent::StrokePhase { .. }))
+        );
+        assert_eq!(owner_events.iter().filter(|event| matches!(event, RoomEvent::StrokeSettlementRequested(value) if *value == commit)).count(), 1);
+        assert!(
+            !second_events
+                .iter()
+                .any(|event| matches!(event, RoomEvent::StrokeSettlementRequested(_)))
+        );
+        let results = [0_usize, 1_usize].map(|index| {
+            let input = commit.players()[index];
+            let reward =
+                synthetic_stroke_reward_v1(commit.config(), input.strokes(), input.completion())
+                    .unwrap_or_else(|_| unreachable!());
+            StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
+        });
+        let persisted = StrokeMatchResult::new(commit.match_id(), commit.result_key(), results);
+        assert_eq!(handle.apply_stroke_commit(persisted).await, Ok(persisted));
+        assert!(handle.shutdown().await.is_ok());
+    }
+
+    #[test]
+    fn stroke_persistence_falls_back_and_retains_work_when_all_outbounds_are_full() {
+        let first = identity(1);
+        let second = identity(2);
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+
+        let owner_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(32);
+        let (second_tx, mut second_rx) = mpsc::channel(32);
+        let mut fallback = RoomState::new(
+            RoomId::new(30).expect("room"),
+            RoomName::parse("fallback").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            owner_tx.clone(),
+            owner_cancel.clone(),
+        );
+        fallback
+            .join_with_cancellation(second.clone(), None, second_tx, second_cancel.clone())
+            .expect("join");
+        fallback
+            .set_ready(first.connection_id, true)
+            .expect("ready");
+        fallback
+            .set_ready(second.connection_id, true)
+            .expect("ready");
+        playing_stroke_room(&mut fallback, &plan);
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        while owner_tx.try_send(RoomEvent::Closed).is_ok() {}
+        let commit = fallback
+            .stroke_give_up(first.connection_id)
+            .expect("give-up settlement");
+        assert!(owner_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
+        let second_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
+        assert_eq!(
+            second_events
+                .iter()
+                .filter(|event| matches!(event, RoomEvent::StrokeSettlementRequested(value) if *value == commit))
+                .count(),
+            1,
+            "only the next deterministic noncancelled coordinator receives work"
+        );
+
+        let owner_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(32);
+        let (second_tx, mut second_rx) = mpsc::channel(32);
+        let mut retained = RoomState::new(
+            RoomId::new(31).expect("room"),
+            RoomName::parse("retained").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            owner_tx.clone(),
+            owner_cancel.clone(),
+        );
+        retained
+            .join_with_cancellation(
+                second.clone(),
+                None,
+                second_tx.clone(),
+                second_cancel.clone(),
+            )
+            .expect("join");
+        retained
+            .set_ready(first.connection_id, true)
+            .expect("ready");
+        retained
+            .set_ready(second.connection_id, true)
+            .expect("ready");
+        playing_stroke_room(&mut retained, &plan);
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        while owner_tx.try_send(RoomEvent::Closed).is_ok() {}
+        while second_tx.try_send(RoomEvent::Closed).is_ok() {}
+        let commit = retained
+            .stroke_give_up(first.connection_id)
+            .expect("give-up settlement");
+        assert!(owner_cancel.is_cancelled());
+        assert!(second_cancel.is_cancelled());
+        assert!(
+            std::iter::from_fn(|| owner_rx.try_recv().ok())
+                .chain(std::iter::from_fn(|| second_rx.try_recv().ok()))
+                .all(|event| !matches!(event, RoomEvent::StrokeSettlementRequested(_)))
+        );
+        assert_eq!(
+            retained.disconnect_outcome(first.connection_id, MatchAbortReason::Disconnect),
+            RoomCloseOutcome::M6Settlement {
+                room_id: retained.id,
+                request: commit,
+            }
+        );
+        assert_eq!(
+            retained.disconnect_outcome(second.connection_id, MatchAbortReason::Disconnect),
+            RoomCloseOutcome::None,
+            "room authority hands retained work to priority cancellation exactly once"
+        );
+        let persisted = persisted_stroke(commit);
+        assert_eq!(retained.apply_stroke_commit(persisted), Ok(persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stroke_turn_timer_fires_without_action_extension_and_shutdown_preserves_settlement() {
+        let first = identity(1);
+        let second = identity(2);
+        let (owner_tx, mut owner_rx) = mpsc::channel(64);
+        let (second_tx, _second_rx) = mpsc::channel(64);
+        let (handle, _) = spawn_room(
+            RoomId::new(21).unwrap_or_else(|_| unreachable!()),
+            RoomName::parse("stroke-timer").unwrap_or_else(|_| unreachable!()),
+            None,
+            RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+            first.clone(),
+            owner_tx,
+            RoomActorLimits::default(),
+        );
+        assert!(handle.join(second.clone(), None, second_tx).await.is_ok());
+        assert!(handle.set_ready(first.connection_id, true).await.is_ok());
+        assert!(handle.set_ready(second.connection_id, true).await.is_ok());
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(4),
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+            3,
+        );
+        assert!(
+            handle
+                .prepare_stroke_start(first.connection_id, plan.clone())
+                .await
+                .is_ok()
+        );
+        assert!(
+            handle
+                .confirm_stroke_begin(
+                    first.connection_id,
+                    plan.begin().match_id(),
+                    plan.begin().result_key()
+                )
+                .await
+                .is_ok()
+        );
+        let loading = StrokeLoadingComplete::new(100).unwrap_or_else(|_| unreachable!());
+        assert!(
+            handle
+                .stroke_loading_complete(first.connection_id, loading)
+                .await
+                .is_ok()
+        );
+        let mark = match handle
+            .stroke_loading_complete(second.connection_id, loading)
+            .await
+        {
+            Ok(StrokeLoadingOutcome::PersistenceRequired(mark)) => mark,
+            _ => unreachable!(),
+        };
+        assert!(handle.confirm_stroke_in_game(mark).await.is_ok());
+        let action =
+            StrokeShotAction::new(1, 1, 10.0, 0.0, 0.0, 0.0).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            handle.stroke_action(first.connection_id, action).await,
+            Ok(RelayDisposition::Accepted)
+        );
+        while owner_rx.try_recv().is_ok() {}
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let commit = std::iter::from_fn(|| owner_rx.try_recv().ok())
+            .find_map(|event| match event {
+                RoomEvent::StrokeSettlementRequested(commit) => Some(commit),
+                _ => None,
+            })
+            .expect("automatic settlement event");
+        let outcome = handle.shutdown().await.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            outcome,
+            RoomCloseOutcome::M6Settlement {
+                room_id: handle.id(),
+                request: commit,
+            }
+        );
     }
 
     #[tokio::test]

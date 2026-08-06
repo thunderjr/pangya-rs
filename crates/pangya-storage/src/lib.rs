@@ -2070,6 +2070,7 @@ const fn stroke_completion_text(completion: StrokeCompletion) -> &'static str {
     match completion {
         StrokeCompletion::Holed => "holed",
         StrokeCompletion::StrokeCap => "stroke_cap",
+        StrokeCompletion::WinnerByForfeit => "winner_by_forfeit",
         StrokeCompletion::GiveUp => "give_up",
         StrokeCompletion::Disconnect => "disconnect",
         StrokeCompletion::TurnTimeout => "turn_timeout",
@@ -2081,6 +2082,7 @@ fn parse_stroke_completion(value: &str) -> Result<StrokeCompletion, MatchReposit
     match value {
         "holed" => Ok(StrokeCompletion::Holed),
         "stroke_cap" => Ok(StrokeCompletion::StrokeCap),
+        "winner_by_forfeit" => Ok(StrokeCompletion::WinnerByForfeit),
         "give_up" => Ok(StrokeCompletion::GiveUp),
         "disconnect" => Ok(StrokeCompletion::Disconnect),
         "turn_timeout" => Ok(StrokeCompletion::TurnTimeout),

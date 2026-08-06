@@ -2533,7 +2533,7 @@ async fn stroke_begin_rejects_player_key_reuse_and_schema_rejects_third_particip
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn stroke_forfeit_is_zero_reward_without_ledger_or_balance_change(pool: PgPool) {
+async fn stroke_winner_and_forfeit_are_truthful_without_course_record(pool: PgPool) {
     let repository = PgRepository::new(pool.clone());
     let first = repository
         .create_account(account("StrokeForfeitA", Some("StrokeForfeitA")))
@@ -2552,11 +2552,22 @@ async fn stroke_forfeit_is_zero_reward_without_ledger_or_balance_change(pool: Pg
     let result = repository
         .commit_stroke_match(stroke_commit(
             &begin,
-            (2, StrokePlace::First, StrokeCompletion::Holed),
+            (0, StrokePlace::First, StrokeCompletion::WinnerByForfeit),
             (0, StrokePlace::Second, StrokeCompletion::GiveUp),
         ))
         .await
         .expect("commit");
+    let winner = result.players()[0];
+    assert_eq!(
+        (
+            winner.score(),
+            winner.pang_reward(),
+            winner.experience_reward(),
+            winner.pang_balance(),
+            winner.experience_balance(),
+        ),
+        (None, 10, 5, 10, 5)
+    );
     let forfeited = result.players()[1];
     assert_eq!(
         (
@@ -2582,7 +2593,63 @@ async fn stroke_forfeit_is_zero_reward_without_ledger_or_balance_change(pool: Pg
         .fetch_one(&pool)
         .await
         .expect("record count");
-    assert_eq!(records, 1, "only the holed participant is eligible");
+    assert_eq!(records, 0, "winner-by-forfeit is record-ineligible");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn schema_defers_and_rejects_malformed_stroke_forfeit_aggregates(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let first = repository
+        .create_account(account("StrokePairA", Some("StrokePairA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokePairB", Some("StrokePairB")))
+        .await
+        .expect("second account");
+    let begin = stroke_begin(first.account.id, second.account.id);
+    repository.begin_stroke(begin.clone()).await.expect("begin");
+    repository
+        .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+        .await
+        .expect("in game");
+
+    for (first_completion, second_completion) in [
+        ("winner_by_forfeit", "winner_by_forfeit"),
+        ("game_timeout", "winner_by_forfeit"),
+        ("winner_by_forfeit", "game_timeout"),
+        ("winner_by_forfeit", "holed"),
+        ("holed", "give_up"),
+    ] {
+        let mut transaction = pool.begin().await.expect("transaction");
+        sqlx::query(
+            "UPDATE match_players AS mp SET \
+                place = malformed.place, completion = malformed.completion, \
+                strokes = CASE WHEN malformed.completion IN ('holed', 'stroke_cap') THEN 1 ELSE 0 END, \
+                score = CASE WHEN malformed.completion IN ('holed', 'stroke_cap') THEN -3 ELSE NULL END, \
+                pang_reward = CASE WHEN malformed.completion = 'winner_by_forfeit' THEN 10 \
+                                   WHEN malformed.completion IN ('holed', 'stroke_cap') THEN 16 ELSE 0 END, \
+                experience_reward = CASE WHEN malformed.completion IN \
+                    ('winner_by_forfeit', 'holed', 'stroke_cap') THEN 5 ELSE 0 END, \
+                pang_balance_after = 100, experience_balance_after = 100, \
+                quit = malformed.completion IN \
+                    ('give_up', 'disconnect', 'turn_timeout', 'game_timeout') \
+             FROM (VALUES (0::smallint, 1::smallint, $2::text), \
+                          (1::smallint, 2::smallint, $3::text)) \
+                  AS malformed(participant_order, place, completion) \
+             WHERE mp.match_id = $1 AND mp.participant_order = malformed.participant_order",
+        )
+        .bind(begin.match_id().get())
+        .bind(first_completion)
+        .bind(second_completion)
+        .execute(&mut *transaction)
+        .await
+        .expect("row-local shape remains valid until aggregate check");
+        assert!(
+            transaction.commit().await.is_err(),
+            "malformed aggregate {first_completion}/{second_completion} must fail at transaction end"
+        );
+    }
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
