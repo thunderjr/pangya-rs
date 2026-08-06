@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE matches SET status = 'committed', committed_at = now() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "834a877b9f96ac45cfeb688186e5ab6ee33b0e42cd3d5b8f93db7b6f19377154"
+}

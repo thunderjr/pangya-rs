@@ -3,7 +3,9 @@
 use std::{fs, path::Path};
 
 use pangya_data::{Catalog, CatalogError, CatalogKind};
-use pangya_domain::{ItemTypeId, StarterCharacter, StarterGrant, StarterItem, StarterKey};
+use pangya_domain::{
+    CourseId, ItemTypeId, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+};
 use sha2::{Digest as _, Sha256};
 
 fn fixtures() -> &'static Path {
@@ -36,6 +38,21 @@ fn generated_golden_catalog_loads_and_cross_checks_starter() {
             .as_ref(),
         b"CLUB"
     );
+    let course = catalog
+        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .expect("generated course");
+    assert_eq!(
+        (course.course_id().get(), course.hole(), course.par()),
+        (7, 1, 3)
+    );
+    assert_eq!(
+        catalog.fingerprint().as_bytes(),
+        &[
+            0xb3, 0x19, 0x59, 0x5c, 0x4a, 0x00, 0x5d, 0xdf, 0x11, 0x4a, 0x5c, 0xe2, 0x22, 0xee,
+            0x7c, 0xa0, 0xee, 0x54, 0x37, 0x6c, 0xec, 0x55, 0xa5, 0xe0, 0xe6, 0x20, 0xd9, 0x37,
+            0x3f, 0xf1, 0xb0, 0xd6,
+        ]
+    );
     let starter = StarterGrant {
         character: StarterCharacter {
             key: key("character"),
@@ -60,6 +77,25 @@ fn generated_golden_catalog_loads_and_cross_checks_starter() {
 }
 
 #[test]
+fn original_m3_families_remain_valid_without_optional_course() {
+    let base = std::env::temp_dir().join(format!("pangya-catalog-m3-only-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).expect("temp");
+    for name in ["character.bin", "club_set.bin", "ball.bin"] {
+        fs::copy(fixtures().join(name), base.join(name)).expect("copy");
+    }
+    let manifest = fs::read_to_string(fixtures().join("manifest.toml")).expect("manifest");
+    let course_start = manifest
+        .rfind("[[files]]\nfilename = \"Course.bin\"")
+        .expect("course declaration");
+    fs::write(base.join("manifest.toml"), &manifest[..course_start]).expect("M3 manifest");
+    let catalog = Catalog::load(&base, Path::new("manifest.toml")).expect("M3-only catalog");
+    assert!(catalog.contains(CatalogKind::Ball, ItemTypeId::new(0x1800_0000)));
+    assert!(!catalog.contains(CatalogKind::Course, ItemTypeId::new(7)));
+    fs::remove_dir_all(base).expect("cleanup");
+}
+
+#[test]
 fn cross_family_duplicate_type_id_is_rejected_globally() {
     let base = std::env::temp_dir().join(format!(
         "pangya-catalog-cross-family-{}",
@@ -67,7 +103,7 @@ fn cross_family_duplicate_type_id_is_rejected_globally() {
     ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("temp");
-    for name in ["character.bin", "club_set.bin", "ball.bin"] {
+    for name in ["character.bin", "club_set.bin", "ball.bin", "Course.bin"] {
         fs::copy(fixtures().join(name), base.join(name)).expect("copy");
     }
     let mut ball = fs::read(base.join("ball.bin")).expect("ball");
@@ -92,7 +128,7 @@ fn digest_and_duplicate_kind_errors_are_redacted_and_typed() {
     let base = std::env::temp_dir().join(format!("pangya-catalog-errors-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("temp");
-    for name in ["character.bin", "club_set.bin", "ball.bin"] {
+    for name in ["character.bin", "club_set.bin", "ball.bin", "Course.bin"] {
         fs::copy(fixtures().join(name), base.join(name)).expect("copy");
     }
     let manifest = fs::read_to_string(fixtures().join("manifest.toml")).expect("manifest");

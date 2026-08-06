@@ -128,6 +128,40 @@ impl From<Uuid> for HandoverId {
     }
 }
 
+macro_rules! uuid_id {
+    ($name:ident, $docs:literal) => {
+        #[doc = $docs]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            /// Creates the identifier from its UUID representation.
+            #[must_use]
+            pub const fn new(value: Uuid) -> Self {
+                Self(value)
+            }
+
+            /// Returns the UUID representation.
+            #[must_use]
+            pub const fn get(self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+uuid_id!(MatchId, "A durable match identifier.");
+uuid_id!(
+    MatchResultKey,
+    "A stable, server-generated match-result idempotency key."
+);
+
 /// Validation failure for a display/normalized account name.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum NameError {
@@ -676,6 +710,678 @@ pub struct AuthenticatedSession {
     pub account_id: AccountId,
     /// Consumed selector for audit correlation.
     pub handover_id: HandoverId,
+}
+
+/// Validation failure for synthetic one-hole match values.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MatchValueError {
+    /// Course zero is reserved and cannot identify a configured course.
+    #[error("course identifier must be nonzero")]
+    InvalidCourse,
+    /// Synthetic one-hole par must be in `1..=10`.
+    #[error("hole par is outside policy")]
+    InvalidPar,
+    /// A stroke count must fit the persisted positive `SMALLINT` range.
+    #[error("stroke count is outside policy")]
+    InvalidStrokes,
+    /// A catalog fingerprint or deterministic seed had the wrong byte length.
+    #[error("fixed-size match bytes have the wrong length")]
+    InvalidBytes,
+    /// Checked score or reward arithmetic overflowed.
+    #[error("match result arithmetic overflowed")]
+    ArithmeticOverflow,
+}
+
+/// A checked, nonzero synthetic course identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CourseId(std::num::NonZeroU32);
+
+impl CourseId {
+    /// Creates a nonzero course identifier.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidCourse`] for zero.
+    pub const fn new(value: u32) -> Result<Self, MatchValueError> {
+        match std::num::NonZeroU32::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(MatchValueError::InvalidCourse),
+        }
+    }
+
+    /// Returns the unsigned catalog/database representation.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u32> for CourseId {
+    type Error = MatchValueError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<i64> for CourseId {
+    type Error = MatchValueError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        u32::try_from(value)
+            .map_err(|_| MatchValueError::InvalidCourse)
+            .and_then(Self::new)
+    }
+}
+
+/// Server-selected weather for a synthetic solo hole.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Weather {
+    /// Clear weather.
+    Clear,
+    /// Cloud cover without rain.
+    Cloudy,
+    /// Rain.
+    Rain,
+}
+
+/// Immutable one-hole synthetic course configuration. Hole number is always one.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OneHoleConfig {
+    course_id: CourseId,
+    par: u8,
+}
+
+impl OneHoleConfig {
+    /// Validates a local one-hole course configuration.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidPar`] unless par is in `1..=10`.
+    pub const fn new(course_id: CourseId, par: u8) -> Result<Self, MatchValueError> {
+        if par >= 1 && par <= 10 {
+            Ok(Self { course_id, par })
+        } else {
+            Err(MatchValueError::InvalidPar)
+        }
+    }
+
+    /// Configured course identifier.
+    #[must_use]
+    pub const fn course_id(self) -> CourseId {
+        self.course_id
+    }
+
+    /// Fixed local hole number.
+    #[must_use]
+    pub const fn hole(self) -> u8 {
+        1
+    }
+
+    /// Configured par.
+    #[must_use]
+    pub const fn par(self) -> u8 {
+        self.par
+    }
+}
+
+/// Checked positive number of strokes persisted for one hole.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StrokeCount(u16);
+
+impl StrokeCount {
+    /// Validates the positive PostgreSQL `SMALLINT` range.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidStrokes`] for zero or values above `i16::MAX`.
+    pub const fn new(value: u16) -> Result<Self, MatchValueError> {
+        if value >= 1 && value <= i16::MAX as u16 {
+            Ok(Self(value))
+        } else {
+            Err(MatchValueError::InvalidStrokes)
+        }
+    }
+
+    /// Returns the unsigned stroke count.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Stable SHA-256 fingerprint of the catalog declaration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CatalogFingerprint([u8; 32]);
+
+impl CatalogFingerprint {
+    /// Creates a fingerprint from exactly 32 digest bytes.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parses exact database bytes without truncation.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidBytes`] unless exactly 32 bytes are supplied.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, MatchValueError> {
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| MatchValueError::InvalidBytes)
+    }
+
+    /// Borrows the fingerprint bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Server-generated deterministic match seed.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct MatchSeed([u8; 32]);
+
+impl MatchSeed {
+    /// Creates a seed from exactly 32 bytes.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parses exact persisted bytes without truncation.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidBytes`] unless exactly 32 bytes are supplied.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, MatchValueError> {
+        bytes
+            .try_into()
+            .map(Self)
+            .map_err(|_| MatchValueError::InvalidBytes)
+    }
+
+    /// Borrows seed bytes for persistence. Seed formatting is intentionally unavailable.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MatchSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MatchSeed([REDACTED])")
+    }
+}
+
+/// Immutable request to begin one synthetic solo match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginSoloMatch {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    account_id: AccountId,
+    config: OneHoleConfig,
+    catalog_fingerprint: CatalogFingerprint,
+    seed: MatchSeed,
+    weather: Weather,
+}
+
+impl BeginSoloMatch {
+    /// Constructs a server-owned begin request from already checked values.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        account_id: AccountId,
+        config: OneHoleConfig,
+        catalog_fingerprint: CatalogFingerprint,
+        seed: MatchSeed,
+        weather: Weather,
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            account_id,
+            config,
+            catalog_fingerprint,
+            seed,
+            weather,
+        }
+    }
+
+    /// Durable match ID.
+    #[must_use]
+    pub const fn match_id(&self) -> MatchId {
+        self.match_id
+    }
+    /// Result idempotency key.
+    #[must_use]
+    pub const fn result_key(&self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Authoritative participant account.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+    /// Persisted course configuration.
+    #[must_use]
+    pub const fn config(&self) -> OneHoleConfig {
+        self.config
+    }
+    /// Persisted catalog fingerprint.
+    #[must_use]
+    pub const fn catalog_fingerprint(&self) -> CatalogFingerprint {
+        self.catalog_fingerprint
+    }
+    /// Persisted deterministic seed.
+    #[must_use]
+    pub const fn seed(&self) -> MatchSeed {
+        self.seed
+    }
+    /// Persisted server-selected weather.
+    #[must_use]
+    pub const fn weather(&self) -> Weather {
+        self.weather
+    }
+}
+
+/// Whether beginning a match inserted it or exactly replayed immutable input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginSoloMatchOutcome {
+    /// A new match and started audit were persisted.
+    Begun,
+    /// The exact immutable request was already persisted.
+    Existing,
+}
+
+/// Stable reason for terminating a synthetic match without reward.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MatchAbortReason {
+    /// The sole participant disconnected.
+    Disconnect,
+    /// Loading exceeded the application deadline.
+    LoadingTimeout,
+    /// Local service shutdown interrupted the match.
+    Shutdown,
+    /// Local startup recovery found a nonterminal match.
+    StartupRecovery,
+}
+
+/// Request to abort one authoritative match without accepting reward data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbortMatch {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    account_id: AccountId,
+    reason: MatchAbortReason,
+}
+
+impl AbortMatch {
+    /// Constructs an abort request.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        account_id: AccountId,
+        reason: MatchAbortReason,
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            account_id,
+            reason,
+        }
+    }
+    /// Durable match ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Authoritative result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Authoritative participant.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+    /// Stable abort reason.
+    #[must_use]
+    pub const fn reason(self) -> MatchAbortReason {
+        self.reason
+    }
+}
+
+/// Request to commit one completed solo hole. Rewards and balances are intentionally absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitSoloHole {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    account_id: AccountId,
+    config: OneHoleConfig,
+    strokes: StrokeCount,
+}
+
+impl CommitSoloHole {
+    /// Constructs a commit request from authoritative identity/config and client stroke evidence.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        account_id: AccountId,
+        config: OneHoleConfig,
+        strokes: StrokeCount,
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            account_id,
+            config,
+            strokes,
+        }
+    }
+    /// Durable match ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Authoritative result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Authoritative participant.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+    /// Authoritative one-hole configuration.
+    #[must_use]
+    pub const fn config(self) -> OneHoleConfig {
+        self.config
+    }
+    /// Checked stroke evidence.
+    #[must_use]
+    pub const fn strokes(self) -> StrokeCount {
+        self.strokes
+    }
+}
+
+/// Checked score and server-computed rewards for one synthetic hole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SoloReward {
+    score: i16,
+    pang: u64,
+    experience: u64,
+}
+
+impl SoloReward {
+    /// Reconstructs already validated persisted reward columns.
+    #[must_use]
+    pub const fn from_persisted(score: i16, pang: u64, experience: u64) -> Self {
+        Self {
+            score,
+            pang,
+            experience,
+        }
+    }
+    /// Signed score relative to par.
+    #[must_use]
+    pub const fn score(self) -> i16 {
+        self.score
+    }
+    /// Pang reward.
+    #[must_use]
+    pub const fn pang(self) -> u64 {
+        self.pang
+    }
+    /// Experience reward.
+    #[must_use]
+    pub const fn experience(self) -> u64 {
+        self.experience
+    }
+}
+
+/// Server balances immediately after an atomic match commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServerBalances {
+    pang: u64,
+    experience: u64,
+}
+
+impl ServerBalances {
+    /// Reconstructs checked nonnegative persisted balances.
+    #[must_use]
+    pub const fn from_persisted(pang: u64, experience: u64) -> Self {
+        Self { pang, experience }
+    }
+    /// Pang balance.
+    #[must_use]
+    pub const fn pang(self) -> u64 {
+        self.pang
+    }
+    /// Experience balance.
+    #[must_use]
+    pub const fn experience(self) -> u64 {
+        self.experience
+    }
+}
+
+/// Server-computed synthetic solo result including post-commit balances.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SoloMatchResult {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    account_id: AccountId,
+    strokes: StrokeCount,
+    score: i16,
+    pang_reward: u64,
+    experience_reward: u64,
+    pang_balance: u64,
+    experience_balance: u64,
+}
+
+impl SoloMatchResult {
+    /// Constructs a result at the trusted persistence boundary.
+    #[must_use]
+    pub const fn new(
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        account_id: AccountId,
+        strokes: StrokeCount,
+        reward: SoloReward,
+        balances: ServerBalances,
+    ) -> Self {
+        Self {
+            match_id,
+            result_key,
+            account_id,
+            strokes,
+            score: reward.score(),
+            pang_reward: reward.pang(),
+            experience_reward: reward.experience(),
+            pang_balance: balances.pang(),
+            experience_balance: balances.experience(),
+        }
+    }
+    /// Match ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+    /// Result idempotency key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+    /// Rewarded account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+    /// Final strokes.
+    #[must_use]
+    pub const fn strokes(self) -> StrokeCount {
+        self.strokes
+    }
+    /// Signed score relative to par.
+    #[must_use]
+    pub const fn score(self) -> i16 {
+        self.score
+    }
+    /// Server-computed Pang reward.
+    #[must_use]
+    pub const fn pang_reward(self) -> u64 {
+        self.pang_reward
+    }
+    /// Server-computed experience reward.
+    #[must_use]
+    pub const fn experience_reward(self) -> u64 {
+        self.experience_reward
+    }
+    /// Pang balance after commit.
+    #[must_use]
+    pub const fn pang_balance(self) -> u64 {
+        self.pang_balance
+    }
+    /// Experience balance after commit.
+    #[must_use]
+    pub const fn experience_balance(self) -> u64 {
+        self.experience_balance
+    }
+}
+
+/// Computes synthetic reward formula `solo-v1` using checked integer arithmetic.
+///
+/// Formula: `score = strokes - par`, `Pang = 10 + 2 * max(par - strokes, 0)`, `EXP = 5`.
+///
+/// # Errors
+/// Returns [`MatchValueError::ArithmeticOverflow`] if an intermediate cannot be represented.
+pub fn synthetic_solo_reward_v1(
+    config: OneHoleConfig,
+    strokes: StrokeCount,
+) -> Result<SoloReward, MatchValueError> {
+    let strokes_i32 = i32::from(strokes.get());
+    let par_i32 = i32::from(config.par());
+    let score = strokes_i32
+        .checked_sub(par_i32)
+        .and_then(|value| i16::try_from(value).ok())
+        .ok_or(MatchValueError::ArithmeticOverflow)?;
+    let under_par = par_i32
+        .checked_sub(strokes_i32)
+        .ok_or(MatchValueError::ArithmeticOverflow)?
+        .max(0);
+    let bonus = u64::try_from(under_par)
+        .ok()
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(MatchValueError::ArithmeticOverflow)?;
+    let pang = 10_u64
+        .checked_add(bonus)
+        .ok_or(MatchValueError::ArithmeticOverflow)?;
+    Ok(SoloReward::from_persisted(score, pang, 5))
+}
+
+/// Outcome of an idempotent abort request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbortMatchOutcome {
+    /// This request changed the match to aborted.
+    Aborted,
+    /// The match was already aborted; no row was mutated.
+    AlreadyAborted,
+    /// The match was already committed; abort is an explicit no-op.
+    AlreadyCommitted(SoloMatchResult),
+}
+
+/// Checked maximum work for local startup cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncompleteMatchAbortLimit(u32);
+
+impl IncompleteMatchAbortLimit {
+    /// Hard maximum number of matches processed in one startup cleanup.
+    pub const MAX: u32 = 10_000;
+
+    /// Validates a nonzero bounded cleanup limit.
+    ///
+    /// # Errors
+    /// Returns [`MatchValueError::InvalidStrokes`] outside `1..=10000`.
+    pub const fn new(value: u32) -> Result<Self, MatchValueError> {
+        if value >= 1 && value <= Self::MAX {
+            Ok(Self(value))
+        } else {
+            Err(MatchValueError::InvalidStrokes)
+        }
+    }
+
+    /// Returns the SQL/application work cap.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Typed match persistence failures safe for application state mapping.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MatchRepositoryError {
+    /// Match ID was not found.
+    #[error("match was not found")]
+    NotFound,
+    /// A begin replay changed immutable input or reused an idempotency key.
+    #[error("match begin input does not match persisted input")]
+    InputDrift,
+    /// The participant does not match the authoritative persisted account.
+    #[error("match account does not match")]
+    WrongAccount,
+    /// Result idempotency key does not match.
+    #[error("match result key does not match")]
+    WrongResultKey,
+    /// Course or one-hole configuration does not match.
+    #[error("match configuration does not match")]
+    WrongConfig,
+    /// The match was aborted and cannot commit.
+    #[error("match was aborted")]
+    Aborted,
+    /// Persisted lifecycle state cannot accept the operation.
+    #[error("match status does not permit the operation")]
+    InvalidStatus,
+    /// Reward addition would exceed PostgreSQL's nonnegative `BIGINT` balance range.
+    #[error("match reward would overflow the balance")]
+    BalanceOverflow,
+    /// Persisted match data violated domain invariants.
+    #[error("persisted match data is invalid")]
+    CorruptData,
+    /// Startup recovery found more nonterminal rows than its explicit work cap.
+    #[error("incomplete match recovery limit was exceeded")]
+    RecoveryLimitExceeded,
+    /// PostgreSQL operation failed.
+    #[error("match storage operation failed")]
+    Storage,
+}
+
+/// Technology-neutral match persistence contract.
+pub trait MatchRepository: Send + Sync {
+    /// Starts or exactly replays immutable solo-match input.
+    fn begin_solo(
+        &self,
+        request: BeginSoloMatch,
+    ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>>;
+
+    /// Aborts a noncommitted match without reward, idempotently.
+    fn abort(
+        &self,
+        request: AbortMatch,
+    ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>>;
+
+    /// Commits server-computed rewards and returns the exact persisted result on replay.
+    fn commit_solo_hole(
+        &self,
+        request: CommitSoloHole,
+    ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>>;
+
+    /// Aborts at most `limit` nonterminal local matches during startup recovery.
+    fn abort_incomplete_matches(
+        &self,
+        limit: IncompleteMatchAbortLimit,
+    ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>>;
 }
 
 /// Typed repository failures safe to map to user-facing outcomes.
@@ -1237,6 +1943,26 @@ mod tests {
     }
 
     #[test]
+    fn match_seed_and_begin_request_debug_redact_seed_bytes() {
+        let seed = MatchSeed::new([231; 32]);
+        assert_eq!(format!("{seed:?}"), "MatchSeed([REDACTED])");
+        assert!(!format!("{seed:?}").contains("231"));
+
+        let begin = BeginSoloMatch::new(
+            MatchId::new(Uuid::nil()),
+            MatchResultKey::new(Uuid::nil()),
+            AccountId::new(1).expect("account"),
+            OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+            CatalogFingerprint::new([0; 32]),
+            seed,
+            Weather::Clear,
+        );
+        let debug = format!("{begin:?}");
+        assert!(debug.contains("MatchSeed([REDACTED])"));
+        assert!(!debug.contains("231"));
+    }
+
+    #[test]
     fn source_addresses_are_masked_and_only_canonical_prefixes_parse() {
         let ipv4 = SourceAddressPrefix::from_ip("192.0.2.199".parse().expect("IPv4"));
         assert_eq!(ipv4.as_str(), "192.0.2.0/24");
@@ -1286,6 +2012,27 @@ mod tests {
             ChatText::parse(&"é".repeat(65)),
             Err(RoomValueError::InvalidLength)
         );
+    }
+
+    #[test]
+    fn synthetic_match_values_and_rewards_are_checked() {
+        let course = CourseId::new(7).expect("course");
+        let config = OneHoleConfig::new(course, 3).expect("configuration");
+        assert_eq!(config.hole(), 1);
+        assert_eq!(
+            synthetic_solo_reward_v1(config, StrokeCount::new(2).expect("strokes")),
+            Ok(SoloReward::from_persisted(-1, 12, 5))
+        );
+        assert_eq!(
+            synthetic_solo_reward_v1(config, StrokeCount::new(5).expect("strokes")),
+            Ok(SoloReward::from_persisted(2, 10, 5))
+        );
+        assert_eq!(CourseId::new(0), Err(MatchValueError::InvalidCourse));
+        assert_eq!(
+            OneHoleConfig::new(course, 0),
+            Err(MatchValueError::InvalidPar)
+        );
+        assert_eq!(StrokeCount::new(0), Err(MatchValueError::InvalidStrokes));
     }
 
     #[test]

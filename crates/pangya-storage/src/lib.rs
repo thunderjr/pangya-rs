@@ -13,13 +13,16 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use pangya_domain::{
-    Account, AccountAggregate, AccountId, AccountRepository, AccountStatus, AuthenticatedSession,
-    AuthenticationRecord, Character, CharacterId, ConsumeHandover, CredentialHash, EquipmentSet,
-    EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository, InventoryItem,
-    InventoryItemId, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS,
-    NewAccount, NewHandover, Nickname, NormalizedNickname, NormalizedUsername, PlayerRepository,
-    PlayerSnapshot, Profile, RepositoryError, RepositoryFuture, ServiceKind, SetupState,
-    StarterGrant, StarterKey,
+    AbortMatch, AbortMatchOutcome, Account, AccountAggregate, AccountId, AccountRepository,
+    AccountStatus, AuthenticatedSession, AuthenticationRecord, BeginSoloMatch,
+    BeginSoloMatchOutcome, Character, CharacterId, CommitSoloHole, ConsumeHandover, CredentialHash,
+    EquipmentSet, EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository,
+    IncompleteMatchAbortLimit, InventoryItem, InventoryItemId, ItemTypeId, MAX_PLAYER_CHARACTERS,
+    MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MatchAbortReason, MatchId, MatchRepository,
+    MatchRepositoryError, MatchResultKey, NewAccount, NewHandover, Nickname, NormalizedNickname,
+    NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile, RepositoryError,
+    RepositoryFuture, ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey,
+    StrokeCount, Weather, synthetic_solo_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -28,6 +31,7 @@ use sqlx::{
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Embedded forward-only PostgreSQL migrations.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -534,6 +538,350 @@ impl PgRepository {
             handover_id: request.id,
         })
     }
+
+    async fn begin_solo_inner(
+        &self,
+        request: BeginSoloMatch,
+    ) -> Result<BeginSoloMatchOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let account_status = sqlx::query_scalar!(
+            "SELECT status FROM accounts WHERE id = $1 FOR UPDATE",
+            request.account_id().get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        match account_status.as_deref() {
+            Some("active") => {}
+            Some(_) => return Err(MatchRepositoryError::InvalidStatus),
+            None => return Err(MatchRepositoryError::WrongAccount),
+        }
+        let catalog_fingerprint = request.catalog_fingerprint();
+        let seed = request.seed();
+        let inserted = sqlx::query!(
+            "INSERT INTO matches \
+             (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather) \
+             VALUES ($1, $2, $3, 1, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+            request.match_id().get(),
+            request.result_key().get(),
+            i64::from(request.config().course_id().get()),
+            i16::from(request.config().par()),
+            catalog_fingerprint.as_bytes().as_slice(),
+            seed.as_bytes().as_slice(),
+            weather_text(request.weather())
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+
+        if inserted.rows_affected() == 1 {
+            sqlx::query!(
+                "INSERT INTO match_players (match_id, account_id) VALUES ($1, $2)",
+                request.match_id().get(),
+                request.account_id().get()
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            sqlx::query!(
+                "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+                 VALUES ($1, $2, 'started', 'success')",
+                request.match_id().get(),
+                request.account_id().get()
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            transaction.commit().await.map_err(match_db_error)?;
+            return Ok(BeginSoloMatchOutcome::Begun);
+        }
+
+        let rows = sqlx::query_as!(
+            MatchPersistenceRow,
+            r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
+                      m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
+                      m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
+                      m.weather AS "weather!", m.reward_formula AS "reward_formula!",
+                      m.status AS "status!", mp.account_id AS "account_id!",
+                      mp.strokes AS "strokes?", mp.score AS "score?",
+                      mp.pang_reward AS "pang_reward?",
+                      mp.experience_reward AS "experience_reward?",
+                      mp.pang_balance_after AS "pang_balance_after?",
+                      mp.experience_balance_after AS "experience_balance_after?"
+               FROM matches m JOIN match_players mp ON mp.match_id = m.id
+               WHERE m.id = $1 OR m.result_commit_key = $2 FOR UPDATE OF m, mp"#,
+            request.match_id().get(),
+            request.result_key().get()
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        let [row] = rows.as_slice() else {
+            return Err(MatchRepositoryError::InputDrift);
+        };
+        if !row.matches_begin(&request)? {
+            return Err(MatchRepositoryError::InputDrift);
+        }
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(BeginSoloMatchOutcome::Existing)
+    }
+
+    async fn abort_match_inner(
+        &self,
+        request: AbortMatch,
+    ) -> Result<AbortMatchOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let row = lock_match(&mut transaction, request.match_id()).await?;
+        validate_authority(&row, request.account_id(), request.result_key())?;
+        match row.status.as_str() {
+            "committed" => {
+                let result = row.persisted_result()?;
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(AbortMatchOutcome::AlreadyCommitted(result));
+            }
+            "aborted" => {
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(AbortMatchOutcome::AlreadyAborted);
+            }
+            "loading" | "in_game" | "results_pending" => {}
+            _ => return Err(MatchRepositoryError::CorruptData),
+        }
+        sqlx::query!(
+            "UPDATE match_players SET quit = TRUE WHERE match_id = $1 AND account_id = $2",
+            request.match_id().get(),
+            request.account_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "UPDATE matches SET status = 'aborted', abort_reason = $2, aborted_at = now() \
+             WHERE id = $1",
+            request.match_id().get(),
+            abort_reason_text(request.reason())
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "INSERT INTO match_audit_events \
+             (match_id, account_id, event, outcome, reason) \
+             VALUES ($1, $2, 'aborted', 'success', $3)",
+            request.match_id().get(),
+            request.account_id().get(),
+            abort_reason_text(request.reason())
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(AbortMatchOutcome::Aborted)
+    }
+
+    async fn commit_solo_hole_inner(
+        &self,
+        request: CommitSoloHole,
+    ) -> Result<SoloMatchResult, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let row = lock_match(&mut transaction, request.match_id()).await?;
+        validate_authority(&row, request.account_id(), request.result_key())?;
+        if row.course_id != i64::from(request.config().course_id().get())
+            || row.hole != 1
+            || row.par != i16::from(request.config().par())
+        {
+            return Err(MatchRepositoryError::WrongConfig);
+        }
+        match row.status.as_str() {
+            "committed" => {
+                let result = row.persisted_result()?;
+                if result.strokes() != request.strokes() {
+                    return Err(MatchRepositoryError::InputDrift);
+                }
+                transaction.commit().await.map_err(match_db_error)?;
+                return Ok(result);
+            }
+            "aborted" => return Err(MatchRepositoryError::Aborted),
+            "loading" | "in_game" | "results_pending" => {}
+            _ => return Err(MatchRepositoryError::CorruptData),
+        }
+
+        let balances = sqlx::query!(
+            r#"SELECT pang AS "pang!", experience AS "experience!"
+               FROM profiles WHERE account_id = $1 FOR UPDATE"#,
+            request.account_id().get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(match_db_error)?
+        .ok_or(MatchRepositoryError::WrongAccount)?;
+        let (old_pang, old_experience) = (balances.pang, balances.experience);
+        let reward = synthetic_solo_reward_v1(request.config(), request.strokes())
+            .map_err(|_| MatchRepositoryError::CorruptData)?;
+        let new_pang = checked_balance_add(old_pang, reward.pang())?;
+        let new_experience = checked_balance_add(old_experience, reward.experience())?;
+        let pang_delta =
+            i64::try_from(reward.pang()).map_err(|_| MatchRepositoryError::BalanceOverflow)?;
+        let experience_delta = i64::try_from(reward.experience())
+            .map_err(|_| MatchRepositoryError::BalanceOverflow)?;
+
+        let updated = sqlx::query!(
+            "UPDATE profiles SET pang = $2, experience = $3, updated_at = now() \
+             WHERE account_id = $1 AND pang = $4 AND experience = $5",
+            request.account_id().get(),
+            new_pang,
+            new_experience,
+            old_pang,
+            old_experience
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(MatchRepositoryError::Storage);
+        }
+        sqlx::query!(
+            "INSERT INTO currency_ledger \
+             (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) \
+             VALUES ($1, $2, $3, 'pang', $4, 'solo-v1', $5)",
+            request.account_id().get(),
+            request.match_id().get(),
+            request.result_key().get(),
+            pang_delta,
+            new_pang
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "INSERT INTO progression_ledger \
+             (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) \
+             VALUES ($1, $2, $3, 'experience', $4, 'solo-v1', $5)",
+            request.account_id().get(),
+            request.match_id().get(),
+            request.result_key().get(),
+            experience_delta,
+            new_experience
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "UPDATE match_players SET strokes = $3, score = $4, pang_reward = $5, \
+                    experience_reward = $6, pang_balance_after = $7, \
+                    experience_balance_after = $8 \
+             WHERE match_id = $1 AND account_id = $2",
+            request.match_id().get(),
+            request.account_id().get(),
+            i16::try_from(request.strokes().get())
+                .map_err(|_| MatchRepositoryError::CorruptData)?,
+            reward.score(),
+            pang_delta,
+            experience_delta,
+            new_pang,
+            new_experience
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+             VALUES ($1, $2, 'committed', 'success')",
+            request.match_id().get(),
+            request.account_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        sqlx::query!(
+            "UPDATE matches SET status = 'committed', committed_at = now() WHERE id = $1",
+            request.match_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        let persisted_balances = sqlx::query!(
+            r#"SELECT pang AS "pang!", experience AS "experience!"
+               FROM profiles WHERE account_id = $1"#,
+            request.account_id().get()
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if (persisted_balances.pang, persisted_balances.experience) != (new_pang, new_experience) {
+            return Err(MatchRepositoryError::Storage);
+        }
+        let result = SoloMatchResult::new(
+            request.match_id(),
+            request.result_key(),
+            request.account_id(),
+            request.strokes(),
+            reward,
+            pangya_domain::ServerBalances::from_persisted(
+                checked_match_u64(new_pang)?,
+                checked_match_u64(new_experience)?,
+            ),
+        );
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(result)
+    }
+
+    async fn abort_incomplete_matches_inner(
+        &self,
+        limit: IncompleteMatchAbortLimit,
+    ) -> Result<u32, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let fetch_limit = i64::from(limit.get())
+            .checked_add(1)
+            .ok_or(MatchRepositoryError::RecoveryLimitExceeded)?;
+        let rows = sqlx::query!(
+            r#"SELECT m.id AS "match_id!", mp.account_id AS "account_id!"
+               FROM matches m JOIN match_players mp ON mp.match_id = m.id
+               WHERE m.status IN ('loading', 'in_game', 'results_pending')
+               ORDER BY m.created_at, m.id FOR UPDATE OF m, mp LIMIT $1"#,
+            fetch_limit
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if rows.len()
+            > usize::try_from(limit.get())
+                .map_err(|_| MatchRepositoryError::RecoveryLimitExceeded)?
+        {
+            return Err(MatchRepositoryError::RecoveryLimitExceeded);
+        }
+        for row in &rows {
+            sqlx::query!(
+                "UPDATE match_players SET quit = TRUE WHERE match_id = $1 AND account_id = $2",
+                row.match_id,
+                row.account_id
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            sqlx::query!(
+                "UPDATE matches SET status = 'aborted', abort_reason = 'startup_recovery', \
+                        aborted_at = now() WHERE id = $1",
+                row.match_id
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+            sqlx::query!(
+                "INSERT INTO match_audit_events \
+                 (match_id, account_id, event, outcome, reason) \
+                 VALUES ($1, $2, 'aborted', 'success', 'startup_recovery')",
+                row.match_id,
+                row.account_id
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(match_db_error)?;
+        }
+        let count =
+            u32::try_from(rows.len()).map_err(|_| MatchRepositoryError::RecoveryLimitExceeded)?;
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(count)
+    }
 }
 
 impl AccountRepository for PgRepository {
@@ -603,6 +951,36 @@ impl HandoverRepository for PgRepository {
         request: ConsumeHandover,
     ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
         Box::pin(self.consume_handover_inner(request))
+    }
+}
+
+impl MatchRepository for PgRepository {
+    fn begin_solo(
+        &self,
+        request: BeginSoloMatch,
+    ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
+        Box::pin(self.begin_solo_inner(request))
+    }
+
+    fn abort(
+        &self,
+        request: AbortMatch,
+    ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>> {
+        Box::pin(self.abort_match_inner(request))
+    }
+
+    fn commit_solo_hole(
+        &self,
+        request: CommitSoloHole,
+    ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>> {
+        Box::pin(self.commit_solo_hole_inner(request))
+    }
+
+    fn abort_incomplete_matches(
+        &self,
+        limit: IncompleteMatchAbortLimit,
+    ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>> {
+        Box::pin(self.abort_incomplete_matches_inner(limit))
     }
 }
 
@@ -698,6 +1076,165 @@ struct HandoverRow {
     consumed_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
     status: String,
+}
+
+#[derive(Clone, FromRow)]
+struct MatchPersistenceRow {
+    id: Uuid,
+    result_commit_key: Uuid,
+    course_id: i64,
+    hole: i16,
+    par: i16,
+    catalog_sha256: Vec<u8>,
+    seed: Vec<u8>,
+    weather: String,
+    reward_formula: String,
+    status: String,
+    account_id: i64,
+    strokes: Option<i16>,
+    score: Option<i16>,
+    pang_reward: Option<i64>,
+    experience_reward: Option<i64>,
+    pang_balance_after: Option<i64>,
+    experience_balance_after: Option<i64>,
+}
+
+impl MatchPersistenceRow {
+    fn matches_begin(&self, request: &BeginSoloMatch) -> Result<bool, MatchRepositoryError> {
+        if self.hole != 1 || self.reward_formula != "solo-v1" {
+            return Err(MatchRepositoryError::CorruptData);
+        }
+        let fingerprint = pangya_domain::CatalogFingerprint::from_slice(&self.catalog_sha256)
+            .map_err(|_| MatchRepositoryError::CorruptData)?;
+        let seed = pangya_domain::MatchSeed::from_slice(&self.seed)
+            .map_err(|_| MatchRepositoryError::CorruptData)?;
+        let weather = parse_weather(&self.weather)?;
+        Ok(self.id == request.match_id().get()
+            && self.result_commit_key == request.result_key().get()
+            && self.account_id == request.account_id().get()
+            && self.course_id == i64::from(request.config().course_id().get())
+            && self.par == i16::from(request.config().par())
+            && fingerprint == request.catalog_fingerprint()
+            && seed == request.seed()
+            && weather == request.weather())
+    }
+
+    fn persisted_result(&self) -> Result<SoloMatchResult, MatchRepositoryError> {
+        if self.status != "committed" || self.hole != 1 || self.reward_formula != "solo-v1" {
+            return Err(MatchRepositoryError::CorruptData);
+        }
+        let strokes = self
+            .strokes
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(MatchRepositoryError::CorruptData)
+            .and_then(|value| {
+                StrokeCount::new(value).map_err(|_| MatchRepositoryError::CorruptData)
+            })?;
+        let reward = pangya_domain::SoloReward::from_persisted(
+            self.score.ok_or(MatchRepositoryError::CorruptData)?,
+            checked_match_u64(self.pang_reward.ok_or(MatchRepositoryError::CorruptData)?)?,
+            checked_match_u64(
+                self.experience_reward
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+        );
+        let balances = pangya_domain::ServerBalances::from_persisted(
+            checked_match_u64(
+                self.pang_balance_after
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+            checked_match_u64(
+                self.experience_balance_after
+                    .ok_or(MatchRepositoryError::CorruptData)?,
+            )?,
+        );
+        Ok(SoloMatchResult::new(
+            MatchId::new(self.id),
+            MatchResultKey::new(self.result_commit_key),
+            AccountId::new(self.account_id).map_err(|_| MatchRepositoryError::CorruptData)?,
+            strokes,
+            reward,
+            balances,
+        ))
+    }
+}
+
+async fn lock_match(
+    transaction: &mut Transaction<'_, Postgres>,
+    match_id: MatchId,
+) -> Result<MatchPersistenceRow, MatchRepositoryError> {
+    sqlx::query_as!(
+        MatchPersistenceRow,
+        r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
+                  m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
+                  m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
+                  m.weather AS "weather!", m.reward_formula AS "reward_formula!",
+                  m.status AS "status!", mp.account_id AS "account_id!",
+                  mp.strokes AS "strokes?", mp.score AS "score?",
+                  mp.pang_reward AS "pang_reward?",
+                  mp.experience_reward AS "experience_reward?",
+                  mp.pang_balance_after AS "pang_balance_after?",
+                  mp.experience_balance_after AS "experience_balance_after?"
+           FROM matches m JOIN match_players mp ON mp.match_id = m.id
+           WHERE m.id = $1 FOR UPDATE OF m, mp"#,
+        match_id.get()
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(match_db_error)?
+    .ok_or(MatchRepositoryError::NotFound)
+}
+
+fn validate_authority(
+    row: &MatchPersistenceRow,
+    account_id: AccountId,
+    result_key: MatchResultKey,
+) -> Result<(), MatchRepositoryError> {
+    if row.account_id != account_id.get() {
+        return Err(MatchRepositoryError::WrongAccount);
+    }
+    if row.result_commit_key != result_key.get() {
+        return Err(MatchRepositoryError::WrongResultKey);
+    }
+    Ok(())
+}
+
+fn checked_balance_add(current: i64, reward: u64) -> Result<i64, MatchRepositoryError> {
+    let current = u64::try_from(current).map_err(|_| MatchRepositoryError::CorruptData)?;
+    let balance = current
+        .checked_add(reward)
+        .ok_or(MatchRepositoryError::BalanceOverflow)?;
+    i64::try_from(balance).map_err(|_| MatchRepositoryError::BalanceOverflow)
+}
+
+fn checked_match_u64(value: i64) -> Result<u64, MatchRepositoryError> {
+    u64::try_from(value).map_err(|_| MatchRepositoryError::CorruptData)
+}
+
+const fn weather_text(weather: Weather) -> &'static str {
+    match weather {
+        Weather::Clear => "clear",
+        Weather::Cloudy => "cloudy",
+        Weather::Rain => "rain",
+    }
+}
+
+fn parse_weather(value: &str) -> Result<Weather, MatchRepositoryError> {
+    match value {
+        "clear" => Ok(Weather::Clear),
+        "cloudy" => Ok(Weather::Cloudy),
+        "rain" => Ok(Weather::Rain),
+        _ => Err(MatchRepositoryError::CorruptData),
+    }
+}
+
+const fn abort_reason_text(reason: MatchAbortReason) -> &'static str {
+    match reason {
+        MatchAbortReason::Disconnect => "disconnect",
+        MatchAbortReason::LoadingTimeout => "loading_timeout",
+        MatchAbortReason::Shutdown => "shutdown",
+        MatchAbortReason::StartupRecovery => "startup_recovery",
+    }
 }
 
 async fn lock_active_account(
@@ -1204,6 +1741,10 @@ fn repository_db_error(error: sqlx::Error) -> RepositoryError {
 
 fn handover_db_error(_error: sqlx::Error) -> HandoverError {
     HandoverError::Storage
+}
+
+fn match_db_error(_error: sqlx::Error) -> MatchRepositoryError {
+    MatchRepositoryError::Storage
 }
 
 /// Marker retained for the M1 crate-boundary test.

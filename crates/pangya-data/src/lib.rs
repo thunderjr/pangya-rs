@@ -17,10 +17,13 @@ use std::{
 };
 
 use cap_std::{ambient_authority, fs::Dir};
-use pangya_domain::{ItemTypeId, PlayerSnapshot, StarterGrant};
+use pangya_domain::{
+    CatalogFingerprint, CourseId, ItemTypeId, OneHoleConfig, PlayerSnapshot, StarterGrant,
+};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use unicode_normalization::is_nfc;
 
 /// Supported manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
@@ -45,6 +48,8 @@ pub enum CatalogKind {
     ClubSet,
     /// Ball inventory records.
     Ball,
+    /// Optional locally generated one-hole course records.
+    Course,
 }
 
 /// One versioned manifest entry.
@@ -82,13 +87,23 @@ pub struct CatalogManifest {
 pub struct CatalogRecord {
     /// First four record bytes interpreted as little-endian type ID.
     pub type_id: ItemTypeId,
-    /// Remaining unattested record bytes.
+    /// Remaining unattested record bytes. For Course, this starts after the local par byte.
     pub opaque: Arc<[u8]>,
+    local_one_hole_par: Option<u8>,
+}
+
+impl CatalogRecord {
+    /// Returns the explicit local one-hole par only for a generated Course record.
+    #[must_use]
+    pub const fn local_one_hole_par(&self) -> Option<u8> {
+        self.local_one_hole_par
+    }
 }
 
 #[derive(Debug)]
 struct CatalogInner {
     records: BTreeMap<CatalogKind, BTreeMap<u32, CatalogRecord>>,
+    fingerprint: CatalogFingerprint,
 }
 
 /// Immutable validated catalog shared across GameService connections.
@@ -130,10 +145,13 @@ impl Catalog {
         {
             return Err(CatalogError::Manifest);
         }
+        for entry in &manifest.files {
+            validate_manifest_entry(entry)?;
+        }
+        let fingerprint = canonical_fingerprint(&manifest)?;
         let mut records = BTreeMap::new();
         let mut type_ids = BTreeSet::new();
         for entry in &manifest.files {
-            validate_manifest_entry(entry)?;
             if records.contains_key(&entry.kind) {
                 return Err(CatalogError::DuplicateKind);
             }
@@ -156,10 +174,19 @@ impl Catalog {
                 return Err(CatalogError::MissingKind);
             }
         }
-        Ok(Self(Arc::new(CatalogInner { records })))
+        Ok(Self(Arc::new(CatalogInner {
+            records,
+            fingerprint,
+        })))
     }
 
-    /// Returns whether a type ID exists in one required family.
+    /// Returns the stable SHA-256 of canonical declared manifest metadata.
+    #[must_use]
+    pub fn fingerprint(&self) -> CatalogFingerprint {
+        self.0.fingerprint
+    }
+
+    /// Returns whether a type ID exists in one declared family.
     #[must_use]
     pub fn contains(&self, kind: CatalogKind, type_id: ItemTypeId) -> bool {
         self.0
@@ -172,6 +199,18 @@ impl Catalog {
     #[must_use]
     pub fn record(&self, kind: CatalogKind, type_id: ItemTypeId) -> Option<&CatalogRecord> {
         self.0.records.get(&kind)?.get(&type_id.get())
+    }
+
+    /// Returns a checked local one-hole configuration from the optional Course family.
+    ///
+    /// # Errors
+    /// Rejects a missing course, a zero/out-of-range course ID, or invalid generated par.
+    pub fn one_hole_course(&self, course_id: CourseId) -> Result<OneHoleConfig, CatalogError> {
+        let record = self
+            .record(CatalogKind::Course, ItemTypeId::new(course_id.get()))
+            .ok_or(CatalogError::Binding)?;
+        let par = record.local_one_hole_par().ok_or(CatalogError::Structure)?;
+        OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)
     }
 
     /// Cross-checks configured starter IDs against the minimum catalog.
@@ -302,9 +341,18 @@ pub fn parse_iff_bytes(
     let mut records = BTreeMap::new();
     for record in bytes[IFF_HEADER_BYTES..].chunks_exact(entry.record_size) {
         let type_id = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let (local_one_hole_par, opaque) = if entry.kind == CatalogKind::Course {
+            let course_id = CourseId::new(type_id).map_err(|_| CatalogError::Structure)?;
+            let par = *record.get(4).ok_or(CatalogError::Structure)?;
+            OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)?;
+            (Some(par), &record[5..])
+        } else {
+            (None, &record[4..])
+        };
         let value = CatalogRecord {
             type_id: ItemTypeId::new(type_id),
-            opaque: Arc::from(&record[4..]),
+            opaque: Arc::from(opaque),
+            local_one_hole_par,
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
@@ -314,8 +362,13 @@ pub fn parse_iff_bytes(
 }
 
 fn validate_manifest_entry(entry: &ManifestFile) -> Result<(), CatalogError> {
+    let minimum_record_size = if entry.kind == CatalogKind::Course {
+        5
+    } else {
+        4
+    };
     if entry.count == 0
-        || !(4..=MAX_RECORD_SIZE).contains(&entry.record_size)
+        || !(minimum_record_size..=MAX_RECORD_SIZE).contains(&entry.record_size)
         || entry.sha256.len() != 64
         || !entry
             .sha256
@@ -327,18 +380,87 @@ fn validate_manifest_entry(entry: &ManifestFile) -> Result<(), CatalogError> {
     validate_relative(&entry.filename)
 }
 
-fn validate_relative(path: &Path) -> Result<(), CatalogError> {
-    if path.as_os_str().is_empty() || path.as_os_str().len() > 240 || path.is_absolute() {
+fn canonical_fingerprint(manifest: &CatalogManifest) -> Result<CatalogFingerprint, CatalogError> {
+    let mut declarations = manifest
+        .files
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let kind = catalog_kind_tag(entry.kind);
+            let filename = canonical_utf8_filename(&entry.filename)?;
+            Ok((kind, filename, entry))
+        })
+        .collect::<Result<Vec<_>, CatalogError>>()?;
+    declarations.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+
+    let mut hasher = Sha256::new();
+    hash_fingerprint_field(&mut hasher, b"pangya-rs-catalog-fingerprint-v2")?;
+    hash_fingerprint_field(&mut hasher, &manifest.manifest_version.to_be_bytes())?;
+    let count = u32::try_from(declarations.len()).map_err(|_| CatalogError::Manifest)?;
+    hash_fingerprint_field(&mut hasher, &count.to_be_bytes())?;
+    for (kind, filename, entry) in declarations {
+        hash_fingerprint_field(&mut hasher, &[kind])?;
+        hash_fingerprint_field(&mut hasher, filename.as_bytes())?;
+        hash_fingerprint_field(&mut hasher, entry.sha256.as_bytes())?;
+        hash_fingerprint_field(&mut hasher, &entry.count.to_be_bytes())?;
+        hash_fingerprint_field(&mut hasher, &entry.binding.to_be_bytes())?;
+        hash_fingerprint_field(&mut hasher, &entry.version.to_be_bytes())?;
+        let record_size = u64::try_from(entry.record_size).map_err(|_| CatalogError::Manifest)?;
+        hash_fingerprint_field(&mut hasher, &record_size.to_be_bytes())?;
+    }
+    Ok(CatalogFingerprint::new(hasher.finalize().into()))
+}
+
+fn hash_fingerprint_field(hasher: &mut Sha256, field: &[u8]) -> Result<(), CatalogError> {
+    let length = u64::try_from(field.len()).map_err(|_| CatalogError::Manifest)?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(field);
+    Ok(())
+}
+
+const fn catalog_kind_tag(kind: CatalogKind) -> u8 {
+    match kind {
+        CatalogKind::Character => 1,
+        CatalogKind::ClubSet => 2,
+        CatalogKind::Ball => 3,
+        CatalogKind::Course => 4,
+    }
+}
+
+fn canonical_utf8_filename(path: &Path) -> Result<String, CatalogError> {
+    let filename = path.to_str().ok_or(CatalogError::Path)?;
+    if filename.is_empty()
+        || filename.len() > 240
+        || path.is_absolute()
+        || filename.contains('\\')
+        || filename.chars().any(char::is_control)
+        || !is_nfc(filename)
+    {
         return Err(CatalogError::Path);
     }
-    if path
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)))
-    {
-        Ok(())
-    } else {
-        Err(CatalogError::Path)
+    let mut canonical = String::with_capacity(filename.len());
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(CatalogError::Path);
+        };
+        let component = component.to_str().ok_or(CatalogError::Path)?;
+        if !canonical.is_empty() {
+            canonical.push('/');
+        }
+        canonical.push_str(component);
     }
+    if canonical != filename {
+        return Err(CatalogError::Path);
+    }
+    Ok(canonical)
+}
+
+fn validate_relative(path: &Path) -> Result<(), CatalogError> {
+    canonical_utf8_filename(path).map(drop)
 }
 
 fn read_bounded_regular(
@@ -418,6 +540,22 @@ mod tests {
         let parsed = parse_iff_bytes(&entry(2, 8), &iff(&[11, 22], 8)).expect("catalog");
         assert_eq!(parsed[&11].type_id, ItemTypeId::new(11));
         assert_eq!(parsed[&22].opaque.as_ref(), [0xa5; 4]);
+        assert_eq!(parsed[&22].local_one_hole_par(), None);
+    }
+
+    #[test]
+    fn course_par_is_explicit_and_checked() {
+        let mut course_entry = entry(1, 5);
+        course_entry.kind = CatalogKind::Course;
+        let mut bytes = iff(&[7], 5);
+        bytes[12] = 3;
+        let parsed = parse_iff_bytes(&course_entry, &bytes).expect("course");
+        assert_eq!(parsed[&7].local_one_hole_par(), Some(3));
+        bytes[12] = 0;
+        assert_eq!(
+            parse_iff_bytes(&course_entry, &bytes),
+            Err(CatalogError::Structure)
+        );
     }
 
     #[test]
@@ -436,6 +574,62 @@ mod tests {
             parse_iff_bytes(&entry(1, 8), &trailing),
             Err(CatalogError::Structure)
         );
+    }
+
+    #[test]
+    fn catalog_fingerprint_is_invariant_to_manifest_declaration_order() {
+        let mut character = entry(1, 8);
+        character.filename = PathBuf::from("Character.bin");
+        let mut ball = entry(2, 12);
+        ball.filename = PathBuf::from("Ball.bin");
+        ball.kind = CatalogKind::Ball;
+        ball.sha256 = "a".repeat(64);
+        let ordered = CatalogManifest {
+            manifest_version: MANIFEST_VERSION,
+            files: vec![character.clone(), ball.clone()],
+        };
+        let reordered = CatalogManifest {
+            manifest_version: MANIFEST_VERSION,
+            files: vec![ball, character],
+        };
+        assert_eq!(
+            canonical_fingerprint(&ordered),
+            canonical_fingerprint(&reordered)
+        );
+    }
+
+    #[test]
+    fn catalog_filenames_are_canonical_utf8_with_security_boundaries() {
+        assert_eq!(
+            canonical_utf8_filename(Path::new("nested/Coursé.bin")),
+            Ok("nested/Coursé.bin".to_owned())
+        );
+        for invalid in [
+            "",
+            "/absolute.bin",
+            "../escape.bin",
+            "nested/../escape.bin",
+            "nested//duplicate-separator.bin",
+            "nested\\platform-ambiguous.bin",
+            "control\n.bin",
+            "Cafe\u{301}.bin",
+        ] {
+            assert_eq!(
+                canonical_utf8_filename(Path::new(invalid)),
+                Err(CatalogError::Path),
+                "accepted noncanonical filename {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_filenames_reject_non_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let filename = PathBuf::from(OsString::from_vec(vec![b'f', 0x80, b'.', b'b']));
+        assert_eq!(canonical_utf8_filename(&filename), Err(CatalogError::Path));
     }
 
     #[cfg(unix)]

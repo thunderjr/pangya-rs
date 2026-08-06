@@ -27,3 +27,12 @@ binding = 3
 version = 1
 record_size = 8
 
+[[files]]
+filename = "Course.bin"
+sha256 = "be82c128ac79c6e84117f79369b902de61d433595ba5d1da9b3670dfd8c04911"
+kind = "course"
+count = 1
+binding = 4
+version = 1
+record_size = 5
+

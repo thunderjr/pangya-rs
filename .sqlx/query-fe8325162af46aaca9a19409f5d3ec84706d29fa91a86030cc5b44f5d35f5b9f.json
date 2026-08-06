@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT m.id AS \"match_id!\", mp.account_id AS \"account_id!\"\n               FROM matches m JOIN match_players mp ON mp.match_id = m.id\n               WHERE m.status IN ('loading', 'in_game', 'results_pending')\n               ORDER BY m.created_at, m.id FOR UPDATE OF m, mp LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "match_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "fe8325162af46aaca9a19409f5d3ec84706d29fa91a86030cc5b44f5d35f5b9f"
+}

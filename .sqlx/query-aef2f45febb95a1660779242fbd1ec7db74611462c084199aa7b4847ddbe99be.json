@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE matches SET status = 'aborted', abort_reason = $2, aborted_at = now() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aef2f45febb95a1660779242fbd1ec7db74611462c084199aa7b4847ddbe99be"
+}

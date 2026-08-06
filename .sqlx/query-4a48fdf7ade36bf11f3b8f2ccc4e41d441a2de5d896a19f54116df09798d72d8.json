@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pang AS \"pang!\", experience AS \"experience!\"\n               FROM profiles WHERE account_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pang!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "experience!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4a48fdf7ade36bf11f3b8f2ccc4e41d441a2de5d896a19f54116df09798d72d8"
+}

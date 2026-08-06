@@ -4,14 +4,18 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use pangya_domain::{
-    AccountRepository, AccountStatus, ConsumeHandover, CredentialHash, HandoverDigest,
-    HandoverError, HandoverRepository, ItemTypeId, MAX_STARTER_ITEMS, NewAccount, Nickname,
-    NormalizedUsername, PlayerRepository, RepositoryError, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, Username,
+    AbortMatch, AbortMatchOutcome, AccountRepository, AccountStatus, BeginSoloMatch,
+    BeginSoloMatchOutcome, CatalogFingerprint, CommitSoloHole, ConsumeHandover, CourseId,
+    CredentialHash, HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
+    ItemTypeId, MAX_STARTER_ITEMS, MatchAbortReason, MatchId, MatchRepository,
+    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
+    OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCount, Username, Weather,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 fn source() -> SourceAddressPrefix {
     SourceAddressPrefix::from_ip("198.51.100.77".parse().expect("test source IP"))
@@ -789,6 +793,711 @@ async fn handover_stores_only_canonical_privacy_minimized_source_prefix(pool: Pg
     assert_eq!(stored, prefix.as_str());
     assert_eq!(stored, "2001:db8:1234:5600::/56");
     assert!(!stored.contains("abcd"));
+}
+
+fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
+    BeginSoloMatch::new(
+        MatchId::new(Uuid::new_v4()),
+        MatchResultKey::new(Uuid::new_v4()),
+        account_id,
+        OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+        CatalogFingerprint::new([0x42; 32]),
+        MatchSeed::new([0x24; 32]),
+        Weather::Clear,
+    )
+}
+
+fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
+    CommitSoloHole::new(
+        begin.match_id(),
+        begin.result_key(),
+        begin.account_id(),
+        begin.config(),
+        StrokeCount::new(strokes).expect("strokes"),
+    )
+}
+
+async fn match_counts(pool: &PgPool, match_id: MatchId) -> (i64, i64, i64, i64) {
+    let players = sqlx::query_scalar("SELECT count(*) FROM match_players WHERE match_id = $1")
+        .bind(match_id.get())
+        .fetch_one(pool)
+        .await
+        .expect("players");
+    let currency = sqlx::query_scalar("SELECT count(*) FROM currency_ledger WHERE match_id = $1")
+        .bind(match_id.get())
+        .fetch_one(pool)
+        .await
+        .expect("currency ledger");
+    let progression =
+        sqlx::query_scalar("SELECT count(*) FROM progression_ledger WHERE match_id = $1")
+            .bind(match_id.get())
+            .fetch_one(pool)
+            .await
+            .expect("progression ledger");
+    let audits = sqlx::query_scalar("SELECT count(*) FROM match_audit_events WHERE match_id = $1")
+        .bind(match_id.get())
+        .fetch_one(pool)
+        .await
+        .expect("audits");
+    (players, currency, progression, audits)
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn solo_match_commit_is_exactly_once_for_sequential_and_concurrent_replay(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("SoloHappy", Some("SoloHappyNick")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    assert_eq!(
+        repository.begin_solo(begin.clone()).await,
+        Ok(BeginSoloMatchOutcome::Begun)
+    );
+    assert_eq!(
+        repository.begin_solo(begin.clone()).await,
+        Ok(BeginSoloMatchOutcome::Existing)
+    );
+    let commit = solo_commit(&begin, 2);
+    let (left, right) = tokio::join!(
+        repository.commit_solo_hole(commit),
+        repository.commit_solo_hole(commit)
+    );
+    let left = left.expect("left commit");
+    let right = right.expect("right replay");
+    assert_eq!(left, right);
+    assert_eq!(
+        (
+            left.score(),
+            left.pang_reward(),
+            left.experience_reward(),
+            left.pang_balance(),
+            left.experience_balance()
+        ),
+        (-1, 12, 5, 12, 5)
+    );
+    assert_eq!(repository.commit_solo_hole(commit).await, Ok(left));
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 1, 1, 2));
+    let profile: (i64, i64) =
+        sqlx::query_as("SELECT pang, experience FROM profiles WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("balances");
+    assert_eq!(profile, (12, 5));
+    assert_eq!(
+        repository
+            .abort(AbortMatch::new(
+                begin.match_id(),
+                begin.result_key(),
+                begin.account_id(),
+                MatchAbortReason::Disconnect,
+            ))
+            .await,
+        Ok(AbortMatchOutcome::AlreadyCommitted(left))
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn distinct_matches_commit_concurrently_for_one_account_without_lost_rewards(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("SoloConcurrent", Some("ConcurrentNick")))
+        .await
+        .expect("account");
+    let first = solo_begin(aggregate.account.id);
+    let second = solo_begin(aggregate.account.id);
+    repository
+        .begin_solo(first.clone())
+        .await
+        .expect("first begin");
+    repository
+        .begin_solo(second.clone())
+        .await
+        .expect("second begin");
+
+    let (first_result, second_result) = tokio::join!(
+        repository.commit_solo_hole(solo_commit(&first, 2)),
+        repository.commit_solo_hole(solo_commit(&second, 4))
+    );
+    let first_result = first_result.expect("first commit");
+    let second_result = second_result.expect("second commit");
+    assert_eq!(
+        (
+            first_result.score(),
+            first_result.pang_reward(),
+            first_result.experience_reward()
+        ),
+        (-1, 12, 5)
+    );
+    assert_eq!(
+        (
+            second_result.score(),
+            second_result.pang_reward(),
+            second_result.experience_reward()
+        ),
+        (1, 10, 5)
+    );
+
+    for (begin, pang_delta) in [(&first, 12_i64), (&second, 10_i64)] {
+        let ledger: (i64, i64, i64) = sqlx::query_as(
+            "SELECT c.delta, p.delta, \
+                    (SELECT count(*) FROM match_players mp WHERE mp.match_id = $1 \
+                     AND mp.pang_reward = c.delta AND mp.experience_reward = p.delta) \
+             FROM currency_ledger c JOIN progression_ledger p ON p.match_id = c.match_id \
+             WHERE c.match_id = $1",
+        )
+        .bind(begin.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("exact ledger row");
+        assert_eq!(ledger, (pang_delta, 5, 1));
+        assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 1, 1, 2));
+    }
+    let balances: (i64, i64) =
+        sqlx::query_as("SELECT pang, experience FROM profiles WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("summed balances");
+    assert_eq!(balances, (22, 10));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn disconnect_abort_is_idempotent_and_never_rewards(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("SoloAbort", Some("SoloAbortNick")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+    let abort = AbortMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        begin.account_id(),
+        MatchAbortReason::Disconnect,
+    );
+    assert_eq!(
+        repository.abort(abort).await,
+        Ok(AbortMatchOutcome::Aborted)
+    );
+    assert_eq!(
+        repository.abort(abort).await,
+        Ok(AbortMatchOutcome::AlreadyAborted)
+    );
+    assert_eq!(
+        repository.commit_solo_hole(solo_commit(&begin, 3)).await,
+        Err(MatchRepositoryError::Aborted)
+    );
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 0, 0, 2));
+    let balances: (i64, i64) =
+        sqlx::query_as("SELECT pang, experience FROM profiles WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("balances");
+    assert_eq!(balances, (0, 0));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPool) {
+    let repository = PgRepository::new(pool);
+    let first = repository
+        .create_account(account("SoloAuthorityA", Some("SoloAuthA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("SoloAuthorityB", Some("SoloAuthB")))
+        .await
+        .expect("second account");
+    let begin = solo_begin(first.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+    let drift = BeginSoloMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        begin.account_id(),
+        begin.config(),
+        CatalogFingerprint::new([9; 32]),
+        begin.seed(),
+        begin.weather(),
+    );
+    assert_eq!(
+        repository.begin_solo(drift).await,
+        Err(MatchRepositoryError::InputDrift)
+    );
+    let wrong_account = CommitSoloHole::new(
+        begin.match_id(),
+        begin.result_key(),
+        second.account.id,
+        begin.config(),
+        StrokeCount::new(3).expect("strokes"),
+    );
+    assert_eq!(
+        repository.commit_solo_hole(wrong_account).await,
+        Err(MatchRepositoryError::WrongAccount)
+    );
+    let wrong_key = CommitSoloHole::new(
+        begin.match_id(),
+        MatchResultKey::new(Uuid::new_v4()),
+        begin.account_id(),
+        begin.config(),
+        StrokeCount::new(3).expect("strokes"),
+    );
+    assert_eq!(
+        repository.commit_solo_hole(wrong_key).await,
+        Err(MatchRepositoryError::WrongResultKey)
+    );
+    let wrong_config = CommitSoloHole::new(
+        begin.match_id(),
+        begin.result_key(),
+        begin.account_id(),
+        OneHoleConfig::new(CourseId::new(8).expect("course"), 3).expect("config"),
+        StrokeCount::new(3).expect("strokes"),
+    );
+    assert_eq!(
+        repository.commit_solo_hole(wrong_config).await,
+        Err(MatchRepositoryError::WrongConfig)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn balance_overflow_rolls_back_result_ledgers_audit_and_profile(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("SoloOverflow", Some("SoloOverflowNick")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+    sqlx::query("UPDATE profiles SET pang = $2 WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .bind(i64::MAX)
+        .execute(&pool)
+        .await
+        .expect("set maximum balance");
+    assert_eq!(
+        repository.commit_solo_hole(solo_commit(&begin, 3)).await,
+        Err(MatchRepositoryError::BalanceOverflow)
+    );
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 0, 0, 1));
+    let state: (String, i64, i64) = sqlx::query_as(
+        "SELECT m.status, p.pang, p.experience FROM matches m \
+         JOIN match_players mp ON mp.match_id = m.id \
+         JOIN profiles p ON p.account_id = mp.account_id WHERE m.id = $1",
+    )
+    .bind(begin.match_id().get())
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert_eq!(state, ("loading".to_owned(), i64::MAX, 0));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stale_startup_recovery_aborts_all_with_audit_and_no_reward(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    for index in 0..3 {
+        let aggregate = repository
+            .create_account(account(
+                &format!("StaleSolo{index}"),
+                Some(&format!("StaleNick{index}")),
+            ))
+            .await
+            .expect("account");
+        repository
+            .begin_solo(solo_begin(aggregate.account.id))
+            .await
+            .expect("begin stale match");
+    }
+    assert_eq!(
+        repository
+            .abort_incomplete_matches(IncompleteMatchAbortLimit::new(3).expect("limit"))
+            .await,
+        Ok(3)
+    );
+    assert_eq!(
+        repository
+            .abort_incomplete_matches(IncompleteMatchAbortLimit::new(3).expect("limit"))
+            .await,
+        Ok(0)
+    );
+    let states: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM matches WHERE status = 'aborted' \
+         AND abort_reason = 'startup_recovery'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("aborted matches");
+    let abort_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM match_audit_events WHERE event = 'aborted' \
+         AND reason = 'startup_recovery'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("abort audits");
+    let ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger) + \
+                (SELECT count(*) FROM progression_ledger)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ledgers");
+    assert_eq!((states, abort_audits, ledgers), (3, 3, 0));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn startup_recovery_second_row_failure_rolls_back_first_row(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    for index in 0..2 {
+        let aggregate = repository
+            .create_account(account(
+                &format!("RecoveryRollback{index}"),
+                Some(&format!("RecoveryRoll{index}")),
+            ))
+            .await
+            .expect("account");
+        repository
+            .begin_solo(solo_begin(aggregate.account.id))
+            .await
+            .expect("begin");
+    }
+    let ordered_match_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM matches WHERE status = 'loading' ORDER BY created_at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("ordered recovery rows");
+    assert_eq!(ordered_match_ids.len(), 2);
+    let second = ordered_match_ids[1];
+    sqlx::query(
+        "CREATE FUNCTION test_fail_second_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected second recovery failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_fail_second_recovery_audit BEFORE INSERT ON match_audit_events \
+         FOR EACH ROW WHEN (NEW.event = 'aborted' AND NEW.match_id = '{second}'::uuid) \
+         EXECUTE FUNCTION test_fail_second_recovery()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("failure trigger");
+
+    assert_eq!(
+        repository
+            .abort_incomplete_matches(IncompleteMatchAbortLimit::new(2).expect("limit"))
+            .await,
+        Err(MatchRepositoryError::Storage)
+    );
+    let state: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT count(*) FROM matches WHERE status = 'loading'), \
+             (SELECT count(*) FROM match_players WHERE quit), \
+             (SELECT count(*) FROM match_audit_events WHERE event = 'aborted')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rolled back recovery state");
+    assert_eq!(state, (2, 0, 0));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn startup_recovery_cap_rejects_without_partial_abort(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    for index in 0..2 {
+        let aggregate = repository
+            .create_account(account(
+                &format!("CappedSolo{index}"),
+                Some(&format!("CappedNick{index}")),
+            ))
+            .await
+            .expect("account");
+        repository
+            .begin_solo(solo_begin(aggregate.account.id))
+            .await
+            .expect("begin");
+    }
+    assert_eq!(
+        repository
+            .abort_incomplete_matches(IncompleteMatchAbortLimit::new(1).expect("limit"))
+            .await,
+        Err(MatchRepositoryError::RecoveryLimitExceeded)
+    );
+    let loading: i64 = sqlx::query_scalar("SELECT count(*) FROM matches WHERE status = 'loading'")
+        .fetch_one(&pool)
+        .await
+        .expect("loading matches");
+    assert_eq!(loading, 2);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn begin_and_abort_stage_failures_leave_no_partial_lifecycle(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("LifecycleRollback", Some("LifecycleRoll")))
+        .await
+        .expect("account");
+    sqlx::query(
+        "CREATE FUNCTION test_fail_match_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected match lifecycle failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+
+    for (stage, table, condition) in [
+        ("match", "matches", ""),
+        ("player", "match_players", ""),
+        (
+            "started audit",
+            "match_audit_events",
+            "WHEN (NEW.event = 'started')",
+        ),
+    ] {
+        let begin = solo_begin(aggregate.account.id);
+        let trigger = format!(
+            "CREATE TRIGGER test_fail_match_lifecycle_stage BEFORE INSERT ON {table} \
+             FOR EACH ROW {condition} EXECUTE FUNCTION test_fail_match_lifecycle()"
+        );
+        sqlx::query(&trigger).execute(&pool).await.expect("trigger");
+        assert_eq!(
+            repository.begin_solo(begin.clone()).await,
+            Err(MatchRepositoryError::Storage),
+            "begin stage {stage}"
+        );
+        sqlx::query(&format!(
+            "DROP TRIGGER test_fail_match_lifecycle_stage ON {table}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("drop trigger");
+        let matches: i64 = sqlx::query_scalar("SELECT count(*) FROM matches WHERE id = $1")
+            .bind(begin.match_id().get())
+            .fetch_one(&pool)
+            .await
+            .expect("match count");
+        assert_eq!(matches, 0, "begin stage {stage} retained a match");
+    }
+
+    for (index, (stage, table, condition)) in [
+        ("player", "match_players", ""),
+        ("match", "matches", ""),
+        (
+            "abort audit",
+            "match_audit_events",
+            "WHEN (NEW.event = 'aborted')",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let begin = solo_begin(aggregate.account.id);
+        repository.begin_solo(begin.clone()).await.expect("begin");
+        let operation = if table == "match_audit_events" {
+            "INSERT"
+        } else {
+            "UPDATE"
+        };
+        let trigger = format!(
+            "CREATE TRIGGER test_fail_match_lifecycle_stage BEFORE {operation} ON {table} \
+             FOR EACH ROW {condition} EXECUTE FUNCTION test_fail_match_lifecycle()"
+        );
+        sqlx::query(&trigger).execute(&pool).await.expect("trigger");
+        let abort = AbortMatch::new(
+            begin.match_id(),
+            begin.result_key(),
+            begin.account_id(),
+            if index == 0 {
+                MatchAbortReason::Disconnect
+            } else {
+                MatchAbortReason::Shutdown
+            },
+        );
+        assert_eq!(
+            repository.abort(abort).await,
+            Err(MatchRepositoryError::Storage),
+            "abort stage {stage}"
+        );
+        sqlx::query(&format!(
+            "DROP TRIGGER test_fail_match_lifecycle_stage ON {table}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("drop trigger");
+        let state: (String, bool, i64) = sqlx::query_as(
+            "SELECT m.status, mp.quit, \
+                    (SELECT count(*) FROM match_audit_events a \
+                     WHERE a.match_id = m.id AND a.event = 'aborted') \
+             FROM matches m JOIN match_players mp ON mp.match_id = m.id WHERE m.id = $1",
+        )
+        .bind(begin.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("state");
+        assert_eq!(
+            state,
+            ("loading".to_owned(), false, 0),
+            "abort stage {stage}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    sqlx::query(
+        "CREATE FUNCTION test_fail_match_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected match commit failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+    let stages = [
+        ("profile", "profiles", "UPDATE", ""),
+        ("pang ledger", "currency_ledger", "INSERT", ""),
+        ("experience ledger", "progression_ledger", "INSERT", ""),
+        ("player result", "match_players", "UPDATE", ""),
+        (
+            "commit audit",
+            "match_audit_events",
+            "INSERT",
+            "WHEN (NEW.event = 'committed')",
+        ),
+        ("match terminal", "matches", "UPDATE", ""),
+    ];
+    for (index, (stage, table, operation, condition)) in stages.into_iter().enumerate() {
+        let aggregate = repository
+            .create_account(account(
+                &format!("CommitRollback{index}"),
+                Some(&format!("CommitRoll{index}")),
+            ))
+            .await
+            .expect("account");
+        let begin = solo_begin(aggregate.account.id);
+        repository.begin_solo(begin.clone()).await.expect("begin");
+        let trigger = format!(
+            "CREATE TRIGGER test_fail_match_stage BEFORE {operation} ON {table} \
+             FOR EACH ROW {condition} EXECUTE FUNCTION test_fail_match_commit()"
+        );
+        sqlx::query(&trigger)
+            .execute(&pool)
+            .await
+            .expect("failure trigger");
+        assert_eq!(
+            repository.commit_solo_hole(solo_commit(&begin, 2)).await,
+            Err(MatchRepositoryError::Storage),
+            "stage {stage}"
+        );
+        let drop_trigger = format!("DROP TRIGGER test_fail_match_stage ON {table}");
+        sqlx::query(&drop_trigger)
+            .execute(&pool)
+            .await
+            .expect("drop failure trigger");
+        assert_eq!(
+            match_counts(&pool, begin.match_id()).await,
+            (1, 0, 0, 1),
+            "stage {stage} retained history"
+        );
+        let state: (String, Option<i16>, i64, i64) = sqlx::query_as(
+            "SELECT m.status, mp.strokes, p.pang, p.experience FROM matches m \
+             JOIN match_players mp ON mp.match_id = m.id \
+             JOIN profiles p ON p.account_id = mp.account_id WHERE m.id = $1",
+        )
+        .bind(begin.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("rolled back state");
+        assert_eq!(state, ("loading".to_owned(), None, 0, 0), "stage {stage}");
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn match_history_composite_foreign_keys_reject_a_different_account(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let owner = repository
+        .create_account(account("HistoryOwner", Some("HistoryOwnerNick")))
+        .await
+        .expect("owner");
+    let other = repository
+        .create_account(account("HistoryOther", Some("HistoryOtherNick")))
+        .await
+        .expect("other");
+    let begin = solo_begin(owner.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO currency_ledger \
+             (account_id, match_id, idempotency_key, currency, delta, reason, balance_after) \
+             VALUES ($1, $2, $3, 'pang', 1, 'solo-v1', 1)",
+        )
+        .bind(other.account.id.get())
+        .bind(begin.match_id().get())
+        .bind(begin.result_key().get())
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO progression_ledger \
+             (account_id, match_id, idempotency_key, progression, delta, reason, balance_after) \
+             VALUES ($1, $2, $3, 'experience', 1, 'solo-v1', 1)",
+        )
+        .bind(other.account.id.get())
+        .bind(begin.match_id().get())
+        .bind(begin.result_key().get())
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO match_audit_events (match_id, account_id, event, outcome) \
+             VALUES ($1, $2, 'committed', 'success')",
+        )
+        .bind(begin.match_id().get())
+        .bind(other.account.id.get())
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn ledgers_and_match_audit_reject_updates_and_deletes(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("ImmutableHistory", Some("ImmutableNick")))
+        .await
+        .expect("account");
+    let begin = solo_begin(aggregate.account.id);
+    repository.begin_solo(begin.clone()).await.expect("begin");
+    repository
+        .commit_solo_hole(solo_commit(&begin, 2))
+        .await
+        .expect("commit");
+
+    for statement in [
+        "UPDATE currency_ledger SET balance_after = balance_after WHERE match_id = $1",
+        "DELETE FROM currency_ledger WHERE match_id = $1",
+        "UPDATE progression_ledger SET balance_after = balance_after WHERE match_id = $1",
+        "DELETE FROM progression_ledger WHERE match_id = $1",
+        "UPDATE match_audit_events SET outcome = outcome WHERE match_id = $1",
+        "DELETE FROM match_audit_events WHERE match_id = $1",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(begin.match_id().get())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "immutable history mutation succeeded: {statement}"
+        );
+    }
+    assert_eq!(match_counts(&pool, begin.match_id()).await, (1, 1, 1, 2));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
