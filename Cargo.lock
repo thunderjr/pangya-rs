@@ -1266,12 +1266,14 @@ dependencies = [
  "pangya-protocol",
  "proptest",
  "rand 0.8.7",
+ "rand_chacha 0.3.1",
  "sha2",
  "subtle",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 

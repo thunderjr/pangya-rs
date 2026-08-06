@@ -1955,6 +1955,9 @@ pub enum RoomError {
     /// A bounded control or shutdown deadline elapsed.
     #[error("room operation timed out")]
     Timeout,
+    /// Room membership/settings/chat mutations are blocked by an active solo match.
+    #[error("room operation is blocked while a match is active")]
+    MatchActive,
 }
 
 /// Marker retained for the M1 crate-boundary test.

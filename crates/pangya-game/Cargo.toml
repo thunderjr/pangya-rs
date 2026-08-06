@@ -12,6 +12,7 @@ pangya-domain = { version = "0.1.0", path = "../pangya-domain" }
 pangya-login = { version = "0.1.0", path = "../pangya-login" }
 pangya-protocol = { version = "0.1.0", path = "../pangya-protocol" }
 rand.workspace = true
+rand_chacha.workspace = true
 sha2 = "=0.10.9"
 subtle = "=2.6.1"
 thiserror.workspace = true
@@ -22,6 +23,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+uuid.workspace = true
 
 [lints]
 workspace = true

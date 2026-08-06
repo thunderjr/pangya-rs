@@ -10,19 +10,25 @@ use std::{
     time::Duration,
 };
 
-use futures_util::future::join_all;
+use futures_util::{StreamExt as _, stream::FuturesOrdered};
 use pangya_domain::{
-    ChatText, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword, RoomSettings,
-    RoomSnapshot, RoomSummary,
+    AbortMatch, BeginSoloMatch, ChatText, CommitSoloHole, MatchAbortReason, MatchId,
+    MatchResultKey, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword, RoomSettings,
+    RoomSnapshot, RoomSummary, SoloMatchResult,
 };
+use pangya_protocol::{LoadingComplete, ShotAction, ShotResult};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::room::{
-    RoomActorEvent, RoomActorLimits, RoomEvent, RoomHandle, RoomIdentity, spawn_room_with_events,
+use crate::{
+    match_state::{RelayDisposition, SoloMatchError, SoloStartPlan},
+    room::{
+        RoomActorEvent, RoomActorLimits, RoomEvent, RoomHandle, RoomIdentity,
+        spawn_room_with_events,
+    },
 };
 
 /// Hard bounds for the lobby registry and each room it creates.
@@ -133,6 +139,92 @@ pub enum LobbyRouteResult {
     ChatAccepted,
 }
 
+/// Typed solo gameplay operation routed from an authoritative connection mapping.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LobbySoloCommand {
+    /// Reserve an immutable begin before repository persistence.
+    PrepareStart(SoloStartPlan),
+    /// Confirm exact begin persistence and enter Loading.
+    ConfirmBegin {
+        /// Match ID returned by PrepareStart.
+        match_id: MatchId,
+        /// Result key returned by PrepareStart.
+        result_key: MatchResultKey,
+    },
+    /// Cancel exact reservation after begin failure/cancellation.
+    CancelBegin {
+        /// Reserved match ID.
+        match_id: MatchId,
+        /// Reserved result key.
+        result_key: MatchResultKey,
+    },
+    /// Canonical validated loading completion.
+    LoadingComplete(LoadingComplete),
+    /// Validated sequenced action.
+    ShotAction(ShotAction),
+    /// Validated result for the pending action.
+    ShotResult(ShotResult),
+    /// Prepare the server-owned commit request.
+    PrepareFinish,
+    /// Apply an exact trusted repository result.
+    ApplyCommit(SoloMatchResult),
+    /// Abort a commit failure/cancellation without reward.
+    Abort(MatchAbortReason),
+    /// Clear a retained abort after repository acknowledgement.
+    AcknowledgeAbort(AbortMatch),
+}
+
+/// Typed output from a routed solo operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LobbySoloRouteResult {
+    /// Immutable begin request for persistence.
+    Begin(BeginSoloMatch),
+    /// Server-owned commit request for persistence.
+    Commit(CommitSoloHole),
+    /// Trusted committed result emitted and match cleared.
+    Committed(SoloMatchResult),
+    /// Accepted or exact duplicate relay status.
+    Relay(RelayDisposition),
+    /// Idempotent no-reward abort, if a match existed.
+    Abort(Option<AbortMatch>),
+    /// Command completed without a data payload.
+    Applied,
+}
+
+/// Bounded retained aborts produced while gracefully shutting down the lobby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LobbyShutdownOutcome {
+    aborts: Vec<AbortMatch>,
+}
+
+impl LobbyShutdownOutcome {
+    /// Retained no-reward aborts, in ascending room-ID shutdown order.
+    #[must_use]
+    pub fn aborts(&self) -> &[AbortMatch] {
+        &self.aborts
+    }
+
+    /// Consumes the outcome into its bounded abort list.
+    #[must_use]
+    pub fn into_aborts(self) -> Vec<AbortMatch> {
+        self.aborts
+    }
+}
+
+/// Typed lobby shutdown failure.
+#[derive(Clone, Copy, Debug, Eq, thiserror::Error, PartialEq)]
+pub enum LobbyShutdownError {
+    /// A lobby or room control operation failed.
+    #[error(transparent)]
+    Room(#[from] RoomError),
+    /// Registry cardinality exceeded its configured hard room cap.
+    #[error("lobby shutdown room cardinality exceeded its configured bound")]
+    CapacityInvariant,
+    /// The bounded abort output could not reserve its configured maximum capacity.
+    #[error("lobby shutdown could not reserve its bounded abort output")]
+    Allocation,
+}
+
 struct RoomRecord {
     handle: RoomHandle,
     summary: RoomSummary,
@@ -184,6 +276,11 @@ enum LobbyCommand {
         command: LobbyRoomCommand,
         reply: oneshot::Sender<Result<LobbyRouteResult, RoomError>>,
     },
+    RouteSolo {
+        connection_id: PlayerConnectionId,
+        command: LobbySoloCommand,
+        reply: oneshot::Sender<Result<LobbySoloRouteResult, SoloMatchError>>,
+    },
     #[cfg(test)]
     AbortRoom {
         room_id: RoomId,
@@ -205,10 +302,10 @@ enum LobbyCommand {
 enum LobbyControl {
     Disconnect {
         connection_id: PlayerConnectionId,
-        reply: oneshot::Sender<Result<Option<RoomSnapshot>, RoomError>>,
+        reply: oneshot::Sender<Result<Option<AbortMatch>, RoomError>>,
     },
     Shutdown {
-        reply: oneshot::Sender<Result<(), RoomError>>,
+        reply: oneshot::Sender<Result<LobbyShutdownOutcome, LobbyShutdownError>>,
     },
 }
 
@@ -361,7 +458,7 @@ impl LobbyHandle {
     pub async fn disconnect(
         &self,
         connection_id: PlayerConnectionId,
-    ) -> Result<Option<RoomSnapshot>, RoomError> {
+    ) -> Result<Option<AbortMatch>, RoomError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send_control(
@@ -395,6 +492,28 @@ impl LobbyHandle {
         Self::await_reply(&gate, receive, self.command_timeout).await?
     }
 
+    /// Routes a typed solo command using only the lobby's connection-to-room mapping.
+    pub async fn route_solo(
+        &self,
+        connection_id: PlayerConnectionId,
+        command: LobbySoloCommand,
+    ) -> Result<LobbySoloRouteResult, SoloMatchError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::RouteSolo {
+                connection_id,
+                command,
+                reply,
+            },
+            Arc::clone(&gate),
+        )
+        .map_err(map_room_to_solo)?;
+        Self::await_reply(&gate, receive, self.command_timeout)
+            .await
+            .map_err(map_room_to_solo)?
+    }
+
     #[cfg(test)]
     async fn abort_room_for_test(&self, room_id: RoomId) -> Result<(), RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -406,8 +525,8 @@ impl LobbyHandle {
         Self::await_reply(&gate, receive, self.command_timeout).await?
     }
 
-    /// Drains all rooms within one bounded registry shutdown deadline.
-    pub async fn shutdown(&self) -> Result<(), RoomError> {
+    /// Drains all rooms and returns their bounded retained aborts.
+    pub async fn shutdown(&self) -> Result<LobbyShutdownOutcome, LobbyShutdownError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send_control(
@@ -415,8 +534,11 @@ impl LobbyHandle {
             Arc::clone(&gate),
             self.shutdown_timeout,
         )
-        .await?;
-        Self::await_reply(&gate, receive, self.shutdown_timeout).await?
+        .await
+        .map_err(LobbyShutdownError::from)?;
+        Self::await_reply(&gate, receive, self.shutdown_timeout)
+            .await
+            .map_err(LobbyShutdownError::from)?
     }
 }
 
@@ -570,10 +692,9 @@ impl LobbyRegistry {
         }
     }
 
-    async fn remove_connection(
+    async fn leave_connection(
         &mut self,
         connection_id: PlayerConnectionId,
-        disconnect: bool,
     ) -> Result<Option<RoomSnapshot>, RoomError> {
         let room_id = self.room_for(connection_id)?;
         let handle = self
@@ -581,12 +702,7 @@ impl LobbyRegistry {
             .get(&room_id)
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
-        let result = if disconnect {
-            handle.disconnect(connection_id).await
-        } else {
-            handle.leave(connection_id).await
-        };
-        match result {
+        match handle.leave(connection_id).await {
             Ok(snapshot) => {
                 self.connections.remove(&connection_id);
                 if let Some(snapshot) = &snapshot {
@@ -595,6 +711,34 @@ impl LobbyRegistry {
                     self.remove_room(room_id, false);
                 }
                 Ok(snapshot)
+            }
+            Err(RoomError::Closed) => {
+                self.remove_room(room_id, true);
+                Err(RoomError::RoomNotFound)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn disconnect_connection(
+        &mut self,
+        connection_id: PlayerConnectionId,
+    ) -> Result<Option<AbortMatch>, RoomError> {
+        let room_id = self.room_for(connection_id)?;
+        let handle = self
+            .rooms
+            .get(&room_id)
+            .map(|record| record.handle.clone())
+            .ok_or(RoomError::RoomNotFound)?;
+        match handle.disconnect_with_abort(connection_id).await {
+            Ok(outcome) => {
+                self.connections.remove(&connection_id);
+                if let Some(snapshot) = &outcome.snapshot {
+                    self.update_snapshot(room_id, snapshot);
+                } else {
+                    self.remove_room(room_id, false);
+                }
+                Ok(outcome.abort)
             }
             Err(RoomError::Closed) => {
                 self.remove_room(room_id, true);
@@ -651,6 +795,71 @@ impl LobbyRegistry {
         }
     }
 
+    async fn route_solo(
+        &mut self,
+        connection_id: PlayerConnectionId,
+        command: LobbySoloCommand,
+    ) -> Result<LobbySoloRouteResult, SoloMatchError> {
+        let room_id = self.room_for(connection_id).map_err(map_room_to_solo)?;
+        let handle = self
+            .rooms
+            .get(&room_id)
+            .map(|record| record.handle.clone())
+            .ok_or(SoloMatchError::Closed)?;
+        let result = match command {
+            LobbySoloCommand::PrepareStart(plan) => handle
+                .prepare_solo_start(connection_id, plan)
+                .await
+                .map(LobbySoloRouteResult::Begin),
+            LobbySoloCommand::ConfirmBegin {
+                match_id,
+                result_key,
+            } => handle
+                .confirm_solo_begin(connection_id, match_id, result_key)
+                .await
+                .map(|()| LobbySoloRouteResult::Applied),
+            LobbySoloCommand::CancelBegin {
+                match_id,
+                result_key,
+            } => handle
+                .cancel_solo_begin(connection_id, match_id, result_key)
+                .await
+                .map(|()| LobbySoloRouteResult::Applied),
+            LobbySoloCommand::LoadingComplete(loading) => handle
+                .solo_loading_complete(connection_id, loading)
+                .await
+                .map(|()| LobbySoloRouteResult::Applied),
+            LobbySoloCommand::ShotAction(action) => handle
+                .solo_action(connection_id, action)
+                .await
+                .map(LobbySoloRouteResult::Relay),
+            LobbySoloCommand::ShotResult(result) => handle
+                .solo_result(connection_id, result)
+                .await
+                .map(LobbySoloRouteResult::Relay),
+            LobbySoloCommand::PrepareFinish => handle
+                .prepare_solo_finish(connection_id)
+                .await
+                .map(LobbySoloRouteResult::Commit),
+            LobbySoloCommand::ApplyCommit(result) => handle
+                .apply_solo_commit(connection_id, result)
+                .await
+                .map(LobbySoloRouteResult::Committed),
+            LobbySoloCommand::Abort(reason) => handle
+                .abort_solo(connection_id, reason)
+                .await
+                .map(LobbySoloRouteResult::Abort),
+            LobbySoloCommand::AcknowledgeAbort(abort) => handle
+                .acknowledge_solo_abort(connection_id, abort)
+                .await
+                .map(|()| LobbySoloRouteResult::Applied),
+        };
+        if result == Err(SoloMatchError::Closed) {
+            self.remove_room(room_id, true);
+        }
+        result
+    }
+
     fn process_event(&mut self, event: RoomActorEvent) {
         match event {
             RoomActorEvent::Summary(summary) => {
@@ -664,21 +873,51 @@ impl LobbyRegistry {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), RoomError> {
-        let handles: Vec<_> = self
-            .rooms
-            .values()
-            .map(|record| record.handle.clone())
-            .collect();
-        let room_ids: Vec<_> = self.rooms.keys().copied().collect();
-        let result = join_all(handles.iter().map(RoomHandle::shutdown)).await;
-        for room_id in room_ids {
+    async fn shutdown(&mut self) -> Result<LobbyShutdownOutcome, LobbyShutdownError> {
+        let max_rooms = self.limits.max_rooms.get();
+        if self.rooms.len() > max_rooms {
+            return Err(LobbyShutdownError::CapacityInvariant);
+        }
+        let mut aborts = Vec::new();
+        aborts
+            .try_reserve_exact(max_rooms)
+            .map_err(|_| LobbyShutdownError::Allocation)?;
+
+        // Futures are inserted in ascending room-ID order and polled concurrently. Ordered output
+        // keeps the persisted handoff deterministic without an unbounded intermediate Vec.
+        let mut shutdowns = FuturesOrdered::new();
+        for record in self.rooms.values() {
+            let handle = record.handle.clone();
+            shutdowns.push_back(async move { handle.shutdown().await });
+        }
+        let mut first_error = None;
+        while let Some(result) = shutdowns.next().await {
+            match result {
+                Ok(Some(abort)) if aborts.len() < max_rooms => aborts.push(abort),
+                Ok(Some(_)) => first_error = Some(LobbyShutdownError::CapacityInvariant),
+                Ok(None) => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(LobbyShutdownError::Room(error));
+                }
+                Err(_) => {}
+            }
+        }
+        while let Some(room_id) = self.rooms.keys().next().copied() {
             self.remove_room(room_id, true);
         }
-        if result.into_iter().any(|result| result.is_err()) {
-            return Err(RoomError::Closed);
+        if let Some(error) = first_error {
+            return Err(error);
         }
-        Ok(())
+        Ok(LobbyShutdownOutcome { aborts })
+    }
+}
+
+fn map_room_to_solo(error: RoomError) -> SoloMatchError {
+    match error {
+        RoomError::NotMember => SoloMatchError::NotMember,
+        RoomError::QueueFull => SoloMatchError::QueueFull,
+        RoomError::Timeout => SoloMatchError::Timeout,
+        _ => SoloMatchError::Closed,
     }
 }
 
@@ -733,7 +972,7 @@ async fn run_lobby(
             biased;
             control = controls.recv() => match control.and_then(begin) {
                 Some(LobbyControl::Disconnect { connection_id, reply }) => {
-                    let result = registry.remove_connection(connection_id, true).await;
+                    let result = registry.disconnect_connection(connection_id).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyControl::Shutdown { reply }) => {
@@ -766,11 +1005,15 @@ async fn run_lobby(
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
-                    let result = registry.remove_connection(connection_id, false).await;
+                    let result = registry.leave_connection(connection_id).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Route { connection_id, command, reply }) => {
                     let result = registry.route(connection_id, command).await;
+                    let _ignored = reply.send(result);
+                }
+                Some(LobbyCommand::RouteSolo { connection_id, command, reply }) => {
+                    let result = registry.route_solo(connection_id, command).await;
                     let _ignored = reply.send(result);
                 }
                 #[cfg(test)]
@@ -803,8 +1046,15 @@ async fn run_lobby(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::future::join_all;
+
     use super::*;
-    use pangya_domain::{AccountId, MemberSnapshot, Nickname};
+    use pangya_domain::{
+        AccountId, CatalogFingerprint, CourseId, MatchSeed, MemberSnapshot, Nickname, OneHoleConfig,
+    };
+    use uuid::Uuid;
+
+    use crate::match_state::deterministic_conditions;
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
@@ -821,6 +1071,27 @@ mod tests {
                 .unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
         }
+    }
+
+    fn solo_plan(account_id: AccountId, timeout: Duration) -> SoloStartPlan {
+        let seed = MatchSeed::new([0; 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        SoloStartPlan::new(
+            BeginSoloMatch::new(
+                MatchId::new(Uuid::from_u128(201)),
+                MatchResultKey::new(Uuid::from_u128(202)),
+                account_id,
+                OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                    .unwrap_or_else(|_| unreachable!()),
+                CatalogFingerprint::new([3; 32]),
+                seed,
+                weather,
+                wind,
+            ),
+            timeout,
+            3,
+        )
+        .unwrap_or_else(|_| unreachable!())
     }
 
     fn limits(max_rooms: usize) -> LobbyLimits {
@@ -1105,6 +1376,25 @@ mod tests {
         policy.command_timeout = Duration::from_millis(100);
         let lobby = spawn_lobby(policy);
         let room = create(&lobby, 1, 2).await;
+        let plan = solo_plan(identity(1).account_id, Duration::from_secs(1));
+        assert!(matches!(
+            lobby
+                .route_solo(id(1), LobbySoloCommand::PrepareStart(plan.clone()))
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+        assert_eq!(
+            lobby
+                .route_solo(
+                    id(1),
+                    LobbySoloCommand::ConfirmBegin {
+                        match_id: plan.begin().match_id(),
+                        result_key: plan.begin().result_key(),
+                    },
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Applied)
+        );
         let (outbound, _events) = mpsc::channel(8);
         let (started, began) = oneshot::channel();
         let (release, continue_execution) = oneshot::channel();
@@ -1147,10 +1437,13 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(release.send(()).is_ok());
-        assert_eq!(
-            disconnect.await.unwrap_or_else(|_| unreachable!()),
-            Ok(None)
-        );
+        let abort = disconnect
+            .await
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(abort.match_id(), plan.begin().match_id());
+        assert_eq!(abort.reason(), MatchAbortReason::Disconnect);
         let listed = lobby.list().await.unwrap_or_default();
         assert!(listed.iter().all(|summary| summary.id() != room.id()));
         assert!(lobby.shutdown().await.is_ok());
@@ -1212,6 +1505,79 @@ mod tests {
         assert!(!unrelated.is_cancelled());
         assert_eq!(lobby.list().await.unwrap_or_default(), vec![other]);
         assert!(lobby.shutdown().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn active_match_isolated_to_its_room_and_shutdown_returns_saturated_abort() {
+        let lobby = spawn_lobby(limits(2));
+        let saturated = CancellationToken::new();
+        let unrelated = CancellationToken::new();
+        let (active_tx, _active_rx) = mpsc::channel(1);
+        let active = lobby
+            .create(
+                RoomName::parse("active").unwrap_or_else(|_| unreachable!()),
+                None,
+                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                identity(1),
+                active_tx,
+                saturated.clone(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let (other_tx, _other_rx) = mpsc::channel(8);
+        let other = lobby
+            .create(
+                RoomName::parse("other").unwrap_or_else(|_| unreachable!()),
+                None,
+                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                identity(2),
+                other_tx,
+                unrelated.clone(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let plan = solo_plan(identity(1).account_id, Duration::from_secs(5));
+        assert!(matches!(
+            lobby
+                .route_solo(id(1), LobbySoloCommand::PrepareStart(plan.clone()))
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+        assert_eq!(
+            lobby
+                .route_solo(
+                    id(1),
+                    LobbySoloCommand::ConfirmBegin {
+                        match_id: plan.begin().match_id(),
+                        result_key: plan.begin().result_key(),
+                    },
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Applied)
+        );
+        assert!(saturated.is_cancelled());
+        assert!(!unrelated.is_cancelled());
+        assert_eq!(
+            lobby.route(id(1), LobbyRoomCommand::SetReady(true)).await,
+            Err(RoomError::MatchActive)
+        );
+        assert!(matches!(
+            lobby.route(id(2), LobbyRoomCommand::SetReady(true)).await,
+            Ok(LobbyRouteResult::Snapshot(_))
+        ));
+        assert_ne!(active.id(), other.id());
+
+        let outcome = lobby.shutdown().await.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            outcome.aborts(),
+            &[AbortMatch::new(
+                plan.begin().match_id(),
+                plan.begin().result_key(),
+                plan.begin().account_id(),
+                MatchAbortReason::Shutdown,
+            )]
+        );
+        assert!(outcome.aborts().len() <= 2);
     }
 
     #[test]

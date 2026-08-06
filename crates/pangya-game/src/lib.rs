@@ -6,10 +6,18 @@
 //! Bounded synthetic GameService handover, bootstrap, lobby, and room runtime.
 
 pub mod lobby;
+pub mod match_state;
 pub mod room;
 
-pub use lobby::{LobbyHandle, LobbyLimits, LobbyRoomCommand, LobbyRouteResult, spawn_lobby};
-pub use room::{RoomActorLimits, RoomEvent, RoomHandle, RoomIdentity, spawn_room};
+pub use lobby::{
+    LobbyHandle, LobbyLimits, LobbyRoomCommand, LobbyRouteResult, LobbyShutdownError,
+    LobbyShutdownOutcome, LobbySoloCommand, LobbySoloRouteResult, spawn_lobby,
+};
+pub use match_state::{
+    LOADING_TIMEOUT_HARD_CAP, MAX_SOLO_STROKES, RelayDisposition, SoloMatchError, SoloMatchPhase,
+    SoloMatchState, SoloStartPlan, deterministic_conditions,
+};
+pub use room::{RoomActorLimits, RoomDisconnect, RoomEvent, RoomHandle, RoomIdentity, spawn_room};
 
 use std::{
     collections::VecDeque,
@@ -666,11 +674,14 @@ where
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
         }
-        let lobby_result = self.lobby.shutdown().await;
+        let lobby_outcome = self.lobby.shutdown().await;
         let _lifecycle_open = drain_room_lifecycle(self.observer.as_ref(), &mut room_lifecycle);
-        if drain_timed_out || lobby_result.is_err() {
+        if drain_timed_out {
             return Err(GameRuntimeError::ShutdownTimeout);
         }
+        // M5 runtime persistence is not active yet, but the bounded retained-abort handoff is
+        // explicitly received here so it cannot be accidentally discarded by API shape.
+        let _shutdown_outcome = lobby_outcome.map_err(|_| GameRuntimeError::ShutdownTimeout)?;
         Ok(())
     }
 
@@ -1344,6 +1355,13 @@ where
                     .await?;
                 Ok(RoomEventEffect::EnterChannel)
             }
+            // M5 GameService wire routing is deliberately deferred to the next checkpoint.
+            RoomEvent::SoloStarted(_)
+            | RoomEvent::SoloPhase(_)
+            | RoomEvent::SoloActionRelay { .. }
+            | RoomEvent::SoloResultRelay { .. }
+            | RoomEvent::AbortRequested(_)
+            | RoomEvent::SoloCommitted(_) => Ok(RoomEventEffect::Remain),
         }
     }
 
@@ -1631,6 +1649,8 @@ fn room_error_result(error: RoomError) -> RoomCommandResult {
         RoomError::RoomNotFound => RoomCommandResult::RoomNotFound,
         RoomError::IdExhausted => RoomCommandResult::IdExhausted,
         RoomError::Timeout => RoomCommandResult::Timeout,
+        // M4 has no match-active discriminator; M5 network mapping is intentionally deferred.
+        RoomError::MatchActive => RoomCommandResult::Closed,
     }
 }
 
