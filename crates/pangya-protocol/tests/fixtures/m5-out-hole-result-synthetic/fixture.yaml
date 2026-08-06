@@ -1,0 +1,12 @@
+source_project: pangya-rs local synthetic M5 model
+upstream_revision: generated-local-no-source
+upstream_url: none
+upstream_path: none
+license: MIT OR Apache-2.0
+client_version: local-synthetic-profile; retail acceptance not claimed
+service: game
+direction: server-to-client
+expected_opcode: 0x7fa4
+redaction_status: generated-no-source; no proprietary, credential, bearer, personal, or client data
+expected_behavior: committed first-hole result with local UUIDs
+sha256_fixture: 278c1fb8c70403db6e0f94276d931af3752a4fdd586865d6ea98e0a415fa566a

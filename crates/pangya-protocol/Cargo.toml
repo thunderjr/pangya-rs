@@ -11,6 +11,7 @@ pangya-crypto = { version = "0.1.0", path = "../pangya-crypto" }
 pangya-domain = { version = "0.1.0", path = "../pangya-domain" }
 thiserror.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

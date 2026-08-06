@@ -51,8 +51,12 @@ pub enum ConnectionState {
     Active,
     /// Authenticated player is in a channel but not a room.
     InChannel,
-    /// Authenticated player is a room member.
+    /// Authenticated player is a room member outside a match.
     InRoom,
+    /// Solo match exists and is waiting for loading completion.
+    InMatchLoading,
+    /// Solo match is accepting gameplay commands.
+    InMatch,
     /// Graceful shutdown in progress.
     Draining,
     /// Terminal state.

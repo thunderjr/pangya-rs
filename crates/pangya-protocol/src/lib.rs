@@ -10,6 +10,7 @@ mod error;
 mod game;
 mod login;
 mod m4_room;
+mod m5_solo;
 mod profile;
 mod reader;
 mod registry;
@@ -38,6 +39,16 @@ pub use m4_room::{
     SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M4_S2C_CHAT,
     SYNTHETIC_M4_S2C_COMMAND_RESULT, SYNTHETIC_M4_S2C_LIST, SYNTHETIC_M4_S2C_MEMBERSHIP_EVENT,
     SYNTHETIC_M4_S2C_STATE, synthetic_m4_registry,
+};
+pub use m5_solo::{
+    BalanceUpdate, FinishHole, HoleResult, Lie, LoadingComplete, MatchAbortReason, MatchAborted,
+    MatchPhase, MatchStarted, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M5_S2C_BALANCE_UPDATE, SYNTHETIC_M5_S2C_COMMAND_RESULT, SYNTHETIC_M5_S2C_HOLE_RESULT,
+    SYNTHETIC_M5_S2C_MATCH_ABORTED, SYNTHETIC_M5_S2C_MATCH_PHASE, SYNTHETIC_M5_S2C_MATCH_STARTED,
+    SYNTHETIC_M5_S2C_SHOT_ACTION_RELAY, SYNTHETIC_M5_S2C_SHOT_RESULT_RELAY, ShotAction,
+    ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
+    SoloCommandResult, SoloPhase, StartSolo, Weather, Wind, synthetic_m5_registry,
 };
 pub use profile::{
     ClientVersion, CompatibilityProfile, ConnectionState, Direction, ProfileError, Region,

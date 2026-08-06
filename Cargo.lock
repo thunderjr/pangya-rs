@@ -1327,6 +1327,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
  "zeroize",
 ]
 
