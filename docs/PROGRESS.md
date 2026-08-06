@@ -173,9 +173,10 @@ Evidence: [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYN
 - [x] Prove capacity serialization, password-gated admission, owner-only mutation/kick, ready/chat broadcast, disconnect cleanup, actor failure isolation, queue/rate limits, and bounded shutdown.
 - [x] Keep password input redacted/zeroized; retain only random-salted SHA-256 with constant-time verification and expose only a protected boolean.
 - [x] Add state-aware GameService dispatch, fixed low-cardinality observations, and bounded unknown-opcode disconnect/ignore/metadata-digest capture. Known wrong-state opcodes always close.
-- [x] Add four generated fixture/provenance pairs, 11 protocol M4 tests, 18 game actor/runtime tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests.
+- [x] Add four generated fixture/provenance pairs, 11 protocol M4 tests, 21 game actor/runtime tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests.
 - [x] Complete the local synthetic TCP room lifecycle through create, list, join, settings, ready, chat, kick, leave, owner transfer, capacity race, and disconnect removal.
-- [ ] Rerun the complete final format/Clippy/workspace/doc/deny/asset/fuzz validation matrix.
+- [x] Close independent-review findings with atomic command gates, a capacity-sized priority cleanup queue, per-member overflow cancellation, isolated actor-failure cleanup, and centralized one-shot room closure observation.
+- [x] Pass the complete final format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/four-target-fuzz validation matrix.
 - [ ] Validate exact room opcodes, layouts, limits, ordering, and successful create/enter behavior with a legally held U.S. 852 client.
 
 No M5 room start, loading, gameplay, scoring, persistence, finish, or reward behavior is implemented.
@@ -212,9 +213,9 @@ Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHET
 
 ## Immediate next actions
 
-1. Rerun the complete final validation matrix and record its command output without weakening the external compatibility boundary.
-2. Obtain a legally held U.S. 852 client build/hash privately and validate login/Game bootstrap plus exact lobby/room opcodes, layouts, ordering, limits, and create/enter acceptance without committing proprietary artifacts.
-3. Preserve the synthetic M2/M3/M4 exits; do not begin M5 start/loading/gameplay/reward work until the real M4 gate is reviewed.
+1. Obtain a legally held U.S. 852 client build/hash privately and validate login/Game bootstrap plus exact lobby/room opcodes, layouts, ordering, limits, and create/enter acceptance without committing proprietary artifacts.
+2. Preserve the synthetic M2/M3/M4 exits and their validation evidence.
+3. Keep the external real-client gate explicit while proceeding only with clearly labeled local synthetic M5 work.
 
 ---
 
@@ -223,7 +224,8 @@ Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHET
 ### 2026-08-05 — local synthetic M4 lobby and room checkpoint
 
 - Added generated `0x7f00`/`0x7f80` room contracts, a bounded lobby registry and sole-owner room actors, authoritative membership/settings/ready/chat/kick/transfer/cleanup, and metadata-digest unknown capture.
-- Recorded 18 game actor/runtime tests, 11 protocol M4 tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the complete final validation rerun remains pending.
+- Recorded 21 game actor/runtime tests, 11 protocol M4 tests, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the complete local validation matrix passed.
+- Closed review findings for timeout/mutation races, saturated cleanup, cross-room overflow isolation, actor-failure cleanup, create ordering, and active-room accounting.
 - Kept the real U.S. 852 M4 exit open for exact opcodes/layout/order and create/enter acceptance, and added no M5 start/loading/gameplay/reward behavior.
 
 ### 2026-08-05 — local synthetic M3 GameService bootstrap

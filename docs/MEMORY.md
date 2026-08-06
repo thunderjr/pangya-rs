@@ -8,7 +8,7 @@
 
 ## One-paragraph state
 
-M1–M3 remain intact. M4's **local synthetic lobby/room checkpoint is complete**: generated `0x7f00`/`0x7f80` contracts, one bounded lobby registry and sole-owner actor per room, authoritative create/list/join/leave/settings/ready/chat/kick/transfer/disconnect behavior, redacted salted password digests, state-aware dispatch, bounded queues/rates/shutdown, and metadata-digest-only unknown capture. Test inventory is 18 game actor/runtime, 11 protocol M4, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the full final validation matrix still needs its final rerun. This is not real U.S. 852 room compatibility: exact room opcodes/layouts/order/limits and real-client create/enter acceptance remain external. There is no M5 start/loading/gameplay/scoring/persistence/reward behavior. Evidence is in [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md).
+M1–M3 remain intact. M4's **local synthetic lobby/room checkpoint is complete**: generated `0x7f00`/`0x7f80` contracts, one bounded lobby registry and sole-owner actor per room, authoritative create/list/join/leave/settings/ready/chat/kick/transfer/disconnect behavior, redacted salted password digests, state-aware dispatch, bounded queues/rates/shutdown, and metadata-digest-only unknown capture. Atomic command gates prevent timeout-after-mutation, a capacity-sized priority queue guarantees ordinary-saturation cleanup, per-member cancellation isolates slow clients, and room closure is observed once. Test inventory is 21 game actor/runtime, 11 protocol M4, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the complete local validation matrix passed. This is not real U.S. 852 room compatibility: exact room opcodes/layouts/order/limits and real-client create/enter acceptance remain external. There is no M5 start/loading/gameplay/scoring/persistence/reward behavior. Evidence is in [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md).
 
 ---
 
@@ -51,7 +51,7 @@ These include accepted baseline decisions from ADR-0001 through ADR-0011 and sho
 5. **Exact advertised ports/packet order/token field** — verify with the chosen client/capture before claiming compatibility.
 6. **Real IFF and GameService layouts** — validate legally held Character/ClubSet/Ball headers, record sizes, Game hello/auth/bootstrap/channel fields and ordering; never infer them from local synthetic M3.
 7. **Real M4 room exit** — validate exact U.S. 852 lobby/room opcodes, fields, limits, order, password/failure semantics, and real-client create/enter acceptance; never label `0x7f00` as U.S. 852.
-8. **Next M5 gate** — do not begin room start/loading/gameplay/scoring/persistence/rewards until real M4 evidence is reviewed.
+8. **Next M5 boundary** — local synthetic M5 work must remain explicitly provisional while real M4 compatibility evidence is still external; never claim the real M4 exit from synthetic tests.
 
 ---
 
@@ -215,7 +215,7 @@ Never persist client-claimed Pang/EXP directly. Simplified Tier-B rewards are ac
 3. Preserve the completed synthetic M2/M3/M4 evidence; do not infer external compatibility from it.
 4. Rerun and record the complete final format/Clippy/workspace/doc/deny/asset/fuzz validation matrix.
 5. Obtain the exact U.S. 852 build/hash privately and validate login/Game plus real lobby/room opcode/layout/order/create-enter behavior without committing it.
-6. Do not begin M5 start/loading/gameplay/scoring/persistence/reward work before the real M4 review gate.
+6. Keep any M5 start/loading/gameplay/scoring/persistence/reward work explicitly synthetic until the real M4 client gate is independently evidenced.
 
 ---
 

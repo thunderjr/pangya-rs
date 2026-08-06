@@ -4,8 +4,8 @@
 
 The local synthetic M4 lobby/room checkpoint is implemented. This evidence does
 **not** claim that the provisional `0x7f00` packet family, layouts, ordering,
-room semantics, or create/enter flow is PangYa U.S. 852 compatible. Full final
-workspace validation is pending a final rerun.
+room semantics, or create/enter flow is PangYa U.S. 852 compatible. The complete
+local validation matrix passed after independent-review blocker closure.
 
 M4 stops at process-local lobby and room state. It contains no M5 room start,
 loading, hole/shot gameplay, scoring, persistence, finish, or rewards.
@@ -19,18 +19,18 @@ loading, hole/shot gameplay, scoring, persistence, finish, or rewards.
 | Known packets are state-aware | list/create/join only in `InChannel`; remaining commands only in `InRoom` | M4 registry test plus TCP wrong-state closure under every unknown policy |
 | Client cannot claim caller/sender authority | authenticated `RoomIdentity`; requests omit sender/account/nickname | protocol no-sender test; TCP chat event and kick/settings authorization assertions |
 | One actor owns room mutation | separate bounded normal and priority control queues | room pure-state invariants, actor lifecycle, saturation, disconnect, and shutdown tests |
-| Lobby serializes discovery/admission | sole registry owns rooms and connection-to-room map | registry cap/unique ID/one-room tests and concurrent-join capacity tests |
+| Lobby serializes discovery/admission | sole registry owns rooms and connection-to-room map; atomic command gates prevent timeout-after-mutation | registry cap/unique ID/one-room tests, concurrent-join capacity, and queued-cancel/begun-commit tests |
 | Capacity and failures do not corrupt state | occupancy `<= 30`; rejected commands do not mutate | pure rejection/property tests; real-PostgreSQL TCP concurrent final-slot race |
 | Passwords remain private | zeroized input; random-salted SHA-256 digest; constant-time verify; public boolean only | actor wrong/correct password tests; TCP absent/wrong/correct password flow; fixture/metrics secret searches |
-| Ownership and cleanup are authoritative | owner-only settings/kick; deterministic transfer; disconnect removes membership/empty room | pure and registry transfer tests; TCP non-owner failures, kick, owner leave, disconnect transfer, room removal |
+| Ownership and cleanup are authoritative | owner-only settings/kick; deterministic transfer; a separately sized priority lobby-control queue reaches room cleanup even when normal work is saturated | pure and registry transfer tests; saturated-normal-queue disconnect; TCP non-owner failures, kick, owner leave, disconnect transfer, room removal |
 | Ready, chat, and public state are bounded | validated ready/chat commands and bounded per-connection event queues | actor ready/chat test; TCP state/chat delivery, chat-rate, command-rate, and outbound-queue tests |
 | Unknown capture retains no raw body | bounded oldest-evicted metadata/digest ring | game unit capture/policy tests; TCP disconnect/ignore/capture continuity, digest metadata, and metric redaction |
-| Observability is low-cardinality and redacted | fixed room/queue/chat/unknown labels | TCP metric presence, active-room gauge cleanup, and room/password/chat/bearer absence checks |
+| Observability is low-cardinality and redacted | fixed room/queue/chat/unknown labels; registry lifecycle messages carry exact active counts | TCP metric presence, exact active-room gauge cleanup, lifecycle-order metrics, and room/password/chat/bearer absence checks |
 | Shutdown cannot wait without bound | command/control timeouts, connection drain, lobby/room shutdown | actor/registry shutdown tests and GameService TCP shutdown-grace coverage |
 
 ## Test inventory at checkpoint
 
-- `cargo test -p pangya-game --lib --locked -- --list` reports **18** game
+- `cargo test -p pangya-game --lib --locked -- --list` reports **21** game
   actor/runtime unit and property tests.
 - `cargo test -p pangya-protocol --test m4_room --locked -- --list` reports
   **11** generated M4 protocol fixture/boundary/property tests.
@@ -40,10 +40,12 @@ loading, hole/shot gameplay, scoring, persistence, finish, or rewards.
   - unknown policies versus known wrong-state closure;
   - command/chat/outbound queue bounds.
 
-These counts describe the current checked-in test inventory. The complete final
-format, Clippy, workspace test, doc-test, deny, asset, and fuzz validation matrix
-must be rerun before any release/merge claim; this document does not substitute
-for that final run.
+After blocker closure, the complete local matrix passed: formatting, strict Clippy
+for every workspace target/feature, workspace and PostgreSQL-backed E2E tests,
+doc tests, SQLx online metadata check and locked offline compilation, root and fuzz
+`cargo deny`, all four fuzz targets for 10,000 runs each, proprietary-asset guard,
+`git diff --check`, and no staged files. Dependency-version duplication remains
+warning-only under the accepted deny policy.
 
 ## Generated fixture evidence
 
@@ -68,8 +70,17 @@ The binary SHA-256 values are:
 - Password material is not stored in summaries, snapshots, fixtures, metrics, or
   debug output. Only salted digest state lives in the actor.
 - Full outbound queues never grow: normal actor and lobby submission reject;
-  per-connection event overflow signals bounded connection cleanup; disconnect
-  and shutdown use the priority control path.
+  per-connection cancellation isolates event overflow to the affected member;
+  disconnect and shutdown use a separately bounded, capacity-sized priority lobby
+  control path and then the room priority path.
+- A queued command may time out only if its atomic gate cancels before execution;
+  once execution begins, the caller awaits the committed outcome instead of
+  reporting a timeout that could desynchronize connection and actor state.
+- Created and Closed lifecycle transitions are published in sole-registry order
+  with the exact post-transition active count; Closed is emitted only after a room
+  is removed and only once. The service observes only received event types and
+  stores every received exact count, draining retained counts after broadcast lag.
+  Affected member tokens cancel while unrelated rooms remain live.
 - Unknown capture records only state, opcode, body length, and SHA-256 body digest
   in a fixed-capacity process-local ring. Known wrong-state packets always close.
 - Rooms are not durable and are removed when empty or when their actor closes.
