@@ -12,6 +12,7 @@ mod login;
 mod m4_room;
 mod m5_solo;
 mod m6_stroke;
+mod m7_economy;
 mod profile;
 mod reader;
 mod registry;
@@ -62,6 +63,16 @@ pub use m6_stroke::{
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
     StrokeTurnStarted, synthetic_m6_registry,
+};
+pub use m7_economy::{
+    ConsumeOneRequest, EconomyCommand, EconomyCommandResult, EconomyItemKind, EconomyOutcome,
+    EquipRequest, EquipmentChanged, InventoryChanged, MAX_PURCHASE_QUANTITY, MAX_SHOP_PAGE_ENTRIES,
+    PurchaseCommitted, PurchaseRequestPacket, RepairCommitted, RepairRequest,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SYNTHETIC_M7_S2C_COMMAND_RESULT,
+    SYNTHETIC_M7_S2C_EQUIPMENT_CHANGED, SYNTHETIC_M7_S2C_INVENTORY_CHANGED,
+    SYNTHETIC_M7_S2C_PURCHASE_COMMITTED, SYNTHETIC_M7_S2C_REPAIR_COMMITTED,
+    SYNTHETIC_M7_S2C_SHOP_PAGE, ShopOffer, ShopPage, ShopPageRequest, synthetic_m7_registry,
 };
 pub use profile::{
     ClientVersion, CompatibilityProfile, ConnectionState, Direction, ProfileError, Region,

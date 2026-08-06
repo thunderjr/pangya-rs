@@ -2,9 +2,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use pangya_protocol::{
-    BalanceUpdate, CheckNickname, CompatibilityProfile, DecodePacket, Direction, FinishHole,
-    HoleResult, LoadingComplete, LoginRequest, MatchAborted, MatchPhase, MatchStarted,
-    PacketReader, RoomChatRequest, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
+    BalanceUpdate, CheckNickname, CompatibilityProfile, ConsumeOneRequest, DecodePacket,
+    Direction, EconomyCommandResult, EquipRequest, EquipmentChanged, FinishHole, HoleResult,
+    InventoryChanged, LoadingComplete, LoginRequest, MatchAborted, MatchPhase, MatchStarted,
+    PacketReader, PurchaseCommitted, PurchaseRequestPacket, RepairCommitted, RepairRequest,
+    RoomChatRequest, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
     RoomLeaveRequest, RoomListRequest, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest,
     SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
     SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
@@ -19,8 +21,13 @@ use pangya_protocol::{
     SYNTHETIC_M6_S2C_ACTION_RELAY, SYNTHETIC_M6_S2C_BALANCE_UPDATE,
     SYNTHETIC_M6_S2C_COMMAND_RESULT, SYNTHETIC_M6_S2C_MATCH_ABORTED,
     SYNTHETIC_M6_S2C_MATCH_STARTED, SYNTHETIC_M6_S2C_PHASE, SYNTHETIC_M6_S2C_RESULT_RELAY,
-    SYNTHETIC_M6_S2C_STANDINGS, SYNTHETIC_M6_S2C_TURN_STARTED, SelectCharacter, SelectServer,
-    ServiceKind, SetNickname, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
+    SYNTHETIC_M6_S2C_STANDINGS, SYNTHETIC_M6_S2C_TURN_STARTED, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SYNTHETIC_M7_S2C_COMMAND_RESULT,
+    SYNTHETIC_M7_S2C_EQUIPMENT_CHANGED, SYNTHETIC_M7_S2C_INVENTORY_CHANGED,
+    SYNTHETIC_M7_S2C_PURCHASE_COMMITTED, SYNTHETIC_M7_S2C_REPAIR_COMMITTED,
+    SYNTHETIC_M7_S2C_SHOP_PAGE, SelectCharacter, SelectServer, ServiceKind, SetNickname,
+    ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
     SoloCommandResult, StartSolo, StartStrokeTwo, StrokeActionRelay, StrokeBalanceUpdate,
     StrokeCommandResult, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted,
     StrokeMatchStarted, StrokePhase, StrokeResultRelay, StrokeShotAction, StrokeShotResult,
@@ -43,12 +50,15 @@ fuzz_target!(|data: &[u8]| {
         (SYNTHETIC_M6_C2S_START_STROKE_TWO..=SYNTHETIC_M6_C2S_GIVE_UP).contains(&opcode);
     let is_m6_s2c =
         (SYNTHETIC_M6_S2C_MATCH_STARTED..=SYNTHETIC_M6_S2C_BALANCE_UPDATE).contains(&opcode);
-    let service = if is_m4 || is_m5_c2s || is_m5_s2c || is_m6_c2s || is_m6_s2c {
+    let is_m7_c2s = (SYNTHETIC_M7_C2S_SHOP_PAGE..=SYNTHETIC_M7_C2S_REPAIR).contains(&opcode);
+    let is_m7_s2c =
+        (SYNTHETIC_M7_S2C_SHOP_PAGE..=SYNTHETIC_M7_S2C_REPAIR_COMMITTED).contains(&opcode);
+    let service = if is_m4 || is_m5_c2s || is_m5_s2c || is_m6_c2s || is_m6_s2c || is_m7_c2s || is_m7_s2c {
         ServiceKind::Game
     } else {
         ServiceKind::Login
     };
-    let direction = if is_m5_s2c || is_m6_s2c {
+    let direction = if is_m5_s2c || is_m6_s2c || is_m7_s2c {
         Direction::ServerToClient
     } else {
         Direction::ClientToServer
@@ -178,6 +188,17 @@ fuzz_target!(|data: &[u8]| {
         SYNTHETIC_M6_S2C_BALANCE_UPDATE => {
             let _ = StrokeBalanceUpdate::decode(&mut reader, &CompatibilityProfile::US_852);
         }
+        SYNTHETIC_M7_C2S_SHOP_PAGE => { let _ = ShopPageRequest::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_C2S_PURCHASE => { let _ = PurchaseRequestPacket::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_C2S_EQUIP => { let _ = EquipRequest::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_C2S_CONSUME => { let _ = ConsumeOneRequest::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_C2S_REPAIR => { let _ = RepairRequest::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_SHOP_PAGE => { let _ = ShopPage::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_COMMAND_RESULT => { let _ = EconomyCommandResult::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_PURCHASE_COMMITTED => { let _ = PurchaseCommitted::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_INVENTORY_CHANGED => { let _ = InventoryChanged::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_EQUIPMENT_CHANGED => { let _ = EquipmentChanged::decode(&mut reader, &CompatibilityProfile::US_852); }
+        SYNTHETIC_M7_S2C_REPAIR_COMMITTED => { let _ = RepairCommitted::decode(&mut reader, &CompatibilityProfile::US_852); }
         _ => {
             let _ = reader.pstring(4096);
         }
