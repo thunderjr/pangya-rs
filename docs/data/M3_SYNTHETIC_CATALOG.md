@@ -3,7 +3,7 @@
 No proprietary IFF files are included. The committed `.bin` files under
 `crates/pangya-data/tests/fixtures/synthetic-catalog/` are generated locally and
 are not client-derived. The three M3 item-family records are eight bytes; the
-optional M5 Course record is five bytes.
+optional M5/M6 Course record is five bytes.
 
 ## Enablement
 
@@ -43,7 +43,8 @@ record_size = 64
 ```
 
 Exactly one declaration for each M3 minimum kind (`character`, `club_set`, and
-`ball`) is required. M5 solo additionally requires one `course` declaration.
+`ball`) is required. Either enabled M5 solo or M6 stroke mode additionally
+requires one `course` declaration.
 The file header is synthetic LE `count:u16`, `binding:u16`, `version:u32`.
 `count` must be nonzero and match the manifest. Exact file length is
 `8 + count * record_size`, computed with checked arithmetic; trailing bytes are
@@ -51,7 +52,9 @@ rejected. Item-family `record_size` is 4..65536; Course requires 5..65536. The
 first four bytes of every record are a LE `u32 type_id`, globally unique across
 all declared families. Item-family remaining bytes stay opaque. For the local
 synthetic Course family only, byte five is the hole-one par in `1..=10`; all
-later bytes remain opaque. This one-byte projection is not a retail IFF claim.
+later bytes remain opaque. M5 and M6 resolve their configured course against
+this same projection before listener bind. This one-byte projection is not a
+retail IFF claim.
 
 The catalog fingerprint canonically hashes the manifest version and sorted,
 length-framed declaration metadata. Reordering declarations does not change it;

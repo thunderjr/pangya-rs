@@ -2,9 +2,9 @@
 
 > Last updated: **2026-08-05**
 >
-> Current stage: **M5 — local synthetic solo-practice checkpoint complete; real U.S. 852 M5 exit remains open**
+> Current stage: **M6 — local synthetic exactly-two stroke checkpoint complete; real U.S. 852 M6 exit remains open**
 >
-> Next gate: **M6 local synthetic design, while legally held U.S. 852 room/solo and IFF/client acceptance remain explicit external gates**
+> Next gate: **the legally held two-client/Course retail gate and a clearly labeled local synthetic M7 slice; no retail M6 claim**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -36,8 +36,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
 | Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
-| Gameplay | 🟡 | Local synthetic one-owner, one-hole M5 start/loading/action/result/finish and exactly-once rewards pass; real U.S. 852 M5 remains external |
-| Economy/social/parity | ⬜ | M7+ |
+| Gameplay | 🟡 | Local synthetic M5 solo and M6 exactly-two-ready-player stroke/turn/standings/settlement checkpoints pass the complete local matrix; real U.S. 852 one-/two-client gates remain open |
+| Economy/social/parity | ⬜ | M7+; no M7 implementation or checkpoint claim |
 
 ---
 
@@ -123,7 +123,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | M3 — Game bootstrap | 🟡 | Local synthetic flow reaches one channel with catalog-validated snapshot; real U.S. 852 exit remains external |
 | M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
 | M5 — Solo first playable | 🟡 | Local synthetic one-hole solo finishes and persists exactly one reward; real-client hole remains open |
-| M6 — Multiplayer stroke | ⬜ | Next local synthetic checkpoint only; real two-client standings remain externally gated |
+| M6 — Multiplayer stroke | 🟡 | Local synthetic exactly-two one-hole flow and complete matrix pass; real two-client/Course acceptance remains open |
 | M7 — Inventory/shop depth | ⬜ | Catalog-derived transactional purchases and equipment validation |
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
@@ -198,9 +198,32 @@ Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHET
 - [x] Pass the complete format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/four-target-fuzz local validation matrix.
 - [ ] Validate exact real room-to-match and solo opcodes, layouts, order, limits, Course/IFF interpretation, one-hole client acceptance, and exactly-once visible result with a legally held U.S. 852 client and legally supplied data.
 
-There is no M6 multiplayer, turn arbitration, standings, items, special-shot interpretation, equipment consumption, or server physics behavior.
+The M5 boundary itself contains no multiplayer, turn arbitration, standings,
+items, special-shot interpretation, equipment consumption, or server physics;
+those claims are not retroactively widened by the separate M6 checkpoint.
 
 Evidence: [`adr/0012-synthetic-m5-solo-practice.md`](adr/0012-synthetic-m5-solo-practice.md), [`protocol/M5_SYNTHETIC_SOLO_FLOW.md`](protocol/M5_SYNTHETIC_SOLO_FLOW.md), and [`evidence/M5_SYNTHETIC_SOLO_2026-08-05.md`](evidence/M5_SYNTHETIC_SOLO_2026-08-05.md).
+
+## M6 — local synthetic exactly-two one-hole stroke
+
+**Status: 🟡 local synthetic checkpoint and full local matrix pass; real two-client/Course gate remains open**
+
+- [x] ADR-0013 fixes exactly two distinct authenticated room members, both ready, owner-only start, stable captured roster, one hole, and sole room-actor authority.
+- [x] Add strict generated `0x7f30..=0x7f34` / `0x7fb0..=0x7fb8` layouts, exact per-stream packet order, 14 generated fixture/provenance pairs, and closed state/discriminator validation.
+- [x] Enforce independent per-player sequences, active action/result turns, bit-exact duplicate coalescing, any-participant give-up, load/turn/game deadlines, and game-deadline tie priority.
+- [x] Distinguish loading timeout/disconnect no-reward abort from in-game disconnect/turn-timeout forfeit settlement; shutdown priority aborts every noncommitted aggregate.
+- [x] Add truthful `WinnerByForfeit` with no score and fixed Pang 10/EXP 5 versus zero-reward loser; whole-game timeout fabricates no winner.
+- [x] Add migrations 0006-0007 for ordered player authority, per-player result keys, places/completions, deferred forfeit pairing, atomic two-player settlement, normal four-ledger history, and holed-only Course records.
+- [x] Retain hidden starting/loading-persistence/results/abort authority, one persistence coordinator, exact acknowledgement, stale-generation rejection, and committed-wins-abort race closure.
+- [x] Complete bounded generic M5/M6 startup recovery once before Game bind and retain fixed-label/redacted M6 metrics, validated config caps, no packet-body logging, and digest-only unknown capture.
+- [x] Verify current compiled inventories: 73 game tests, 11 M6 protocol tests, 19 real-PostgreSQL Game E2E tests, and 45 storage tests; targeted M6 protocol and game suites pass.
+- [x] Pass the complete release matrix: format, strict Clippy, workspace/all-target/all-feature PostgreSQL tests, docs, SQLx online/offline, deny, asset guard, links/diff, and four bounded fuzz targets at 10,000 runs each.
+- [ ] Validate exact retail ready/start/loading/turn/action/result/give-up/disconnect/standings/reward/record behavior with two legally held U.S. 852 clients and legally supplied Course/IFF data.
+
+This checkpoint is generated synthetic/non-retail and contains no M7 inventory,
+shop, equipment, social/ranking, or parity implementation.
+
+Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-two-player-stroke.md), [`protocol/M6_SYNTHETIC_STROKE_FLOW.md`](protocol/M6_SYNTHETIC_STROKE_FLOW.md), and [`evidence/M6_SYNTHETIC_STROKE_2026-08-05.md`](evidence/M6_SYNTHETIC_STROKE_2026-08-05.md).
 
 ## Research proof ledger
 
@@ -228,18 +251,27 @@ Evidence: [`adr/0012-synthetic-m5-solo-practice.md`](adr/0012-synthetic-m5-solo-
 4. **Exact Game bootstrap** — validate hello, auth, bootstrap segmentation, channel packet layouts/order, and acceptance with the selected client.
 5. **Exact lobby/room flow** — validate real U.S. 852 lobby/room opcodes, fields, limits, ordering, password/failure behavior, and client create/enter acceptance; never identify the provisional `0x7f00` family as retail protocol.
 6. **Real M5 solo exit** — complete the evidence file's external 12-step gate for real Course/IFF interpretation and start/loading/action/result/finish/reward acceptance; never identify `0x7f20`/`0x7fa0` or `solo-v1` as retail behavior.
+7. **M6 local validation** — the complete format/Clippy/workspace/PostgreSQL/doc/SQLx/deny/asset/link/diff/fuzz matrix passed; preserve this evidence.
+8. **Real M6 two-client/Course exit** — complete the M6 evidence file's external gate with two legally held clients and legally supplied data; never identify `0x7f30`/`0x7fb0`, `stroke-two-v1`, generated standings, or record rules as retail behavior.
 
 ---
 
 ## Immediate next actions
 
-1. Design only the clearly labeled local synthetic M6 boundary; do not add multiplayer/turn/standings claims to M5.
-2. Preserve the validated synthetic M2-M5 exits and their evidence.
-3. In parallel, complete the legally held U.S. 852 room and M5 12-step external client/IFF gate without committing proprietary artifacts.
+1. Design only a clearly labeled local synthetic M7 inventory/shop boundary; preserve M6 semantics.
+2. Preserve the validated synthetic M2-M6 evidence and complete local matrix.
+3. Complete the legally held U.S. 852 room/M5 gates and the M6 two-client/Course gate without committing proprietary artifacts.
 
 ---
 
 ## Change log
+
+### 2026-08-05 — local synthetic M6 exactly-two stroke checkpoint
+
+- Added generated `0x7f30`/`0x7fb0` exactly-two-ready-player one-hole flow, owner start, sole actor turns, load/turn/game deadlines, and any-participant give-up.
+- Added truthful winner-by-forfeit 10/5 versus zero loser, load abort versus in-game forfeit, shutdown priority abort, atomic normal four-ledger settlement, and holed-only Course records through migrations 0006-0007.
+- Recorded 14 fixture hashes and current inventories of 73 game, 11 M6 protocol, 19 Game E2E, and 45 storage tests; the complete local validation matrix passed.
+- Kept the real M6 exit open behind the external two-client/Course gate and added no M7 behavior.
 
 ### 2026-08-05 — local synthetic M5 solo-practice checkpoint
 
