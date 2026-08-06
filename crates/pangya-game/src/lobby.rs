@@ -95,6 +95,20 @@ impl Default for LobbyLimits {
     }
 }
 
+/// Ordered room lifecycle kind published by the sole lobby registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoomLifecycleEvent {
+    Created,
+    Closed,
+}
+
+/// Ordered room lifecycle state published without room identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoomLifecycle {
+    pub(crate) event: RoomLifecycleEvent,
+    pub(crate) active_count: usize,
+}
+
 /// A room operation routed by the registry using the caller's registered connection identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LobbyRoomCommand {
@@ -205,7 +219,7 @@ pub struct LobbyHandle {
     controls: mpsc::Sender<GatedCommand<LobbyControl>>,
     command_timeout: Duration,
     shutdown_timeout: Duration,
-    room_closures: broadcast::Sender<RoomId>,
+    room_lifecycle: broadcast::Sender<RoomLifecycle>,
 }
 
 impl std::fmt::Debug for LobbyHandle {
@@ -217,8 +231,8 @@ impl std::fmt::Debug for LobbyHandle {
 }
 
 impl LobbyHandle {
-    pub(crate) fn subscribe_room_closures(&self) -> broadcast::Receiver<RoomId> {
-        self.room_closures.subscribe()
+    pub(crate) fn subscribe_room_lifecycle(&self) -> broadcast::Receiver<RoomLifecycle> {
+        self.room_lifecycle.subscribe()
     }
 
     fn send(&self, command: LobbyCommand, gate: CommandGate) -> Result<(), RoomError> {
@@ -412,7 +426,7 @@ struct LobbyRegistry {
     connections: HashMap<PlayerConnectionId, ConnectionRecord>,
     next_room_id: u32,
     events: mpsc::Sender<RoomActorEvent>,
-    room_closures: broadcast::Sender<RoomId>,
+    room_lifecycle: broadcast::Sender<RoomLifecycle>,
 }
 
 impl LobbyRegistry {
@@ -433,8 +447,16 @@ impl LobbyRegistry {
         Err(RoomError::IdExhausted)
     }
 
+    fn publish_lifecycle(&self, event: RoomLifecycleEvent) {
+        let lifecycle = RoomLifecycle {
+            event,
+            active_count: self.rooms.len(),
+        };
+        let _no_receivers = self.room_lifecycle.send(lifecycle);
+    }
+
     fn remove_room(&mut self, room_id: RoomId, cancel_members: bool) {
-        self.rooms.remove(&room_id);
+        let removed = self.rooms.remove(&room_id).is_some();
         self.connections.retain(|_, connection| {
             if connection.room_id != room_id {
                 return true;
@@ -444,6 +466,9 @@ impl LobbyRegistry {
             }
             false
         });
+        if removed {
+            self.publish_lifecycle(RoomLifecycleEvent::Closed);
+        }
     }
 
     fn update_snapshot(&mut self, room_id: RoomId, snapshot: &RoomSnapshot) {
@@ -494,6 +519,7 @@ impl LobbyRegistry {
                 summary: summary.clone(),
             },
         );
+        self.publish_lifecycle(RoomLifecycleEvent::Created);
         self.connections.insert(
             connection_id,
             ConnectionRecord {
@@ -634,7 +660,6 @@ impl LobbyRegistry {
             }
             RoomActorEvent::Closed(room_id) => {
                 self.remove_room(room_id, true);
-                let _no_receivers = self.room_closures.send(room_id);
             }
         }
     }
@@ -645,9 +670,11 @@ impl LobbyRegistry {
             .values()
             .map(|record| record.handle.clone())
             .collect();
+        let room_ids: Vec<_> = self.rooms.keys().copied().collect();
         let result = join_all(handles.iter().map(RoomHandle::shutdown)).await;
-        self.rooms.clear();
-        self.connections.clear();
+        for room_id in room_ids {
+            self.remove_room(room_id, true);
+        }
         if result.into_iter().any(|result| result.is_err()) {
             return Err(RoomError::Closed);
         }
@@ -661,13 +688,13 @@ pub fn spawn_lobby(limits: LobbyLimits) -> LobbyHandle {
     let (commands, command_rx) = mpsc::channel(limits.command_capacity.get());
     let (controls, control_rx) = mpsc::channel(limits.cleanup_capacity.get());
     let (events, event_rx) = mpsc::channel(limits.event_capacity.get());
-    let (room_closures, _) = broadcast::channel(limits.max_rooms.get());
+    let (room_lifecycle, _) = broadcast::channel(limits.max_rooms.get());
     let handle = LobbyHandle {
         commands,
         controls,
         command_timeout: limits.command_timeout,
         shutdown_timeout: limits.shutdown_timeout,
-        room_closures: room_closures.clone(),
+        room_lifecycle: room_lifecycle.clone(),
     };
     let registry = LobbyRegistry {
         limits,
@@ -675,7 +702,7 @@ pub fn spawn_lobby(limits: LobbyLimits) -> LobbyHandle {
         connections: HashMap::new(),
         next_room_id: 1,
         events,
-        room_closures,
+        room_lifecycle,
     };
     tokio::spawn(run_lobby(registry, command_rx, control_rx, event_rx));
     handle
@@ -1130,12 +1157,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_actor_cancels_only_its_members_and_publishes_one_closure() {
+    async fn lifecycle_is_ordered_and_aborted_actor_is_isolated() {
         let lobby = spawn_lobby(limits(4));
         let owner = CancellationToken::new();
         let member = CancellationToken::new();
         let unrelated = CancellationToken::new();
         let (tx, _rx) = mpsc::channel(16);
+        let other = lobby
+            .create(
+                RoomName::parse("survivor").unwrap_or_else(|_| unreachable!()),
+                None,
+                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                identity(3),
+                tx.clone(),
+                unrelated.clone(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let mut lifecycle = lobby.subscribe_room_lifecycle();
         let room = lobby
             .create(
                 RoomName::parse("failed").unwrap_or_else(|_| unreachable!()),
@@ -1147,28 +1186,26 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            lifecycle.recv().await,
+            Ok(RoomLifecycle {
+                event: RoomLifecycleEvent::Created,
+                active_count: 2,
+            })
+        );
         assert!(
             lobby
-                .join(room.id(), identity(2), None, tx.clone(), member.clone())
+                .join(room.id(), identity(2), None, tx, member.clone())
                 .await
                 .is_ok()
         );
-        let other = lobby
-            .create(
-                RoomName::parse("survivor").unwrap_or_else(|_| unreachable!()),
-                None,
-                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
-                identity(3),
-                tx,
-                unrelated.clone(),
-            )
-            .await
-            .unwrap_or_else(|_| unreachable!());
-        let mut closures = lobby.subscribe_room_closures();
         assert!(lobby.abort_room_for_test(room.id()).await.is_ok());
         assert_eq!(
-            timeout(Duration::from_secs(1), closures.recv()).await,
-            Ok(Ok(room.id()))
+            timeout(Duration::from_secs(1), lifecycle.recv()).await,
+            Ok(Ok(RoomLifecycle {
+                event: RoomLifecycleEvent::Closed,
+                active_count: 1,
+            }))
         );
         assert!(owner.is_cancelled());
         assert!(member.is_cancelled());

@@ -247,6 +247,8 @@ pub trait GameObserver: Send + Sync + 'static {
     fn authenticated(&self, _account_id: AccountId) {}
     /// Fixed room lifecycle observation.
     fn room(&self, _event: GameRoomObservation) {}
+    /// Stores the sole registry's exact active-room count.
+    fn rooms_active(&self, _active_count: usize) {}
     /// Fixed queue observation.
     fn queue(&self, _event: GameQueueObservation) {}
     /// Fixed chat observation.
@@ -619,15 +621,18 @@ where
         shutdown: CancellationToken,
     ) -> Result<(), GameRuntimeError> {
         let mut tasks = JoinSet::new();
-        let mut room_closures = self.lobby.subscribe_room_closures();
+        let mut room_lifecycle = self.lobby.subscribe_room_lifecycle();
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                closed = room_closures.recv() => match closed {
-                    Ok(_room_id) => self.observer.room(GameRoomObservation::Closed),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        for _ in 0..skipped {
-                            self.observer.room(GameRoomObservation::Closed);
+                lifecycle = room_lifecycle.recv() => match lifecycle {
+                    Ok(lifecycle) => observe_room_lifecycle(self.observer.as_ref(), lifecycle),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !drain_room_lifecycle(
+                            self.observer.as_ref(),
+                            &mut room_lifecycle,
+                        ) {
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -662,6 +667,7 @@ where
             while tasks.join_next().await.is_some() {}
         }
         let lobby_result = self.lobby.shutdown().await;
+        let _lifecycle_open = drain_room_lifecycle(self.observer.as_ref(), &mut room_lifecycle);
         if drain_timed_out || lobby_result.is_err() {
             return Err(GameRuntimeError::ShutdownTimeout);
         }
@@ -1104,7 +1110,6 @@ where
                                     .await?;
                                 self.send(framed, &RoomStateResponse { room: snapshot })
                                     .await?;
-                                self.observer.room(GameRoomObservation::Created);
                                 Ok(GameState::InRoom)
                             }
                             Err(error) => {
@@ -1585,6 +1590,29 @@ fn is_known_room_opcode(opcode: u16) -> bool {
             | SYNTHETIC_M4_C2S_KICK
             | SYNTHETIC_M4_C2S_STATE
     )
+}
+
+fn observe_room_lifecycle(observer: &dyn GameObserver, lifecycle: lobby::RoomLifecycle) {
+    let event = match lifecycle.event {
+        lobby::RoomLifecycleEvent::Created => GameRoomObservation::Created,
+        lobby::RoomLifecycleEvent::Closed => GameRoomObservation::Closed,
+    };
+    observer.room(event);
+    observer.rooms_active(lifecycle.active_count);
+}
+
+fn drain_room_lifecycle(
+    observer: &dyn GameObserver,
+    lifecycle: &mut broadcast::Receiver<lobby::RoomLifecycle>,
+) -> bool {
+    loop {
+        match lifecycle.try_recv() {
+            Ok(lifecycle) => observe_room_lifecycle(observer, lifecycle),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Empty) => return true,
+            Err(broadcast::error::TryRecvError::Closed) => return false,
+        }
+    }
 }
 
 fn room_error_result(error: RoomError) -> RoomCommandResult {

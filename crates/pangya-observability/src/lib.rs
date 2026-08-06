@@ -865,25 +865,12 @@ impl GameObserver for M2Metrics {
             GameRoomObservation::Closed => 8,
         };
         self.game_room[index].fetch_add(1, Ordering::Relaxed);
-        match event {
-            GameRoomObservation::Created => {
-                self.game_active_rooms.fetch_add(1, Ordering::Relaxed);
-            }
-            GameRoomObservation::Closed => {
-                let _ = self.game_active_rooms.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |active| Some(active.saturating_sub(1)),
-                );
-            }
-            GameRoomObservation::Listed
-            | GameRoomObservation::Joined
-            | GameRoomObservation::Left
-            | GameRoomObservation::SettingsChanged
-            | GameRoomObservation::ReadyChanged
-            | GameRoomObservation::Kicked
-            | GameRoomObservation::StateSent => {}
-        }
+    }
+
+    fn rooms_active(&self, active_count: usize) {
+        let active_count = u64::try_from(active_count).map_or(u64::MAX, |value| value);
+        self.game_active_rooms
+            .store(active_count, Ordering::Relaxed);
     }
 
     fn queue(&self, event: GameQueueObservation) {
@@ -1162,10 +1149,11 @@ mod tests {
     }
 
     #[test]
-    fn game_m4_metrics_use_only_fixed_labels_and_active_rooms_never_underflows() {
+    fn game_m4_metrics_use_only_fixed_labels_and_explicit_active_room_gauge() {
         let metrics = M2Metrics::default();
         GameObserver::rate_limited(&metrics, GameRateClass::RoomCommandsConnection);
         GameObserver::rate_limited(&metrics, GameRateClass::ChatConnection);
+        GameObserver::rooms_active(&metrics, 7);
         GameObserver::room(&metrics, GameRoomObservation::Closed);
         GameObserver::room(&metrics, GameRoomObservation::Created);
         GameObserver::room(&metrics, GameRoomObservation::SettingsChanged);
@@ -1177,7 +1165,7 @@ mod tests {
         for expected in [
             "pangya_game_rate_limit_total{class=\"room_commands_connection\"} 1",
             "pangya_game_rate_limit_total{class=\"chat_connection\"} 1",
-            "pangya_game_rooms_active{service=\"game\"} 1",
+            "pangya_game_rooms_active{service=\"game\"} 7",
             "pangya_game_room_events_total{event=\"closed\"} 1",
             "pangya_game_room_events_total{event=\"created\"} 1",
             "pangya_game_room_events_total{event=\"settings_changed\"} 1",
@@ -1197,5 +1185,19 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret_or_unbounded_label));
         }
+    }
+
+    #[test]
+    fn ordered_room_create_and_close_stores_zero_active_rooms() {
+        let metrics = M2Metrics::default();
+        GameObserver::room(&metrics, GameRoomObservation::Created);
+        GameObserver::rooms_active(&metrics, 1);
+        GameObserver::room(&metrics, GameRoomObservation::Closed);
+        GameObserver::rooms_active(&metrics, 0);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("pangya_game_rooms_active{service=\"game\"} 0"));
+        assert!(rendered.contains("pangya_game_room_events_total{event=\"created\"} 1"));
+        assert!(rendered.contains("pangya_game_room_events_total{event=\"closed\"} 1"));
     }
 }
