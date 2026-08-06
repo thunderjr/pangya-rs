@@ -1057,6 +1057,8 @@ pub enum MatchAbortReason {
     Shutdown,
     /// Local startup recovery found a nonterminal match.
     StartupRecovery,
+    /// Persistence failed after a runtime reservation or durable transition became ambiguous.
+    PersistenceFailure,
 }
 
 /// Request to abort one authoritative match without accepting reward data.

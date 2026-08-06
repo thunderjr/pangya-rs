@@ -32,26 +32,33 @@ use std::{
 use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_data::Catalog;
 use pangya_domain::{
-    AccountId, ConsumeHandover, HandoverRepository, Nickname, PlayerConnectionId, PlayerRepository,
-    PlayerSnapshot, RepositoryError, RoomError, RoomId, ServiceKind as DomainServiceKind,
-    SourceAddressPrefix,
+    AbortMatch, AbortMatchOutcome, AccountId, BeginSoloMatch, BeginSoloMatchOutcome,
+    CatalogFingerprint, ConsumeHandover, HandoverRepository, MatchAbortReason, MatchId,
+    MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig, PlayerConnectionId,
+    PlayerRepository, PlayerSnapshot, RepositoryError, RoomError, RoomId,
+    ServiceKind as DomainServiceKind, SoloMatchResult, SourceAddressPrefix,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
     RegistryError, RegistryGuard, parse_handover,
 };
 use pangya_protocol::{
-    ChannelJoined, CharacterBootstrap, CharacterInfo, CodecLimits, CompatibilityProfile,
-    DecodePacket, EncodePacket, EquipmentInfo, FrameCodec, GAME_INVENTORY_SEGMENT_ITEMS, GameAuth,
-    InventoryBootstrap, InventorySegment, OutboundFrame, PacketEncodeError, PlayerInfo,
-    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
-    RoomCreateRequest, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest,
-    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
-    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
-    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
-    SYNTHETIC_M4_C2S_STATE, SelectChannel, ServiceKind, decode_packet_payload,
-    encode_packet_payload, synthetic_game_hello,
+    BalanceUpdate, ChannelJoined, CharacterBootstrap, CharacterInfo, CodecLimits,
+    CompatibilityProfile, DecodePacket, EncodePacket, EquipmentInfo, FinishHole, FrameCodec,
+    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HoleResult, InventoryBootstrap, InventorySegment,
+    LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
+    MatchStarted, OutboundFrame, PacketEncodeError, PlayerInfo, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
+    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
+    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
+    SYNTHETIC_M5_C2S_START_SOLO, SelectChannel, ServiceKind, ShotAction, ShotActionRelay,
+    ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase,
+    StartSolo, Weather as ProtocolWeather, Wind, decode_packet_payload, encode_packet_payload,
+    synthetic_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -89,6 +96,10 @@ pub enum GameState {
     InChannel,
     /// Authoritatively registered in a room.
     InRoom,
+    /// Solo begin committed; waiting for loading completion.
+    InMatchLoading,
+    /// Solo gameplay is active or waiting for durable commit.
+    InMatch,
     /// Terminal state.
     Closed,
 }
@@ -181,6 +192,53 @@ pub enum GameRateClass {
     RoomCommandsConnection,
     /// Per-connection chat messages.
     ChatConnection,
+    /// Per-connection solo shot action/result packets.
+    ShotPacketsConnection,
+}
+
+/// Fixed solo match lifecycle observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameMatchObservation {
+    /// Begin was durably confirmed.
+    Started,
+    /// Loading completed.
+    LoadingComplete,
+    /// Result committed and emitted.
+    Finished,
+    /// Match aborted without reward.
+    Aborted,
+    /// Actor loading deadline elapsed.
+    LoadingTimeout,
+}
+
+/// Fixed repository transaction observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameCommitObservation {
+    /// New begin row inserted.
+    Begun,
+    /// Exact begin already existed.
+    Existing,
+    /// Hole commit completed.
+    Committed,
+    /// A committed result won an abort race.
+    Idempotent,
+    /// Repository or actor application failed.
+    Failed,
+    /// Deadline or shutdown cancelled repository work.
+    Cancelled,
+}
+
+/// Fixed shot handling observations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameShotObservation {
+    /// New shot relay accepted.
+    Accepted,
+    /// Exact relay duplicate accepted without mutation.
+    Duplicate,
+    /// Shot was rejected by validation/state.
+    Rejected,
+    /// Local shot budget was exceeded.
+    RateLimited,
 }
 
 /// Fixed room observations.
@@ -263,6 +321,14 @@ pub trait GameObserver: Send + Sync + 'static {
     fn chat(&self, _event: GameChatObservation) {}
     /// Fixed unknown-opcode observation.
     fn unknown(&self, _event: GameUnknownObservation) {}
+    /// Exact process-local active solo match gauge.
+    fn matches_active(&self, _active: usize) {}
+    /// Fixed solo lifecycle observation.
+    fn match_event(&self, _event: GameMatchObservation) {}
+    /// Fixed persistence outcome.
+    fn commit(&self, _outcome: GameCommitObservation) {}
+    /// Fixed shot outcome.
+    fn shot(&self, _outcome: GameShotObservation) {}
 }
 
 /// No-op GameService observer.
@@ -357,6 +423,25 @@ impl Default for GameRuntimeLimits {
     }
 }
 
+/// Checked optional synthetic solo-practice composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SoloRuntimeConfig {
+    /// Catalog-validated one-hole course.
+    pub course: OneHoleConfig,
+    /// Exact fingerprint of the loaded catalog.
+    pub catalog_fingerprint: CatalogFingerprint,
+    /// Actor-owned loading deadline, represented exactly in protocol milliseconds.
+    pub loading_timeout: Duration,
+    /// Repository operation deadline.
+    pub commit_timeout: Duration,
+    /// Authoritative stroke cap.
+    pub max_strokes: u8,
+    /// Startup recovery work cap.
+    pub startup_recovery_limit: pangya_domain::IncompleteMatchAbortLimit,
+    /// Per-connection action/result packet budget per shared rate window.
+    pub shot_packets_per_window: u32,
+}
+
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
@@ -366,6 +451,8 @@ pub struct GameRuntimeConfig {
     pub unknown_opcode_policy: UnknownOpcodePolicy,
     /// Resource, rate, actor, and deadline limits.
     pub limits: GameRuntimeLimits,
+    /// Optional local-only synthetic solo practice.
+    pub solo_practice: Option<SoloRuntimeConfig>,
 }
 
 impl Default for GameRuntimeConfig {
@@ -374,6 +461,7 @@ impl Default for GameRuntimeConfig {
             channel_id: 1,
             unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
             limits: GameRuntimeLimits::default(),
+            solo_practice: None,
         }
     }
 }
@@ -408,9 +496,18 @@ pub enum GameRuntimeError {
     /// Runtime composition was invalid.
     #[error("GameService runtime configuration is invalid")]
     InvalidConfig,
+    /// Match persistence failed with details redacted.
+    #[error("GameService match persistence failed")]
+    MatchPersistence,
     /// Connection or lobby drain exceeded grace.
     #[error("GameService graceful shutdown timed out")]
     ShutdownTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AbortResolution {
+    Aborted,
+    Committed,
 }
 
 struct Admission {
@@ -458,7 +555,7 @@ impl CaptureSink {
 /// Generic bounded GameService over domain repositories and an immutable catalog.
 pub struct GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
 {
     repository: Arc<R>,
     catalog: Catalog,
@@ -482,7 +579,7 @@ where
 
 impl<R> std::fmt::Debug for GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -494,7 +591,7 @@ where
 
 impl<R> GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
 {
     /// Creates a GameService after validating every direct and actor bound.
     pub fn new(
@@ -535,6 +632,7 @@ where
             || limits.unknown_capture_capacity == 0
             || limits.unknown_capture_capacity > 65_536
             || limits.outbound_room_event_capacity == 0
+            || (config.solo_practice.is_some() && limits.outbound_room_event_capacity < 2)
             || limits.outbound_room_event_capacity > 65_536
             || !limits.lobby.is_valid()
             || limits.lobby.cleanup_capacity() < limits.global_connections.saturating_add(1)
@@ -554,9 +652,30 @@ where
             || limits.codec.max_server_plaintext_bytes < 2
             || limits.codec.max_server_plaintext_bytes > 64 * 1024 * 1024
             || limits.codec.max_expansion_ratio == 0
-            || limits.codec.max_expansion_ratio > 1_024;
+            || limits.codec.max_expansion_ratio > 1_024
+            || config.solo_practice.is_some_and(|solo| {
+                let loading_ms = solo.loading_timeout.as_millis();
+                solo.loading_timeout.is_zero()
+                    || solo.loading_timeout > LOADING_TIMEOUT_HARD_CAP
+                    || loading_ms == 0
+                    || loading_ms > u128::from(u32::MAX)
+                    || solo.commit_timeout.is_zero()
+                    || solo.commit_timeout > limits.shutdown_grace
+                    || solo.commit_timeout > Duration::from_secs(60)
+                    || !(1..=MAX_SOLO_STROKES).contains(&solo.max_strokes)
+                    || solo.shot_packets_per_window == 0
+                    || solo.shot_packets_per_window > 1_000_000
+            });
         if invalid {
             return Err(GameRuntimeError::InvalidConfig);
+        }
+        if let Some(solo) = config.solo_practice {
+            let catalog_course = catalog
+                .one_hole_course(solo.course.course_id())
+                .map_err(|_| GameRuntimeError::Catalog)?;
+            if catalog_course != solo.course || catalog.fingerprint() != solo.catalog_fingerprint {
+                return Err(GameRuntimeError::Catalog);
+            }
         }
         let lobby = spawn_lobby(limits.lobby);
         Ok(Self {
@@ -630,16 +749,24 @@ where
     ) -> Result<(), GameRuntimeError> {
         let mut tasks = JoinSet::new();
         let mut room_lifecycle = self.lobby.subscribe_room_lifecycle();
-        loop {
+        let mut match_lifecycle = self.lobby.subscribe_match_lifecycle();
+        let mut service_failure = None;
+        'accept: loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 lifecycle = room_lifecycle.recv() => match lifecycle {
                     Ok(lifecycle) => observe_room_lifecycle(self.observer.as_ref(), lifecycle),
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if !drain_room_lifecycle(
-                            self.observer.as_ref(),
-                            &mut room_lifecycle,
-                        ) {
+                        if !drain_room_lifecycle(self.observer.as_ref(), &mut room_lifecycle) {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                lifecycle = match_lifecycle.recv() => match lifecycle {
+                    Ok(lifecycle) => observe_match_lifecycle(self.observer.as_ref(), lifecycle),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !drain_match_lifecycle(self.observer.as_ref(), &mut match_lifecycle) {
                             break;
                         }
                     }
@@ -650,39 +777,59 @@ where
                     match self.admit(peer) {
                         Ok(admission) => {
                             while tasks.len() >= self.config.limits.global_connections {
-                                let _completed = tasks.join_next().await;
+                                if joined_match_persistence(tasks.join_next().await) {
+                                    service_failure = Some(GameRuntimeError::MatchPersistence);
+                                    shutdown.cancel();
+                                    break 'accept;
+                                }
                             }
                             let service = Arc::clone(&self);
                             let child = shutdown.child_token();
                             tasks.spawn(async move {
-                                let _outcome = service.run_admitted(stream, admission, child).await;
+                                service.run_admitted(stream, admission, child).await
                             });
                         }
                         Err(_) => drop(stream),
                     }
                 }
-                joined = tasks.join_next(), if !tasks.is_empty() => { let _completed = joined; }
+                joined = tasks.join_next(), if !tasks.is_empty() => {
+                    if joined_match_persistence(joined) {
+                        service_failure = Some(GameRuntimeError::MatchPersistence);
+                        shutdown.cancel();
+                        break;
+                    }
+                }
             }
         }
         drop(listener);
-        let drain_timed_out = timeout(self.config.limits.shutdown_grace, async {
-            while tasks.join_next().await.is_some() {}
+        let drained = timeout(self.config.limits.shutdown_grace, async {
+            while let Some(joined) = tasks.join_next().await {
+                if joined_match_persistence(Some(joined)) {
+                    service_failure = Some(GameRuntimeError::MatchPersistence);
+                }
+            }
+            let outcome = self.lobby.shutdown().await.map_err(|error| match error {
+                LobbyShutdownError::Room(RoomError::Timeout) => GameRuntimeError::ShutdownTimeout,
+                _ => GameRuntimeError::MatchPersistence,
+            })?;
+            for abort in outcome.into_aborts() {
+                self.persist_shutdown_abort(abort).await?;
+            }
+            service_failure.map_or(Ok(()), Err)
         })
-        .await
-        .is_err();
-        if drain_timed_out {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
+        .await;
+        let _room_lifecycle_open =
+            drain_room_lifecycle(self.observer.as_ref(), &mut room_lifecycle);
+        let _match_lifecycle_open =
+            drain_match_lifecycle(self.observer.as_ref(), &mut match_lifecycle);
+        match drained {
+            Ok(result) => result,
+            Err(_) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Err(GameRuntimeError::ShutdownTimeout)
+            }
         }
-        let lobby_outcome = self.lobby.shutdown().await;
-        let _lifecycle_open = drain_room_lifecycle(self.observer.as_ref(), &mut room_lifecycle);
-        if drain_timed_out {
-            return Err(GameRuntimeError::ShutdownTimeout);
-        }
-        // M5 runtime persistence is not active yet, but the bounded retained-abort handoff is
-        // explicitly received here so it cannot be accidentally discarded by API shape.
-        let _shutdown_outcome = lobby_outcome.map_err(|_| GameRuntimeError::ShutdownTimeout)?;
-        Ok(())
     }
 
     fn admit(&self, peer: SocketAddr) -> Result<Admission, GameRuntimeError> {
@@ -780,6 +927,7 @@ where
         let mut local = LocalRateWindow::new(self.config.limits.rate_window);
         let mut commands = LocalRateWindow::new(self.config.limits.rate_window);
         let mut chats = LocalRateWindow::new(self.config.limits.rate_window);
+        let mut shots = LocalRateWindow::new(self.config.limits.rate_window);
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
@@ -801,12 +949,17 @@ where
                     self.observer.queue(GameQueueObservation::OutboundDropped);
                     break Err(GameRuntimeError::Limited);
                 }
-                event = room_events.recv(), if state == GameState::InRoom => {
+                event = room_events.recv(), if matches!(state, GameState::InRoom | GameState::InMatchLoading | GameState::InMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
                     let handled = tokio::select! {
                         biased;
                         () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
-                        handled = self.handle_room_event(&mut framed, event, room_id) => handled,
+                        handled = self.handle_room_event(
+                            &mut framed,
+                            event,
+                            room_id,
+                            connection_id,
+                        ) => handled,
                     };
                     match handled {
                         Ok(RoomEventEffect::Remain) => {}
@@ -814,6 +967,9 @@ where
                             state = GameState::InChannel;
                             room_id = None;
                         }
+                        Ok(RoomEventEffect::EnterRoom) => state = GameState::InRoom,
+                        Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
+                        Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
                         Err(error) => break Err(error),
                     }
                 }
@@ -879,7 +1035,7 @@ where
                             }
                             state = GameState::InChannel;
                         }
-                        GameState::InChannel | GameState::InRoom => {
+                        GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch => {
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
                             } else if is_known_room_opcode(frame.opcode) {
@@ -905,6 +1061,26 @@ where
                                         &mut room_id,
                                     ) => handled,
                                 };
+                                match handled {
+                                    Ok(next) => state = next,
+                                    Err(error) => break Err(error),
+                                }
+                            } else if is_known_solo_opcode(frame.opcode) {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                let handled = self
+                                    .handle_solo_command(
+                                        &mut framed,
+                                        state,
+                                        established,
+                                        &shutdown,
+                                        idle_deadline,
+                                        &mut shots,
+                                        frame.opcode,
+                                        &frame.payload,
+                                    )
+                                    .await;
                                 match handled {
                                     Ok(next) => state = next,
                                     Err(error) => break Err(error),
@@ -937,15 +1113,20 @@ where
 
         state = GameState::Closed;
         let cleanup = self.lobby.disconnect(connection_id).await;
-        if !matches!(
-            cleanup,
-            Ok(Some(_)) | Ok(None) | Err(RoomError::NotMember | RoomError::RoomNotFound)
-        ) {
-            self.observer.queue(GameQueueObservation::LobbyRejected);
-        }
+        let cleanup_result = match cleanup {
+            Ok(Some(abort)) => self.persist_cleanup_abort(abort).await.map(drop),
+            Ok(None) | Err(RoomError::NotMember | RoomError::RoomNotFound) => Ok(()),
+            Err(_) => {
+                self.observer.queue(GameQueueObservation::LobbyRejected);
+                Ok(())
+            }
+        };
         drop(presence);
         let _terminal_state = state;
-        result
+        match cleanup_result {
+            Err(error) => Err(error),
+            Ok(()) => result,
+        }
     }
 
     async fn authenticate(
@@ -1288,6 +1469,325 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_solo_command(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+        identity: &RoomIdentity,
+        shutdown: &CancellationToken,
+        idle_deadline: Instant,
+        shots: &mut LocalRateWindow,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<GameState, GameRuntimeError> {
+        let solo = self
+            .config
+            .solo_practice
+            .ok_or(GameRuntimeError::Protocol)?;
+        let profile = &CompatibilityProfile::US_852;
+        match (state, opcode) {
+            (GameState::InRoom, SYNTHETIC_M5_C2S_START_SOLO) => {
+                decode_packet_payload::<StartSolo>(payload, profile, ServiceKind::Game)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let match_id = MatchId::new(uuid::Uuid::new_v4());
+                let result_key = MatchResultKey::new(uuid::Uuid::new_v4());
+                let mut seed_bytes = [0_u8; 32];
+                OsRng.fill_bytes(&mut seed_bytes);
+                let seed = MatchSeed::new(seed_bytes);
+                let (weather, wind) =
+                    deterministic_conditions(seed).map_err(|_| GameRuntimeError::InvalidConfig)?;
+                let begin = BeginSoloMatch::new(
+                    match_id,
+                    result_key,
+                    identity.account_id,
+                    solo.course,
+                    solo.catalog_fingerprint,
+                    seed,
+                    weather,
+                    wind,
+                );
+                let plan = SoloStartPlan::new(begin, solo.loading_timeout, solo.max_strokes)
+                    .map_err(|_| GameRuntimeError::InvalidConfig)?;
+                let prepared = self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::PrepareStart(plan))
+                    .await;
+                let begin = match prepared {
+                    Ok(LobbySoloRouteResult::Begin(begin)) => begin,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(error) => {
+                        self.send_solo_result(
+                            framed,
+                            SoloCommand::StartSolo,
+                            solo_error_outcome(error),
+                        )
+                        .await?;
+                        return Ok(GameState::InRoom);
+                    }
+                };
+                self.persist_and_confirm_begin(
+                    identity.connection_id,
+                    begin,
+                    shutdown,
+                    idle_deadline,
+                )
+                .await?;
+                self.send_solo_result(framed, SoloCommand::StartSolo, SoloCommandOutcome::Success)
+                    .await?;
+                Ok(GameState::InRoom)
+            }
+            (GameState::InMatchLoading, SYNTHETIC_M5_C2S_LOADING_COMPLETE) => {
+                let loading =
+                    decode_packet_payload::<LoadingComplete>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let result = self
+                    .lobby
+                    .route_solo(
+                        identity.connection_id,
+                        LobbySoloCommand::LoadingComplete(loading),
+                    )
+                    .await;
+                let outcome = solo_route_outcome(result);
+                if outcome == SoloCommandOutcome::Success {
+                    self.observer
+                        .match_event(GameMatchObservation::LoadingComplete);
+                }
+                self.send_solo_result(framed, SoloCommand::LoadingComplete, outcome)
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InMatch, SYNTHETIC_M5_C2S_SHOT_ACTION) => {
+                if !shots.admit_count(solo.shot_packets_per_window) {
+                    self.observer
+                        .rate_limited(GameRateClass::ShotPacketsConnection);
+                    self.observer.shot(GameShotObservation::RateLimited);
+                    self.send_solo_result(
+                        framed,
+                        SoloCommand::ShotAction,
+                        SoloCommandOutcome::Timeout,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
+                let action =
+                    decode_packet_payload::<ShotAction>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let result = self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::ShotAction(action))
+                    .await;
+                let outcome = observe_relay_result(self.observer.as_ref(), &result);
+                self.send_solo_result(framed, SoloCommand::ShotAction, outcome)
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InMatch, SYNTHETIC_M5_C2S_SHOT_RESULT) => {
+                if !shots.admit_count(solo.shot_packets_per_window) {
+                    self.observer
+                        .rate_limited(GameRateClass::ShotPacketsConnection);
+                    self.observer.shot(GameShotObservation::RateLimited);
+                    self.send_solo_result(
+                        framed,
+                        SoloCommand::ShotResult,
+                        SoloCommandOutcome::Timeout,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
+                let shot_result =
+                    decode_packet_payload::<ShotResult>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let result = self
+                    .lobby
+                    .route_solo(
+                        identity.connection_id,
+                        LobbySoloCommand::ShotResult(shot_result),
+                    )
+                    .await;
+                let outcome = observe_relay_result(self.observer.as_ref(), &result);
+                self.send_solo_result(framed, SoloCommand::ShotResult, outcome)
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InMatch, SYNTHETIC_M5_C2S_FINISH_HOLE) => {
+                decode_packet_payload::<FinishHole>(payload, profile, ServiceKind::Game)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let commit = match self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::PrepareFinish)
+                    .await
+                {
+                    Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(error) => {
+                        self.send_solo_result(
+                            framed,
+                            SoloCommand::FinishHole,
+                            solo_error_outcome(error),
+                        )
+                        .await?;
+                        return Ok(state);
+                    }
+                };
+                self.persist_and_apply_commit(
+                    identity.connection_id,
+                    commit,
+                    shutdown,
+                    idle_deadline,
+                )
+                .await?;
+                Ok(state)
+            }
+            _ => Err(GameRuntimeError::Protocol),
+        }
+    }
+
+    async fn persist_and_confirm_begin(
+        &self,
+        connection_id: PlayerConnectionId,
+        begin: BeginSoloMatch,
+        shutdown: &CancellationToken,
+        idle_deadline: Instant,
+    ) -> Result<(), GameRuntimeError> {
+        let solo = self
+            .config
+            .solo_practice
+            .ok_or(GameRuntimeError::InvalidConfig)?;
+        let cancelled_before = shutdown.is_cancelled() || Instant::now() >= idle_deadline;
+        let persisted = if cancelled_before {
+            self.observer.commit(GameCommitObservation::Cancelled);
+            None
+        } else {
+            match timeout(
+                solo.commit_timeout,
+                self.repository.begin_solo(begin.clone()),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => Some(outcome),
+                Ok(Err(_)) => {
+                    self.observer.commit(GameCommitObservation::Failed);
+                    None
+                }
+                Err(_) => {
+                    self.observer.commit(GameCommitObservation::Cancelled);
+                    None
+                }
+            }
+        };
+        let caller_cancelled = shutdown.is_cancelled() || Instant::now() >= idle_deadline;
+        let Some(persisted) = persisted else {
+            self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, false)
+                .await?;
+            return Err(if cancelled_before {
+                GameRuntimeError::Timeout
+            } else {
+                GameRuntimeError::MatchPersistence
+            });
+        };
+        self.observer.commit(match persisted {
+            BeginSoloMatchOutcome::Begun => GameCommitObservation::Begun,
+            BeginSoloMatchOutcome::Existing => GameCommitObservation::Existing,
+        });
+        if caller_cancelled {
+            self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, false)
+                .await?;
+            return Err(GameRuntimeError::Timeout);
+        }
+        let confirmation = self
+            .lobby
+            .route_solo(
+                connection_id,
+                LobbySoloCommand::ConfirmBegin {
+                    match_id: begin.match_id(),
+                    result_key: begin.result_key(),
+                },
+            )
+            .await;
+        self.resolve_persisted_begin(connection_id, confirmation)
+            .await
+    }
+
+    async fn resolve_persisted_begin(
+        &self,
+        connection_id: PlayerConnectionId,
+        confirmation: Result<LobbySoloRouteResult, SoloMatchError>,
+    ) -> Result<(), GameRuntimeError> {
+        if matches!(confirmation, Ok(LobbySoloRouteResult::Applied)) {
+            return Ok(());
+        }
+        self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, false)
+            .await?;
+        Err(GameRuntimeError::MatchPersistence)
+    }
+
+    async fn persist_and_apply_commit(
+        &self,
+        connection_id: PlayerConnectionId,
+        commit: pangya_domain::CommitSoloHole,
+        shutdown: &CancellationToken,
+        idle_deadline: Instant,
+    ) -> Result<(), GameRuntimeError> {
+        let solo = self
+            .config
+            .solo_practice
+            .ok_or(GameRuntimeError::InvalidConfig)?;
+        let committed = if shutdown.is_cancelled() || Instant::now() >= idle_deadline {
+            self.observer.commit(GameCommitObservation::Cancelled);
+            None
+        } else {
+            match timeout(
+                solo.commit_timeout,
+                self.repository.commit_solo_hole(commit),
+            )
+            .await
+            {
+                Ok(Ok(committed)) => Some(committed),
+                Ok(Err(_)) => {
+                    self.observer.commit(GameCommitObservation::Failed);
+                    None
+                }
+                Err(_) => {
+                    self.observer.commit(GameCommitObservation::Cancelled);
+                    None
+                }
+            }
+        };
+        let Some(committed) = committed else {
+            self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, true)
+                .await?;
+            return Err(GameRuntimeError::MatchPersistence);
+        };
+        self.observer.commit(GameCommitObservation::Committed);
+        match self
+            .lobby
+            .route_solo(connection_id, LobbySoloCommand::ApplyCommit(committed))
+            .await
+        {
+            Ok(LobbySoloRouteResult::Committed(_)) => {
+                self.observer.match_event(GameMatchObservation::Finished);
+                Ok(())
+            }
+            _ => {
+                self.observer.commit(GameCommitObservation::Failed);
+                self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, true)
+                    .await?;
+                Err(GameRuntimeError::MatchPersistence)
+            }
+        }
+    }
+
+    async fn send_solo_result(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        command: SoloCommand,
+        outcome: SoloCommandOutcome,
+    ) -> Result<(), GameRuntimeError> {
+        self.send(framed, &SoloCommandResult::new(command, outcome))
+            .await
+    }
+
     async fn route_snapshot(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -1315,6 +1815,7 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         event: RoomEvent,
         room_id: Option<RoomId>,
+        connection_id: PlayerConnectionId,
     ) -> Result<RoomEventEffect, GameRuntimeError> {
         match event {
             RoomEvent::Snapshot(room) => {
@@ -1355,14 +1856,221 @@ where
                     .await?;
                 Ok(RoomEventEffect::EnterChannel)
             }
-            // M5 GameService wire routing is deliberately deferred to the next checkpoint.
-            RoomEvent::SoloStarted(_)
-            | RoomEvent::SoloPhase(_)
-            | RoomEvent::SoloActionRelay { .. }
-            | RoomEvent::SoloResultRelay { .. }
-            | RoomEvent::AbortRequested(_)
-            | RoomEvent::SoloCommitted(_) => Ok(RoomEventEffect::Remain),
+            RoomEvent::SoloStarted(plan) => {
+                let begin = plan.begin();
+                let weather = match begin.weather() {
+                    pangya_domain::Weather::Clear => ProtocolWeather::Clear,
+                    pangya_domain::Weather::Cloudy => ProtocolWeather::Cloudy,
+                    pangya_domain::Weather::Rain => ProtocolWeather::Rain,
+                };
+                let wind = Wind::new(
+                    f32::from(begin.wind().speed_tenths()) / 10.0,
+                    f32::from(begin.wind().angle_degrees()),
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                let timeout_ms = u32::try_from(plan.loading_timeout().as_millis())
+                    .map_err(|_| GameRuntimeError::InvalidConfig)?;
+                self.send(
+                    framed,
+                    &MatchStarted::new(
+                        begin.match_id().get(),
+                        begin.config().course_id().get(),
+                        begin.config().par(),
+                        *begin.seed().as_bytes(),
+                        weather,
+                        wind,
+                        timeout_ms,
+                    )
+                    .map_err(|_| GameRuntimeError::Protocol)?,
+                )
+                .await?;
+                Ok(RoomEventEffect::EnterLoading)
+            }
+            RoomEvent::SoloPhase { match_id, phase } => {
+                let protocol_phase = match phase {
+                    SoloMatchPhase::Loading => Some(SoloPhase::Loading),
+                    SoloMatchPhase::AwaitAction { .. } | SoloMatchPhase::AwaitResult { .. } => {
+                        Some(SoloPhase::Playing)
+                    }
+                    SoloMatchPhase::HoleComplete | SoloMatchPhase::ResultsPendingCommit => {
+                        Some(SoloPhase::HoleComplete)
+                    }
+                    SoloMatchPhase::Open | SoloMatchPhase::Starting | SoloMatchPhase::Aborted => {
+                        None
+                    }
+                };
+                if let Some(protocol_phase) = protocol_phase {
+                    self.send(framed, &MatchPhase::new(match_id.get(), protocol_phase))
+                        .await?;
+                }
+                if matches!(
+                    phase,
+                    SoloMatchPhase::AwaitAction { .. } | SoloMatchPhase::AwaitResult { .. }
+                ) {
+                    Ok(RoomEventEffect::EnterMatch)
+                } else {
+                    Ok(RoomEventEffect::Remain)
+                }
+            }
+            RoomEvent::SoloActionRelay { from, action } => {
+                let relay = ShotActionRelay::new(from.get(), action)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                self.send(framed, &relay).await?;
+                Ok(RoomEventEffect::Remain)
+            }
+            RoomEvent::SoloResultRelay { from, result } => {
+                let relay = ShotResultRelay::new(from.get(), result)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                self.send(framed, &relay).await?;
+                Ok(RoomEventEffect::Remain)
+            }
+            RoomEvent::AbortRequested(abort) => {
+                match self.persist_actor_abort(connection_id, abort, true).await? {
+                    AbortResolution::Aborted => {
+                        self.send(
+                            framed,
+                            &MatchAborted::new(
+                                abort.match_id().get(),
+                                protocol_abort_reason(abort.reason()),
+                            ),
+                        )
+                        .await?;
+                        Ok(RoomEventEffect::EnterRoom)
+                    }
+                    AbortResolution::Committed => Ok(RoomEventEffect::Remain),
+                }
+            }
+            RoomEvent::SoloCommitted(result) => {
+                self.send_committed_result(framed, result).await?;
+                Ok(RoomEventEffect::EnterRoom)
+            }
         }
+    }
+
+    async fn send_committed_result(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        result: SoloMatchResult,
+    ) -> Result<(), GameRuntimeError> {
+        self.send(
+            framed,
+            &HoleResult::new(
+                result.match_id().get(),
+                result.strokes().get(),
+                result.score(),
+                result.pang_reward(),
+                result.experience_reward(),
+                result.result_key().get(),
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?,
+        )
+        .await?;
+        self.send(
+            framed,
+            &BalanceUpdate::new(result.pang_balance(), result.experience_balance()),
+        )
+        .await?;
+        self.send_solo_result(framed, SoloCommand::FinishHole, SoloCommandOutcome::Success)
+            .await?;
+        self.send(
+            framed,
+            &MatchPhase::new(result.match_id().get(), SoloPhase::HoleComplete),
+        )
+        .await?;
+        self.send(
+            framed,
+            &MatchPhase::new(result.match_id().get(), SoloPhase::Finished),
+        )
+        .await
+    }
+
+    async fn abort_actor_match(
+        &self,
+        connection_id: PlayerConnectionId,
+        reason: MatchAbortReason,
+        classify_terminal: bool,
+    ) -> Result<AbortResolution, GameRuntimeError> {
+        let routed = self
+            .lobby
+            .route_solo(connection_id, LobbySoloCommand::Abort(reason))
+            .await
+            .map_err(|_| GameRuntimeError::MatchPersistence)?;
+        let LobbySoloRouteResult::Abort(Some(abort)) = routed else {
+            return Err(GameRuntimeError::MatchPersistence);
+        };
+        self.persist_actor_abort(connection_id, abort, classify_terminal)
+            .await
+    }
+
+    async fn persist_actor_abort(
+        &self,
+        connection_id: PlayerConnectionId,
+        abort: AbortMatch,
+        classify_terminal: bool,
+    ) -> Result<AbortResolution, GameRuntimeError> {
+        let Some(solo) = self.config.solo_practice else {
+            return Err(GameRuntimeError::InvalidConfig);
+        };
+        let outcome = timeout(solo.commit_timeout, self.repository.abort(abort))
+            .await
+            .map_err(|_| GameRuntimeError::MatchPersistence)?;
+        match outcome {
+            Ok(AbortMatchOutcome::Aborted | AbortMatchOutcome::AlreadyAborted)
+            | Err(pangya_domain::MatchRepositoryError::NotFound) => {
+                self.lobby
+                    .route_solo(connection_id, LobbySoloCommand::AcknowledgeAbort(abort))
+                    .await
+                    .map_err(|_| GameRuntimeError::MatchPersistence)?;
+                if classify_terminal {
+                    observe_abort_terminal(self.observer.as_ref(), abort.reason());
+                }
+                Ok(AbortResolution::Aborted)
+            }
+            Ok(AbortMatchOutcome::AlreadyCommitted(committed)) => {
+                self.observer.commit(GameCommitObservation::Idempotent);
+                self.lobby
+                    .route_solo(connection_id, LobbySoloCommand::ApplyCommit(committed))
+                    .await
+                    .map_err(|_| GameRuntimeError::MatchPersistence)?;
+                if classify_terminal {
+                    self.observer.match_event(GameMatchObservation::Finished);
+                }
+                Ok(AbortResolution::Committed)
+            }
+            Err(_) => Err(GameRuntimeError::MatchPersistence),
+        }
+    }
+
+    async fn persist_cleanup_abort(
+        &self,
+        abort: AbortMatch,
+    ) -> Result<AbortResolution, GameRuntimeError> {
+        let Some(solo) = self.config.solo_practice else {
+            return Err(GameRuntimeError::InvalidConfig);
+        };
+        let outcome = timeout(solo.commit_timeout, self.repository.abort(abort))
+            .await
+            .map_err(|_| GameRuntimeError::MatchPersistence)?;
+        match outcome {
+            Ok(AbortMatchOutcome::Aborted | AbortMatchOutcome::AlreadyAborted)
+            | Err(pangya_domain::MatchRepositoryError::NotFound) => {
+                observe_abort_terminal(self.observer.as_ref(), abort.reason());
+                Ok(AbortResolution::Aborted)
+            }
+            Ok(AbortMatchOutcome::AlreadyCommitted(_)) => {
+                self.observer.commit(GameCommitObservation::Idempotent);
+                self.observer.match_event(GameMatchObservation::Finished);
+                Ok(AbortResolution::Committed)
+            }
+            Err(_) => Err(GameRuntimeError::MatchPersistence),
+        }
+    }
+
+    async fn persist_shutdown_abort(
+        &self,
+        abort: AbortMatch,
+    ) -> Result<AbortResolution, GameRuntimeError> {
+        self.persist_cleanup_abort(abort).await
     }
 
     async fn send_result(
@@ -1557,6 +2265,9 @@ where
 enum RoomEventEffect {
     Remain,
     EnterChannel,
+    EnterRoom,
+    EnterLoading,
+    EnterMatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1595,6 +2306,80 @@ fn unknown_decision(
     }
 }
 
+fn is_known_solo_opcode(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        SYNTHETIC_M5_C2S_START_SOLO
+            | SYNTHETIC_M5_C2S_LOADING_COMPLETE
+            | SYNTHETIC_M5_C2S_SHOT_ACTION
+            | SYNTHETIC_M5_C2S_SHOT_RESULT
+            | SYNTHETIC_M5_C2S_FINISH_HOLE
+    )
+}
+
+fn solo_error_outcome(error: SoloMatchError) -> SoloCommandOutcome {
+    match error {
+        SoloMatchError::InvalidSequence | SoloMatchError::ConflictingReplay => {
+            SoloCommandOutcome::InvalidSequence
+        }
+        SoloMatchError::Timeout | SoloMatchError::QueueFull | SoloMatchError::Closed => {
+            SoloCommandOutcome::Timeout
+        }
+        SoloMatchError::DeterministicConditionsInvariant
+        | SoloMatchError::InvalidPlan
+        | SoloMatchError::InvalidPhase
+        | SoloMatchError::IdentityMismatch
+        | SoloMatchError::AccountMismatch
+        | SoloMatchError::InvalidProgress
+        | SoloMatchError::InvalidStrokes
+        | SoloMatchError::NotMember
+        | SoloMatchError::NotOwner
+        | SoloMatchError::NotSolo => SoloCommandOutcome::InvalidPhase,
+    }
+}
+
+fn solo_route_outcome(result: Result<LobbySoloRouteResult, SoloMatchError>) -> SoloCommandOutcome {
+    match result {
+        Ok(LobbySoloRouteResult::Applied) => SoloCommandOutcome::Success,
+        Ok(_) => SoloCommandOutcome::InvalidPhase,
+        Err(error) => solo_error_outcome(error),
+    }
+}
+
+fn observe_relay_result(
+    observer: &dyn GameObserver,
+    result: &Result<LobbySoloRouteResult, SoloMatchError>,
+) -> SoloCommandOutcome {
+    match result {
+        Ok(LobbySoloRouteResult::Relay(RelayDisposition::Accepted)) => {
+            observer.shot(GameShotObservation::Accepted);
+            SoloCommandOutcome::Success
+        }
+        Ok(LobbySoloRouteResult::Relay(RelayDisposition::Duplicate)) => {
+            observer.shot(GameShotObservation::Duplicate);
+            SoloCommandOutcome::Success
+        }
+        Ok(_) => {
+            observer.shot(GameShotObservation::Rejected);
+            SoloCommandOutcome::InvalidPhase
+        }
+        Err(error) => {
+            observer.shot(GameShotObservation::Rejected);
+            solo_error_outcome(*error)
+        }
+    }
+}
+
+const fn protocol_abort_reason(reason: MatchAbortReason) -> ProtocolMatchAbortReason {
+    match reason {
+        MatchAbortReason::Disconnect => ProtocolMatchAbortReason::PlayerDisconnected,
+        MatchAbortReason::LoadingTimeout => ProtocolMatchAbortReason::LoadingTimeout,
+        MatchAbortReason::Shutdown
+        | MatchAbortReason::StartupRecovery
+        | MatchAbortReason::PersistenceFailure => ProtocolMatchAbortReason::ServerShutdown,
+    }
+}
+
 fn is_known_room_opcode(opcode: u16) -> bool {
     matches!(
         opcode,
@@ -1608,6 +2393,12 @@ fn is_known_room_opcode(opcode: u16) -> bool {
             | SYNTHETIC_M4_C2S_KICK
             | SYNTHETIC_M4_C2S_STATE
     )
+}
+
+fn joined_match_persistence(
+    joined: Option<Result<Result<(), GameRuntimeError>, tokio::task::JoinError>>,
+) -> bool {
+    matches!(joined, Some(Ok(Err(GameRuntimeError::MatchPersistence))))
 }
 
 fn observe_room_lifecycle(observer: &dyn GameObserver, lifecycle: lobby::RoomLifecycle) {
@@ -1626,6 +2417,36 @@ fn drain_room_lifecycle(
     loop {
         match lifecycle.try_recv() {
             Ok(lifecycle) => observe_room_lifecycle(observer, lifecycle),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Empty) => return true,
+            Err(broadcast::error::TryRecvError::Closed) => return false,
+        }
+    }
+}
+
+fn observe_match_lifecycle(observer: &dyn GameObserver, lifecycle: lobby::MatchLifecycle) {
+    if lifecycle.event == lobby::MatchLifecycleEvent::Activated {
+        observer.match_event(GameMatchObservation::Started);
+    }
+    observer.matches_active(lifecycle.active_count);
+}
+
+fn observe_abort_terminal(observer: &dyn GameObserver, reason: MatchAbortReason) {
+    let event = if reason == MatchAbortReason::LoadingTimeout {
+        GameMatchObservation::LoadingTimeout
+    } else {
+        GameMatchObservation::Aborted
+    };
+    observer.match_event(event);
+}
+
+fn drain_match_lifecycle(
+    observer: &dyn GameObserver,
+    lifecycle: &mut broadcast::Receiver<lobby::MatchLifecycle>,
+) -> bool {
+    loop {
+        match lifecycle.try_recv() {
+            Ok(lifecycle) => observe_match_lifecycle(observer, lifecycle),
             Err(broadcast::error::TryRecvError::Lagged(_)) => {}
             Err(broadcast::error::TryRecvError::Empty) => return true,
             Err(broadcast::error::TryRecvError::Closed) => return false,
@@ -1705,7 +2526,258 @@ pub const fn crate_boundary() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use pangya_domain::{
+        AuthenticatedSession, HandoverError, IncompleteMatchAbortLimit, MatchRepositoryError,
+        NewHandover, RepositoryFuture,
+    };
+
     use super::*;
+
+    struct FakeRepository {
+        begin_calls: AtomicUsize,
+        commit_calls: AtomicUsize,
+        abort_calls: AtomicUsize,
+        begin_delay: Mutex<Duration>,
+        commit_delay: Mutex<Duration>,
+        abort_delay: Mutex<Duration>,
+        begin_outcome: Mutex<Result<BeginSoloMatchOutcome, MatchRepositoryError>>,
+        commit_outcome: Mutex<Result<SoloMatchResult, MatchRepositoryError>>,
+        abort_outcome: Mutex<Result<AbortMatchOutcome, MatchRepositoryError>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        active: Mutex<Vec<usize>>,
+        events: Mutex<Vec<GameMatchObservation>>,
+        commits: Mutex<Vec<GameCommitObservation>>,
+    }
+
+    impl GameObserver for RecordingObserver {
+        fn matches_active(&self, active: usize) {
+            if let Ok(mut values) = self.active.lock() {
+                values.push(active);
+            }
+        }
+
+        fn match_event(&self, event: GameMatchObservation) {
+            if let Ok(mut values) = self.events.lock() {
+                values.push(event);
+            }
+        }
+
+        fn commit(&self, outcome: GameCommitObservation) {
+            if let Ok(mut values) = self.commits.lock() {
+                values.push(outcome);
+            }
+        }
+    }
+
+    impl Default for FakeRepository {
+        fn default() -> Self {
+            Self {
+                begin_calls: AtomicUsize::new(0),
+                commit_calls: AtomicUsize::new(0),
+                abort_calls: AtomicUsize::new(0),
+                begin_delay: Mutex::new(Duration::ZERO),
+                commit_delay: Mutex::new(Duration::ZERO),
+                abort_delay: Mutex::new(Duration::ZERO),
+                begin_outcome: Mutex::new(Ok(BeginSoloMatchOutcome::Begun)),
+                commit_outcome: Mutex::new(Err(MatchRepositoryError::Storage)),
+                abort_outcome: Mutex::new(Ok(AbortMatchOutcome::Aborted)),
+            }
+        }
+    }
+
+    impl HandoverRepository for FakeRepository {
+        fn issue(&self, _handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
+            Box::pin(async { Err(HandoverError::Storage) })
+        }
+
+        fn consume(
+            &self,
+            _request: ConsumeHandover,
+        ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
+            Box::pin(async { Err(HandoverError::Storage) })
+        }
+    }
+
+    impl PlayerRepository for FakeRepository {
+        fn load_player_snapshot(
+            &self,
+            _account_id: AccountId,
+        ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
+            Box::pin(async { Err(RepositoryError::Storage) })
+        }
+    }
+
+    impl MatchRepository for FakeRepository {
+        fn begin_solo(
+            &self,
+            _request: BeginSoloMatch,
+        ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
+            self.begin_calls.fetch_add(1, Ordering::Relaxed);
+            let delay = self
+                .begin_delay
+                .lock()
+                .map_or(Duration::ZERO, |value| *value);
+            let outcome = self
+                .begin_outcome
+                .lock()
+                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                outcome
+            })
+        }
+
+        fn abort(
+            &self,
+            _request: AbortMatch,
+        ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>> {
+            self.abort_calls.fetch_add(1, Ordering::Relaxed);
+            let delay = self
+                .abort_delay
+                .lock()
+                .map_or(Duration::ZERO, |value| *value);
+            let outcome = self
+                .abort_outcome
+                .lock()
+                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                outcome
+            })
+        }
+
+        fn commit_solo_hole(
+            &self,
+            _request: pangya_domain::CommitSoloHole,
+        ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>> {
+            self.commit_calls.fetch_add(1, Ordering::Relaxed);
+            let delay = self
+                .commit_delay
+                .lock()
+                .map_or(Duration::ZERO, |value| *value);
+            let outcome = self
+                .commit_outcome
+                .lock()
+                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                outcome
+            })
+        }
+
+        fn abort_incomplete_matches(
+            &self,
+            _limit: IncompleteMatchAbortLimit,
+        ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    fn test_catalog() -> Catalog {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog");
+        Catalog::load(&root, std::path::Path::new("manifest.toml"))
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn solo_config(catalog: &Catalog, commit_timeout: Duration) -> SoloRuntimeConfig {
+        SoloRuntimeConfig {
+            course: catalog
+                .one_hole_course(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+                .unwrap_or_else(|_| unreachable!()),
+            catalog_fingerprint: catalog.fingerprint(),
+            loading_timeout: Duration::from_secs(5),
+            commit_timeout,
+            max_strokes: 9,
+            startup_recovery_limit: IncompleteMatchAbortLimit::new(10)
+                .unwrap_or_else(|_| unreachable!()),
+            shot_packets_per_window: 80,
+        }
+    }
+
+    fn test_service(
+        repository: Arc<FakeRepository>,
+        commit_timeout: Duration,
+    ) -> GameService<FakeRepository> {
+        let catalog = test_catalog();
+        GameService::new(
+            repository,
+            catalog.clone(),
+            GameRuntimeConfig {
+                solo_practice: Some(solo_config(&catalog, commit_timeout)),
+                ..GameRuntimeConfig::default()
+            },
+            Arc::new(NoopGameObserver),
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn test_identity() -> RoomIdentity {
+        RoomIdentity {
+            connection_id: PlayerConnectionId::new(1).unwrap_or_else(|_| unreachable!()),
+            account_id: AccountId::new(7).unwrap_or_else(|_| unreachable!()),
+            nickname: Nickname::parse("Tester").unwrap_or_else(|_| unreachable!()),
+        }
+    }
+
+    fn test_plan(service: &GameService<FakeRepository>, nonce: u128) -> SoloStartPlan {
+        let solo = service
+            .config
+            .solo_practice
+            .unwrap_or_else(|| unreachable!());
+        let seed = MatchSeed::new([u8::try_from(nonce).unwrap_or(1); 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        SoloStartPlan::new(
+            BeginSoloMatch::new(
+                MatchId::new(uuid::Uuid::from_u128(nonce)),
+                MatchResultKey::new(uuid::Uuid::from_u128(nonce.saturating_add(100))),
+                test_identity().account_id,
+                solo.course,
+                solo.catalog_fingerprint,
+                seed,
+                weather,
+                wind,
+            ),
+            solo.loading_timeout,
+            solo.max_strokes,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
+    async fn prepare_test_room(
+        service: &GameService<FakeRepository>,
+        plan: SoloStartPlan,
+    ) -> mpsc::Receiver<RoomEvent> {
+        let (outbound, receiver) = mpsc::channel(32);
+        service
+            .lobby
+            .create(
+                pangya_domain::RoomName::parse("solo").unwrap_or_else(|_| unreachable!()),
+                None,
+                pangya_domain::RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                test_identity(),
+                outbound,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::PrepareStart(plan)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+        receiver
+    }
 
     #[test]
     fn state_policy_and_termination_labels_are_fixed() {
@@ -1754,11 +2826,948 @@ mod tests {
         assert!(limits.unknown_capture_capacity > 65_536);
     }
 
+    #[tokio::test]
+    async fn solo_requires_two_event_slots_and_capacity_two_drains_start_pair() {
+        let repository = Arc::new(FakeRepository::default());
+        let catalog = test_catalog();
+        let limits = GameRuntimeLimits {
+            outbound_room_event_capacity: 1,
+            ..GameRuntimeLimits::default()
+        };
+        assert_eq!(
+            GameService::new(
+                Arc::clone(&repository),
+                catalog.clone(),
+                GameRuntimeConfig {
+                    limits,
+                    solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                    ..GameRuntimeConfig::default()
+                },
+                Arc::new(NoopGameObserver),
+            )
+            .err(),
+            Some(GameRuntimeError::InvalidConfig)
+        );
+
+        let limits = GameRuntimeLimits {
+            outbound_room_event_capacity: 2,
+            ..GameRuntimeLimits::default()
+        };
+        let service = GameService::new(
+            repository,
+            catalog.clone(),
+            GameRuntimeConfig {
+                limits,
+                solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                ..GameRuntimeConfig::default()
+            },
+            Arc::new(NoopGameObserver),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let plan = test_plan(&service, 31);
+        let (outbound, mut events) = mpsc::channel(2);
+        let cancellation = CancellationToken::new();
+        service
+            .lobby
+            .create(
+                pangya_domain::RoomName::parse("two-events").unwrap_or_else(|_| unreachable!()),
+                None,
+                pangya_domain::RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                test_identity(),
+                outbound,
+                cancellation.clone(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::PrepareStart(plan.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            events.recv().await,
+            Some(RoomEvent::SoloStarted(_))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(RoomEvent::SoloPhase {
+                phase: SoloMatchPhase::Loading,
+                ..
+            })
+        ));
+        assert!(!cancellation.is_cancelled());
+    }
+
     #[test]
     fn fixed_windows_bound_room_and_chat_commands() {
         let mut commands = LocalRateWindow::new(Duration::from_secs(60));
         assert!(commands.admit_count(2));
         assert!(commands.admit_count(2));
         assert!(!commands.admit_count(2));
+    }
+
+    #[tokio::test]
+    async fn begin_failure_and_timeout_abort_exact_reservation_without_orphan() {
+        for (delay, expected) in [
+            (Duration::ZERO, GameRuntimeError::MatchPersistence),
+            (
+                Duration::from_millis(50),
+                GameRuntimeError::MatchPersistence,
+            ),
+        ] {
+            let repository = Arc::new(FakeRepository::default());
+            if let Ok(mut configured) = repository.begin_delay.lock() {
+                *configured = delay;
+            }
+            if delay.is_zero()
+                && let Ok(mut configured) = repository.begin_outcome.lock()
+            {
+                *configured = Err(MatchRepositoryError::Storage);
+            }
+            let service = test_service(Arc::clone(&repository), Duration::from_millis(5));
+            let plan = test_plan(&service, if delay.is_zero() { 1 } else { 2 });
+            let _events = prepare_test_room(&service, plan.clone()).await;
+            let result = service
+                .persist_and_confirm_begin(
+                    test_identity().connection_id,
+                    plan.begin().clone(),
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await;
+            assert_eq!(result, Err(expected));
+            assert_eq!(repository.begin_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+            let replacement = test_plan(&service, if delay.is_zero() { 3 } else { 4 });
+            assert!(matches!(
+                service
+                    .lobby
+                    .route_solo(
+                        test_identity().connection_id,
+                        LobbySoloCommand::PrepareStart(replacement)
+                    )
+                    .await,
+                Ok(LobbySoloRouteResult::Begin(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_confirm_failure_persists_one_abort_without_cleanup_duplicate() {
+        let repository = Arc::new(FakeRepository::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let catalog = test_catalog();
+        let service = GameService::new(
+            Arc::clone(&repository),
+            catalog.clone(),
+            GameRuntimeConfig {
+                solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                ..GameRuntimeConfig::default()
+            },
+            observer.clone(),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let plan = test_plan(&service, 5);
+        let _events = prepare_test_room(&service, plan.clone()).await;
+        assert!(repository.begin_solo(plan.begin().clone()).await.is_ok());
+        assert_eq!(
+            service
+                .resolve_persisted_begin(
+                    test_identity().connection_id,
+                    Err(SoloMatchError::Closed),
+                )
+                .await,
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            service
+                .lobby
+                .disconnect(test_identity().connection_id)
+                .await,
+            Ok(None)
+        );
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+        assert!(observer.events.lock().is_ok_and(|events| events.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn commit_timeout_routes_persists_and_acknowledges_abort() {
+        let repository = Arc::new(FakeRepository::default());
+        if let Ok(mut delay) = repository.commit_delay.lock() {
+            *delay = Duration::from_millis(50);
+        }
+        let service = test_service(Arc::clone(&repository), Duration::from_millis(5));
+        let plan = test_plan(&service, 9);
+        let _events = prepare_test_room(&service, plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::LoadingComplete(
+                    LoadingComplete::new(100).unwrap_or_else(|_| unreachable!()),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let action = ShotAction::new(1, 1, 1.0, 0.0, 0.0, 0.0).unwrap_or_else(|_| unreachable!());
+        service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::ShotAction(action),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let result = ShotResult::new(1, 1.0, 0.0, 0.0, pangya_protocol::Lie::Green, true)
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::ShotResult(result),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let commit = match service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::PrepareFinish,
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            service
+                .persist_and_apply_commit(
+                    test_identity().connection_id,
+                    commit,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+        let replacement = test_plan(&service, 12);
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::PrepareStart(replacement)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn abort_persistence_failure_is_retained_and_already_committed_race_applies() {
+        let repository = Arc::new(FakeRepository::default());
+        if let Ok(mut begin) = repository.begin_outcome.lock() {
+            *begin = Err(MatchRepositoryError::Storage);
+        }
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Err(MatchRepositoryError::Storage);
+        }
+        let service = test_service(Arc::clone(&repository), Duration::from_millis(20));
+        let plan = test_plan(&service, 10);
+        let _events = prepare_test_room(&service, plan.clone()).await;
+        assert_eq!(
+            service
+                .persist_and_confirm_begin(
+                    test_identity().connection_id,
+                    plan.begin().clone(),
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::Abort(MatchAbortReason::PersistenceFailure)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Abort(Some(abort))) if abort.match_id() == plan.begin().match_id()
+        ));
+
+        let committed = SoloMatchResult::new(
+            plan.begin().match_id(),
+            plan.begin().result_key(),
+            plan.begin().account_id(),
+            pangya_domain::StrokeCount::new(1).unwrap_or_else(|_| unreachable!()),
+            pangya_domain::SoloReward::from_persisted(0, 10, 5),
+            pangya_domain::ServerBalances::from_persisted(10, 5),
+        );
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Ok(AbortMatchOutcome::AlreadyCommitted(committed));
+        }
+        assert_eq!(
+            service
+                .abort_actor_match(
+                    test_identity().connection_id,
+                    MatchAbortReason::PersistenceFailure,
+                    false,
+                )
+                .await,
+            Ok(AbortResolution::Committed)
+        );
+        let replacement = test_plan(&service, 11);
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::PrepareStart(replacement)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_path_mutates_storage_only_at_begin_and_finish_and_deduplicates_relays() {
+        let repository = Arc::new(FakeRepository::default());
+        let service = test_service(Arc::clone(&repository), Duration::from_millis(50));
+        let plan = test_plan(&service, 20);
+        let _events = prepare_test_room(&service, plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(repository.begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::LoadingComplete(
+                        LoadingComplete::new(100).unwrap_or_else(|_| unreachable!())
+                    )
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Applied)
+        ));
+        let action = ShotAction::new(1, 1, 1.0, 0.0, 0.0, 0.0).unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::ShotAction(action)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Relay(RelayDisposition::Accepted))
+        );
+        assert_eq!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::ShotAction(action)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Relay(RelayDisposition::Duplicate))
+        );
+        let result = ShotResult::new(1, 1.0, 0.0, 0.0, pangya_protocol::Lie::Green, true)
+            .unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::ShotResult(result)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Relay(RelayDisposition::Accepted))
+        ));
+        let commit = match service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::PrepareFinish,
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+            _ => unreachable!(),
+        };
+        let committed = SoloMatchResult::new(
+            commit.match_id(),
+            commit.result_key(),
+            commit.account_id(),
+            commit.strokes(),
+            pangya_domain::SoloReward::from_persisted(0, 10, 5),
+            pangya_domain::ServerBalances::from_persisted(10, 5),
+        );
+        if let Ok(mut outcome) = repository.commit_outcome.lock() {
+            *outcome = Ok(committed);
+        }
+        service
+            .persist_and_apply_commit(
+                test_identity().connection_id,
+                commit,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(repository.begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_failure_cleanup_aborts_active_match_once() {
+        let repository = Arc::new(FakeRepository::default());
+        let service = test_service(Arc::clone(&repository), Duration::from_millis(20));
+        let plan = test_plan(&service, 28);
+        let (outbound, receiver) = mpsc::channel(1);
+        drop(receiver);
+        service
+            .lobby
+            .create(
+                pangya_domain::RoomName::parse("failed-outbound")
+                    .unwrap_or_else(|_| unreachable!()),
+                None,
+                pangya_domain::RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                test_identity(),
+                outbound,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::PrepareStart(plan.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let abort = service
+            .lobby
+            .disconnect(test_identity().connection_id)
+            .await
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(abort.match_id(), plan.begin().match_id());
+        assert_eq!(abort.reason(), MatchAbortReason::Disconnect);
+        service
+            .persist_cleanup_abort(abort)
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_abort_failure_from_serve_is_match_persistence() {
+        let repository = Arc::new(FakeRepository::default());
+        let service = Arc::new(test_service(
+            Arc::clone(&repository),
+            Duration::from_millis(50),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let address = listener.local_addr().unwrap_or_else(|_| unreachable!());
+        let shutdown = CancellationToken::new();
+        let task_service = Arc::clone(&service);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { task_service.serve(listener, task_shutdown).await });
+        tokio::task::yield_now().await;
+
+        let plan = test_plan(service.as_ref(), 32);
+        let _events = prepare_test_room(service.as_ref(), plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Err(MatchRepositoryError::Storage);
+        }
+        let client = TcpStream::connect(address)
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        drop(client);
+        assert_eq!(
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap_or_else(|_| unreachable!())
+                .unwrap_or_else(|_| unreachable!()),
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn lobby_shutdown_abort_persistence_failure_fails_service() {
+        let repository = Arc::new(FakeRepository::default());
+        let service = Arc::new(test_service(
+            Arc::clone(&repository),
+            Duration::from_millis(20),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let shutdown = CancellationToken::new();
+        let task_service = Arc::clone(&service);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { task_service.serve(listener, task_shutdown).await });
+        tokio::task::yield_now().await;
+        let plan = test_plan(service.as_ref(), 29);
+        let _events = prepare_test_room(service.as_ref(), plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Err(MatchRepositoryError::Storage);
+        }
+        shutdown.cancel();
+        assert_eq!(
+            task.await.unwrap_or_else(|_| unreachable!()),
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_is_recorded_before_socket_write_failure() {
+        let repository = Arc::new(FakeRepository::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let catalog = test_catalog();
+        let service = GameService::new(
+            repository,
+            catalog.clone(),
+            GameRuntimeConfig {
+                solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                ..GameRuntimeConfig::default()
+            },
+            observer.clone(),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let plan = test_plan(&service, 33);
+        let mut events = prepare_test_room(&service, plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let _ = events.recv().await;
+        let _ = events.recv().await;
+        let abort = match service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::Abort(MatchAbortReason::Disconnect),
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::Abort(Some(abort))) => abort,
+            _ => unreachable!(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let address = listener.local_addr().unwrap_or_else(|_| unreachable!());
+        let client = TcpStream::connect(address);
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(client, accepted);
+        let client = client.unwrap_or_else(|_| unreachable!());
+        let (mut server, _) = accepted.unwrap_or_else(|_| unreachable!());
+        server.shutdown().await.unwrap_or_else(|_| unreachable!());
+        drop(client);
+        let mut framed = Framed::new(
+            server,
+            FrameCodec::new(0, ServiceKind::Game, CodecLimits::default()),
+        );
+        assert_eq!(
+            service
+                .handle_room_event(
+                    &mut framed,
+                    RoomEvent::AbortRequested(abort),
+                    None,
+                    test_identity().connection_id,
+                )
+                .await,
+            Err(GameRuntimeError::Io)
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .map_or_else(|_| Vec::new(), |events| events.clone()),
+            vec![GameMatchObservation::Aborted]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_observes_registry_exact_gauge_despite_outbound_failure() {
+        let repository = Arc::new(FakeRepository::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let catalog = test_catalog();
+        let service = Arc::new(
+            GameService::new(
+                Arc::clone(&repository),
+                catalog.clone(),
+                GameRuntimeConfig {
+                    solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                    ..GameRuntimeConfig::default()
+                },
+                observer.clone(),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let shutdown = CancellationToken::new();
+        let task_service = Arc::clone(&service);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { task_service.serve(listener, task_shutdown).await });
+        tokio::task::yield_now().await;
+
+        let plan = test_plan(service.as_ref(), 30);
+        let (outbound, receiver) = mpsc::channel(1);
+        drop(receiver);
+        service
+            .lobby
+            .create(
+                pangya_domain::RoomName::parse("failed-outbound")
+                    .unwrap_or_else(|_| unreachable!()),
+                None,
+                pangya_domain::RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                test_identity(),
+                outbound,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::PrepareStart(plan.clone())
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observer
+                    .active
+                    .lock()
+                    .is_ok_and(|values| values.last() == Some(&1))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| unreachable!());
+
+        shutdown.cancel();
+        assert!(task.await.unwrap_or_else(|_| unreachable!()).is_ok());
+        assert_eq!(
+            observer
+                .active
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![1, 0]
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![GameMatchObservation::Started, GameMatchObservation::Aborted]
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_already_committed_is_finished_once_with_zero_gauge() {
+        let repository = Arc::new(FakeRepository::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let catalog = test_catalog();
+        let service = Arc::new(
+            GameService::new(
+                Arc::clone(&repository),
+                catalog.clone(),
+                GameRuntimeConfig {
+                    solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                    ..GameRuntimeConfig::default()
+                },
+                observer.clone(),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let shutdown = CancellationToken::new();
+        let task_service = Arc::clone(&service);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { task_service.serve(listener, task_shutdown).await });
+        tokio::task::yield_now().await;
+        let plan = test_plan(service.as_ref(), 34);
+        let _events = prepare_test_room(service.as_ref(), plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let committed = SoloMatchResult::new(
+            plan.begin().match_id(),
+            plan.begin().result_key(),
+            plan.begin().account_id(),
+            pangya_domain::StrokeCount::new(1).unwrap_or_else(|_| unreachable!()),
+            pangya_domain::SoloReward::from_persisted(0, 10, 5),
+            pangya_domain::ServerBalances::from_persisted(10, 5),
+        );
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Ok(AbortMatchOutcome::AlreadyCommitted(committed));
+        }
+        let abort = service
+            .lobby
+            .disconnect(test_identity().connection_id)
+            .await
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            service.persist_cleanup_abort(abort).await,
+            Ok(AbortResolution::Committed)
+        );
+        shutdown.cancel();
+        assert!(task.await.unwrap_or_else(|_| unreachable!()).is_ok());
+        assert_eq!(
+            observer
+                .active
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![1, 0]
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![
+                GameMatchObservation::Started,
+                GameMatchObservation::Finished
+            ]
+        );
+        assert!(observer.commits.lock().is_ok_and(|commits| {
+            commits
+                .iter()
+                .filter(|outcome| **outcome == GameCommitObservation::Idempotent)
+                .count()
+                == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn shutdown_already_committed_is_finished_once_with_zero_gauge() {
+        let repository = Arc::new(FakeRepository::default());
+        let observer = Arc::new(RecordingObserver::default());
+        let catalog = test_catalog();
+        let service = Arc::new(
+            GameService::new(
+                Arc::clone(&repository),
+                catalog.clone(),
+                GameRuntimeConfig {
+                    solo_practice: Some(solo_config(&catalog, Duration::from_millis(50))),
+                    ..GameRuntimeConfig::default()
+                },
+                observer.clone(),
+            )
+            .unwrap_or_else(|_| unreachable!()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let shutdown = CancellationToken::new();
+        let task_service = Arc::clone(&service);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { task_service.serve(listener, task_shutdown).await });
+        tokio::task::yield_now().await;
+        let plan = test_plan(service.as_ref(), 35);
+        let _events = prepare_test_room(service.as_ref(), plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let committed = SoloMatchResult::new(
+            plan.begin().match_id(),
+            plan.begin().result_key(),
+            plan.begin().account_id(),
+            pangya_domain::StrokeCount::new(1).unwrap_or_else(|_| unreachable!()),
+            pangya_domain::SoloReward::from_persisted(0, 10, 5),
+            pangya_domain::ServerBalances::from_persisted(10, 5),
+        );
+        if let Ok(mut abort) = repository.abort_outcome.lock() {
+            *abort = Ok(AbortMatchOutcome::AlreadyCommitted(committed));
+        }
+        shutdown.cancel();
+        assert!(task.await.unwrap_or_else(|_| unreachable!()).is_ok());
+        assert_eq!(
+            observer
+                .active
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![1, 0]
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .map_or_else(|_| Vec::new(), |values| values.clone()),
+            vec![
+                GameMatchObservation::Started,
+                GameMatchObservation::Finished
+            ]
+        );
+        assert!(observer.commits.lock().is_ok_and(|commits| {
+            commits
+                .iter()
+                .filter(|outcome| **outcome == GameCommitObservation::Idempotent)
+                .count()
+                == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn solo_runtime_cross_checks_catalog_and_persists_cleanup_abort_once() {
+        let catalog = test_catalog();
+        let course = catalog
+            .one_hole_course(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+            .unwrap_or_else(|_| unreachable!());
+        let solo = SoloRuntimeConfig {
+            course,
+            catalog_fingerprint: catalog.fingerprint(),
+            loading_timeout: Duration::from_secs(5),
+            commit_timeout: Duration::from_secs(1),
+            max_strokes: 9,
+            startup_recovery_limit: IncompleteMatchAbortLimit::new(10)
+                .unwrap_or_else(|_| unreachable!()),
+            shot_packets_per_window: 80,
+        };
+        let repository = Arc::new(FakeRepository::default());
+        let service = GameService::new(
+            Arc::clone(&repository),
+            catalog.clone(),
+            GameRuntimeConfig {
+                solo_practice: Some(solo),
+                ..GameRuntimeConfig::default()
+            },
+            Arc::new(NoopGameObserver),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let abort = AbortMatch::new(
+            MatchId::new(uuid::Uuid::from_u128(1)),
+            MatchResultKey::new(uuid::Uuid::from_u128(2)),
+            AccountId::new(7).unwrap_or_else(|_| unreachable!()),
+            MatchAbortReason::Disconnect,
+        );
+        assert!(service.persist_cleanup_abort(abort).await.is_ok());
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+
+        let drifted = SoloRuntimeConfig {
+            catalog_fingerprint: CatalogFingerprint::new([0; 32]),
+            ..solo
+        };
+        assert_eq!(
+            GameService::new(
+                Arc::new(FakeRepository::default()),
+                catalog,
+                GameRuntimeConfig {
+                    solo_practice: Some(drifted),
+                    ..GameRuntimeConfig::default()
+                },
+                Arc::new(NoopGameObserver),
+            )
+            .err(),
+            Some(GameRuntimeError::Catalog)
+        );
     }
 }

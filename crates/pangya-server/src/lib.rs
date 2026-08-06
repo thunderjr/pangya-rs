@@ -10,6 +10,7 @@ pub mod configuration;
 use std::{
     env, fs,
     io::{Read as _, Write as _},
+    net::SocketAddr,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,9 +20,13 @@ use std::{
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::Catalog;
-use pangya_domain::{NewAccount, Nickname, RepositoryError, Username};
+use pangya_domain::{
+    HandoverRepository, MatchRepository, NewAccount, Nickname, PlayerRepository, RepositoryError,
+    Username,
+};
 use pangya_game::{
-    GameRuntimeConfig, GameRuntimeLimits, GameService, LobbyLimits, RoomActorLimits,
+    GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService, LobbyLimits, RoomActorLimits,
+    SoloRuntimeConfig,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
@@ -181,6 +186,74 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
     }
 }
 
+async fn bind_after_startup_recovery<R: MatchRepository>(
+    repository: &R,
+    solo: Option<configuration::ValidatedSoloPractice>,
+    login_bind: SocketAddr,
+    http_bind: SocketAddr,
+    game_bind: Option<SocketAddr>,
+) -> Result<(TcpListener, TcpListener, Option<TcpListener>), ServerError> {
+    if let Some(solo) = solo {
+        timeout(
+            solo.commit_timeout,
+            repository.abort_incomplete_matches(solo.startup_recovery_limit),
+        )
+        .await
+        .map_err(|_| ServerError::Runtime)?
+        .map_err(|_| ServerError::Runtime)?;
+    }
+    let login = TcpListener::bind(login_bind)
+        .await
+        .map_err(|_| ServerError::Bind)?;
+    let http = TcpListener::bind(http_bind)
+        .await
+        .map_err(|_| ServerError::Bind)?;
+    let game = match game_bind {
+        Some(address) => Some(
+            TcpListener::bind(address)
+                .await
+                .map_err(|_| ServerError::Bind)?,
+        ),
+        None => None,
+    };
+    Ok((login, http, game))
+}
+
+fn resolve_solo_runtime_config(
+    catalog: &Catalog,
+    solo: Option<configuration::ValidatedSoloPractice>,
+) -> Result<Option<SoloRuntimeConfig>, ServerError> {
+    solo.map(|solo| {
+        let course = catalog
+            .one_hole_course(solo.course_id)
+            .map_err(|_| ServerError::Data)?;
+        Ok(SoloRuntimeConfig {
+            course,
+            catalog_fingerprint: catalog.fingerprint(),
+            loading_timeout: solo.loading_timeout,
+            commit_timeout: solo.commit_timeout,
+            max_strokes: solo.max_strokes,
+            startup_recovery_limit: solo.startup_recovery_limit,
+            shot_packets_per_window: solo.shot_packets_per_window,
+        })
+    })
+    .transpose()
+}
+
+fn compose_game_service<R>(
+    repository: Arc<R>,
+    catalog: Catalog,
+    config: GameRuntimeConfig,
+    observer: Arc<dyn GameObserver>,
+) -> Result<Arc<GameService<R>>, ServerError>
+where
+    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
+{
+    GameService::new(repository, catalog, config, observer)
+        .map(Arc::new)
+        .map_err(|_| ServerError::Runtime)
+}
+
 async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let pool = connect_and_migrate(&config).await?;
     let repository = Arc::new(PgRepository::new(pool.clone()));
@@ -200,23 +273,40 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     } else {
         None
     };
-    let login_listener = TcpListener::bind(config.login_bind)
-        .await
-        .map_err(|_| ServerError::Bind)?;
-    let http_listener = TcpListener::bind(config.http_bind)
-        .await
-        .map_err(|_| ServerError::Bind)?;
-    let game_listener = if config.game_enabled {
-        Some(
-            TcpListener::bind(config.game_bind.ok_or(ServerError::Bind)?)
-                .await
-                .map_err(|_| ServerError::Bind)?,
-        )
+    let solo_practice = catalog
+        .as_ref()
+        .map(|catalog| resolve_solo_runtime_config(catalog, config.solo_practice))
+        .transpose()?
+        .flatten();
+    let metrics = Arc::new(M2Metrics::default());
+    let game = match catalog {
+        Some(catalog) => Some(compose_game_service(
+            Arc::clone(&repository),
+            catalog,
+            GameRuntimeConfig {
+                channel_id: config.game_channel_id,
+                unknown_opcode_policy: config.unknown_opcode_policy,
+                limits: game_runtime_limits(&config)?,
+                solo_practice,
+            },
+            metrics.clone(),
+        )?),
+        None => None,
+    };
+    let game_bind = if config.game_enabled {
+        Some(config.game_bind.ok_or(ServerError::Bind)?)
     } else {
         None
     };
+    let (login_listener, http_listener, game_listener) = bind_after_startup_recovery(
+        repository.as_ref(),
+        config.solo_practice,
+        config.login_bind,
+        config.http_bind,
+        game_bind,
+    )
+    .await?;
 
-    let metrics = Arc::new(M2Metrics::default());
     let health = Arc::new(HealthState::new(
         Arc::clone(&metrics),
         config.heartbeat_stale_after,
@@ -226,7 +316,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     health.set_config_valid(true);
     health.set_database_migrated(true);
     health.set_login_bound(true);
-    health.set_catalog_loaded(catalog.is_some());
+    health.set_catalog_loaded(game.is_some());
     health.set_game_bound(game_listener.is_some());
 
     let policy = Arc::new(CredentialPolicy::new().map_err(|_| ServerError::Credential)?);
@@ -273,23 +363,6 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         )
         .map_err(|_| ServerError::Runtime)?,
     );
-    let game = match catalog {
-        Some(catalog) => Some(Arc::new(
-            GameService::new(
-                Arc::clone(&repository),
-                catalog,
-                GameRuntimeConfig {
-                    channel_id: config.game_channel_id,
-                    unknown_opcode_policy: config.unknown_opcode_policy,
-                    limits: game_runtime_limits(&config)?,
-                },
-                metrics.clone(),
-            )
-            .map_err(|_| ServerError::Runtime)?,
-        )),
-        None => None,
-    };
-
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let login_shutdown = shutdown.child_token();
@@ -830,7 +903,198 @@ async fn shutdown_signal() -> Result<(), ServerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pangya_domain::{
+        AbortMatch, AbortMatchOutcome, AccountId, AuthenticatedSession, BeginSoloMatch,
+        BeginSoloMatchOutcome, CatalogFingerprint, CommitSoloHole, ConsumeHandover, CourseId,
+        HandoverError, HandoverRepository, IncompleteMatchAbortLimit, MatchRepositoryError,
+        NewHandover, PlayerRepository, PlayerSnapshot, RepositoryError, RepositoryFuture,
+        SoloMatchResult,
+    };
+    use tokio::{net::TcpStream, sync::Notify};
+
     use super::*;
+
+    struct RecoveryGate {
+        calls: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl RecoveryGate {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                started: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+    }
+
+    impl HandoverRepository for RecoveryGate {
+        fn issue(&self, _handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
+            Box::pin(async { Err(HandoverError::Storage) })
+        }
+
+        fn consume(
+            &self,
+            _request: ConsumeHandover,
+        ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
+            Box::pin(async { Err(HandoverError::Storage) })
+        }
+    }
+
+    impl PlayerRepository for RecoveryGate {
+        fn load_player_snapshot(
+            &self,
+            _account_id: AccountId,
+        ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
+            Box::pin(async { Err(RepositoryError::Storage) })
+        }
+    }
+
+    impl MatchRepository for RecoveryGate {
+        fn begin_solo(
+            &self,
+            _request: BeginSoloMatch,
+        ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
+            Box::pin(async { Err(MatchRepositoryError::Storage) })
+        }
+
+        fn abort(
+            &self,
+            _request: AbortMatch,
+        ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>> {
+            Box::pin(async { Err(MatchRepositoryError::Storage) })
+        }
+
+        fn commit_solo_hole(
+            &self,
+            _request: CommitSoloHole,
+        ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>> {
+            Box::pin(async { Err(MatchRepositoryError::Storage) })
+        }
+
+        fn abort_incomplete_matches(
+            &self,
+            _limit: IncompleteMatchAbortLimit,
+        ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
+            Box::pin(async {
+                self.release.notified().await;
+                Ok(0)
+            })
+        }
+    }
+
+    #[test]
+    fn invalid_solo_course_and_fingerprint_fail_before_listener_bind() {
+        let login_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve login");
+        let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve http");
+        let game_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve game");
+        let addresses = [
+            login_reservation.local_addr().expect("login address"),
+            http_reservation.local_addr().expect("http address"),
+            game_reservation.local_addr().expect("game address"),
+        ];
+        drop((login_reservation, http_reservation, game_reservation));
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog");
+        let catalog = Catalog::load(&root, Path::new("manifest.toml")).expect("catalog");
+        let invalid_course = configuration::ValidatedSoloPractice {
+            course_id: CourseId::new(u32::MAX).expect("course"),
+            loading_timeout: Duration::from_secs(5),
+            commit_timeout: Duration::from_secs(1),
+            max_strokes: 9,
+            startup_recovery_limit: IncompleteMatchAbortLimit::new(10).expect("limit"),
+            shot_packets_per_window: 80,
+        };
+        assert!(matches!(
+            resolve_solo_runtime_config(&catalog, Some(invalid_course)),
+            Err(ServerError::Data)
+        ));
+
+        let valid = resolve_solo_runtime_config(
+            &catalog,
+            Some(configuration::ValidatedSoloPractice {
+                course_id: CourseId::new(7).expect("course"),
+                ..invalid_course
+            }),
+        )
+        .expect("resolve")
+        .expect("solo");
+        let drifted = SoloRuntimeConfig {
+            catalog_fingerprint: CatalogFingerprint::new([0; 32]),
+            ..valid
+        };
+        assert!(matches!(
+            compose_game_service(
+                Arc::new(RecoveryGate::new()),
+                catalog,
+                GameRuntimeConfig {
+                    solo_practice: Some(drifted),
+                    ..GameRuntimeConfig::default()
+                },
+                Arc::new(M2Metrics::default()),
+            ),
+            Err(ServerError::Runtime)
+        ));
+        let rebound = addresses.map(|address| {
+            std::net::TcpListener::bind(address).expect("startup failure left port bindable")
+        });
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_before_any_listener_binds() {
+        let login_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve login");
+        let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve http");
+        let game_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve game");
+        let login = login_reservation.local_addr().expect("login address");
+        let http = http_reservation.local_addr().expect("http address");
+        let game = game_reservation.local_addr().expect("game address");
+        drop((login_reservation, http_reservation, game_reservation));
+
+        let repository = Arc::new(RecoveryGate::new());
+        let task_repository = Arc::clone(&repository);
+        let startup = tokio::spawn(async move {
+            bind_after_startup_recovery(
+                task_repository.as_ref(),
+                Some(configuration::ValidatedSoloPractice {
+                    course_id: CourseId::new(7).expect("course"),
+                    loading_timeout: Duration::from_secs(5),
+                    commit_timeout: Duration::from_secs(1),
+                    max_strokes: 9,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(10).expect("limit"),
+                    shot_packets_per_window: 80,
+                }),
+                login,
+                http,
+                Some(game),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), repository.started.notified())
+            .await
+            .expect("recovery started");
+        assert_eq!(repository.calls.load(Ordering::Relaxed), 1);
+        for address in [login, http, game] {
+            assert!(TcpStream::connect(address).await.is_err());
+        }
+
+        repository.release.notify_one();
+        let (login_listener, http_listener, game_listener) = startup
+            .await
+            .expect("startup join")
+            .expect("startup listeners");
+        assert!(TcpStream::connect(login).await.is_ok());
+        assert!(TcpStream::connect(http).await.is_ok());
+        assert!(TcpStream::connect(game).await.is_ok());
+        drop((login_listener, http_listener, game_listener));
+    }
 
     #[test]
     fn enabled_game_partitions_every_process_total_without_inflation() {

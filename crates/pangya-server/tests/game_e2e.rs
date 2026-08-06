@@ -132,6 +132,7 @@ fn game_service_with_policy(
                 channel_id: 1,
                 unknown_opcode_policy,
                 limits,
+                solo_practice: None,
             },
             metrics,
         )
@@ -518,6 +519,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 channel_id: 1,
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits::default(),
+                solo_practice: None,
             },
             metrics.clone(),
         )
@@ -1637,7 +1639,7 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always_closes(
+async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_always_closes(
     pool: PgPool,
 ) {
     let limits = GameRuntimeLimits {
@@ -1681,6 +1683,16 @@ async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always
     )
     .await;
     assert_closed(&mut disconnect_wrong_state.stream).await;
+    let mut disconnect_wrong_m5 = connect_m4(&pool, address, "M5DiscState").await;
+    send_packet(
+        &mut disconnect_wrong_m5.stream,
+        disconnect_wrong_m5.key,
+        5,
+        pangya_protocol::SYNTHETIC_M5_C2S_START_SOLO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut disconnect_wrong_m5.stream).await;
     shutdown.cancel();
     task.await.expect("join").expect("serve");
 
@@ -1788,6 +1800,16 @@ async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always
     )
     .await;
     assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
+    let mut ignore_wrong_m5 = connect_m4(&pool, address, "M5IgnState").await;
+    send_packet(
+        &mut ignore_wrong_m5.stream,
+        ignore_wrong_m5.key,
+        30,
+        pangya_protocol::SYNTHETIC_M5_C2S_START_SOLO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut ignore_wrong_m5.stream).await;
     shutdown.cancel();
     task.await.expect("join").expect("serve");
 
@@ -1813,6 +1835,16 @@ async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always
     assert!(rendered.contains("pangya_game_unknown_opcode_actions_total{action=\"captured\"} 1"));
     assert!(!rendered.contains("unknown-capture-private-body"));
     assert!(!rendered.contains(&captured.token));
+    let mut capture_wrong_m5 = connect_m4(&pool, address, "M5CapState").await;
+    send_packet(
+        &mut capture_wrong_m5.stream,
+        capture_wrong_m5.key,
+        5,
+        pangya_protocol::SYNTHETIC_M5_C2S_START_SOLO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut capture_wrong_m5.stream).await;
 
     send_typed(
         &mut captured.stream,
@@ -1855,7 +1887,7 @@ async fn game_m4_unknown_policies_continue_or_close_and_known_wrong_state_always
     assert_closed(&mut captured.stream).await;
     assert_metric(
         &metrics,
-        "pangya_connections_closed_total{service=\"game\",reason=\"protocol\"} 1",
+        "pangya_connections_closed_total{service=\"game\",reason=\"protocol\"} 2",
     )
     .await;
     assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;

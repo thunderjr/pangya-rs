@@ -11,7 +11,8 @@ use std::{
 
 use config::{Config, Environment, File};
 use pangya_domain::{
-    ItemTypeId, MAX_STARTER_ITEMS, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+    CourseId, IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, StarterCharacter,
+    StarterGrant, StarterItem, StarterKey,
 };
 use pangya_game::UnknownOpcodePolicy;
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,15 @@ section_default!(LoginSection {
     client_profile: String = "us_852".to_owned(),
     auto_create_accounts: bool = false
 });
+section_default!(SoloPracticeSection {
+    enabled: bool = false,
+    course_id: u32 = 7,
+    loading_timeout: String = "30s".to_owned(),
+    commit_timeout: String = "3s".to_owned(),
+    max_strokes: u8 = 30,
+    startup_recovery_limit: u32 = 1_000,
+    shot_packets_per_window: u32 = 120
+});
 section_default!(GameSection {
     enabled: bool = false,
     bind: String = "127.0.0.1:20201".to_owned(),
@@ -115,7 +125,8 @@ section_default!(GameSection {
     chat_messages_per_window: u32 = 10,
     unknown_opcode_strikes: u32 = 3,
     unknown_capture_capacity: usize = 256,
-    command_timeout: String = "3s".to_owned()
+    command_timeout: String = "3s".to_owned(),
+    solo_practice: SoloPracticeSection = SoloPracticeSection::default()
 });
 section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
@@ -282,6 +293,8 @@ pub struct AppConfig {
     pub game_command_timeout: Duration,
     /// Post-channel policy for truly unknown opcodes.
     pub unknown_opcode_policy: UnknownOpcodePolicy,
+    /// Optional validated local-only solo-practice policy.
+    pub solo_practice: Option<ValidatedSoloPractice>,
     /// Admin HTTP listener.
     pub http_bind: SocketAddr,
     /// Enables read-only metrics exposition.
@@ -336,6 +349,23 @@ pub struct AppConfig {
     pub data_manifest: Option<PathBuf>,
     /// Bounded blocking catalog load duration.
     pub data_load_timeout: Duration,
+}
+
+/// Validated local-only synthetic solo-practice policy.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedSoloPractice {
+    /// Catalog course to resolve after loading.
+    pub course_id: CourseId,
+    /// Actor loading deadline.
+    pub loading_timeout: Duration,
+    /// Repository deadline.
+    pub commit_timeout: Duration,
+    /// Authoritative stroke cap.
+    pub max_strokes: u8,
+    /// Startup recovery cap.
+    pub startup_recovery_limit: IncompleteMatchAbortLimit,
+    /// Per-connection shot packet budget.
+    pub shot_packets_per_window: u32,
 }
 
 /// Validated security limits.
@@ -621,6 +651,16 @@ fn validate(
         "game.command_timeout",
         &mut issues,
     );
+    let solo_loading_timeout = duration(
+        &raw.game.solo_practice.loading_timeout,
+        "game.solo_practice.loading_timeout",
+        &mut issues,
+    );
+    let solo_commit_timeout = duration(
+        &raw.game.solo_practice.commit_timeout,
+        "game.solo_practice.commit_timeout",
+        &mut issues,
+    );
 
     for (field, zero) in [
         ("game.id", raw.game.id == 0),
@@ -746,6 +786,18 @@ fn validate(
         (
             "game.unknown_capture_capacity",
             raw.game.unknown_capture_capacity == 0,
+        ),
+        (
+            "game.solo_practice.course_id",
+            raw.game.solo_practice.course_id == 0,
+        ),
+        (
+            "game.solo_practice.startup_recovery_limit",
+            raw.game.solo_practice.startup_recovery_limit == 0,
+        ),
+        (
+            "game.solo_practice.shot_packets_per_window",
+            raw.game.solo_practice.shot_packets_per_window == 0,
         ),
     ] {
         if zero {
@@ -875,6 +927,14 @@ fn validate(
             "game.unknown_capture_capacity",
             raw.game.unknown_capture_capacity > 4_096,
         ),
+        (
+            "game.solo_practice.startup_recovery_limit",
+            raw.game.solo_practice.startup_recovery_limit > IncompleteMatchAbortLimit::MAX,
+        ),
+        (
+            "game.solo_practice.shot_packets_per_window",
+            raw.game.solo_practice.shot_packets_per_window > 1_000_000,
+        ),
     ] {
         if exceeded {
             issue(&mut issues, field, "exceeds the supported hard upper bound");
@@ -885,6 +945,27 @@ fn validate(
             &mut issues,
             "security.connections_per_source",
             "must not exceed global_connections",
+        );
+    }
+    if raw.game.solo_practice.enabled && !raw.game.enabled {
+        issue(
+            &mut issues,
+            "game.solo_practice.enabled",
+            "requires game.enabled",
+        );
+    }
+    if raw.game.solo_practice.enabled && raw.game.outbound_room_event_capacity < 2 {
+        issue(
+            &mut issues,
+            "game.outbound_room_event_capacity",
+            "must be at least 2 when solo practice is enabled",
+        );
+    }
+    if !(1..=30).contains(&raw.game.solo_practice.max_strokes) {
+        issue(
+            &mut issues,
+            "game.solo_practice.max_strokes",
+            "must be within 1..=30",
         );
     }
     if raw.game.enabled {
@@ -937,6 +1018,34 @@ fn validate(
             &mut issues,
             "game.command_timeout",
             "must not exceed server.shutdown_grace",
+        );
+    }
+    if shutdown_grace
+        .zip(solo_commit_timeout)
+        .is_some_and(|(grace, commit)| commit > grace)
+    {
+        issue(
+            &mut issues,
+            "game.solo_practice.commit_timeout",
+            "must not exceed server.shutdown_grace",
+        );
+    }
+    if solo_commit_timeout.is_some_and(|commit| commit > Duration::from_secs(60)) {
+        issue(
+            &mut issues,
+            "game.solo_practice.commit_timeout",
+            "exceeds the 60 second hard cap",
+        );
+    }
+    if solo_loading_timeout.is_some_and(|loading| {
+        loading > pangya_game::LOADING_TIMEOUT_HARD_CAP
+            || loading.as_millis() == 0
+            || loading.as_millis() > u128::from(u32::MAX)
+    }) {
+        issue(
+            &mut issues,
+            "game.solo_practice.loading_timeout",
+            "exceeds the actor or u32 millisecond hard cap",
         );
     }
     for (field, value, maximum) in [
@@ -1064,6 +1173,50 @@ fn validate(
         );
     }
 
+    let solo_course_id = match CourseId::new(raw.game.solo_practice.course_id) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            issue(
+                &mut issues,
+                "game.solo_practice.course_id",
+                "must be a nonzero course identifier",
+            );
+            None
+        }
+    };
+    let solo_recovery =
+        match IncompleteMatchAbortLimit::new(raw.game.solo_practice.startup_recovery_limit) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                issue(
+                    &mut issues,
+                    "game.solo_practice.startup_recovery_limit",
+                    "must be within 1..=10000",
+                );
+                None
+            }
+        };
+    let solo_practice = if raw.game.solo_practice.enabled {
+        solo_course_id
+            .zip(solo_loading_timeout)
+            .zip(solo_commit_timeout)
+            .zip(solo_recovery)
+            .map(
+                |(((course_id, loading_timeout), commit_timeout), startup_recovery_limit)| {
+                    ValidatedSoloPractice {
+                        course_id,
+                        loading_timeout,
+                        commit_timeout,
+                        max_strokes: raw.game.solo_practice.max_strokes,
+                        startup_recovery_limit,
+                        shot_packets_per_window: raw.game.solo_practice.shot_packets_per_window,
+                    }
+                },
+            )
+    } else {
+        None
+    };
+
     let starter = starter(&raw.starter, &mut issues);
     let database_url = resolve_database_url(&raw.database, database_secret, &mut issues);
 
@@ -1096,6 +1249,7 @@ fn validate(
         game_unknown_capture_capacity: raw.game.unknown_capture_capacity,
         game_command_timeout: required(game_command_timeout)?,
         unknown_opcode_policy: required(unknown_opcode_policy)?,
+        solo_practice,
         http_bind: required(http_bind)?,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
@@ -1716,6 +1870,77 @@ mod tests {
             login_limits.global_bytes_per_window + game_limits.global_bytes_per_window,
             config.security.global_bytes_per_window
         );
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
+    fn solo_practice_defaults_disabled_and_validates_enablement_and_hard_caps() {
+        let defaults = test_load(None, &CliOverrides::default()).expect("defaults");
+        assert!(defaults.solo_practice.is_none());
+
+        let path = file(
+            "[game.solo_practice]\nenabled=true\ncourse_id=0\nloading_timeout='301s'\n\
+             commit_timeout='61s'\nmax_strokes=31\nstartup_recovery_limit=10001\n\
+             shot_packets_per_window=1000001\n",
+        );
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("invalid solo")
+        else {
+            panic!("expected validation");
+        };
+        let fields = error
+            .issues
+            .iter()
+            .map(|issue| issue.field)
+            .collect::<HashSet<_>>();
+        for expected in [
+            "game.solo_practice.enabled",
+            "game.solo_practice.course_id",
+            "game.solo_practice.loading_timeout",
+            "game.solo_practice.commit_timeout",
+            "game.solo_practice.max_strokes",
+            "game.solo_practice.startup_recovery_limit",
+            "game.solo_practice.shot_packets_per_window",
+        ] {
+            assert!(fields.contains(expected), "missing {expected}: {fields:?}");
+        }
+        fs::remove_file(path).expect("remove");
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog");
+        let solo_config = |capacity| {
+            format!(
+                "[game]\nenabled=true\noutbound_room_event_capacity={capacity}\n\
+                 [game.solo_practice]\nenabled=true\ncourse_id=7\nloading_timeout='5s'\n\
+                 commit_timeout='2s'\nmax_strokes=9\nstartup_recovery_limit=50\n\
+                 shot_packets_per_window=80\n[data]\ncatalog_required_m3=true\n\
+                 iff_directory='{}'\nmanifest='manifest.toml'\n",
+                root.display()
+            )
+        };
+        let path = file(&solo_config(1));
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("solo queue too small")
+        else {
+            panic!("expected validation");
+        };
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "game.outbound_room_event_capacity")
+        );
+        fs::remove_file(path).expect("remove");
+
+        let path = file(&solo_config(2));
+        let config = test_load(Some(&path), &CliOverrides::default()).expect("valid solo");
+        let solo = config.solo_practice.expect("enabled solo");
+        assert_eq!(solo.course_id.get(), 7);
+        assert_eq!(solo.loading_timeout, Duration::from_secs(5));
+        assert_eq!(solo.commit_timeout, Duration::from_secs(2));
+        assert_eq!(solo.max_strokes, 9);
+        assert_eq!(solo.startup_recovery_limit.get(), 50);
+        assert_eq!(solo.shot_packets_per_window, 80);
         fs::remove_file(path).expect("remove");
     }
 

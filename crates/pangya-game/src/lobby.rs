@@ -115,6 +115,20 @@ pub(crate) struct RoomLifecycle {
     pub(crate) active_count: usize,
 }
 
+/// Ordered match cardinality transition published by the sole lobby registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MatchLifecycleEvent {
+    Activated,
+    Deactivated,
+}
+
+/// Exact process-local match count after one authoritative transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MatchLifecycle {
+    pub(crate) event: MatchLifecycleEvent,
+    pub(crate) active_count: usize,
+}
+
 /// A room operation routed by the registry using the caller's registered connection identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LobbyRoomCommand {
@@ -317,6 +331,7 @@ pub struct LobbyHandle {
     command_timeout: Duration,
     shutdown_timeout: Duration,
     room_lifecycle: broadcast::Sender<RoomLifecycle>,
+    match_lifecycle: broadcast::Sender<MatchLifecycle>,
 }
 
 impl std::fmt::Debug for LobbyHandle {
@@ -330,6 +345,10 @@ impl std::fmt::Debug for LobbyHandle {
 impl LobbyHandle {
     pub(crate) fn subscribe_room_lifecycle(&self) -> broadcast::Receiver<RoomLifecycle> {
         self.room_lifecycle.subscribe()
+    }
+
+    pub(crate) fn subscribe_match_lifecycle(&self) -> broadcast::Receiver<MatchLifecycle> {
+        self.match_lifecycle.subscribe()
     }
 
     fn send(&self, command: LobbyCommand, gate: CommandGate) -> Result<(), RoomError> {
@@ -549,6 +568,9 @@ struct LobbyRegistry {
     next_room_id: u32,
     events: mpsc::Sender<RoomActorEvent>,
     room_lifecycle: broadcast::Sender<RoomLifecycle>,
+    match_lifecycle: broadcast::Sender<MatchLifecycle>,
+    prepared_matches: BTreeMap<RoomId, BeginSoloMatch>,
+    active_matches: BTreeMap<RoomId, AbortMatch>,
 }
 
 impl LobbyRegistry {
@@ -577,7 +599,55 @@ impl LobbyRegistry {
         let _no_receivers = self.room_lifecycle.send(lifecycle);
     }
 
+    fn publish_match_lifecycle(&self, event: MatchLifecycleEvent) {
+        let lifecycle = MatchLifecycle {
+            event,
+            active_count: self.active_matches.len(),
+        };
+        let _no_receivers = self.match_lifecycle.send(lifecycle);
+    }
+
+    fn start_match(&mut self, room_id: RoomId, begin: BeginSoloMatch) {
+        let abort = AbortMatch::new(
+            begin.match_id(),
+            begin.result_key(),
+            begin.account_id(),
+            MatchAbortReason::PersistenceFailure,
+        );
+        if self.active_matches.insert(room_id, abort).is_none() {
+            self.publish_match_lifecycle(MatchLifecycleEvent::Activated);
+        }
+    }
+
+    fn deactivate_committed_match(&mut self, room_id: RoomId, result: SoloMatchResult) {
+        let exact = self.active_matches.get(&room_id).is_some_and(|active| {
+            active.match_id() == result.match_id()
+                && active.result_key() == result.result_key()
+                && active.account_id() == result.account_id()
+        });
+        if exact {
+            self.active_matches.remove(&room_id);
+            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+        }
+    }
+
+    fn deactivate_aborted_match(&mut self, room_id: RoomId, abort: AbortMatch) {
+        let exact = self.active_matches.get(&room_id).is_some_and(|active| {
+            active.match_id() == abort.match_id()
+                && active.result_key() == abort.result_key()
+                && active.account_id() == abort.account_id()
+        });
+        if exact {
+            self.active_matches.remove(&room_id);
+            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+        }
+    }
+
     fn remove_room(&mut self, room_id: RoomId, cancel_members: bool) {
+        self.prepared_matches.remove(&room_id);
+        if self.active_matches.remove(&room_id).is_some() {
+            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+        }
         let removed = self.rooms.remove(&room_id).is_some();
         self.connections.retain(|_, connection| {
             if connection.room_id != room_id {
@@ -733,6 +803,10 @@ impl LobbyRegistry {
         match handle.disconnect_with_abort(connection_id).await {
             Ok(outcome) => {
                 self.connections.remove(&connection_id);
+                if let Some(abort) = outcome.abort {
+                    self.prepared_matches.remove(&room_id);
+                    self.deactivate_aborted_match(room_id, abort);
+                }
                 if let Some(snapshot) = &outcome.snapshot {
                     self.update_snapshot(room_id, snapshot);
                 } else {
@@ -807,24 +881,39 @@ impl LobbyRegistry {
             .map(|record| record.handle.clone())
             .ok_or(SoloMatchError::Closed)?;
         let result = match command {
-            LobbySoloCommand::PrepareStart(plan) => handle
-                .prepare_solo_start(connection_id, plan)
-                .await
-                .map(LobbySoloRouteResult::Begin),
+            LobbySoloCommand::PrepareStart(plan) => {
+                let result = handle.prepare_solo_start(connection_id, plan).await;
+                if let Ok(begin) = &result {
+                    self.prepared_matches.insert(room_id, begin.clone());
+                }
+                result.map(LobbySoloRouteResult::Begin)
+            }
             LobbySoloCommand::ConfirmBegin {
                 match_id,
                 result_key,
-            } => handle
-                .confirm_solo_begin(connection_id, match_id, result_key)
-                .await
-                .map(|()| LobbySoloRouteResult::Applied),
+            } => {
+                let result = handle
+                    .confirm_solo_begin(connection_id, match_id, result_key)
+                    .await;
+                if result.is_ok()
+                    && let Some(begin) = self.prepared_matches.remove(&room_id)
+                {
+                    self.start_match(room_id, begin);
+                }
+                result.map(|()| LobbySoloRouteResult::Applied)
+            }
             LobbySoloCommand::CancelBegin {
                 match_id,
                 result_key,
-            } => handle
-                .cancel_solo_begin(connection_id, match_id, result_key)
-                .await
-                .map(|()| LobbySoloRouteResult::Applied),
+            } => {
+                let result = handle
+                    .cancel_solo_begin(connection_id, match_id, result_key)
+                    .await;
+                if result.is_ok() {
+                    self.prepared_matches.remove(&room_id);
+                }
+                result.map(|()| LobbySoloRouteResult::Applied)
+            }
             LobbySoloCommand::LoadingComplete(loading) => handle
                 .solo_loading_complete(connection_id, loading)
                 .await
@@ -841,18 +930,31 @@ impl LobbyRegistry {
                 .prepare_solo_finish(connection_id)
                 .await
                 .map(LobbySoloRouteResult::Commit),
-            LobbySoloCommand::ApplyCommit(result) => handle
-                .apply_solo_commit(connection_id, result)
-                .await
-                .map(LobbySoloRouteResult::Committed),
-            LobbySoloCommand::Abort(reason) => handle
-                .abort_solo(connection_id, reason)
-                .await
-                .map(LobbySoloRouteResult::Abort),
-            LobbySoloCommand::AcknowledgeAbort(abort) => handle
-                .acknowledge_solo_abort(connection_id, abort)
-                .await
-                .map(|()| LobbySoloRouteResult::Applied),
+            LobbySoloCommand::ApplyCommit(result) => {
+                let applied = handle.apply_solo_commit(connection_id, result).await;
+                if let Ok(committed) = applied {
+                    self.prepared_matches.remove(&room_id);
+                    self.deactivate_committed_match(room_id, committed);
+                    Ok(LobbySoloRouteResult::Committed(committed))
+                } else {
+                    applied.map(LobbySoloRouteResult::Committed)
+                }
+            }
+            LobbySoloCommand::Abort(reason) => {
+                let aborted = handle.abort_solo(connection_id, reason).await;
+                if aborted.is_ok() {
+                    self.prepared_matches.remove(&room_id);
+                }
+                aborted.map(LobbySoloRouteResult::Abort)
+            }
+            LobbySoloCommand::AcknowledgeAbort(abort) => {
+                let acknowledged = handle.acknowledge_solo_abort(connection_id, abort).await;
+                if acknowledged.is_ok() {
+                    self.prepared_matches.remove(&room_id);
+                    self.deactivate_aborted_match(room_id, abort);
+                }
+                acknowledged.map(|()| LobbySoloRouteResult::Applied)
+            }
         };
         if result == Err(SoloMatchError::Closed) {
             self.remove_room(room_id, true);
@@ -886,14 +988,19 @@ impl LobbyRegistry {
         // Futures are inserted in ascending room-ID order and polled concurrently. Ordered output
         // keeps the persisted handoff deterministic without an unbounded intermediate Vec.
         let mut shutdowns = FuturesOrdered::new();
-        for record in self.rooms.values() {
+        for (room_id, record) in &self.rooms {
+            let room_id = *room_id;
             let handle = record.handle.clone();
-            shutdowns.push_back(async move { handle.shutdown().await });
+            shutdowns.push_back(async move { (room_id, handle.shutdown().await) });
         }
         let mut first_error = None;
-        while let Some(result) = shutdowns.next().await {
+        while let Some((room_id, result)) = shutdowns.next().await {
             match result {
-                Ok(Some(abort)) if aborts.len() < max_rooms => aborts.push(abort),
+                Ok(Some(abort)) if aborts.len() < max_rooms => {
+                    self.prepared_matches.remove(&room_id);
+                    self.deactivate_aborted_match(room_id, abort);
+                    aborts.push(abort);
+                }
                 Ok(Some(_)) => first_error = Some(LobbyShutdownError::CapacityInvariant),
                 Ok(None) => {}
                 Err(error) if first_error.is_none() => {
@@ -928,12 +1035,14 @@ pub fn spawn_lobby(limits: LobbyLimits) -> LobbyHandle {
     let (controls, control_rx) = mpsc::channel(limits.cleanup_capacity.get());
     let (events, event_rx) = mpsc::channel(limits.event_capacity.get());
     let (room_lifecycle, _) = broadcast::channel(limits.max_rooms.get());
+    let (match_lifecycle, _) = broadcast::channel(limits.max_rooms.get());
     let handle = LobbyHandle {
         commands,
         controls,
         command_timeout: limits.command_timeout,
         shutdown_timeout: limits.shutdown_timeout,
         room_lifecycle: room_lifecycle.clone(),
+        match_lifecycle: match_lifecycle.clone(),
     };
     let registry = LobbyRegistry {
         limits,
@@ -942,6 +1051,9 @@ pub fn spawn_lobby(limits: LobbyLimits) -> LobbyHandle {
         next_room_id: 1,
         events,
         room_lifecycle,
+        match_lifecycle,
+        prepared_matches: BTreeMap::new(),
+        active_matches: BTreeMap::new(),
     };
     tokio::spawn(run_lobby(registry, command_rx, control_rx, event_rx));
     handle
@@ -1536,6 +1648,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| unreachable!());
+        let mut match_lifecycle = lobby.subscribe_match_lifecycle();
         let plan = solo_plan(identity(1).account_id, Duration::from_secs(5));
         assert!(matches!(
             lobby
@@ -1554,6 +1667,13 @@ mod tests {
                 )
                 .await,
             Ok(LobbySoloRouteResult::Applied)
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), match_lifecycle.recv()).await,
+            Ok(Ok(MatchLifecycle {
+                event: MatchLifecycleEvent::Activated,
+                active_count: 1,
+            }))
         );
         assert!(saturated.is_cancelled());
         assert!(!unrelated.is_cancelled());
@@ -1578,6 +1698,17 @@ mod tests {
             )]
         );
         assert!(outcome.aborts().len() <= 2);
+        assert_eq!(
+            timeout(Duration::from_secs(1), match_lifecycle.recv()).await,
+            Ok(Ok(MatchLifecycle {
+                event: MatchLifecycleEvent::Deactivated,
+                active_count: 0,
+            }))
+        );
+        assert!(matches!(
+            match_lifecycle.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

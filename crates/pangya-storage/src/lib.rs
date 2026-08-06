@@ -1254,6 +1254,7 @@ const fn abort_reason_text(reason: MatchAbortReason) -> &'static str {
         MatchAbortReason::LoadingTimeout => "loading_timeout",
         MatchAbortReason::Shutdown => "shutdown",
         MatchAbortReason::StartupRecovery => "startup_recovery",
+        MatchAbortReason::PersistenceFailure => "persistence_failure",
     }
 }
 

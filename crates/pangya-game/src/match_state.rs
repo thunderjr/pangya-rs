@@ -440,6 +440,16 @@ impl SoloMatchState {
         &mut self,
         result: SoloMatchResult,
     ) -> Result<SoloMatchResult, SoloMatchError> {
+        if let Some(abort) = self.pending_abort {
+            if result.match_id() != abort.match_id() || result.result_key() != abort.result_key() {
+                return Err(SoloMatchError::IdentityMismatch);
+            }
+            if result.account_id() != abort.account_id() {
+                return Err(SoloMatchError::AccountMismatch);
+            }
+            self.pending_abort = None;
+            return Ok(result);
+        }
         let active = self.active.as_ref().ok_or(SoloMatchError::InvalidPhase)?;
         if active.phase != ActivePhase::ResultsPendingCommit {
             return Err(SoloMatchError::InvalidPhase);

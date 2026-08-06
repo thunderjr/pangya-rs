@@ -1,4 +1,4 @@
-# M2/M3 configuration reference
+# Server configuration reference
 
 Precedence is `typed defaults < optional TOML < PANGYA__... environment <
 explicit CLI flags`. Nested environment keys use `__`, for example
@@ -37,6 +37,16 @@ Shutdown clears readiness before listener cancellation. `game.enabled=false`
 preserves this M2 boundary. When enabled, `data.catalog_required_m3=true`,
 `iff_directory`, and a relative `manifest` are mandatory; bounded catalog load,
 starter cross-check, and GameService binding must all succeed before readiness.
+`[game.solo_practice]` is a disabled-by-default, synthetic/local-only M5 mode and does
+not claim retail compatibility. Enabling it requires `game.enabled=true` and a catalog
+Course record exactly matching `course_id`; startup resolves the catalog par and exact
+catalog fingerprint into immutable runtime configuration. `loading_timeout` is nonzero,
+representable as `u32` milliseconds, and capped at 300 seconds. `commit_timeout` is
+nonzero, capped at 60 seconds, and cannot exceed `server.shutdown_grace`. `max_strokes`
+is `1..=30`, `startup_recovery_limit` is `1..=10000`, and
+`shot_packets_per_window` is `1..=1000000`. Startup abort recovery is completed under
+the commit timeout before any Game listener binds; failure prevents readiness.
+
 Catalog loading occurs before any listener bind. The blocking filesystem work is
 noncancellable, but it runs on one detached standard thread rather than Tokio's
 blocking pool; timeout therefore cannot retain the Tokio runtime or delay runtime/

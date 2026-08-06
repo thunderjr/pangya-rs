@@ -51,8 +51,13 @@ pub enum RoomEvent {
     },
     /// A persisted checked solo plan was confirmed and loading started.
     SoloStarted(SoloStartPlan),
-    /// Authoritative solo phase changed.
-    SoloPhase(SoloMatchPhase),
+    /// Authoritative solo phase changed for an exact match.
+    SoloPhase {
+        /// Durable match identity.
+        match_id: MatchId,
+        /// Authoritative phase projection.
+        phase: SoloMatchPhase,
+    },
     /// Validated action relayed with authoritative connection identity.
     SoloActionRelay {
         /// Sole authoritative sender.
@@ -439,7 +444,10 @@ impl RoomState {
             .cloned()
             .ok_or(SoloMatchError::InvalidPhase)?;
         self.deliver_solo(RoomEvent::SoloStarted(plan));
-        self.deliver_solo(RoomEvent::SoloPhase(SoloMatchPhase::Loading));
+        self.deliver_solo(RoomEvent::SoloPhase {
+            match_id,
+            phase: SoloMatchPhase::Loading,
+        });
         Ok(())
     }
 
@@ -459,9 +467,17 @@ impl RoomState {
         loading: LoadingComplete,
     ) -> Result<(), SoloMatchError> {
         self.solo_owner(caller)?;
+        let match_id = self
+            .solo
+            .start_plan()
+            .map(|plan| plan.begin().match_id())
+            .ok_or(SoloMatchError::InvalidPhase)?;
         self.solo.loading_complete(loading.progress())?;
         self.loading_deadline = None;
-        self.deliver_solo(RoomEvent::SoloPhase(self.solo.phase()));
+        self.deliver_solo(RoomEvent::SoloPhase {
+            match_id,
+            phase: self.solo.phase(),
+        });
         Ok(())
     }
 
@@ -471,13 +487,21 @@ impl RoomState {
         action: ShotAction,
     ) -> Result<RelayDisposition, SoloMatchError> {
         self.solo_owner(caller)?;
+        let match_id = self
+            .solo
+            .start_plan()
+            .map(|plan| plan.begin().match_id())
+            .ok_or(SoloMatchError::InvalidPhase)?;
         let disposition = self.solo.accept_action(action)?;
         if disposition == RelayDisposition::Accepted {
             self.deliver_solo(RoomEvent::SoloActionRelay {
                 from: caller,
                 action,
             });
-            self.deliver_solo(RoomEvent::SoloPhase(self.solo.phase()));
+            self.deliver_solo(RoomEvent::SoloPhase {
+                match_id,
+                phase: self.solo.phase(),
+            });
         }
         Ok(disposition)
     }
@@ -488,13 +512,21 @@ impl RoomState {
         result: ShotResult,
     ) -> Result<RelayDisposition, SoloMatchError> {
         self.solo_owner(caller)?;
+        let match_id = self
+            .solo
+            .start_plan()
+            .map(|plan| plan.begin().match_id())
+            .ok_or(SoloMatchError::InvalidPhase)?;
         let disposition = self.solo.accept_result(result)?;
         if disposition == RelayDisposition::Accepted {
             self.deliver_solo(RoomEvent::SoloResultRelay {
                 from: caller,
                 result,
             });
-            self.deliver_solo(RoomEvent::SoloPhase(self.solo.phase()));
+            self.deliver_solo(RoomEvent::SoloPhase {
+                match_id,
+                phase: self.solo.phase(),
+            });
         }
         Ok(disposition)
     }
@@ -505,7 +537,10 @@ impl RoomState {
     ) -> Result<CommitSoloHole, SoloMatchError> {
         self.solo_owner(caller)?;
         let commit = self.solo.prepare_finish()?;
-        self.deliver_solo(RoomEvent::SoloPhase(self.solo.phase()));
+        self.deliver_solo(RoomEvent::SoloPhase {
+            match_id: commit.match_id(),
+            phase: self.solo.phase(),
+        });
         Ok(commit)
     }
 
@@ -526,7 +561,8 @@ impl RoomState {
         reason: MatchAbortReason,
     ) -> Result<Option<AbortMatch>, SoloMatchError> {
         self.solo_owner(caller)?;
-        Ok(self.mark_aborted(reason))
+        self.loading_deadline = None;
+        Ok(self.solo.abort(reason))
     }
 
     fn acknowledge_solo_abort(
@@ -536,7 +572,10 @@ impl RoomState {
     ) -> Result<(), SoloMatchError> {
         self.solo_owner(caller)?;
         self.solo.acknowledge_abort(abort)?;
-        self.deliver_solo(RoomEvent::SoloPhase(SoloMatchPhase::Open));
+        self.deliver_solo(RoomEvent::SoloPhase {
+            match_id: abort.match_id(),
+            phase: SoloMatchPhase::Open,
+        });
         Ok(())
     }
 

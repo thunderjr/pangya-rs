@@ -19,12 +19,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-uuid.workspace = true
 
 [lints]
 workspace = true

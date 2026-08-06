@@ -1,4 +1,4 @@
-# Local M2 plus opt-in synthetic M3 example. Copy to an ignored local file before editing.
+# Local M2 plus opt-in synthetic GameService/M5 solo example. Copy to an ignored local file.
 [server]
 profile = "local"
 shutdown_grace = "10s"
@@ -30,6 +30,16 @@ unknown_opcode_strikes = 3
 # Capture retains bounded opcode/state/length metadata plus a SHA-256 digest, never raw payloads.
 unknown_capture_capacity = 256
 command_timeout = "3s"
+
+[game.solo_practice]
+# Local synthetic protocol only; disabled by default and not retail-compatible.
+enabled = false
+course_id = 7
+loading_timeout = "30s"
+commit_timeout = "3s"
+max_strokes = 30
+startup_recovery_limit = 1000
+shot_packets_per_window = 120
 
 [http]
 bind = "127.0.0.1:8080"

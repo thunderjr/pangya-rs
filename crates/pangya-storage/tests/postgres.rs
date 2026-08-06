@@ -1033,7 +1033,7 @@ async fn distinct_matches_commit_concurrently_for_one_account_without_lost_rewar
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn disconnect_abort_is_idempotent_and_never_rewards(pool: PgPool) {
+async fn persistence_failure_abort_is_idempotent_and_never_rewards(pool: PgPool) {
     let repository = PgRepository::new(pool.clone());
     let aggregate = repository
         .create_account(account("SoloAbort", Some("SoloAbortNick")))
@@ -1045,7 +1045,7 @@ async fn disconnect_abort_is_idempotent_and_never_rewards(pool: PgPool) {
         begin.match_id(),
         begin.result_key(),
         begin.account_id(),
-        MatchAbortReason::Disconnect,
+        MatchAbortReason::PersistenceFailure,
     );
     assert_eq!(
         repository.abort(abort).await,
