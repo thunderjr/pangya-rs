@@ -908,9 +908,9 @@ mod tests {
     use pangya_domain::{
         AbortMatch, AbortMatchOutcome, AccountId, AuthenticatedSession, BeginSoloMatch,
         BeginSoloMatchOutcome, CatalogFingerprint, CommitSoloHole, ConsumeHandover, CourseId,
-        HandoverError, HandoverRepository, IncompleteMatchAbortLimit, MatchRepositoryError,
-        NewHandover, PlayerRepository, PlayerSnapshot, RepositoryError, RepositoryFuture,
-        SoloMatchResult,
+        HandoverError, HandoverRepository, IncompleteMatchAbortLimit, MarkSoloInGame,
+        MarkSoloInGameOutcome, MatchRepositoryError, NewHandover, PlayerRepository, PlayerSnapshot,
+        RepositoryError, RepositoryFuture, SoloMatchResult,
     };
     use tokio::{net::TcpStream, sync::Notify};
 
@@ -959,6 +959,13 @@ mod tests {
             &self,
             _request: BeginSoloMatch,
         ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
+            Box::pin(async { Err(MatchRepositoryError::Storage) })
+        }
+
+        fn mark_solo_in_game(
+            &self,
+            _request: MarkSoloInGame,
+        ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>> {
             Box::pin(async { Err(MatchRepositoryError::Storage) })
         }
 

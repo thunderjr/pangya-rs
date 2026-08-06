@@ -33,9 +33,9 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_data::Catalog;
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AccountId, BeginSoloMatch, BeginSoloMatchOutcome,
-    CatalogFingerprint, ConsumeHandover, HandoverRepository, MatchAbortReason, MatchId,
-    MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig, PlayerConnectionId,
-    PlayerRepository, PlayerSnapshot, RepositoryError, RoomError, RoomId,
+    CatalogFingerprint, ConsumeHandover, HandoverRepository, MarkSoloInGame, MarkSoloInGameOutcome,
+    MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, RepositoryError, RoomError, RoomId,
     ServiceKind as DomainServiceKind, SoloMatchResult, SourceAddressPrefix,
 };
 use pangya_login::{
@@ -1112,7 +1112,15 @@ where
         };
 
         state = GameState::Closed;
-        let cleanup = self.lobby.disconnect(connection_id).await;
+        let cleanup_reason = if shutdown.is_cancelled() {
+            MatchAbortReason::Shutdown
+        } else {
+            MatchAbortReason::Disconnect
+        };
+        let cleanup = self
+            .lobby
+            .disconnect_with_reason(connection_id, cleanup_reason)
+            .await;
         let cleanup_result = match cleanup {
             Ok(Some(abort)) => self.persist_cleanup_abort(abort).await.map(drop),
             Ok(None) | Err(RoomError::NotMember | RoomError::RoomNotFound) => Ok(()),
@@ -1541,20 +1549,36 @@ where
                 let loading =
                     decode_packet_payload::<LoadingComplete>(payload, profile, ServiceKind::Game)
                         .map_err(|_| GameRuntimeError::Protocol)?;
-                let result = self
+                let mark = match self
                     .lobby
                     .route_solo(
                         identity.connection_id,
                         LobbySoloCommand::LoadingComplete(loading),
                     )
-                    .await;
-                let outcome = solo_route_outcome(result);
-                if outcome == SoloCommandOutcome::Success {
-                    self.observer
-                        .match_event(GameMatchObservation::LoadingComplete);
-                }
-                self.send_solo_result(framed, SoloCommand::LoadingComplete, outcome)
+                    .await
+                {
+                    Ok(LobbySoloRouteResult::InGame(mark)) => mark,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(error) => {
+                        self.send_solo_result(
+                            framed,
+                            SoloCommand::LoadingComplete,
+                            solo_error_outcome(error),
+                        )
+                        .await?;
+                        return Ok(state);
+                    }
+                };
+                self.persist_in_game(identity.connection_id, mark, shutdown, idle_deadline)
                     .await?;
+                self.observer
+                    .match_event(GameMatchObservation::LoadingComplete);
+                self.send_solo_result(
+                    framed,
+                    SoloCommand::LoadingComplete,
+                    SoloCommandOutcome::Success,
+                )
+                .await?;
                 Ok(state)
             }
             (GameState::InMatch, SYNTHETIC_M5_C2S_SHOT_ACTION) => {
@@ -1720,6 +1744,43 @@ where
         self.abort_actor_match(connection_id, MatchAbortReason::PersistenceFailure, false)
             .await?;
         Err(GameRuntimeError::MatchPersistence)
+    }
+
+    async fn persist_in_game(
+        &self,
+        connection_id: PlayerConnectionId,
+        mark: MarkSoloInGame,
+        shutdown: &CancellationToken,
+        idle_deadline: Instant,
+    ) -> Result<(), GameRuntimeError> {
+        let solo = self
+            .config
+            .solo_practice
+            .ok_or(GameRuntimeError::InvalidConfig)?;
+        let cancelled_before = shutdown.is_cancelled() || Instant::now() >= idle_deadline;
+        let marked = if cancelled_before {
+            None
+        } else {
+            match timeout(solo.commit_timeout, self.repository.mark_solo_in_game(mark)).await {
+                Ok(Ok(MarkSoloInGameOutcome::Marked | MarkSoloInGameOutcome::Existing)) => Some(()),
+                Ok(Err(_)) | Err(_) => None,
+            }
+        };
+        let cancelled_after = shutdown.is_cancelled() || Instant::now() >= idle_deadline;
+        if marked.is_some() && !cancelled_after {
+            return Ok(());
+        }
+        let reason = if shutdown.is_cancelled() {
+            MatchAbortReason::Shutdown
+        } else {
+            MatchAbortReason::PersistenceFailure
+        };
+        self.abort_actor_match(connection_id, reason, true).await?;
+        Err(if cancelled_before || cancelled_after {
+            GameRuntimeError::Timeout
+        } else {
+            GameRuntimeError::MatchPersistence
+        })
     }
 
     async fn persist_and_apply_commit(
@@ -1972,11 +2033,6 @@ where
         .await?;
         self.send_solo_result(framed, SoloCommand::FinishHole, SoloCommandOutcome::Success)
             .await?;
-        self.send(
-            framed,
-            &MatchPhase::new(result.match_id().get(), SoloPhase::HoleComplete),
-        )
-        .await?;
         self.send(
             framed,
             &MatchPhase::new(result.match_id().get(), SoloPhase::Finished),
@@ -2338,14 +2394,6 @@ fn solo_error_outcome(error: SoloMatchError) -> SoloCommandOutcome {
     }
 }
 
-fn solo_route_outcome(result: Result<LobbySoloRouteResult, SoloMatchError>) -> SoloCommandOutcome {
-    match result {
-        Ok(LobbySoloRouteResult::Applied) => SoloCommandOutcome::Success,
-        Ok(_) => SoloCommandOutcome::InvalidPhase,
-        Err(error) => solo_error_outcome(error),
-    }
-}
-
 fn observe_relay_result(
     observer: &dyn GameObserver,
     result: &Result<LobbySoloRouteResult, SoloMatchError>,
@@ -2537,12 +2585,15 @@ mod tests {
 
     struct FakeRepository {
         begin_calls: AtomicUsize,
+        mark_calls: AtomicUsize,
         commit_calls: AtomicUsize,
         abort_calls: AtomicUsize,
         begin_delay: Mutex<Duration>,
+        mark_delay: Mutex<Duration>,
         commit_delay: Mutex<Duration>,
         abort_delay: Mutex<Duration>,
         begin_outcome: Mutex<Result<BeginSoloMatchOutcome, MatchRepositoryError>>,
+        mark_outcome: Mutex<Result<MarkSoloInGameOutcome, MatchRepositoryError>>,
         commit_outcome: Mutex<Result<SoloMatchResult, MatchRepositoryError>>,
         abort_outcome: Mutex<Result<AbortMatchOutcome, MatchRepositoryError>>,
     }
@@ -2578,12 +2629,15 @@ mod tests {
         fn default() -> Self {
             Self {
                 begin_calls: AtomicUsize::new(0),
+                mark_calls: AtomicUsize::new(0),
                 commit_calls: AtomicUsize::new(0),
                 abort_calls: AtomicUsize::new(0),
                 begin_delay: Mutex::new(Duration::ZERO),
+                mark_delay: Mutex::new(Duration::ZERO),
                 commit_delay: Mutex::new(Duration::ZERO),
                 abort_delay: Mutex::new(Duration::ZERO),
                 begin_outcome: Mutex::new(Ok(BeginSoloMatchOutcome::Begun)),
+                mark_outcome: Mutex::new(Ok(MarkSoloInGameOutcome::Marked)),
                 commit_outcome: Mutex::new(Err(MatchRepositoryError::Storage)),
                 abort_outcome: Mutex::new(Ok(AbortMatchOutcome::Aborted)),
             }
@@ -2624,6 +2678,25 @@ mod tests {
                 .map_or(Duration::ZERO, |value| *value);
             let outcome = self
                 .begin_outcome
+                .lock()
+                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                outcome
+            })
+        }
+
+        fn mark_solo_in_game(
+            &self,
+            _request: MarkSoloInGame,
+        ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>> {
+            self.mark_calls.fetch_add(1, Ordering::Relaxed);
+            let delay = self
+                .mark_delay
+                .lock()
+                .map_or(Duration::ZERO, |value| *value);
+            let outcome = self
+                .mark_outcome
                 .lock()
                 .map_or(Err(MatchRepositoryError::Storage), |value| *value);
             Box::pin(async move {
@@ -3021,13 +3094,25 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| unreachable!());
-        service
+        let mark = match service
             .lobby
             .route_solo(
                 test_identity().connection_id,
                 LobbySoloCommand::LoadingComplete(
                     LoadingComplete::new(100).unwrap_or_else(|_| unreachable!()),
                 ),
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::InGame(mark)) => mark,
+            _ => unreachable!(),
+        };
+        service
+            .persist_in_game(
+                test_identity().connection_id,
+                mark,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
             )
             .await
             .unwrap_or_else(|_| unreachable!());
@@ -3081,6 +3166,62 @@ mod tests {
                 .route_solo(
                     test_identity().connection_id,
                     LobbySoloCommand::PrepareStart(replacement)
+                )
+                .await,
+            Ok(LobbySoloRouteResult::Begin(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_game_mark_failure_aborts_actor_and_durable_match() {
+        let repository = Arc::new(FakeRepository::default());
+        if let Ok(mut outcome) = repository.mark_outcome.lock() {
+            *outcome = Err(MatchRepositoryError::Storage);
+        }
+        let service = test_service(Arc::clone(&repository), Duration::from_millis(50));
+        let plan = test_plan(&service, 13);
+        let _events = prepare_test_room(&service, plan.clone()).await;
+        service
+            .persist_and_confirm_begin(
+                test_identity().connection_id,
+                plan.begin().clone(),
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let mark = match service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::LoadingComplete(
+                    LoadingComplete::new(100).unwrap_or_else(|_| unreachable!()),
+                ),
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::InGame(mark)) => mark,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            service
+                .persist_in_game(
+                    test_identity().connection_id,
+                    mark,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(GameRuntimeError::MatchPersistence)
+        );
+        assert_eq!(repository.mark_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            service
+                .lobby
+                .route_solo(
+                    test_identity().connection_id,
+                    LobbySoloCommand::PrepareStart(test_plan(&service, 14)),
                 )
                 .await,
             Ok(LobbySoloRouteResult::Begin(_))
@@ -3156,7 +3297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_path_mutates_storage_only_at_begin_and_finish_and_deduplicates_relays() {
+    async fn runtime_path_mutates_storage_only_at_lifecycle_marks_and_deduplicates_relays() {
         let repository = Arc::new(FakeRepository::default());
         let service = test_service(Arc::clone(&repository), Duration::from_millis(50));
         let plan = test_plan(&service, 20);
@@ -3171,20 +3312,32 @@ mod tests {
             .await
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(repository.begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.mark_calls.load(Ordering::Relaxed), 0);
         assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 0);
         assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 0);
-        assert!(matches!(
-            service
-                .lobby
-                .route_solo(
-                    test_identity().connection_id,
-                    LobbySoloCommand::LoadingComplete(
-                        LoadingComplete::new(100).unwrap_or_else(|_| unreachable!())
-                    )
-                )
-                .await,
-            Ok(LobbySoloRouteResult::Applied)
-        ));
+        let mark = match service
+            .lobby
+            .route_solo(
+                test_identity().connection_id,
+                LobbySoloCommand::LoadingComplete(
+                    LoadingComplete::new(100).unwrap_or_else(|_| unreachable!()),
+                ),
+            )
+            .await
+        {
+            Ok(LobbySoloRouteResult::InGame(mark)) => mark,
+            _ => unreachable!(),
+        };
+        service
+            .persist_in_game(
+                test_identity().connection_id,
+                mark,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(repository.mark_calls.load(Ordering::Relaxed), 1);
         let action = ShotAction::new(1, 1, 1.0, 0.0, 0.0, 0.0).unwrap_or_else(|_| unreachable!());
         assert_eq!(
             service
@@ -3250,6 +3403,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(repository.begin_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.mark_calls.load(Ordering::Relaxed), 1);
         assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 1);
         assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 0);
     }

@@ -8,23 +8,31 @@ use std::{
 
 use pangya_data::Catalog;
 use pangya_domain::{
-    AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CredentialHash,
-    HandoverRepository as _, ItemTypeId, MemberSnapshot, NewAccount, Nickname, PlayerConnectionId,
-    RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, Username,
+    AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
+    CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
+    MemberSnapshot, NewAccount, Nickname, PlayerConnectionId, RoomId, RoomName, RoomPassword,
+    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix, StarterCharacter,
+    StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
-use pangya_game::{GameRuntimeConfig, GameRuntimeLimits, GameService, UnknownOpcodePolicy};
+use pangya_game::{
+    GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig, UnknownOpcodePolicy,
+    deterministic_conditions,
+};
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
     LoginRuntimeLimits, LoginService, generate_handover,
 };
 use pangya_observability::M2Metrics;
 use pangya_protocol::{
-    CompatibilityProfile, DecodePacket, EncodePacket, PacketWriter, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
-    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    ServiceKind as ProtocolServiceKind, decode_packet_payload, encode_packet_payload,
+    BalanceUpdate, CompatibilityProfile, DecodePacket, EncodePacket, FinishHole, HoleResult, Lie,
+    LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase, MatchStarted, PacketWriter,
+    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
+    RoomCreateRequest, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest,
+    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, ServiceKind as ProtocolServiceKind,
+    ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
+    SoloCommandResult, SoloPhase, StartSolo, Weather as ProtocolWeather, decode_packet_payload,
+    encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -116,6 +124,103 @@ fn catalog() -> Catalog {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../pangya-data/tests/fixtures/synthetic-catalog");
     Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("catalog")
+}
+
+/// Builds a test-only generated catalog whose local Course record is course 1, hole 1, par 3.
+fn m5_catalog() -> Catalog {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../pangya-data/tests/fixtures/synthetic-catalog");
+    let root = std::env::temp_dir().join(format!("pangya-m5-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).expect("unique M5 catalog directory");
+    for filename in ["character.bin", "club_set.bin", "ball.bin"] {
+        std::fs::copy(fixture.join(filename), root.join(filename)).expect("copy catalog family");
+    }
+    std::fs::write(
+        root.join("Course.bin"),
+        [1, 0, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 3],
+    )
+    .expect("generated Course");
+    std::fs::write(
+        root.join("manifest.toml"),
+        r#"manifest_version = 1
+
+[[files]]
+filename = "character.bin"
+sha256 = "8e634d84dbf7ba1d9c8b8515d6ca1a4e0e87e270df97e28427d58dd53fd5b5c4"
+kind = "character"
+count = 1
+binding = 1
+version = 1
+record_size = 8
+
+[[files]]
+filename = "club_set.bin"
+sha256 = "2bc63711f5c8e4abbda812fe5a413b49250830c6b1861fc7c2be39ac2ffb574e"
+kind = "club_set"
+count = 1
+binding = 2
+version = 1
+record_size = 8
+
+[[files]]
+filename = "ball.bin"
+sha256 = "7f270c607407c9fecedefa12ae5c69408a41badfd82c989d4cbc67ab4765045e"
+kind = "ball"
+count = 1
+binding = 3
+version = 1
+record_size = 8
+
+[[files]]
+filename = "Course.bin"
+sha256 = "e1c73f87e1206253eef0097f67a259eb0721a7351564bd627df5c07c30e12611"
+kind = "course"
+count = 1
+binding = 4
+version = 1
+record_size = 5
+"#,
+    )
+    .expect("generated catalog manifest");
+    let catalog = Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("M5 catalog");
+    std::fs::remove_dir_all(&root).expect("remove M5 catalog directory");
+    catalog
+}
+
+fn solo_service(
+    pool: PgPool,
+    limits: GameRuntimeLimits,
+    metrics: Arc<M2Metrics>,
+    loading_timeout: Duration,
+    shot_packets_per_window: u32,
+) -> Arc<GameService<PgRepository>> {
+    let catalog = m5_catalog();
+    let course = catalog
+        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .expect("one-hole course");
+    Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool)),
+            catalog.clone(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits,
+                solo_practice: Some(SoloRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout,
+                    commit_timeout: Duration::from_secs(1),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window,
+                }),
+            },
+            metrics,
+        )
+        .expect("solo game"),
+    )
 }
 
 fn game_service_with_policy(
@@ -290,38 +395,96 @@ async fn assert_closed(stream: &mut TcpStream) {
     let mut eof = [0_u8; 1];
     let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
         .await
-        .expect("bounded close")
-        .expect("close read");
-    assert_eq!(read, 0);
+        .expect("bounded close");
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(
+                read,
+                Err(ref error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                    )
+            ),
+        "connection remained readable: {read:?}"
+    );
 }
 
-async fn assert_metric(metrics: &M2Metrics, needle: &str) {
+async fn assert_closed_after_draining(stream: &mut TcpStream) {
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !metrics.render().contains(needle) {
-            tokio::task::yield_now().await;
+        let mut buffered = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffered).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("unexpected close error: {error}"),
+            }
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("missing metric {needle}: {}", metrics.render()));
+    .expect("bounded close after buffered events");
 }
 
-async fn assert_counter_at_least(metrics: &M2Metrics, prefix: &str, minimum: u64) {
+fn metric_sample(rendered: &str, key: &str) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        let (candidate, value) = line.rsplit_once(' ')?;
+        (candidate == key)
+            .then(|| value.parse::<f64>().ok())
+            .flatten()
+    })
+}
+
+fn parse_expected_metric(expected: &str) -> (String, f64) {
+    let (key, value) = expected
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("metric sample lacks a value: {expected}"));
+    let key = if key.starts_with("class=\"") {
+        format!("pangya_game_rate_limit_total{{{key}")
+    } else if key.starts_with("service=\"game\",reason=") {
+        format!("pangya_connections_closed_total{{{key}")
+    } else {
+        key.to_owned()
+    };
+    let value = value
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("metric sample has a nonnumeric value: {expected}"));
+    (key, value)
+}
+
+async fn assert_metric(metrics: &M2Metrics, expected: &str) {
+    let (key, value) = parse_expected_metric(expected);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            let rendered = metrics.render();
-            let reached = rendered.lines().any(|line| {
-                line.strip_prefix(prefix)
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .is_some_and(|value| value >= minimum)
-            });
-            if reached {
+            if metric_sample(&metrics.render(), &key) == Some(value) {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("counter below {minimum} for {prefix}: {}", metrics.render()));
+    .unwrap_or_else(|_| panic!("missing exact metric {expected}: {}", metrics.render()));
+}
+
+async fn assert_counter_at_least(metrics: &M2Metrics, key: &str, minimum: u64) {
+    let key = key.trim_end();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if metric_sample(&metrics.render(), key).is_some_and(|value| value >= minimum as f64) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("counter below {minimum} for {key}: {}", metrics.render()));
 }
 
 fn auth_payload(account_id: i64, token: &str) -> Vec<u8> {
@@ -359,8 +522,45 @@ async fn issue_token(
     generated.token.expose_secret().to_owned()
 }
 
+async fn read_player_info(stream: &mut TcpStream, key: u8) -> (u64, Vec<u8>, u64, u64, u64) {
+    let (opcode, body) = receive_packet(stream, key).await;
+    assert_eq!(opcode, 0x0070);
+    let account_id = u64::from_le_bytes(body[0..8].try_into().expect("account bytes"));
+    let nickname_len = usize::from(u16::from_le_bytes(
+        body[8..10].try_into().expect("nickname length"),
+    ));
+    let balances = 10 + nickname_len;
+    assert_eq!(body.len(), balances + 24);
+    (
+        account_id,
+        body[10..balances].to_vec(),
+        u64::from_le_bytes(body[balances..balances + 8].try_into().expect("pang bytes")),
+        u64::from_le_bytes(
+            body[balances + 8..balances + 16]
+                .try_into()
+                .expect("points bytes"),
+        ),
+        u64::from_le_bytes(
+            body[balances + 16..balances + 24]
+                .try_into()
+                .expect("experience bytes"),
+        ),
+    )
+}
+
+async fn read_bootstrap_after_player(stream: &mut TcpStream, key: u8, inventory_segments: usize) {
+    assert_eq!(receive_packet(stream, key).await.0, 0x0072);
+    for index in 0..inventory_segments {
+        let (opcode, body) = receive_packet(stream, key).await;
+        assert_eq!(opcode, 0x0073);
+        assert_eq!(usize::from(u16::from_le_bytes([body[0], body[1]])), index);
+        assert!(usize::from(u16::from_le_bytes([body[4], body[5]])) <= 50);
+    }
+    assert_eq!(receive_packet(stream, key).await.0, 0x004d);
+}
+
 async fn read_bootstrap(stream: &mut TcpStream, key: u8, inventory_segments: usize) {
-    assert_eq!(receive_packet(stream, key).await.0, 0x0070);
+    let _ = read_player_info(stream, key).await;
     assert_eq!(receive_packet(stream, key).await.0, 0x0072);
     for index in 0..inventory_segments {
         let (opcode, body) = receive_packet(stream, key).await;
@@ -407,6 +607,225 @@ async fn connect_m4(pool: &PgPool, address: std::net::SocketAddr, username: &str
         nickname: format!("N{username}"),
         token,
     }
+}
+
+type PersistedBeginRow = (
+    i64,
+    i16,
+    i16,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i16,
+    i16,
+    String,
+    String,
+);
+
+struct M5Client {
+    stream: TcpStream,
+    key: u8,
+    account_id: AccountId,
+    nickname: String,
+    token: String,
+    connection_id: u64,
+}
+
+async fn connect_m5_owner(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    username: &str,
+    room_name: &str,
+) -> M5Client {
+    let mut client = connect_m4(pool, address, username).await;
+    send_typed(
+        &mut client.stream,
+        client.key,
+        3,
+        &RoomCreateRequest {
+            name: RoomName::parse(room_name).expect("room name"),
+            password: None,
+            settings: RoomSettings::new(2).expect("solo room settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut client.stream,
+        client.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let state = receive_typed::<RoomStateResponse>(&mut client.stream, client.key).await;
+    assert_eq!(state.room.summary().name().as_str(), room_name);
+    assert_eq!(state.room.members().len(), 1);
+    let connection_id = state.room.members()[0].connection_id().get();
+    assert!(state.room.members()[0].is_owner());
+    M5Client {
+        stream: client.stream,
+        key: client.key,
+        account_id: client.account_id,
+        nickname: client.nickname,
+        token: client.token,
+        connection_id,
+    }
+}
+
+async fn receive_solo_result(
+    client: &mut M5Client,
+    command: SoloCommand,
+    result: SoloCommandOutcome,
+) {
+    assert_eq!(
+        receive_typed::<SoloCommandResult>(&mut client.stream, client.key).await,
+        SoloCommandResult::new(command, result)
+    );
+}
+
+async fn start_solo(client: &mut M5Client) -> MatchStarted {
+    send_typed(&mut client.stream, client.key, 4, &StartSolo::new()).await;
+    receive_solo_result(client, SoloCommand::StartSolo, SoloCommandOutcome::Success).await;
+    let started = receive_typed::<MatchStarted>(&mut client.stream, client.key).await;
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key).await,
+        MatchPhase::new(started.match_id(), SoloPhase::Loading)
+    );
+    started
+}
+
+async fn enter_playing(client: &mut M5Client, started: &MatchStarted) {
+    send_typed(
+        &mut client.stream,
+        client.key,
+        5,
+        &LoadingComplete::new(100).expect("loading complete"),
+    )
+    .await;
+    // Documented loading sequence: durable transition success, then playing phase.
+    receive_solo_result(
+        client,
+        SoloCommand::LoadingComplete,
+        SoloCommandOutcome::Success,
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key).await,
+        MatchPhase::new(started.match_id(), SoloPhase::Playing)
+    );
+}
+
+async fn receive_action_success(client: &mut M5Client, action: ShotAction) {
+    // Documented action sequence: command success, authoritative relay, playing phase.
+    receive_solo_result(client, SoloCommand::ShotAction, SoloCommandOutcome::Success).await;
+    assert_eq!(
+        receive_typed::<ShotActionRelay>(&mut client.stream, client.key).await,
+        ShotActionRelay::new(client.connection_id, action).expect("action relay")
+    );
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key)
+            .await
+            .phase(),
+        SoloPhase::Playing
+    );
+}
+
+async fn receive_shot_result_success(client: &mut M5Client, result: ShotResult) {
+    // Documented result sequence: command success, authoritative relay, resulting phase.
+    receive_solo_result(client, SoloCommand::ShotResult, SoloCommandOutcome::Success).await;
+    assert_eq!(
+        receive_typed::<ShotResultRelay>(&mut client.stream, client.key).await,
+        ShotResultRelay::new(client.connection_id, result).expect("result relay")
+    );
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key)
+            .await
+            .phase(),
+        if result.holed() {
+            SoloPhase::HoleComplete
+        } else {
+            SoloPhase::Playing
+        }
+    );
+}
+
+async fn relay_shot(client: &mut M5Client, salt: u8, action: ShotAction, result: ShotResult) {
+    send_typed(&mut client.stream, client.key, salt, &action).await;
+    receive_action_success(client, action).await;
+    send_typed(
+        &mut client.stream,
+        client.key,
+        salt.wrapping_add(1),
+        &result,
+    )
+    .await;
+    receive_shot_result_success(client, result).await;
+}
+
+async fn finish_solo(client: &mut M5Client, started: &MatchStarted) -> (HoleResult, BalanceUpdate) {
+    send_typed(&mut client.stream, client.key, 10, &FinishHole::new()).await;
+    // Documented finish sequence: precommit phase, then committed result/balance/success/finished.
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key).await,
+        MatchPhase::new(started.match_id(), SoloPhase::HoleComplete)
+    );
+    let hole = receive_typed::<HoleResult>(&mut client.stream, client.key).await;
+    let balance = receive_typed::<BalanceUpdate>(&mut client.stream, client.key).await;
+    receive_solo_result(client, SoloCommand::FinishHole, SoloCommandOutcome::Success).await;
+    assert_eq!(
+        receive_typed::<MatchPhase>(&mut client.stream, client.key).await,
+        MatchPhase::new(started.match_id(), SoloPhase::Finished)
+    );
+    (hole, balance)
+}
+
+async fn wait_for_abort(pool: &PgPool, match_id: &str, reason: &str) {
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state: Option<(String, Option<String>, bool)> = sqlx::query_as(
+                "SELECT m.status, m.abort_reason, mp.quit FROM matches m \
+                 JOIN match_players mp ON mp.match_id = m.id WHERE m.id::text = $1",
+            )
+            .bind(match_id)
+            .fetch_optional(pool)
+            .await
+            .expect("abort state");
+            if state
+                .as_ref()
+                .is_some_and(|row| row.0 == "aborted" && row.1.as_deref() == Some(reason) && row.2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if completed.is_err() {
+        let state: Option<(String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT m.status, m.abort_reason, mp.quit FROM matches m \
+             JOIN match_players mp ON mp.match_id = m.id WHERE m.id::text = $1",
+        )
+        .bind(match_id)
+        .fetch_optional(pool)
+        .await
+        .expect("timed-out abort state");
+        panic!("abort {match_id} did not reach {reason}: {state:?}");
+    }
+}
+
+async fn assert_no_match_reward(pool: &PgPool, match_id: &str, account_id: AccountId) {
+    let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM progression_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM match_audit_events WHERE match_id::text = $1), \
+                (SELECT pang FROM profiles WHERE account_id = $2), \
+                (SELECT experience FROM profiles WHERE account_id = $2)",
+    )
+    .bind(match_id)
+    .bind(account_id.get())
+    .fetch_one(pool)
+    .await
+    .expect("no-reward snapshot");
+    assert_eq!(state, (0, 0, 2, 0, 0));
 }
 
 fn member(client: &M4Client, connection_id: u64, owner: bool, ready: bool) -> MemberSnapshot {
@@ -565,7 +984,10 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
     send_packet(&mut game_stream, game_key, 4, 4, &1_u32.to_le_bytes()).await;
     assert_eq!(receive_packet(&mut game_stream, game_key).await.0, 0x004e);
     let rendered = metrics.render();
-    assert!(rendered.contains("pangya_game_auth_total{outcome=\"success\"} 1"));
+    assert_eq!(
+        metric_sample(&rendered, "pangya_game_auth_total{outcome=\"success\"}"),
+        Some(1.0)
+    );
     assert!(!rendered.contains(&token));
     assert!(!rendered.contains(SECRET));
     let trace_bytes = traces.lock().expect("traces").clone();
@@ -737,7 +1159,7 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
         idle_timeout: Duration::from_secs(2),
         ..GameRuntimeLimits::default()
     };
-    let (address, shutdown, task, metrics) = start_game(pool.clone(), limits).await;
+    let (address, shutdown, task, metrics) = start_game(pool.clone(), limits.clone()).await;
     let first_token = issue_token(
         &pool,
         aggregate.account.id,
@@ -773,9 +1195,19 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
     .await;
     read_bootstrap(&mut duplicate, duplicate_key, 1).await;
     assert_closed(&mut duplicate).await;
-    assert!(metrics.render().contains("outcome=\"duplicate\"} 1"));
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_auth_total{outcome=\"duplicate\"}",
+        ),
+        Some(1.0)
+    );
     drop(first);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    shutdown.cancel();
+    task.await
+        .expect("presence service join")
+        .expect("presence service serve");
+    let (address, shutdown, task, _metrics) = start_game(pool.clone(), limits).await;
     let third_token = issue_token(
         &pool,
         aggregate.account.id,
@@ -795,14 +1227,14 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
     read_bootstrap(&mut third, third_key, 1).await;
     drop(third);
 
+    let concurrent_account = create_account(&pool, "GameConcurrent", 1, 0x1000_0000).await;
     let concurrent = issue_token(
         &pool,
-        aggregate.account.id,
+        concurrent_account.account.id,
         SystemTime::now(),
         ServiceKind::Game,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
     let (mut left, left_key) = connect_game(address).await;
     let (mut right, right_key) = connect_game(address).await;
     send_packet(
@@ -810,7 +1242,7 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
         left_key,
         4,
         2,
-        &auth_payload(aggregate.account.id.get(), &concurrent),
+        &auth_payload(concurrent_account.account.id.get(), &concurrent),
     )
     .await;
     send_packet(
@@ -818,7 +1250,7 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
         right_key,
         5,
         2,
-        &auth_payload(aggregate.account.id.get(), &concurrent),
+        &auth_payload(concurrent_account.account.id.get(), &concurrent),
     )
     .await;
     let (left_result, right_result) = tokio::join!(
@@ -847,7 +1279,13 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
     let (_first, _) = connect_game(address).await;
     let mut second = TcpStream::connect(address).await.expect("second");
     assert_eq!(second.read(&mut eof).await.expect("rate close"), 0);
-    assert!(metrics.render().contains("class=\"accept_global\"} 1"));
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_rate_limit_total{class=\"accept_global\"}",
+        ),
+        Some(1.0)
+    );
     shutdown.cancel();
     task.await.expect("join").expect("serve");
 }
@@ -1101,10 +1539,12 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
         .expect("join")
         .expect("serve");
     assert_metric(&metrics, "service=\"game\",reason=\"cancelled\"} 1").await;
-    assert!(
-        metrics
-            .render()
-            .contains("pangya_connections_active{service=\"game\"} 0")
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_connections_active{service=\"game\"}",
+        ),
+        Some(0.0)
     );
 
     let reconnect_token = issue_token(
@@ -1547,10 +1987,12 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
     receive_state(&mut second.stream, second.key, &protected_full).await;
     receive_state(&mut third.stream, third.key, &protected_full).await;
 
-    assert!(
-        metrics
-            .render()
-            .contains("pangya_game_rooms_active{service=\"game\"} 1")
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_rooms_active{service=\"game\"}",
+        ),
+        Some(1.0)
     );
     send_typed(&mut second.stream, second.key, 23, &RoomLeaveRequest).await;
     receive_result(
@@ -1612,7 +2054,10 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
         "pangya_game_chat_events_total{event=\"accepted\"}",
         "pangya_game_unknown_opcode_actions_total{action=\"captured\"}",
     ] {
-        assert!(rendered.contains(fixed_label), "missing {fixed_label}");
+        assert!(
+            metric_sample(&rendered, fixed_label).is_some(),
+            "missing {fixed_label}"
+        );
     }
     for secret in [
         "M4 Open Room",
@@ -1631,10 +2076,12 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
         .expect("bounded shutdown")
         .expect("join")
         .expect("serve");
-    assert!(
-        metrics
-            .render()
-            .contains("pangya_game_rooms_active{service=\"game\"} 0")
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_rooms_active{service=\"game\"}",
+        ),
+        Some(0.0)
     );
 }
 
@@ -1832,7 +2279,13 @@ async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_alw
     assert_eq!(captures[0].opcode, 0x7779);
     assert_eq!(captures[0].payload_len, capture_body.len());
     let rendered = metrics.render();
-    assert!(rendered.contains("pangya_game_unknown_opcode_actions_total{action=\"captured\"} 1"));
+    assert_eq!(
+        metric_sample(
+            &rendered,
+            "pangya_game_unknown_opcode_actions_total{action=\"captured\"}",
+        ),
+        Some(1.0)
+    );
     assert!(!rendered.contains("unknown-capture-private-body"));
     assert!(!rendered.contains(&captured.token));
     let mut capture_wrong_m5 = connect_m4(&pool, address, "M5CapState").await;
@@ -2143,6 +2596,664 @@ async fn game_m4_command_chat_and_outbound_queues_are_bounded(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(pool: PgPool) {
+    let traces = tracing_capture();
+    let trace_start = traces.lock().expect("traces").len();
+    let limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        outbound_room_event_capacity: 2,
+        ..GameRuntimeLimits::default()
+    };
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_secs(2),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let room_name = uuid::Uuid::new_v4().simple().to_string();
+    let mut client = connect_m5_owner(&pool, address, "M5Happy", &room_name).await;
+    let started = start_solo(&mut client).await;
+    assert_eq!(started.course_id(), 1);
+    assert_eq!(started.hole(), 1);
+    assert_eq!(started.par(), 3);
+    assert_ne!(started.match_id().as_u128(), 0);
+    assert_eq!(started.seed().len(), 32);
+    assert!(started.seed().iter().any(|byte| *byte != 0));
+    assert_eq!(started.load_timeout_ms(), 2_000);
+    let (expected_weather, expected_wind) =
+        deterministic_conditions(MatchSeed::new(*started.seed())).expect("conditions");
+    assert_eq!(
+        started.weather(),
+        match expected_weather {
+            Weather::Clear => ProtocolWeather::Clear,
+            Weather::Cloudy => ProtocolWeather::Cloudy,
+            Weather::Rain => ProtocolWeather::Rain,
+        }
+    );
+    assert_eq!(
+        started.wind().speed(),
+        f32::from(expected_wind.speed_tenths()) / 10.0
+    );
+    assert_eq!(
+        started.wind().angle(),
+        f32::from(expected_wind.angle_degrees())
+    );
+
+    let catalog_fingerprint = m5_catalog().fingerprint();
+    let persisted_begin: PersistedBeginRow = sqlx::query_as(
+        "SELECT course_id, hole, par, catalog_sha256, seed, weather, wind_speed_tenths, \
+                    wind_angle_degrees, reward_formula, status FROM matches WHERE id::text = $1",
+    )
+    .bind(started.match_id().to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("persisted begin");
+    assert_eq!(persisted_begin.0, 1);
+    assert_eq!((persisted_begin.1, persisted_begin.2), (1, 3));
+    assert_eq!(persisted_begin.3, catalog_fingerprint.as_bytes());
+    assert_eq!(persisted_begin.4, started.seed());
+    assert_eq!(
+        persisted_begin.5,
+        match expected_weather {
+            Weather::Clear => "clear",
+            Weather::Cloudy => "cloudy",
+            Weather::Rain => "rain",
+        }
+    );
+    assert_eq!(
+        persisted_begin.6,
+        i16::try_from(expected_wind.speed_tenths()).expect("speed")
+    );
+    assert_eq!(
+        persisted_begin.7,
+        i16::try_from(expected_wind.angle_degrees()).expect("angle")
+    );
+    assert_eq!(
+        (&persisted_begin.8, &persisted_begin.9),
+        (&"solo-v1".to_owned(), &"loading".to_owned())
+    );
+
+    enter_playing(&mut client, &started).await;
+    let action_power_canary = f32::from_bits(0x42f6_abcd);
+    let result_x_canary = f32::from_bits(0x42ca_dcba);
+    let first_action =
+        ShotAction::new(1, 0, action_power_canary, 10.25, 0.5, -0.25).expect("action one");
+    let first_result =
+        ShotResult::new(1, result_x_canary, 2.5, -3.75, Lie::Fairway, false).expect("result one");
+    relay_shot(&mut client, 6, first_action, first_result).await;
+    let second_action = ShotAction::new(2, 1, 77.0, -5.0, 0.0, 0.0).expect("action two");
+    let second_result = ShotResult::new(2, 0.125, 0.25, 0.5, Lie::Green, true).expect("result two");
+    relay_shot(&mut client, 8, second_action, second_result).await;
+
+    let before_finish: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT m.status, \
+            (SELECT count(*) FROM match_players WHERE match_id = m.id), \
+            (SELECT count(*) FROM currency_ledger WHERE match_id = m.id), \
+            (SELECT count(*) FROM progression_ledger WHERE match_id = m.id), \
+            (SELECT count(*) FROM match_audit_events WHERE match_id = m.id), \
+            (SELECT pang + experience FROM profiles WHERE account_id = $2) \
+         FROM matches m WHERE m.id::text = $1",
+    )
+    .bind(started.match_id().to_string())
+    .bind(client.account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("pre-finish snapshot");
+    assert_eq!(before_finish, ("in_game".to_owned(), 1, 0, 0, 1, 0));
+
+    let (hole, balance) = finish_solo(&mut client, &started).await;
+    assert_eq!(hole.match_id(), started.match_id());
+    assert_eq!(hole.hole(), 1);
+    assert_eq!(hole.strokes(), 2);
+    assert_eq!(hole.score(), -1);
+    assert_eq!(hole.pang(), 12);
+    assert_eq!(hole.experience(), 5);
+    assert_ne!(hole.result_id().as_u128(), 0);
+    assert_eq!(balance, BalanceUpdate::new(12, 5));
+
+    let committed: (String, String, i16, i16, bool, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT m.status, m.result_commit_key::text, mp.strokes, mp.score, mp.quit, \
+                mp.pang_reward, mp.experience_reward, mp.pang_balance_after, \
+                mp.experience_balance_after FROM matches m JOIN match_players mp \
+                ON mp.match_id = m.id WHERE m.id::text = $1",
+    )
+    .bind(started.match_id().to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("committed match");
+    assert_eq!(committed.0, "committed");
+    assert_eq!(committed.1, hole.result_id().to_string());
+    assert_eq!((committed.2, committed.3, committed.4), (2, -1, false));
+    assert_eq!(
+        (committed.5, committed.6, committed.7, committed.8),
+        (12, 5, 12, 5)
+    );
+    let history: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM progression_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM match_audit_events WHERE match_id::text = $1), \
+                (SELECT pang FROM profiles WHERE account_id = $2), \
+                (SELECT experience FROM profiles WHERE account_id = $2)",
+    )
+    .bind(started.match_id().to_string())
+    .bind(client.account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("committed history");
+    assert_eq!(history, (1, 1, 2, 12, 5));
+    let audits: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event, outcome, reason FROM match_audit_events WHERE match_id::text = $1 ORDER BY id",
+    )
+    .bind(started.match_id().to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("audits");
+    assert_eq!(
+        audits,
+        vec![
+            ("started".to_owned(), "success".to_owned(), None),
+            ("committed".to_owned(), "success".to_owned(), None),
+        ]
+    );
+
+    send_typed(&mut client.stream, client.key, 11, &FinishHole::new()).await;
+    assert_closed(&mut client.stream).await;
+    let history_after_duplicate: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM progression_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM match_audit_events WHERE match_id::text = $1), \
+                (SELECT pang FROM profiles WHERE account_id = $2), \
+                (SELECT experience FROM profiles WHERE account_id = $2)",
+    )
+    .bind(started.match_id().to_string())
+    .bind(client.account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate history");
+    assert_eq!(history_after_duplicate, history);
+
+    let rendered = metrics.render();
+    for expected in [
+        "pangya_game_match_events_total{event=\"started\"} 1",
+        "pangya_game_match_events_total{event=\"loading_complete\"} 1",
+        "pangya_game_match_events_total{event=\"finished\"} 1",
+        "pangya_game_commit_outcomes_total{outcome=\"begun\"} 1",
+        "pangya_game_commit_outcomes_total{outcome=\"committed\"} 1",
+        "pangya_game_shot_outcomes_total{outcome=\"accepted\"} 4",
+        "pangya_game_matches_active{mode=\"solo_practice\"} 0",
+    ] {
+        let (key, value) = parse_expected_metric(expected);
+        assert_eq!(metric_sample(&rendered, &key), Some(value), "{expected}");
+    }
+    let seed_hex = started
+        .seed()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let action_value_canary = format!("{action_power_canary:?}");
+    let result_value_canary = format!("{result_x_canary:?}");
+    let action_bits_canary = format!("{:08x}", action_power_canary.to_bits());
+    let result_bits_canary = format!("{:08x}", result_x_canary.to_bits());
+    for sensitive in [
+        room_name.as_str(),
+        client.nickname.as_str(),
+        seed_hex.as_str(),
+        committed.1.as_str(),
+        action_value_canary.as_str(),
+        result_value_canary.as_str(),
+        action_bits_canary.as_str(),
+        result_bits_canary.as_str(),
+        client.token.as_str(),
+        "pang=12",
+        "experience=5",
+    ] {
+        assert!(!rendered.contains(sensitive));
+    }
+    let trace_bytes = traces.lock().expect("traces").clone();
+    let trace_text = String::from_utf8_lossy(&trace_bytes[trace_start..]);
+    for sensitive in [
+        room_name.as_str(),
+        client.nickname.as_str(),
+        seed_hex.as_str(),
+        committed.1.as_str(),
+        action_value_canary.as_str(),
+        result_value_canary.as_str(),
+        action_bits_canary.as_str(),
+        result_bits_canary.as_str(),
+        client.token.as_str(),
+        "pang=12",
+        "experience=5",
+    ] {
+        assert!(!trace_text.contains(sensitive), "trace leaked {sensitive}");
+    }
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("first service shutdown")
+        .expect("first service join")
+        .expect("first service serve");
+
+    let restart_metrics = Arc::new(M2Metrics::default());
+    let restarted = solo_service(
+        pool.clone(),
+        limits,
+        restart_metrics,
+        Duration::from_secs(2),
+        20,
+    );
+    let (address, shutdown, task) = start_service(restarted).await;
+    let fresh_token = issue_token(
+        &pool,
+        client.account_id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut fresh, key) = connect_game(address).await;
+    send_packet(
+        &mut fresh,
+        key,
+        12,
+        2,
+        &auth_payload(client.account_id.get(), &fresh_token),
+    )
+    .await;
+    let player = read_player_info(&mut fresh, key).await;
+    assert_eq!(
+        player.0,
+        u64::try_from(client.account_id.get()).expect("account")
+    );
+    assert_eq!(player.1, client.nickname.as_bytes());
+    assert_eq!((player.2, player.3, player.4), (12, 0, 5));
+    read_bootstrap_after_player(&mut fresh, key, 1).await;
+    let unchanged: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, \
+                (SELECT count(*) FROM currency_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM progression_ledger WHERE match_id::text = $1), \
+                (SELECT count(*) FROM match_audit_events WHERE match_id::text = $1) \
+         FROM matches WHERE id::text = $1",
+    )
+    .bind(started.match_id().to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("restart persistence");
+    assert_eq!(unchanged, ("committed".to_owned(), 1, 1, 2));
+    shutdown.cancel();
+    task.await.expect("restart join").expect("restart serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m5_unclean_in_game_restart_recovers_before_fresh_auth(pool: PgPool) {
+    let limits = GameRuntimeLimits {
+        global_connections: 4,
+        connections_per_source: 4,
+        global_auth_per_window: 10,
+        auth_per_window: 10,
+        ..GameRuntimeLimits::default()
+    };
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        Arc::new(M2Metrics::default()),
+        Duration::from_secs(2),
+        20,
+    );
+    let (address, _shutdown, task) = start_service(service).await;
+    let mut client = connect_m5_owner(&pool, address, "M5Unclean", "Unclean Recovery").await;
+    let started = start_solo(&mut client).await;
+    enter_playing(&mut client, &started).await;
+    let match_id = started.match_id().to_string();
+    let account_id = client.account_id;
+    let status: String = sqlx::query_scalar("SELECT status FROM matches WHERE id::text = $1")
+        .bind(&match_id)
+        .fetch_one(&pool)
+        .await
+        .expect("durable in-game status");
+    assert_eq!(status, "in_game");
+
+    // Simulate process loss: abort supervision without allowing connection or lobby cleanup.
+    task.abort();
+    assert!(task.await.expect_err("unclean task abort").is_cancelled());
+    drop(client);
+    let status: String = sqlx::query_scalar("SELECT status FROM matches WHERE id::text = $1")
+        .bind(&match_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stale in-game status");
+    assert_eq!(status, "in_game");
+
+    // This is the same bounded repository call made by production before listener binding.
+    let repository = PgRepository::new(pool.clone());
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(1),
+        pangya_domain::MatchRepository::abort_incomplete_matches(
+            &repository,
+            IncompleteMatchAbortLimit::new(100).expect("recovery limit"),
+        ),
+    )
+    .await
+    .expect("bounded recovery")
+    .expect("startup recovery");
+    assert_eq!(recovered, 1);
+    wait_for_abort(&pool, &match_id, "startup_recovery").await;
+    assert_no_match_reward(&pool, &match_id, account_id).await;
+
+    // Only after recovery completes is a fresh GameService listener started and authenticated.
+    let service = solo_service(
+        pool.clone(),
+        limits,
+        Arc::new(M2Metrics::default()),
+        Duration::from_secs(2),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(&pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut fresh, key) = connect_game(address).await;
+    send_packet(
+        &mut fresh,
+        key,
+        30,
+        2,
+        &auth_payload(account_id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut fresh, key, 1).await;
+    shutdown.cancel();
+    task.await.expect("fresh join").expect("fresh serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m5_shot_sequence_and_fixed_window_limits_are_independent(pool: PgPool) {
+    let limits = GameRuntimeLimits {
+        global_connections: 4,
+        connections_per_source: 4,
+        global_auth_per_window: 20,
+        auth_per_window: 20,
+        rate_window: Duration::from_secs(2),
+        ..GameRuntimeLimits::default()
+    };
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits,
+        metrics.clone(),
+        Duration::from_secs(1),
+        4,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut client = connect_m5_owner(&pool, address, "M5ShotBound", "Shot Bounds").await;
+    let started = start_solo(&mut client).await;
+    enter_playing(&mut client, &started).await;
+    let action = ShotAction::new(1, 1, 50.0, 0.0, 0.0, 0.0).expect("action");
+    send_typed(&mut client.stream, client.key, 6, &action).await;
+    receive_action_success(&mut client, action).await;
+
+    // Exact duplicate coalesces without another relay, while changed content conflicts.
+    send_typed(&mut client.stream, client.key, 7, &action).await;
+    receive_solo_result(
+        &mut client,
+        SoloCommand::ShotAction,
+        SoloCommandOutcome::Success,
+    )
+    .await;
+    let conflict = ShotAction::new(1, 1, 51.0, 0.0, 0.0, 0.0).expect("conflict");
+    send_typed(&mut client.stream, client.key, 8, &conflict).await;
+    receive_solo_result(
+        &mut client,
+        SoloCommand::ShotAction,
+        SoloCommandOutcome::InvalidSequence,
+    )
+    .await;
+    let result = ShotResult::new(1, 1.0, 2.0, 3.0, Lie::Fairway, false).expect("result");
+    send_typed(&mut client.stream, client.key, 9, &result).await;
+    receive_shot_result_success(&mut client, result).await;
+
+    // The fifth action/result packet hits only the M5 shot budget, not general packet limits.
+    let next = ShotAction::new(2, 1, 50.0, 0.0, 0.0, 0.0).expect("next action");
+    send_typed(&mut client.stream, client.key, 10, &next).await;
+    receive_solo_result(
+        &mut client,
+        SoloCommand::ShotAction,
+        SoloCommandOutcome::Timeout,
+    )
+    .await;
+    send_typed(&mut client.stream, client.key, 11, &next).await;
+    receive_solo_result(
+        &mut client,
+        SoloCommand::ShotAction,
+        SoloCommandOutcome::Timeout,
+    )
+    .await;
+    assert_metric(&metrics, "class=\"shot_packets_connection\"} 2").await;
+    assert_metric(
+        &metrics,
+        "pangya_game_shot_outcomes_total{outcome=\"duplicate\"} 1",
+    )
+    .await;
+    shutdown.cancel();
+    task.await.expect("shot join").expect("shot serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not_reward(
+    pool: PgPool,
+) {
+    let limits = GameRuntimeLimits {
+        global_connections: 8,
+        connections_per_source: 8,
+        global_auth_per_window: 50,
+        auth_per_window: 50,
+        idle_timeout: Duration::from_secs(3),
+        command_timeout: Duration::from_millis(200),
+        shutdown_grace: Duration::from_secs(1),
+        ..GameRuntimeLimits::default()
+    };
+
+    // Disconnect while loading.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_secs(1),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut loading = connect_m5_owner(&pool, address, "M5AbortLoad", "Abort Loading").await;
+    let loading_started = start_solo(&mut loading).await;
+    let loading_id = loading_started.match_id().to_string();
+    let loading_account = loading.account_id;
+    loading.stream.shutdown().await.expect("loading disconnect");
+    drop(loading);
+    wait_for_abort(&pool, &loading_id, "disconnect").await;
+    assert_no_match_reward(&pool, &loading_id, loading_account).await;
+    assert_metric(
+        &metrics,
+        "pangya_game_match_events_total{event=\"aborted\"} 1",
+    )
+    .await;
+    shutdown.cancel();
+    task.await.expect("loading join").expect("loading serve");
+
+    // A fresh service proves presence cleanup without scheduler-yield timing assumptions.
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        Arc::new(M2Metrics::default()),
+        Duration::from_secs(1),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let reconnect_token =
+        issue_token(&pool, loading_account, SystemTime::now(), ServiceKind::Game).await;
+    let (mut reconnect, reconnect_key) = connect_game(address).await;
+    send_packet(
+        &mut reconnect,
+        reconnect_key,
+        20,
+        2,
+        &auth_payload(loading_account.get(), &reconnect_token),
+    )
+    .await;
+    read_bootstrap(&mut reconnect, reconnect_key, 1).await;
+    send_packet(&mut reconnect, reconnect_key, 21, 4, &1_u32.to_le_bytes()).await;
+    assert_eq!(
+        receive_packet(&mut reconnect, reconnect_key).await.0,
+        0x004e
+    );
+    send_typed(
+        &mut reconnect,
+        reconnect_key,
+        22,
+        &LoadingComplete::new(100).expect("loading"),
+    )
+    .await;
+    assert_closed(&mut reconnect).await;
+    assert_no_match_reward(&pool, &loading_id, loading_account).await;
+    shutdown.cancel();
+    task.await
+        .expect("loading reconnect join")
+        .expect("loading reconnect serve");
+
+    // Disconnect after an accepted action in game.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_secs(1),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut playing = connect_m5_owner(&pool, address, "M5AbortPlay", "Abort Playing").await;
+    let playing_started = start_solo(&mut playing).await;
+    enter_playing(&mut playing, &playing_started).await;
+    let action = ShotAction::new(1, 2, 88.0, 0.0, 0.0, 0.0).expect("abort action");
+    send_typed(&mut playing.stream, playing.key, 6, &action).await;
+    receive_action_success(&mut playing, action).await;
+    let playing_id = playing_started.match_id().to_string();
+    let playing_account = playing.account_id;
+    playing.stream.shutdown().await.expect("playing disconnect");
+    drop(playing);
+    wait_for_abort(&pool, &playing_id, "disconnect").await;
+    assert_no_match_reward(&pool, &playing_id, playing_account).await;
+    shutdown.cancel();
+    task.await.expect("playing join").expect("playing serve");
+
+    // Actor loading timeout is visible on the encrypted wire and persisted once.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_millis(150),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut timed = connect_m5_owner(&pool, address, "M5LoadTimeout", "Loading Timeout").await;
+    let timed_started = start_solo(&mut timed).await;
+    let aborted = tokio::time::timeout(
+        Duration::from_secs(1),
+        receive_typed::<MatchAborted>(&mut timed.stream, timed.key),
+    )
+    .await
+    .expect("bounded timeout event");
+    assert_eq!(
+        aborted,
+        MatchAborted::new(timed_started.match_id(), MatchAbortReason::LoadingTimeout)
+    );
+    let timed_id = timed_started.match_id().to_string();
+    wait_for_abort(&pool, &timed_id, "loading_timeout").await;
+    assert_no_match_reward(&pool, &timed_id, timed.account_id).await;
+    for needle in [
+        "pangya_game_match_events_total{event=\"started\"} 1",
+        "pangya_game_match_events_total{event=\"loading_timeout\"} 1",
+        "pangya_game_commit_outcomes_total{outcome=\"begun\"} 1",
+        "pangya_game_matches_active{mode=\"solo_practice\"} 0",
+    ] {
+        assert_metric(&metrics, needle).await;
+    }
+    shutdown.cancel();
+    task.await.expect("timeout join").expect("timeout serve");
+
+    // A non-finite raw action is rejected by protocol decoding; cleanup aborts without reward.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(
+        pool.clone(),
+        limits.clone(),
+        metrics,
+        Duration::from_secs(1),
+        20,
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut malformed = connect_m5_owner(&pool, address, "M5Malformed", "Malformed Shot").await;
+    let malformed_started = start_solo(&mut malformed).await;
+    enter_playing(&mut malformed, &malformed_started).await;
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u32.to_le_bytes());
+    body.push(0);
+    body.extend_from_slice(&f32::NAN.to_le_bytes());
+    body.extend_from_slice(&0_f32.to_le_bytes());
+    body.extend_from_slice(&0_f32.to_le_bytes());
+    body.extend_from_slice(&0_f32.to_le_bytes());
+    send_packet(
+        &mut malformed.stream,
+        malformed.key,
+        7,
+        pangya_protocol::SYNTHETIC_M5_C2S_SHOT_ACTION,
+        &body,
+    )
+    .await;
+    assert_closed(&mut malformed.stream).await;
+    let malformed_id = malformed_started.match_id().to_string();
+    wait_for_abort(&pool, &malformed_id, "disconnect").await;
+    assert_no_match_reward(&pool, &malformed_id, malformed.account_id).await;
+    shutdown.cancel();
+    task.await
+        .expect("malformed join")
+        .expect("malformed serve");
+
+    // Service shutdown drains the active room and persists its terminal reason.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = solo_service(pool.clone(), limits, metrics, Duration::from_secs(1), 20);
+    let (address, shutdown, task) = start_service(service).await;
+    let mut stopping = connect_m5_owner(&pool, address, "M5Shutdown", "Shutdown Match").await;
+    send_typed(&mut stopping.stream, stopping.key, 4, &StartSolo::new()).await;
+    receive_solo_result(
+        &mut stopping,
+        SoloCommand::StartSolo,
+        SoloCommandOutcome::Success,
+    )
+    .await;
+    // Cancel before draining SoloStarted/Loading so cleanup cannot depend on lagging local state.
+    let stopping_account = stopping.account_id;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shutdown bound")
+        .expect("shutdown join")
+        .expect("shutdown serve");
+    let stopping_id: String = sqlx::query_scalar(
+        "SELECT id::text FROM matches WHERE id IN \
+         (SELECT match_id FROM match_players WHERE account_id = $1)",
+    )
+    .bind(stopping_account.get())
+    .fetch_one(&pool)
+    .await
+    .expect("shutdown match ID");
+    wait_for_abort(&pool, &stopping_id, "shutdown").await;
+    assert_no_match_reward(&pool, &stopping_id, stopping_account).await;
+    assert_closed_after_draining(&mut stopping.stream).await;
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn game_connection_task_bound_and_shutdown_grace_are_enforced(pool: PgPool) {
     let limits = GameRuntimeLimits {
         global_connections: 2,
@@ -2159,10 +3270,12 @@ async fn game_connection_task_bound_and_shutdown_grace_are_enforced(pool: PgPool
     let mut excess = TcpStream::connect(address).await.expect("excess connect");
     assert_closed(&mut excess).await;
     assert_metric(&metrics, "class=\"connection_global\"} 1").await;
-    assert!(
-        metrics
-            .render()
-            .contains("pangya_connections_active{service=\"game\"} 2")
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_connections_active{service=\"game\"}",
+        ),
+        Some(2.0)
     );
     shutdown.cancel();
     tokio::time::timeout(Duration::from_millis(200), task)
@@ -2170,9 +3283,11 @@ async fn game_connection_task_bound_and_shutdown_grace_are_enforced(pool: PgPool
         .expect("shutdown grace bound")
         .expect("join")
         .expect("serve");
-    assert!(
-        metrics
-            .render()
-            .contains("pangya_connections_active{service=\"game\"} 0")
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_connections_active{service=\"game\"}",
+        ),
+        Some(0.0)
     );
 }

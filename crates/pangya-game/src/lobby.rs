@@ -12,9 +12,9 @@ use std::{
 
 use futures_util::{StreamExt as _, stream::FuturesOrdered};
 use pangya_domain::{
-    AbortMatch, BeginSoloMatch, ChatText, CommitSoloHole, MatchAbortReason, MatchId,
-    MatchResultKey, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword, RoomSettings,
-    RoomSnapshot, RoomSummary, SoloMatchResult,
+    AbortMatch, BeginSoloMatch, ChatText, CommitSoloHole, MarkSoloInGame, MatchAbortReason,
+    MatchId, MatchResultKey, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword,
+    RoomSettings, RoomSnapshot, RoomSummary, SoloMatchResult,
 };
 use pangya_protocol::{LoadingComplete, ShotAction, ShotResult};
 use tokio::{
@@ -193,6 +193,8 @@ pub enum LobbySoloCommand {
 pub enum LobbySoloRouteResult {
     /// Immutable begin request for persistence.
     Begin(BeginSoloMatch),
+    /// Authoritative in-game transition request for persistence.
+    InGame(MarkSoloInGame),
     /// Server-owned commit request for persistence.
     Commit(CommitSoloHole),
     /// Trusted committed result emitted and match cleared.
@@ -316,6 +318,7 @@ enum LobbyCommand {
 enum LobbyControl {
     Disconnect {
         connection_id: PlayerConnectionId,
+        reason: MatchAbortReason,
         reply: oneshot::Sender<Result<Option<AbortMatch>, RoomError>>,
     },
     Shutdown {
@@ -478,11 +481,22 @@ impl LobbyHandle {
         &self,
         connection_id: PlayerConnectionId,
     ) -> Result<Option<AbortMatch>, RoomError> {
+        self.disconnect_with_reason(connection_id, MatchAbortReason::Disconnect)
+            .await
+    }
+
+    /// Routes cleanup through the priority queue with an authoritative abort reason.
+    pub async fn disconnect_with_reason(
+        &self,
+        connection_id: PlayerConnectionId,
+        reason: MatchAbortReason,
+    ) -> Result<Option<AbortMatch>, RoomError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send_control(
             LobbyControl::Disconnect {
                 connection_id,
+                reason,
                 reply,
             },
             Arc::clone(&gate),
@@ -793,6 +807,7 @@ impl LobbyRegistry {
     async fn disconnect_connection(
         &mut self,
         connection_id: PlayerConnectionId,
+        reason: MatchAbortReason,
     ) -> Result<Option<AbortMatch>, RoomError> {
         let room_id = self.room_for(connection_id)?;
         let handle = self
@@ -800,7 +815,7 @@ impl LobbyRegistry {
             .get(&room_id)
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
-        match handle.disconnect_with_abort(connection_id).await {
+        match handle.disconnect_with_abort(connection_id, reason).await {
             Ok(outcome) => {
                 self.connections.remove(&connection_id);
                 if let Some(abort) = outcome.abort {
@@ -917,7 +932,7 @@ impl LobbyRegistry {
             LobbySoloCommand::LoadingComplete(loading) => handle
                 .solo_loading_complete(connection_id, loading)
                 .await
-                .map(|()| LobbySoloRouteResult::Applied),
+                .map(LobbySoloRouteResult::InGame),
             LobbySoloCommand::ShotAction(action) => handle
                 .solo_action(connection_id, action)
                 .await
@@ -1083,8 +1098,8 @@ async fn run_lobby(
         tokio::select! {
             biased;
             control = controls.recv() => match control.and_then(begin) {
-                Some(LobbyControl::Disconnect { connection_id, reply }) => {
-                    let result = registry.disconnect_connection(connection_id).await;
+                Some(LobbyControl::Disconnect { connection_id, reason, reply }) => {
+                    let result = registry.disconnect_connection(connection_id, reason).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyControl::Shutdown { reply }) => {
@@ -1482,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priority_disconnect_survives_saturated_normal_queue() {
+    async fn priority_disconnect_reason_survives_saturated_normal_queue() {
         let mut policy = limits(4);
         policy.command_capacity = nonzero(2);
         policy.command_timeout = Duration::from_millis(100);
@@ -1545,7 +1560,11 @@ mod tests {
         );
         let disconnect = {
             let lobby = lobby.clone();
-            tokio::spawn(async move { lobby.disconnect(id(1)).await })
+            tokio::spawn(async move {
+                lobby
+                    .disconnect_with_reason(id(1), MatchAbortReason::Shutdown)
+                    .await
+            })
         };
         tokio::task::yield_now().await;
         assert!(release.send(()).is_ok());
@@ -1555,7 +1574,7 @@ mod tests {
             .unwrap_or_else(|_| unreachable!())
             .unwrap_or_else(|| unreachable!());
         assert_eq!(abort.match_id(), plan.begin().match_id());
-        assert_eq!(abort.reason(), MatchAbortReason::Disconnect);
+        assert_eq!(abort.reason(), MatchAbortReason::Shutdown);
         let listed = lobby.list().await.unwrap_or_default();
         assert!(listed.iter().all(|summary| summary.id() != room.id()));
         assert!(lobby.shutdown().await.is_ok());

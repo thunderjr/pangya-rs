@@ -1046,6 +1046,53 @@ pub enum BeginSoloMatchOutcome {
     Existing,
 }
 
+/// Authoritative identity used to durably mark a loaded solo match in game.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkSoloInGame {
+    match_id: MatchId,
+    result_key: MatchResultKey,
+    account_id: AccountId,
+}
+
+impl MarkSoloInGame {
+    /// Constructs an in-game transition request from server-owned begin identity.
+    #[must_use]
+    pub const fn new(match_id: MatchId, result_key: MatchResultKey, account_id: AccountId) -> Self {
+        Self {
+            match_id,
+            result_key,
+            account_id,
+        }
+    }
+
+    /// Durable match ID.
+    #[must_use]
+    pub const fn match_id(self) -> MatchId {
+        self.match_id
+    }
+
+    /// Authoritative result key.
+    #[must_use]
+    pub const fn result_key(self) -> MatchResultKey {
+        self.result_key
+    }
+
+    /// Authoritative participant.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+}
+
+/// Outcome of the checked loading-to-in-game persistence transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkSoloInGameOutcome {
+    /// Loading was transitioned to in-game.
+    Marked,
+    /// The exact authoritative match was already in-game.
+    Existing,
+}
+
 /// Stable reason for terminating a synthetic match without reward.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MatchAbortReason {
@@ -1420,6 +1467,12 @@ pub trait MatchRepository: Send + Sync {
         &self,
         request: BeginSoloMatch,
     ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>>;
+
+    /// Marks an exact loaded solo match in-game, idempotently.
+    fn mark_solo_in_game(
+        &self,
+        request: MarkSoloInGame,
+    ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>>;
 
     /// Aborts a noncommitted match without reward, idempotently.
     fn abort(

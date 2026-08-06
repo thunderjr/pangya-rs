@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE matches SET status = 'in_game' WHERE id = $1 AND status = 'loading'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa86a0a265b352d85e533d8cd9d79d1c6b98e3b766e9ea4f990f9a1a047080c2"
+}

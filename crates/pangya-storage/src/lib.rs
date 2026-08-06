@@ -18,11 +18,12 @@ use pangya_domain::{
     BeginSoloMatchOutcome, Character, CharacterId, CommitSoloHole, ConsumeHandover, CredentialHash,
     EquipmentSet, EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository,
     IncompleteMatchAbortLimit, InventoryItem, InventoryItemId, ItemTypeId, MAX_PLAYER_CHARACTERS,
-    MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, NewAccount, NewHandover, Nickname, NormalizedNickname,
-    NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile, RepositoryError,
-    RepositoryFuture, ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey,
-    StrokeCount, Weather, WindConditions, synthetic_solo_reward_v1,
+    MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
+    MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
+    NewHandover, Nickname, NormalizedNickname, NormalizedUsername, PlayerRepository,
+    PlayerSnapshot, Profile, RepositoryError, RepositoryFuture, ServiceKind, SetupState,
+    SoloMatchResult, StarterGrant, StarterKey, StrokeCount, Weather, WindConditions,
+    synthetic_solo_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -634,6 +635,37 @@ impl PgRepository {
         Ok(BeginSoloMatchOutcome::Existing)
     }
 
+    async fn mark_solo_in_game_inner(
+        &self,
+        request: MarkSoloInGame,
+    ) -> Result<MarkSoloInGameOutcome, MatchRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(match_db_error)?;
+        let row = lock_match(&mut transaction, request.match_id()).await?;
+        validate_authority(&row, request.account_id(), request.result_key())?;
+        let outcome = match row.status.as_str() {
+            "loading" => {
+                let updated = sqlx::query!(
+                    "UPDATE matches SET status = 'in_game' WHERE id = $1 AND status = 'loading'",
+                    request.match_id().get()
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(match_db_error)?;
+                if updated.rows_affected() != 1 {
+                    return Err(MatchRepositoryError::Storage);
+                }
+                MarkSoloInGameOutcome::Marked
+            }
+            "in_game" => MarkSoloInGameOutcome::Existing,
+            "committed" | "aborted" | "results_pending" => {
+                return Err(MatchRepositoryError::InvalidStatus);
+            }
+            _ => return Err(MatchRepositoryError::CorruptData),
+        };
+        transaction.commit().await.map_err(match_db_error)?;
+        Ok(outcome)
+    }
+
     async fn abort_match_inner(
         &self,
         request: AbortMatch,
@@ -709,8 +741,20 @@ impl PgRepository {
                 return Ok(result);
             }
             "aborted" => return Err(MatchRepositoryError::Aborted),
-            "loading" | "in_game" | "results_pending" => {}
+            "in_game" | "results_pending" => {}
+            "loading" => return Err(MatchRepositoryError::InvalidStatus),
             _ => return Err(MatchRepositoryError::CorruptData),
+        }
+
+        let pending = sqlx::query!(
+            "UPDATE matches SET status = 'results_pending' WHERE id = $1",
+            request.match_id().get()
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(match_db_error)?;
+        if pending.rows_affected() != 1 {
+            return Err(MatchRepositoryError::Storage);
         }
 
         let balances = sqlx::query!(
@@ -968,6 +1012,13 @@ impl MatchRepository for PgRepository {
         request: BeginSoloMatch,
     ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
         Box::pin(self.begin_solo_inner(request))
+    }
+
+    fn mark_solo_in_game(
+        &self,
+        request: MarkSoloInGame,
+    ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>> {
+        Box::pin(self.mark_solo_in_game_inner(request))
     }
 
     fn abort(

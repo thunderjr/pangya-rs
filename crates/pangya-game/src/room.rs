@@ -3,9 +3,10 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use pangya_domain::{
-    AbortMatch, AccountId, BeginSoloMatch, ChatText, CommitSoloHole, MatchAbortReason, MatchId,
-    MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId, RoomError, RoomId, RoomName,
-    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, SoloMatchResult,
+    AbortMatch, AccountId, BeginSoloMatch, ChatText, CommitSoloHole, MarkSoloInGame,
+    MatchAbortReason, MatchId, MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId,
+    RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
+    SoloMatchResult,
 };
 use pangya_protocol::{LoadingComplete, ShotAction, ShotResult};
 use rand::{RngCore as _, rngs::OsRng};
@@ -465,20 +466,17 @@ impl RoomState {
         &mut self,
         caller: PlayerConnectionId,
         loading: LoadingComplete,
-    ) -> Result<(), SoloMatchError> {
+    ) -> Result<MarkSoloInGame, SoloMatchError> {
         self.solo_owner(caller)?;
-        let match_id = self
-            .solo
-            .start_plan()
-            .map(|plan| plan.begin().match_id())
-            .ok_or(SoloMatchError::InvalidPhase)?;
+        let begin = self.solo.begin().ok_or(SoloMatchError::InvalidPhase)?;
+        let mark = MarkSoloInGame::new(begin.match_id(), begin.result_key(), begin.account_id());
         self.solo.loading_complete(loading.progress())?;
         self.loading_deadline = None;
         self.deliver_solo(RoomEvent::SoloPhase {
-            match_id,
+            match_id: mark.match_id(),
             phase: self.solo.phase(),
         });
-        Ok(())
+        Ok(mark)
     }
 
     fn solo_action(
@@ -656,7 +654,7 @@ enum RoomCommand {
     SoloLoading {
         caller: PlayerConnectionId,
         loading: LoadingComplete,
-        reply: oneshot::Sender<Result<(), SoloMatchError>>,
+        reply: oneshot::Sender<Result<MarkSoloInGame, SoloMatchError>>,
     },
     SoloAction {
         caller: PlayerConnectionId,
@@ -701,6 +699,7 @@ pub struct RoomDisconnect {
 enum ControlCommand {
     Disconnect {
         caller: PlayerConnectionId,
+        reason: MatchAbortReason,
         reply: oneshot::Sender<Result<RoomDisconnect, RoomError>>,
     },
     Shutdown {
@@ -901,7 +900,7 @@ impl RoomHandle {
         &self,
         caller: PlayerConnectionId,
         loading: LoadingComplete,
-    ) -> Result<(), SoloMatchError> {
+    ) -> Result<MarkSoloInGame, SoloMatchError> {
         let (reply, receive) = oneshot::channel();
         self.send_solo(RoomCommand::SoloLoading {
             caller,
@@ -1011,7 +1010,7 @@ impl RoomHandle {
         &self,
         caller: PlayerConnectionId,
     ) -> Result<Option<RoomSnapshot>, RoomError> {
-        self.disconnect_with_abort(caller)
+        self.disconnect_with_abort(caller, MatchAbortReason::Disconnect)
             .await
             .map(|outcome| outcome.snapshot)
     }
@@ -1020,10 +1019,15 @@ impl RoomHandle {
     pub async fn disconnect_with_abort(
         &self,
         caller: PlayerConnectionId,
+        reason: MatchAbortReason,
     ) -> Result<RoomDisconnect, RoomError> {
         let (reply, receive) = oneshot::channel();
-        self.send_control(ControlCommand::Disconnect { caller, reply })
-            .await?;
+        self.send_control(ControlCommand::Disconnect {
+            caller,
+            reason,
+            reply,
+        })
+        .await?;
         receive.await.map_err(|_| RoomError::Closed)?
     }
 
@@ -1134,11 +1138,11 @@ async fn run_room(
                 let _abort = state.mark_aborted(MatchAbortReason::LoadingTimeout);
             }
             command = control.recv() => match command {
-                Some(ControlCommand::Disconnect { caller, reply }) => {
+                Some(ControlCommand::Disconnect { caller, reason, reply }) => {
                     let result = if state.member_index(caller).is_none() {
                         Err(RoomError::NotMember)
                     } else {
-                        let abort = state.mark_aborted(MatchAbortReason::Disconnect);
+                        let abort = state.mark_aborted(reason);
                         state.remove(caller).map(|snapshot| RoomDisconnect { snapshot, abort })
                     };
                     if let Ok(outcome) = &result {
@@ -1789,6 +1793,7 @@ mod tests {
             control_tx
                 .try_send(ControlCommand::Disconnect {
                     caller: id(1),
+                    reason: MatchAbortReason::Disconnect,
                     reply,
                 })
                 .is_ok()
@@ -1833,6 +1838,7 @@ mod tests {
             control_tx
                 .try_send(ControlCommand::Disconnect {
                     caller: id(1),
+                    reason: MatchAbortReason::Disconnect,
                     reply: disconnect_reply,
                 })
                 .is_ok()

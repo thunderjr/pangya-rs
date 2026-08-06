@@ -7,11 +7,11 @@ use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AccountRepository, AccountStatus, BeginSoloMatch,
     BeginSoloMatchOutcome, CatalogFingerprint, CommitSoloHole, ConsumeHandover, CourseId,
     CredentialHash, HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
-    ItemTypeId, MAX_STARTER_ITEMS, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
-    OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCount, Username, Weather,
-    WindConditions,
+    ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MatchAbortReason,
+    MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
+    Nickname, NormalizedUsername, OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCount,
+    Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -809,6 +809,10 @@ fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
     )
 }
 
+fn solo_mark(begin: &BeginSoloMatch) -> MarkSoloInGame {
+    MarkSoloInGame::new(begin.match_id(), begin.result_key(), begin.account_id())
+}
+
 fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
     CommitSoloHole::new(
         begin.match_id(),
@@ -912,6 +916,125 @@ async fn match_counts(pool: &PgPool, match_id: MatchId) -> (i64, i64, i64, i64) 
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn solo_in_game_transition_is_checked_idempotent_and_atomic(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let owner = repository
+        .create_account(account("SoloMarkOwner", Some("MarkOwner")))
+        .await
+        .expect("owner");
+    let other = repository
+        .create_account(account("SoloMarkOther", Some("MarkOther")))
+        .await
+        .expect("other");
+
+    let committed = solo_begin(owner.account.id);
+    repository
+        .begin_solo(committed.clone())
+        .await
+        .expect("begin committed candidate");
+    assert_eq!(
+        repository
+            .mark_solo_in_game(MarkSoloInGame::new(
+                committed.match_id(),
+                committed.result_key(),
+                other.account.id,
+            ))
+            .await,
+        Err(MatchRepositoryError::WrongAccount)
+    );
+    assert_eq!(
+        repository
+            .mark_solo_in_game(MarkSoloInGame::new(
+                committed.match_id(),
+                MatchResultKey::new(Uuid::new_v4()),
+                committed.account_id(),
+            ))
+            .await,
+        Err(MatchRepositoryError::WrongResultKey)
+    );
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&committed)).await,
+        Ok(MarkSoloInGameOutcome::Marked)
+    );
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&committed)).await,
+        Ok(MarkSoloInGameOutcome::Existing)
+    );
+    repository
+        .commit_solo_hole(solo_commit(&committed, 2))
+        .await
+        .expect("commit");
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&committed)).await,
+        Err(MatchRepositoryError::InvalidStatus)
+    );
+
+    let aborted = solo_begin(owner.account.id);
+    repository
+        .begin_solo(aborted.clone())
+        .await
+        .expect("begin aborted candidate");
+    repository
+        .abort(AbortMatch::new(
+            aborted.match_id(),
+            aborted.result_key(),
+            aborted.account_id(),
+            MatchAbortReason::Disconnect,
+        ))
+        .await
+        .expect("abort");
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&aborted)).await,
+        Err(MatchRepositoryError::InvalidStatus)
+    );
+
+    let wrong_status = solo_begin(owner.account.id);
+    repository
+        .begin_solo(wrong_status.clone())
+        .await
+        .expect("begin wrong status");
+    sqlx::query("UPDATE matches SET status = 'results_pending' WHERE id = $1")
+        .bind(wrong_status.match_id().get())
+        .execute(&pool)
+        .await
+        .expect("set wrong status");
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&wrong_status)).await,
+        Err(MatchRepositoryError::InvalidStatus)
+    );
+
+    let rollback = solo_begin(owner.account.id);
+    repository
+        .begin_solo(rollback.clone())
+        .await
+        .expect("begin rollback candidate");
+    sqlx::query(
+        "CREATE FUNCTION test_fail_mark_in_game() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected mark failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("mark failure function");
+    sqlx::query(
+        "CREATE TRIGGER test_fail_mark_in_game BEFORE UPDATE ON matches \
+         FOR EACH ROW WHEN (NEW.status = 'in_game') EXECUTE FUNCTION test_fail_mark_in_game()",
+    )
+    .execute(&pool)
+    .await
+    .expect("mark failure trigger");
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&rollback)).await,
+        Err(MatchRepositoryError::Storage)
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM matches WHERE id = $1")
+        .bind(rollback.match_id().get())
+        .fetch_one(&pool)
+        .await
+        .expect("rollback status");
+    assert_eq!(status, "loading");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn solo_match_commit_is_exactly_once_for_sequential_and_concurrent_replay(pool: PgPool) {
     let repository = PgRepository::new(pool.clone());
     let aggregate = repository
@@ -926,6 +1049,10 @@ async fn solo_match_commit_is_exactly_once_for_sequential_and_concurrent_replay(
     assert_eq!(
         repository.begin_solo(begin.clone()).await,
         Ok(BeginSoloMatchOutcome::Existing)
+    );
+    assert_eq!(
+        repository.mark_solo_in_game(solo_mark(&begin)).await,
+        Ok(MarkSoloInGameOutcome::Marked)
     );
     let commit = solo_commit(&begin, 2);
     let (left, right) = tokio::join!(
@@ -984,6 +1111,14 @@ async fn distinct_matches_commit_concurrently_for_one_account_without_lost_rewar
         .begin_solo(second.clone())
         .await
         .expect("second begin");
+    repository
+        .mark_solo_in_game(solo_mark(&first))
+        .await
+        .expect("first in game");
+    repository
+        .mark_solo_in_game(solo_mark(&second))
+        .await
+        .expect("second in game");
 
     let (first_result, second_result) = tokio::join!(
         repository.commit_solo_hole(solo_commit(&first, 2)),
@@ -1082,6 +1217,10 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
         .expect("second account");
     let begin = solo_begin(first.account.id);
     repository.begin_solo(begin.clone()).await.expect("begin");
+    repository
+        .mark_solo_in_game(solo_mark(&begin))
+        .await
+        .expect("in game");
     let drift = BeginSoloMatch::new(
         begin.match_id(),
         begin.result_key(),
@@ -1144,6 +1283,10 @@ async fn balance_overflow_rolls_back_result_ledgers_audit_and_profile(pool: PgPo
         .expect("account");
     let begin = solo_begin(aggregate.account.id);
     repository.begin_solo(begin.clone()).await.expect("begin");
+    repository
+        .mark_solo_in_game(solo_mark(&begin))
+        .await
+        .expect("in game");
     sqlx::query("UPDATE profiles SET pang = $2 WHERE account_id = $1")
         .bind(aggregate.account.id.get())
         .bind(i64::MAX)
@@ -1164,7 +1307,7 @@ async fn balance_overflow_rolls_back_result_ledgers_audit_and_profile(pool: PgPo
     .fetch_one(&pool)
     .await
     .expect("state");
-    assert_eq!(state, ("loading".to_owned(), i64::MAX, 0));
+    assert_eq!(state, ("in_game".to_owned(), i64::MAX, 0));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
@@ -1429,6 +1572,12 @@ async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: P
     .await
     .expect("failure function");
     let stages = [
+        (
+            "match pending",
+            "matches",
+            "UPDATE",
+            "WHEN (NEW.status = 'results_pending')",
+        ),
         ("profile", "profiles", "UPDATE", ""),
         ("pang ledger", "currency_ledger", "INSERT", ""),
         ("experience ledger", "progression_ledger", "INSERT", ""),
@@ -1439,7 +1588,12 @@ async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: P
             "INSERT",
             "WHEN (NEW.event = 'committed')",
         ),
-        ("match terminal", "matches", "UPDATE", ""),
+        (
+            "match terminal",
+            "matches",
+            "UPDATE",
+            "WHEN (NEW.status = 'committed')",
+        ),
     ];
     for (index, (stage, table, operation, condition)) in stages.into_iter().enumerate() {
         let aggregate = repository
@@ -1451,6 +1605,10 @@ async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: P
             .expect("account");
         let begin = solo_begin(aggregate.account.id);
         repository.begin_solo(begin.clone()).await.expect("begin");
+        repository
+            .mark_solo_in_game(solo_mark(&begin))
+            .await
+            .expect("in game");
         let trigger = format!(
             "CREATE TRIGGER test_fail_match_stage BEFORE {operation} ON {table} \
              FOR EACH ROW {condition} EXECUTE FUNCTION test_fail_match_commit()"
@@ -1483,7 +1641,7 @@ async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: P
         .fetch_one(&pool)
         .await
         .expect("rolled back state");
-        assert_eq!(state, ("loading".to_owned(), None, 0, 0), "stage {stage}");
+        assert_eq!(state, ("in_game".to_owned(), None, 0, 0), "stage {stage}");
     }
 }
 
@@ -1549,6 +1707,10 @@ async fn ledgers_and_match_audit_reject_updates_and_deletes(pool: PgPool) {
         .expect("account");
     let begin = solo_begin(aggregate.account.id);
     repository.begin_solo(begin.clone()).await.expect("begin");
+    repository
+        .mark_solo_in_game(solo_mark(&begin))
+        .await
+        .expect("in game");
     repository
         .commit_solo_hole(solo_commit(&begin, 2))
         .await
