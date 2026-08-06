@@ -47,6 +47,17 @@ is `1..=30`, `startup_recovery_limit` is `1..=10000`, and
 `shot_packets_per_window` is `1..=1000000`. Startup abort recovery is completed under
 the commit timeout before any Game listener binds; failure prevents readiness.
 
+`[game.stroke_two]` is the independent disabled-by-default synthetic M6 exactly-two,
+one-hole mode. It resolves `course_id` and the catalog fingerprint before listener bind.
+`loading_timeout`, `turn_timeout`, and `game_timeout` must be nonzero and exactly
+representable as `u32` milliseconds; loading is capped at 300 seconds, turn/game at one
+hour, and `turn_timeout` cannot exceed `game_timeout`. `commit_timeout` is capped at 60
+seconds and by `server.shutdown_grace`; `max_strokes`, recovery, and shot-budget bounds
+match solo practice. Its outbound queue must hold at least three events, the actual
+standings/own-balance/finished terminal burst. If either synthetic mode is enabled,
+startup performs generic incomplete-match recovery exactly once using the larger enabled
+recovery cap and timeout before any listener binds.
+
 Catalog loading occurs before any listener bind. The blocking filesystem work is
 noncancellable, but it runs on one detached standard thread rather than Tokio's
 blocking pool; timeout therefore cannot retain the Tokio runtime or delay runtime/

@@ -26,7 +26,7 @@ use pangya_domain::{
 };
 use pangya_game::{
     GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService, LobbyLimits, RoomActorLimits,
-    SoloRuntimeConfig,
+    SoloRuntimeConfig, StrokeRuntimeConfig,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
@@ -189,14 +189,29 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
 async fn bind_after_startup_recovery<R: MatchRepository>(
     repository: &R,
     solo: Option<configuration::ValidatedSoloPractice>,
+    stroke: Option<configuration::ValidatedStrokeTwo>,
     login_bind: SocketAddr,
     http_bind: SocketAddr,
     game_bind: Option<SocketAddr>,
 ) -> Result<(TcpListener, TcpListener, Option<TcpListener>), ServerError> {
-    if let Some(solo) = solo {
+    let recovery = match (solo, stroke) {
+        (None, None) => None,
+        (Some(solo), None) => Some((solo.commit_timeout, solo.startup_recovery_limit)),
+        (None, Some(stroke)) => Some((stroke.commit_timeout, stroke.startup_recovery_limit)),
+        (Some(solo), Some(stroke)) => Some((
+            solo.commit_timeout.max(stroke.commit_timeout),
+            pangya_domain::IncompleteMatchAbortLimit::new(
+                solo.startup_recovery_limit
+                    .get()
+                    .max(stroke.startup_recovery_limit.get()),
+            )
+            .map_err(|_| ServerError::Runtime)?,
+        )),
+    };
+    if let Some((commit_timeout, recovery_limit)) = recovery {
         timeout(
-            solo.commit_timeout,
-            repository.abort_incomplete_matches(solo.startup_recovery_limit),
+            commit_timeout,
+            repository.abort_incomplete_matches(recovery_limit),
         )
         .await
         .map_err(|_| ServerError::Runtime)?
@@ -240,6 +255,30 @@ fn resolve_solo_runtime_config(
     .transpose()
 }
 
+fn resolve_stroke_runtime_config(
+    catalog: &Catalog,
+    stroke: Option<configuration::ValidatedStrokeTwo>,
+) -> Result<Option<StrokeRuntimeConfig>, ServerError> {
+    stroke
+        .map(|stroke| {
+            let course = catalog
+                .one_hole_course(stroke.course_id)
+                .map_err(|_| ServerError::Data)?;
+            Ok(StrokeRuntimeConfig {
+                course,
+                catalog_fingerprint: catalog.fingerprint(),
+                loading_timeout: stroke.loading_timeout,
+                turn_timeout: stroke.turn_timeout,
+                game_timeout: stroke.game_timeout,
+                commit_timeout: stroke.commit_timeout,
+                max_strokes: stroke.max_strokes,
+                startup_recovery_limit: stroke.startup_recovery_limit,
+                shot_packets_per_window: stroke.shot_packets_per_window,
+            })
+        })
+        .transpose()
+}
+
 fn compose_game_service<R>(
     repository: Arc<R>,
     catalog: Catalog,
@@ -278,6 +317,11 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         .map(|catalog| resolve_solo_runtime_config(catalog, config.solo_practice))
         .transpose()?
         .flatten();
+    let stroke_two = catalog
+        .as_ref()
+        .map(|catalog| resolve_stroke_runtime_config(catalog, config.stroke_two))
+        .transpose()?
+        .flatten();
     let metrics = Arc::new(M2Metrics::default());
     let game = match catalog {
         Some(catalog) => Some(compose_game_service(
@@ -288,6 +332,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 unknown_opcode_policy: config.unknown_opcode_policy,
                 limits: game_runtime_limits(&config)?,
                 solo_practice,
+                stroke_two,
             },
             metrics.clone(),
         )?),
@@ -301,6 +346,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let (login_listener, http_listener, game_listener) = bind_after_startup_recovery(
         repository.as_ref(),
         config.solo_practice,
+        config.stroke_two,
         config.login_bind,
         config.http_bind,
         game_bind,
@@ -1076,6 +1122,16 @@ mod tests {
                     commit_timeout: Duration::from_secs(1),
                     max_strokes: 9,
                     startup_recovery_limit: IncompleteMatchAbortLimit::new(10).expect("limit"),
+                    shot_packets_per_window: 80,
+                }),
+                Some(configuration::ValidatedStrokeTwo {
+                    course_id: CourseId::new(7).expect("course"),
+                    loading_timeout: Duration::from_secs(4),
+                    turn_timeout: Duration::from_secs(5),
+                    game_timeout: Duration::from_secs(30),
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 9,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(20).expect("limit"),
                     shot_packets_per_window: 80,
                 }),
                 login,

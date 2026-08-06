@@ -107,6 +107,17 @@ section_default!(SoloPracticeSection {
     startup_recovery_limit: u32 = 1_000,
     shot_packets_per_window: u32 = 120
 });
+section_default!(StrokeTwoSection {
+    enabled: bool = false,
+    course_id: u32 = 7,
+    loading_timeout: String = "30s".to_owned(),
+    turn_timeout: String = "30s".to_owned(),
+    game_timeout: String = "10m".to_owned(),
+    commit_timeout: String = "3s".to_owned(),
+    max_strokes: u8 = 30,
+    startup_recovery_limit: u32 = 1_000,
+    shot_packets_per_window: u32 = 120
+});
 section_default!(GameSection {
     enabled: bool = false,
     bind: String = "127.0.0.1:20201".to_owned(),
@@ -126,7 +137,8 @@ section_default!(GameSection {
     unknown_opcode_strikes: u32 = 3,
     unknown_capture_capacity: usize = 256,
     command_timeout: String = "3s".to_owned(),
-    solo_practice: SoloPracticeSection = SoloPracticeSection::default()
+    solo_practice: SoloPracticeSection = SoloPracticeSection::default(),
+    stroke_two: StrokeTwoSection = StrokeTwoSection::default()
 });
 section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
@@ -295,6 +307,8 @@ pub struct AppConfig {
     pub unknown_opcode_policy: UnknownOpcodePolicy,
     /// Optional validated local-only solo-practice policy.
     pub solo_practice: Option<ValidatedSoloPractice>,
+    /// Optional validated local-only exactly-two stroke policy.
+    pub stroke_two: Option<ValidatedStrokeTwo>,
     /// Admin HTTP listener.
     pub http_bind: SocketAddr,
     /// Enables read-only metrics exposition.
@@ -361,6 +375,27 @@ pub struct ValidatedSoloPractice {
     /// Repository deadline.
     pub commit_timeout: Duration,
     /// Authoritative stroke cap.
+    pub max_strokes: u8,
+    /// Startup recovery cap.
+    pub startup_recovery_limit: IncompleteMatchAbortLimit,
+    /// Per-connection shot packet budget.
+    pub shot_packets_per_window: u32,
+}
+
+/// Validated local-only synthetic exactly-two stroke policy.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedStrokeTwo {
+    /// Catalog course to resolve after loading.
+    pub course_id: CourseId,
+    /// Actor loading barrier deadline.
+    pub loading_timeout: Duration,
+    /// Actor active-turn deadline.
+    pub turn_timeout: Duration,
+    /// Actor whole-game deadline.
+    pub game_timeout: Duration,
+    /// Repository deadline.
+    pub commit_timeout: Duration,
+    /// Authoritative per-player stroke cap.
     pub max_strokes: u8,
     /// Startup recovery cap.
     pub startup_recovery_limit: IncompleteMatchAbortLimit,
@@ -661,6 +696,26 @@ fn validate(
         "game.solo_practice.commit_timeout",
         &mut issues,
     );
+    let stroke_loading_timeout = duration(
+        &raw.game.stroke_two.loading_timeout,
+        "game.stroke_two.loading_timeout",
+        &mut issues,
+    );
+    let stroke_turn_timeout = duration(
+        &raw.game.stroke_two.turn_timeout,
+        "game.stroke_two.turn_timeout",
+        &mut issues,
+    );
+    let stroke_game_timeout = duration(
+        &raw.game.stroke_two.game_timeout,
+        "game.stroke_two.game_timeout",
+        &mut issues,
+    );
+    let stroke_commit_timeout = duration(
+        &raw.game.stroke_two.commit_timeout,
+        "game.stroke_two.commit_timeout",
+        &mut issues,
+    );
 
     for (field, zero) in [
         ("game.id", raw.game.id == 0),
@@ -799,6 +854,18 @@ fn validate(
             "game.solo_practice.shot_packets_per_window",
             raw.game.solo_practice.shot_packets_per_window == 0,
         ),
+        (
+            "game.stroke_two.course_id",
+            raw.game.stroke_two.course_id == 0,
+        ),
+        (
+            "game.stroke_two.startup_recovery_limit",
+            raw.game.stroke_two.startup_recovery_limit == 0,
+        ),
+        (
+            "game.stroke_two.shot_packets_per_window",
+            raw.game.stroke_two.shot_packets_per_window == 0,
+        ),
     ] {
         if zero {
             issue(
@@ -935,6 +1002,14 @@ fn validate(
             "game.solo_practice.shot_packets_per_window",
             raw.game.solo_practice.shot_packets_per_window > 1_000_000,
         ),
+        (
+            "game.stroke_two.startup_recovery_limit",
+            raw.game.stroke_two.startup_recovery_limit > IncompleteMatchAbortLimit::MAX,
+        ),
+        (
+            "game.stroke_two.shot_packets_per_window",
+            raw.game.stroke_two.shot_packets_per_window > 1_000_000,
+        ),
     ] {
         if exceeded {
             issue(&mut issues, field, "exceeds the supported hard upper bound");
@@ -954,6 +1029,13 @@ fn validate(
             "requires game.enabled",
         );
     }
+    if raw.game.stroke_two.enabled && !raw.game.enabled {
+        issue(
+            &mut issues,
+            "game.stroke_two.enabled",
+            "requires game.enabled",
+        );
+    }
     if raw.game.solo_practice.enabled && raw.game.outbound_room_event_capacity < 2 {
         issue(
             &mut issues,
@@ -961,10 +1043,24 @@ fn validate(
             "must be at least 2 when solo practice is enabled",
         );
     }
+    if raw.game.stroke_two.enabled && raw.game.outbound_room_event_capacity < 3 {
+        issue(
+            &mut issues,
+            "game.outbound_room_event_capacity",
+            "must be at least 3 for the stroke standings/balance/finished burst",
+        );
+    }
     if !(1..=30).contains(&raw.game.solo_practice.max_strokes) {
         issue(
             &mut issues,
             "game.solo_practice.max_strokes",
+            "must be within 1..=30",
+        );
+    }
+    if !(1..=30).contains(&raw.game.stroke_two.max_strokes) {
+        issue(
+            &mut issues,
+            "game.stroke_two.max_strokes",
             "must be within 1..=30",
         );
     }
@@ -1046,6 +1142,56 @@ fn validate(
             &mut issues,
             "game.solo_practice.loading_timeout",
             "exceeds the actor or u32 millisecond hard cap",
+        );
+    }
+    if shutdown_grace
+        .zip(stroke_commit_timeout)
+        .is_some_and(|(grace, commit)| commit > grace)
+        || stroke_commit_timeout.is_some_and(|commit| commit > Duration::from_secs(60))
+    {
+        issue(
+            &mut issues,
+            "game.stroke_two.commit_timeout",
+            "must not exceed shutdown grace or the 60 second hard cap",
+        );
+    }
+    for (field, value, maximum) in [
+        (
+            "game.stroke_two.loading_timeout",
+            stroke_loading_timeout,
+            pangya_game::LOADING_TIMEOUT_HARD_CAP,
+        ),
+        (
+            "game.stroke_two.turn_timeout",
+            stroke_turn_timeout,
+            pangya_game::STROKE_GAME_TIMEOUT_HARD_CAP,
+        ),
+        (
+            "game.stroke_two.game_timeout",
+            stroke_game_timeout,
+            pangya_game::STROKE_GAME_TIMEOUT_HARD_CAP,
+        ),
+    ] {
+        if value.is_some_and(|duration| {
+            duration > maximum
+                || duration.as_millis() == 0
+                || duration.as_millis() > u128::from(u32::MAX)
+        }) {
+            issue(
+                &mut issues,
+                field,
+                "exceeds the actor or u32 millisecond hard cap",
+            );
+        }
+    }
+    if stroke_turn_timeout
+        .zip(stroke_game_timeout)
+        .is_some_and(|(turn, game)| turn > game)
+    {
+        issue(
+            &mut issues,
+            "game.stroke_two.turn_timeout",
+            "must not exceed game_timeout",
         );
     }
     for (field, value, maximum) in [
@@ -1217,6 +1363,57 @@ fn validate(
         None
     };
 
+    let stroke_course_id = match CourseId::new(raw.game.stroke_two.course_id) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            issue(
+                &mut issues,
+                "game.stroke_two.course_id",
+                "must be a nonzero course identifier",
+            );
+            None
+        }
+    };
+    let stroke_recovery =
+        match IncompleteMatchAbortLimit::new(raw.game.stroke_two.startup_recovery_limit) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                issue(
+                    &mut issues,
+                    "game.stroke_two.startup_recovery_limit",
+                    "must be within 1..=10000",
+                );
+                None
+            }
+        };
+    let stroke_two = if raw.game.stroke_two.enabled {
+        stroke_course_id
+            .zip(stroke_loading_timeout)
+            .zip(stroke_turn_timeout)
+            .zip(stroke_game_timeout)
+            .zip(stroke_commit_timeout)
+            .zip(stroke_recovery)
+            .map(
+                |(
+                    ((((course_id, loading_timeout), turn_timeout), game_timeout), commit_timeout),
+                    startup_recovery_limit,
+                )| {
+                    ValidatedStrokeTwo {
+                        course_id,
+                        loading_timeout,
+                        turn_timeout,
+                        game_timeout,
+                        commit_timeout,
+                        max_strokes: raw.game.stroke_two.max_strokes,
+                        startup_recovery_limit,
+                        shot_packets_per_window: raw.game.stroke_two.shot_packets_per_window,
+                    }
+                },
+            )
+    } else {
+        None
+    };
+
     let starter = starter(&raw.starter, &mut issues);
     let database_url = resolve_database_url(&raw.database, database_secret, &mut issues);
 
@@ -1250,6 +1447,7 @@ fn validate(
         game_command_timeout: required(game_command_timeout)?,
         unknown_opcode_policy: required(unknown_opcode_policy)?,
         solo_practice,
+        stroke_two,
         http_bind: required(http_bind)?,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
@@ -1877,6 +2075,7 @@ mod tests {
     fn solo_practice_defaults_disabled_and_validates_enablement_and_hard_caps() {
         let defaults = test_load(None, &CliOverrides::default()).expect("defaults");
         assert!(defaults.solo_practice.is_none());
+        assert!(defaults.stroke_two.is_none());
 
         let path = file(
             "[game.solo_practice]\nenabled=true\ncourse_id=0\nloading_timeout='301s'\n\
@@ -1941,6 +2140,66 @@ mod tests {
         assert_eq!(solo.max_strokes, 9);
         assert_eq!(solo.startup_recovery_limit.get(), 50);
         assert_eq!(solo.shot_packets_per_window, 80);
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
+    fn stroke_two_validates_cross_relations_caps_and_terminal_burst_capacity() {
+        let path = file(
+            "[game.stroke_two]\nenabled=true\ncourse_id=0\nloading_timeout='301s'\n\
+             turn_timeout='20s'\ngame_timeout='10s'\ncommit_timeout='61s'\nmax_strokes=31\n\
+             startup_recovery_limit=10001\nshot_packets_per_window=1000001\n",
+        );
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("invalid stroke")
+        else {
+            panic!("expected validation");
+        };
+        let fields = error
+            .issues
+            .iter()
+            .map(|issue| issue.field)
+            .collect::<HashSet<_>>();
+        for expected in [
+            "game.stroke_two.enabled",
+            "game.stroke_two.course_id",
+            "game.stroke_two.loading_timeout",
+            "game.stroke_two.turn_timeout",
+            "game.stroke_two.commit_timeout",
+            "game.stroke_two.max_strokes",
+            "game.stroke_two.startup_recovery_limit",
+            "game.stroke_two.shot_packets_per_window",
+        ] {
+            assert!(fields.contains(expected), "missing {expected}: {fields:?}");
+        }
+        fs::remove_file(path).expect("remove");
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog");
+        let config_text = |capacity| {
+            format!(
+                "[server]\nshutdown_grace='5s'\n[game]\nenabled=true\noutbound_room_event_capacity={capacity}\n\
+                 [game.stroke_two]\nenabled=true\ncourse_id=7\nloading_timeout='2s'\n\
+                 turn_timeout='3s'\ngame_timeout='30s'\ncommit_timeout='2s'\nmax_strokes=9\n\
+                 startup_recovery_limit=50\nshot_packets_per_window=80\n[data]\n\
+                 catalog_required_m3=true\niff_directory='{}'\nmanifest='manifest.toml'\n",
+                root.display()
+            )
+        };
+        let path = file(&config_text(2));
+        assert!(test_load(Some(&path), &CliOverrides::default()).is_err());
+        fs::remove_file(path).expect("remove");
+        let path = file(&config_text(3));
+        let config = test_load(Some(&path), &CliOverrides::default()).expect("valid stroke");
+        let stroke = config.stroke_two.expect("enabled stroke");
+        assert_eq!(stroke.course_id.get(), 7);
+        assert_eq!(stroke.loading_timeout, Duration::from_secs(2));
+        assert_eq!(stroke.turn_timeout, Duration::from_secs(3));
+        assert_eq!(stroke.game_timeout, Duration::from_secs(30));
+        assert_eq!(stroke.commit_timeout, Duration::from_secs(2));
+        assert_eq!(stroke.max_strokes, 9);
+        assert_eq!(stroke.startup_recovery_limit.get(), 50);
+        assert_eq!(stroke.shot_packets_per_window, 80);
         fs::remove_file(path).expect("remove");
     }
 

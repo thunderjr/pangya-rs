@@ -805,6 +805,22 @@ impl StrokeMatchState {
         Some(abort)
     }
 
+    /// Replaces any noncommitted or pending terminal outcome with a higher-priority abort.
+    ///
+    /// Service shutdown uses this to ensure a concurrent disconnect/timeout cannot settle rewards.
+    pub fn prioritize_abort(&mut self, reason: MatchAbortReason) -> Option<AbortStrokeMatch> {
+        if let Some(pending) = self.pending_abort.as_mut() {
+            let request = AbortStrokeMatch::new(
+                pending.request.match_id(),
+                pending.request.result_key(),
+                reason,
+            );
+            pending.request = request;
+            return Some(request);
+        }
+        self.abort(reason)
+    }
+
     /// Retained exact abort.
     #[must_use]
     pub const fn pending_abort(&self) -> Option<AbortStrokeMatch> {

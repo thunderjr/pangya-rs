@@ -127,11 +127,21 @@ pub(crate) enum MatchLifecycleEvent {
     Deactivated,
 }
 
-/// Exact process-local match count after one authoritative transition.
+/// Fixed mode identity for exact active gauges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MatchLifecycleMode {
+    SoloPractice,
+    StrokeTwo,
+}
+
+/// Exact process-local match counts after one authoritative transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MatchLifecycle {
     pub(crate) event: MatchLifecycleEvent,
+    pub(crate) mode: MatchLifecycleMode,
     pub(crate) active_count: usize,
+    pub(crate) solo_active: usize,
+    pub(crate) stroke_active: usize,
 }
 
 /// A room operation routed by the registry using the caller's registered connection identity.
@@ -328,6 +338,7 @@ pub enum LobbyShutdownError {
 struct RoomRecord {
     handle: RoomHandle,
     summary: RoomSummary,
+    retain_for_persistence: bool,
 }
 
 struct ConnectionRecord {
@@ -395,6 +406,11 @@ enum LobbyCommand {
         room_id: RoomId,
         result: StrokeMatchResult,
         reply: oneshot::Sender<Result<StrokeMatchResult, StrokeMatchError>>,
+    },
+    PrioritizeStrokeAbort {
+        room_id: RoomId,
+        reason: MatchAbortReason,
+        reply: oneshot::Sender<Result<AbortStrokeMatch, StrokeMatchError>>,
     },
     AcknowledgeStrokeAbort {
         room_id: RoomId,
@@ -731,6 +747,28 @@ impl LobbyHandle {
             .map_err(map_room_to_stroke)?
     }
 
+    /// Replaces retained terminal work with a priority abort using room authority.
+    pub async fn prioritize_stroke_abort_by_room(
+        &self,
+        room_id: RoomId,
+        reason: MatchAbortReason,
+    ) -> Result<AbortStrokeMatch, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::PrioritizeStrokeAbort {
+                room_id,
+                reason,
+                reply,
+            },
+            Arc::clone(&gate),
+        )
+        .map_err(map_room_to_stroke)?;
+        Self::await_reply(&gate, receive, self.command_timeout)
+            .await
+            .map_err(map_room_to_stroke)?
+    }
+
     /// Acknowledges a durable abort using room authority after mapping removal.
     pub async fn acknowledge_stroke_abort_by_room(
         &self,
@@ -821,13 +859,16 @@ impl LobbyRegistry {
         let _no_receivers = self.room_lifecycle.send(lifecycle);
     }
 
-    fn publish_match_lifecycle(&self, event: MatchLifecycleEvent) {
+    fn publish_match_lifecycle(&self, event: MatchLifecycleEvent, mode: MatchLifecycleMode) {
         let lifecycle = MatchLifecycle {
             event,
+            mode,
             active_count: self
                 .active_matches
                 .len()
                 .saturating_add(self.active_stroke.len()),
+            solo_active: self.active_matches.len(),
+            stroke_active: self.active_stroke.len(),
         };
         let _no_receivers = self.match_lifecycle.send(lifecycle);
     }
@@ -840,7 +881,10 @@ impl LobbyRegistry {
             MatchAbortReason::PersistenceFailure,
         );
         if self.active_matches.insert(room_id, abort).is_none() {
-            self.publish_match_lifecycle(MatchLifecycleEvent::Activated);
+            self.publish_match_lifecycle(
+                MatchLifecycleEvent::Activated,
+                MatchLifecycleMode::SoloPractice,
+            );
         }
     }
 
@@ -850,7 +894,10 @@ impl LobbyRegistry {
             .insert(room_id, (begin.match_id(), begin.result_key()))
             .is_none()
         {
-            self.publish_match_lifecycle(MatchLifecycleEvent::Activated);
+            self.publish_match_lifecycle(
+                MatchLifecycleEvent::Activated,
+                MatchLifecycleMode::StrokeTwo,
+            );
         }
     }
 
@@ -866,7 +913,10 @@ impl LobbyRegistry {
             .is_some_and(|current| *current == (match_id, result_key));
         if exact {
             self.active_stroke.remove(&room_id);
-            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+            self.publish_match_lifecycle(
+                MatchLifecycleEvent::Deactivated,
+                MatchLifecycleMode::StrokeTwo,
+            );
         }
     }
 
@@ -878,7 +928,10 @@ impl LobbyRegistry {
         });
         if exact {
             self.active_matches.remove(&room_id);
-            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+            self.publish_match_lifecycle(
+                MatchLifecycleEvent::Deactivated,
+                MatchLifecycleMode::SoloPractice,
+            );
         }
     }
 
@@ -890,7 +943,10 @@ impl LobbyRegistry {
         });
         if exact {
             self.active_matches.remove(&room_id);
-            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+            self.publish_match_lifecycle(
+                MatchLifecycleEvent::Deactivated,
+                MatchLifecycleMode::SoloPractice,
+            );
         }
     }
 
@@ -900,7 +956,12 @@ impl LobbyRegistry {
         let removed_match = self.active_matches.remove(&room_id).is_some();
         let removed_stroke = self.active_stroke.remove(&room_id).is_some();
         if removed_match || removed_stroke {
-            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated);
+            let mode = if removed_stroke {
+                MatchLifecycleMode::StrokeTwo
+            } else {
+                MatchLifecycleMode::SoloPractice
+            };
+            self.publish_match_lifecycle(MatchLifecycleEvent::Deactivated, mode);
         }
         let removed = self.rooms.remove(&room_id).is_some();
         self.connections.retain(|_, connection| {
@@ -963,6 +1024,7 @@ impl LobbyRegistry {
             RoomRecord {
                 handle,
                 summary: summary.clone(),
+                retain_for_persistence: false,
             },
         );
         self.publish_lifecycle(RoomLifecycleEvent::Created);
@@ -990,6 +1052,7 @@ impl LobbyRegistry {
         let handle = self
             .rooms
             .get(&room_id)
+            .filter(|record| !record.retain_for_persistence)
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
         let connection_id = identity.connection_id;
@@ -1076,6 +1139,10 @@ impl LobbyRegistry {
                 }
                 if let Some(snapshot) = &outcome.snapshot {
                     self.update_snapshot(room_id, snapshot);
+                } else if outcome.retain_for_persistence {
+                    if let Some(record) = self.rooms.get_mut(&room_id) {
+                        record.retain_for_persistence = true;
+                    }
                 } else {
                     self.remove_room(room_id, false);
                 }
@@ -1344,7 +1411,33 @@ impl LobbyRegistry {
             .ok_or(StrokeMatchError::Closed)?;
         let committed = handle.apply_stroke_commit(result).await?;
         self.deactivate_stroke(room_id, committed.match_id(), committed.result_key());
+        if self
+            .rooms
+            .get(&room_id)
+            .is_some_and(|record| record.retain_for_persistence)
+        {
+            self.remove_room(room_id, false);
+        }
         Ok(committed)
+    }
+
+    async fn prioritize_stroke_abort(
+        &mut self,
+        room_id: RoomId,
+        reason: MatchAbortReason,
+    ) -> Result<AbortStrokeMatch, StrokeMatchError> {
+        if !self.active_stroke.contains_key(&room_id) {
+            return Err(StrokeMatchError::IdentityMismatch);
+        }
+        let handle = self
+            .rooms
+            .get(&room_id)
+            .map(|record| record.handle.clone())
+            .ok_or(StrokeMatchError::Closed)?;
+        handle
+            .prioritize_stroke_abort(reason)
+            .await?
+            .ok_or(StrokeMatchError::InvalidPhase)
     }
 
     async fn acknowledge_stroke_abort(
@@ -1366,6 +1459,13 @@ impl LobbyRegistry {
             .ok_or(StrokeMatchError::Closed)?;
         handle.acknowledge_stroke_abort(abort).await?;
         self.deactivate_stroke(room_id, abort.match_id(), abort.result_key());
+        if self
+            .rooms
+            .get(&room_id)
+            .is_some_and(|record| record.retain_for_persistence)
+        {
+            self.remove_room(room_id, false);
+        }
         Ok(())
     }
 
@@ -1549,7 +1649,10 @@ async fn run_lobby(
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::List { reply }) => {
-                    let summaries = registry.rooms.values().map(|record| record.summary.clone()).collect();
+                    let summaries = registry.rooms.values()
+                        .filter(|record| !record.retain_for_persistence)
+                        .map(|record| record.summary.clone())
+                        .collect();
                     let _ignored = reply.send(summaries);
                 }
                 Some(LobbyCommand::Join { room_id, identity, password, outbound, cancellation, reply }) => {
@@ -1578,6 +1681,10 @@ async fn run_lobby(
                 }
                 Some(LobbyCommand::ApplyStrokeCommit { room_id, result, reply }) => {
                     let result = registry.apply_stroke_commit(room_id, result).await;
+                    let _ignored = reply.send(result);
+                }
+                Some(LobbyCommand::PrioritizeStrokeAbort { room_id, reason, reply }) => {
+                    let result = registry.prioritize_stroke_abort(room_id, reason).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::AcknowledgeStrokeAbort { room_id, abort, reply }) => {
@@ -2171,7 +2278,10 @@ mod tests {
             timeout(Duration::from_secs(1), match_lifecycle.recv()).await,
             Ok(Ok(MatchLifecycle {
                 event: MatchLifecycleEvent::Activated,
+                mode: MatchLifecycleMode::SoloPractice,
                 active_count: 1,
+                solo_active: 1,
+                stroke_active: 0,
             }))
         );
         assert!(saturated.is_cancelled());
@@ -2201,7 +2311,10 @@ mod tests {
             timeout(Duration::from_secs(1), match_lifecycle.recv()).await,
             Ok(Ok(MatchLifecycle {
                 event: MatchLifecycleEvent::Deactivated,
+                mode: MatchLifecycleMode::SoloPractice,
                 active_count: 0,
+                solo_active: 0,
+                stroke_active: 0,
             }))
         );
         assert!(matches!(
@@ -2215,8 +2328,8 @@ mod tests {
         let lobby = spawn_lobby(limits(3));
         let first = identity(1);
         let second = identity(2);
-        let (first_tx, _first_rx) = mpsc::channel(64);
-        let (second_tx, _second_rx) = mpsc::channel(64);
+        let (first_tx, mut first_rx) = mpsc::channel(64);
+        let (second_tx, mut second_rx) = mpsc::channel(64);
         let room = lobby
             .create(
                 RoomName::parse("stroke-room").unwrap_or_else(|_| unreachable!()),
@@ -2309,6 +2422,8 @@ mod tests {
                 .await
                 .is_ok()
         );
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
         let outcome = lobby
             .disconnect_with_work(first.connection_id, MatchAbortReason::Disconnect)
             .await
@@ -2321,6 +2436,13 @@ mod tests {
             unreachable!()
         };
         assert_eq!(room_id, room.id());
+        assert!(
+            std::iter::from_fn(|| second_rx.try_recv().ok()).all(|event| !matches!(
+                event,
+                RoomEvent::StrokeSettlementRequested(_) | RoomEvent::StrokeAbortRequested(_)
+            )),
+            "priority disconnect persistence belongs solely to connection cleanup"
+        );
         assert_eq!(
             lobby
                 .route(first.connection_id, LobbyRoomCommand::GetState)
@@ -2340,6 +2462,11 @@ mod tests {
             Ok(result)
         );
         assert_eq!(
+            second_rx.recv().await,
+            Some(RoomEvent::StrokeCommitted(result)),
+            "survivor receives only the persisted settlement result"
+        );
+        assert_eq!(
             lifecycle.recv().await.map(|value| value.active_count),
             Ok(0)
         );
@@ -2348,6 +2475,121 @@ mod tests {
                 .route(second.connection_id, LobbyRoomCommand::GetState)
                 .await
                 .is_ok()
+        );
+        assert!(lobby.shutdown().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn priority_abort_claim_is_not_reissued_to_second_lobby_cleanup() {
+        let lobby = spawn_lobby(limits(2));
+        let first = identity(1);
+        let second = identity(2);
+        let (first_tx, _first_rx) = mpsc::channel(64);
+        let (second_tx, _second_rx) = mpsc::channel(64);
+        let room = lobby
+            .create(
+                RoomName::parse("stroke-claim").expect("name"),
+                None,
+                RoomSettings::new(2).expect("settings"),
+                first.clone(),
+                first_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("create");
+        lobby
+            .join(
+                room.id(),
+                second.clone(),
+                None,
+                second_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("join");
+        lobby
+            .route(first.connection_id, LobbyRoomCommand::SetReady(true))
+            .await
+            .expect("owner ready");
+        lobby
+            .route(second.connection_id, LobbyRoomCommand::SetReady(true))
+            .await
+            .expect("peer ready");
+        let plan = stroke_plan(&first, &second);
+        assert!(matches!(
+            lobby
+                .route_stroke(
+                    first.connection_id,
+                    LobbyStrokeCommand::PrepareStart(plan.clone()),
+                )
+                .await,
+            Ok(LobbyStrokeRouteResult::Begin(_))
+        ));
+        lobby
+            .route_stroke(
+                first.connection_id,
+                LobbyStrokeCommand::ConfirmBegin {
+                    match_id: plan.begin().match_id(),
+                    result_key: plan.begin().result_key(),
+                },
+            )
+            .await
+            .expect("confirm begin");
+        let loading = StrokeLoadingComplete::new(100).expect("loading");
+        lobby
+            .route_stroke(
+                second.connection_id,
+                LobbyStrokeCommand::LoadingComplete(loading),
+            )
+            .await
+            .expect("peer loaded");
+        let mark = match lobby
+            .route_stroke(
+                first.connection_id,
+                LobbyStrokeCommand::LoadingComplete(loading),
+            )
+            .await
+        {
+            Ok(LobbyStrokeRouteResult::Loading(StrokeLoadingOutcome::PersistenceRequired(
+                mark,
+            ))) => mark,
+            _ => unreachable!(),
+        };
+        lobby
+            .apply_stroke_in_game_by_room(room.id(), mark)
+            .await
+            .expect("in game");
+
+        assert!(matches!(
+            lobby
+                .disconnect_with_work(first.connection_id, MatchAbortReason::Disconnect)
+                .await,
+            Ok(RoomCloseOutcome::M6Settlement { .. })
+        ));
+        assert_eq!(
+            lobby
+                .disconnect_with_work(second.connection_id, MatchAbortReason::Shutdown)
+                .await,
+            Ok(RoomCloseOutcome::None),
+            "the second cleanup cannot steal the first control claim"
+        );
+        let abort = lobby
+            .prioritize_stroke_abort_by_room(room.id(), MatchAbortReason::Shutdown)
+            .await
+            .expect("priority abort");
+        assert_eq!(abort.reason(), MatchAbortReason::Shutdown);
+        assert_eq!(
+            lobby
+                .acknowledge_stroke_abort_by_room(room.id(), abort)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            lobby
+                .acknowledge_stroke_abort_by_room(room.id(), abort)
+                .await,
+            Err(StrokeMatchError::IdentityMismatch),
+            "the lobby accepts one exact acknowledgement"
         );
         assert!(lobby.shutdown().await.is_ok());
     }

@@ -2,7 +2,10 @@
 
 use std::{
     io,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -15,8 +18,8 @@ use pangya_domain::{
     StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
-    GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig, UnknownOpcodePolicy,
-    deterministic_conditions,
+    GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig, StrokeRuntimeConfig,
+    UnknownOpcodePolicy, deterministic_conditions,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
@@ -31,7 +34,11 @@ use pangya_protocol::{
     RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, ServiceKind as ProtocolServiceKind,
     ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
-    SoloCommandResult, SoloPhase, StartSolo, Weather as ProtocolWeather, decode_packet_payload,
+    SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay,
+    StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome, StrokeCommandResult,
+    StrokeCompletion, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted,
+    StrokePhase, StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult,
+    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, decode_packet_payload,
     encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
@@ -39,11 +46,158 @@ use sqlx::PgPool;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
+    sync::Notify,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::MakeWriter;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
+/// Generous packet deadline for ordinary E2E assertions. Timeout-path tests use their own short
+/// product deadlines, so a missing expected packet fails deterministically instead of hanging.
+const E2E_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct BlockingStrokeCommitRepository {
+    inner: PgRepository,
+    commit_started: Notify,
+    commit_calls: AtomicUsize,
+    abort_calls: AtomicUsize,
+}
+
+impl BlockingStrokeCommitRepository {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            inner: PgRepository::new(pool),
+            commit_started: Notify::new(),
+            commit_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl pangya_domain::HandoverRepository for BlockingStrokeCommitRepository {
+    fn issue(
+        &self,
+        handover: pangya_domain::NewHandover,
+    ) -> pangya_domain::RepositoryFuture<'_, Result<(), pangya_domain::HandoverError>> {
+        pangya_domain::HandoverRepository::issue(&self.inner, handover)
+    }
+
+    fn consume(
+        &self,
+        request: pangya_domain::ConsumeHandover,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::AuthenticatedSession, pangya_domain::HandoverError>,
+    > {
+        pangya_domain::HandoverRepository::consume(&self.inner, request)
+    }
+}
+
+impl pangya_domain::PlayerRepository for BlockingStrokeCommitRepository {
+    fn load_player_snapshot(
+        &self,
+        account_id: AccountId,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::PlayerSnapshot, pangya_domain::RepositoryError>,
+    > {
+        pangya_domain::PlayerRepository::load_player_snapshot(&self.inner, account_id)
+    }
+}
+
+impl pangya_domain::MatchRepository for BlockingStrokeCommitRepository {
+    fn begin_stroke(
+        &self,
+        request: pangya_domain::BeginStrokeMatch,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::BeginStrokeMatchOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::begin_stroke(&self.inner, request)
+    }
+
+    fn mark_stroke_in_game(
+        &self,
+        request: pangya_domain::MarkStrokeInGame,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::MarkStrokeInGameOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::mark_stroke_in_game(&self.inner, request)
+    }
+
+    fn abort_stroke(
+        &self,
+        request: pangya_domain::AbortStrokeMatch,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::AbortStrokeMatchOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        self.abort_calls.fetch_add(1, Ordering::Relaxed);
+        pangya_domain::MatchRepository::abort_stroke(&self.inner, request)
+    }
+
+    fn commit_stroke_match(
+        &self,
+        _request: pangya_domain::CommitStrokeMatch,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::StrokeMatchResult, pangya_domain::MatchRepositoryError>,
+    > {
+        self.commit_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            self.commit_started.notify_one();
+            std::future::pending().await
+        })
+    }
+
+    fn begin_solo(
+        &self,
+        request: pangya_domain::BeginSoloMatch,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::BeginSoloMatchOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::begin_solo(&self.inner, request)
+    }
+
+    fn mark_solo_in_game(
+        &self,
+        request: pangya_domain::MarkSoloInGame,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::MarkSoloInGameOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::mark_solo_in_game(&self.inner, request)
+    }
+
+    fn abort(
+        &self,
+        request: pangya_domain::AbortMatch,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::AbortMatchOutcome, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::abort(&self.inner, request)
+    }
+
+    fn commit_solo_hole(
+        &self,
+        request: pangya_domain::CommitSoloHole,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::SoloMatchResult, pangya_domain::MatchRepositoryError>,
+    > {
+        pangya_domain::MatchRepository::commit_solo_hole(&self.inner, request)
+    }
+
+    fn abort_incomplete_matches(
+        &self,
+        limit: IncompleteMatchAbortLimit,
+    ) -> pangya_domain::RepositoryFuture<'_, Result<u32, pangya_domain::MatchRepositoryError>> {
+        pangya_domain::MatchRepository::abort_incomplete_matches(&self.inner, limit)
+    }
+}
 
 #[derive(Clone)]
 struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -216,10 +370,66 @@ fn solo_service(
                         .expect("recovery limit"),
                     shot_packets_per_window,
                 }),
+                stroke_two: None,
             },
             metrics,
         )
         .expect("solo game"),
+    )
+}
+
+fn stroke_service(
+    pool: PgPool,
+    limits: GameRuntimeLimits,
+    metrics: Arc<M2Metrics>,
+) -> Arc<GameService<PgRepository>> {
+    stroke_service_with_deadlines(
+        pool,
+        limits,
+        metrics,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Duration::from_secs(120),
+    )
+}
+
+fn stroke_service_with_deadlines(
+    pool: PgPool,
+    limits: GameRuntimeLimits,
+    metrics: Arc<M2Metrics>,
+    loading_timeout: Duration,
+    turn_timeout: Duration,
+    game_timeout: Duration,
+) -> Arc<GameService<PgRepository>> {
+    let catalog = m5_catalog();
+    let course = catalog
+        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .expect("one-hole course");
+    Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool)),
+            catalog.clone(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits,
+                solo_practice: None,
+                stroke_two: Some(StrokeRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout,
+                    turn_timeout,
+                    game_timeout,
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window: 120,
+                }),
+            },
+            metrics,
+        )
+        .expect("stroke game"),
     )
 }
 
@@ -238,6 +448,7 @@ fn game_service_with_policy(
                 unknown_opcode_policy,
                 limits,
                 solo_practice: None,
+                stroke_two: None,
             },
             metrics,
         )
@@ -253,13 +464,19 @@ fn game_service(
     game_service_with_policy(pool, limits, metrics, UnknownOpcodePolicy::Disconnect)
 }
 
-async fn start_service(
-    service: Arc<GameService<PgRepository>>,
+async fn start_service<R>(
+    service: Arc<GameService<R>>,
 ) -> (
     std::net::SocketAddr,
     CancellationToken,
     tokio::task::JoinHandle<Result<(), pangya_game::GameRuntimeError>>,
-) {
+)
+where
+    R: pangya_domain::HandoverRepository
+        + pangya_domain::PlayerRepository
+        + pangya_domain::MatchRepository
+        + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let shutdown = CancellationToken::new();
@@ -286,7 +503,10 @@ async fn start_game(
 async fn connect_game(address: std::net::SocketAddr) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut hello = [0_u8; 4];
-    stream.read_exact(&mut hello).await.expect("hello");
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, stream.read_exact(&mut hello))
+        .await
+        .expect("bounded game hello")
+        .expect("hello");
     assert!(hello[3] <= 0x0f);
     (stream, hello[3])
 }
@@ -294,7 +514,10 @@ async fn connect_game(address: std::net::SocketAddr) -> (TcpStream, u8) {
 async fn connect_login(address: std::net::SocketAddr) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut hello = [0_u8; 14];
-    stream.read_exact(&mut hello).await.expect("hello");
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, stream.read_exact(&mut hello))
+        .await
+        .expect("bounded login hello")
+        .expect("hello");
     (stream, hello[6])
 }
 
@@ -307,17 +530,22 @@ async fn send_packet(stream: &mut TcpStream, key: u8, salt: u8, opcode: u16, pay
 }
 
 async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
-    let mut header = [0_u8; 3];
-    stream.read_exact(&mut header).await.expect("header");
-    let total = usize::from(u16::from_le_bytes([header[1], header[2]])) + 3;
-    let mut frame = vec![0_u8; total];
-    frame[..3].copy_from_slice(&header);
-    stream.read_exact(&mut frame[3..]).await.expect("frame");
-    let plain = pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).expect("decrypt");
-    (
-        u16::from_le_bytes([plain[0], plain[1]]),
-        plain[2..].to_vec(),
-    )
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, async {
+        let mut header = [0_u8; 3];
+        stream.read_exact(&mut header).await.expect("header");
+        let total = usize::from(u16::from_le_bytes([header[1], header[2]])) + 3;
+        let mut frame = vec![0_u8; total];
+        frame[..3].copy_from_slice(&header);
+        stream.read_exact(&mut frame[3..]).await.expect("frame");
+        let plain =
+            pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).expect("decrypt");
+        (
+            u16::from_le_bytes([plain[0], plain[1]]),
+            plain[2..].to_vec(),
+        )
+    })
+    .await
+    .expect("bounded packet receive")
 }
 
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
@@ -939,6 +1167,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits::default(),
                 solo_practice: None,
+                stroke_two: None,
             },
             metrics.clone(),
         )
@@ -2086,7 +2315,7 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_always_closes(
+async fn game_m4_m5_m6_unknown_policies_continue_or_close_and_known_wrong_state_always_closes(
     pool: PgPool,
 ) {
     let limits = GameRuntimeLimits {
@@ -2140,6 +2369,16 @@ async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_alw
     )
     .await;
     assert_closed(&mut disconnect_wrong_m5.stream).await;
+    let mut disconnect_wrong_m6 = connect_m4(&pool, address, "M6DiscState").await;
+    send_packet(
+        &mut disconnect_wrong_m6.stream,
+        disconnect_wrong_m6.key,
+        6,
+        pangya_protocol::SYNTHETIC_M6_C2S_START_STROKE_TWO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut disconnect_wrong_m6.stream).await;
     shutdown.cancel();
     task.await.expect("join").expect("serve");
 
@@ -2257,6 +2496,16 @@ async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_alw
     )
     .await;
     assert_closed(&mut ignore_wrong_m5.stream).await;
+    let mut ignore_wrong_m6 = connect_m4(&pool, address, "M6IgnState").await;
+    send_packet(
+        &mut ignore_wrong_m6.stream,
+        ignore_wrong_m6.key,
+        31,
+        pangya_protocol::SYNTHETIC_M6_C2S_START_STROKE_TWO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut ignore_wrong_m6.stream).await;
     shutdown.cancel();
     task.await.expect("join").expect("serve");
 
@@ -2298,6 +2547,16 @@ async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_alw
     )
     .await;
     assert_closed(&mut capture_wrong_m5.stream).await;
+    let mut capture_wrong_m6 = connect_m4(&pool, address, "M6CapState").await;
+    send_packet(
+        &mut capture_wrong_m6.stream,
+        capture_wrong_m6.key,
+        6,
+        pangya_protocol::SYNTHETIC_M6_C2S_START_STROKE_TWO,
+        &[],
+    )
+    .await;
+    assert_closed(&mut capture_wrong_m6.stream).await;
 
     send_typed(
         &mut captured.stream,
@@ -2340,7 +2599,7 @@ async fn game_m4_m5_unknown_policies_continue_or_close_and_known_wrong_state_alw
     assert_closed(&mut captured.stream).await;
     assert_metric(
         &metrics,
-        "pangya_connections_closed_total{service=\"game\",reason=\"protocol\"} 2",
+        "pangya_connections_closed_total{service=\"game\",reason=\"protocol\"} 3",
     )
     .await;
     assert_metric(&metrics, "pangya_game_rooms_active{service=\"game\"} 0").await;
@@ -2780,12 +3039,12 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
 
     let rendered = metrics.render();
     for expected in [
-        "pangya_game_match_events_total{event=\"started\"} 1",
-        "pangya_game_match_events_total{event=\"loading_complete\"} 1",
-        "pangya_game_match_events_total{event=\"finished\"} 1",
-        "pangya_game_commit_outcomes_total{outcome=\"begun\"} 1",
-        "pangya_game_commit_outcomes_total{outcome=\"committed\"} 1",
-        "pangya_game_shot_outcomes_total{outcome=\"accepted\"} 4",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"started\"} 1",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"loading_complete\"} 1",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"finished\"} 1",
+        "pangya_game_commit_outcomes_total{mode=\"solo_practice\",outcome=\"begun\"} 1",
+        "pangya_game_commit_outcomes_total{mode=\"solo_practice\",outcome=\"committed\"} 1",
+        "pangya_game_shot_outcomes_total{mode=\"solo_practice\",outcome=\"accepted\"} 4",
         "pangya_game_matches_active{mode=\"solo_practice\"} 0",
     ] {
         let (key, value) = parse_expected_metric(expected);
@@ -3034,7 +3293,7 @@ async fn game_m5_shot_sequence_and_fixed_window_limits_are_independent(pool: PgP
     assert_metric(&metrics, "class=\"shot_packets_connection\"} 2").await;
     assert_metric(
         &metrics,
-        "pangya_game_shot_outcomes_total{outcome=\"duplicate\"} 1",
+        "pangya_game_shot_outcomes_total{mode=\"solo_practice\",outcome=\"duplicate\"} 1",
     )
     .await;
     shutdown.cancel();
@@ -3076,7 +3335,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
     assert_no_match_reward(&pool, &loading_id, loading_account).await;
     assert_metric(
         &metrics,
-        "pangya_game_match_events_total{event=\"aborted\"} 1",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"aborted\"} 1",
     )
     .await;
     shutdown.cancel();
@@ -3173,9 +3432,9 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
     wait_for_abort(&pool, &timed_id, "loading_timeout").await;
     assert_no_match_reward(&pool, &timed_id, timed.account_id).await;
     for needle in [
-        "pangya_game_match_events_total{event=\"started\"} 1",
-        "pangya_game_match_events_total{event=\"loading_timeout\"} 1",
-        "pangya_game_commit_outcomes_total{outcome=\"begun\"} 1",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"started\"} 1",
+        "pangya_game_match_events_total{mode=\"solo_practice\",event=\"loading_timeout\"} 1",
+        "pangya_game_commit_outcomes_total{mode=\"solo_practice\",outcome=\"begun\"} 1",
         "pangya_game_matches_active{mode=\"solo_practice\"} 0",
     ] {
         assert_metric(&metrics, needle).await;
@@ -3251,6 +3510,1407 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
     wait_for_abort(&pool, &stopping_id, "shutdown").await;
     assert_no_match_reward(&pool, &stopping_id, stopping_account).await;
     assert_closed_after_draining(&mut stopping.stream).await;
+}
+
+async fn start_stroke_loading_pair(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    suffix: &str,
+) -> (M4Client, M4Client, StrokeMatchStarted, u64, u64) {
+    let mut owner = connect_m4(pool, address, &format!("M6Own{suffix}")).await;
+    let mut peer = connect_m4(pool, address, &format!("M6Peer{suffix}")).await;
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        40,
+        &RoomCreateRequest {
+            name: RoomName::parse(&format!("Stroke {suffix}")).expect("room"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let owner_state = receive_typed::<RoomStateResponse>(&mut owner.stream, owner.key).await;
+    let room_id = owner_state.room.summary().id();
+    let owner_connection = owner_state.room.members()[0].connection_id().get();
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        41,
+        &RoomJoinRequest {
+            room_id,
+            password: None,
+        },
+    )
+    .await;
+    receive_result(
+        &mut peer.stream,
+        peer.key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let joined = receive_typed::<RoomStateResponse>(&mut peer.stream, peer.key).await;
+    let peer_connection = joined.room.members()[1].connection_id().get();
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        42,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        42,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut peer.stream,
+        peer.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    send_typed(&mut owner.stream, owner.key, 43, &StartStrokeTwo).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Start, StrokeCommandOutcome::Success)
+    );
+    let started = receive_typed::<StrokeMatchStarted>(&mut owner.stream, owner.key).await;
+    assert_eq!(
+        receive_typed::<StrokeMatchStarted>(&mut peer.stream, peer.key).await,
+        started
+    );
+    for client in [&mut owner, &mut peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(started.match_id(), StrokePhaseKind::Loading)
+        );
+    }
+    (owner, peer, started, owner_connection, peer_connection)
+}
+
+async fn enter_stroke_playing(
+    owner: &mut M4Client,
+    peer: &mut M4Client,
+    started: &StrokeMatchStarted,
+) -> u64 {
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        45,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut peer.stream, peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        46,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    let mut active = None;
+    for client in [owner, peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(started.match_id(), StrokePhaseKind::Playing)
+        );
+        let turn = receive_typed::<StrokeTurnStarted>(&mut client.stream, client.key).await;
+        if let Some(expected) = active {
+            assert_eq!(turn.active_connection_id(), expected);
+        } else {
+            active = Some(turn.active_connection_id());
+        }
+    }
+    active.expect("active stroke participant")
+}
+
+async fn assert_stroke_match_status(
+    pool: &PgPool,
+    match_id: uuid::Uuid,
+    status: &str,
+    expected_audit_terminal: &str,
+) {
+    let row: (String, i64) = sqlx::query_as(
+        "SELECT status, (SELECT count(*) FROM match_audit_events \
+         WHERE match_id = matches.id AND event = $2) FROM matches WHERE id = $1",
+    )
+    .bind(match_id)
+    .bind(expected_audit_terminal)
+    .fetch_one(pool)
+    .await
+    .expect("terminal match status");
+    assert_eq!(row, (status.to_owned(), 1));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m6_encrypted_tcp_deadlines_persist_normative_terminal_policy(pool: PgPool) {
+    let limits = GameRuntimeLimits {
+        global_connections: 6,
+        connections_per_source: 6,
+        auth_per_window: 40,
+        packets_per_window: 300,
+        room_commands_per_window: 150,
+        outbound_room_event_capacity: 16,
+        ..GameRuntimeLimits::default()
+    };
+
+    // Loading deadline is an aggregate no-reward abort.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service_with_deadlines(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_millis(750),
+        Duration::from_secs(2),
+        Duration::from_secs(3),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut loading_owner, mut loading_peer, loading_started, _, _) =
+        start_stroke_loading_pair(&pool, address, "DLoad").await;
+    for client in [&mut loading_owner, &mut loading_peer] {
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                receive_typed::<StrokeMatchAborted>(&mut client.stream, client.key),
+            )
+            .await
+            .expect("bounded loading deadline"),
+            StrokeMatchAborted::new(
+                loading_started.match_id(),
+                StrokeAbortReason::LoadingTimeout,
+            )
+        );
+    }
+    assert_stroke_match_status(&pool, loading_started.match_id(), "aborted", "aborted").await;
+    let loading_ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1)",
+    )
+    .bind(loading_started.match_id())
+    .fetch_one(&pool)
+    .await
+    .expect("loading deadline ledgers");
+    assert_eq!(loading_ledgers, 0);
+    assert_metric(
+        &metrics,
+        "pangya_game_matches_active{mode=\"stroke_two\"} 0",
+    )
+    .await;
+    shutdown.cancel();
+    task.await
+        .expect("loading deadline join")
+        .expect("loading deadline service");
+
+    // The active participant loses on a turn deadline and the other receives one reward pair.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service_with_deadlines(
+        pool.clone(),
+        limits.clone(),
+        metrics.clone(),
+        Duration::from_secs(2),
+        Duration::from_millis(750),
+        Duration::from_secs(3),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut turn_owner, mut turn_peer, turn_started, owner_connection, peer_connection) =
+        start_stroke_loading_pair(&pool, address, "DTurn").await;
+    assert_eq!(
+        enter_stroke_playing(&mut turn_owner, &mut turn_peer, &turn_started).await,
+        owner_connection
+    );
+    let mut turn_standings = None;
+    for client in [&mut turn_owner, &mut turn_peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(turn_started.match_id(), StrokePhaseKind::ResultsPending)
+        );
+        let standings = receive_typed::<StrokeStandings>(&mut client.stream, client.key).await;
+        if let Some(expected) = &turn_standings {
+            assert_eq!(&standings, expected);
+        } else {
+            turn_standings = Some(standings);
+        }
+        let _: StrokeBalanceUpdate = receive_typed(&mut client.stream, client.key).await;
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(turn_started.match_id(), StrokePhaseKind::Finished)
+        );
+    }
+    let entries = turn_standings.expect("turn standings");
+    assert_eq!(entries.entries()[0].connection_id(), peer_connection);
+    assert_eq!(
+        entries.entries()[0].completion(),
+        StrokeCompletion::WinnerByForfeit
+    );
+    assert_eq!(
+        (
+            entries.entries()[0].pang(),
+            entries.entries()[0].experience()
+        ),
+        (10, 5)
+    );
+    assert_eq!(entries.entries()[1].connection_id(), owner_connection);
+    assert_eq!(
+        entries.entries()[1].completion(),
+        StrokeCompletion::TurnTimeout
+    );
+    assert_eq!(
+        (
+            entries.entries()[1].pang(),
+            entries.entries()[1].experience()
+        ),
+        (0, 0)
+    );
+    assert_stroke_match_status(&pool, turn_started.match_id(), "committed", "committed").await;
+    let turn_ledgers: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT 'currency', count(*) FROM currency_ledger WHERE match_id = $1 \
+         UNION ALL SELECT 'progression', count(*) FROM progression_ledger WHERE match_id = $1 \
+         ORDER BY 1",
+    )
+    .bind(turn_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("turn deadline ledgers");
+    assert_eq!(
+        turn_ledgers,
+        vec![("currency".to_owned(), 1), ("progression".to_owned(), 1)]
+    );
+    assert_metric(
+        &metrics,
+        "pangya_game_matches_active{mode=\"stroke_two\"} 0",
+    )
+    .await;
+    shutdown.cancel();
+    task.await
+        .expect("turn deadline join")
+        .expect("turn deadline service");
+
+    // An exact turn/game tie is actor-defined to choose the whole-game cap; both unfinished
+    // participants complete as GameTimeout and the aggregate is atomically committed once.
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service_with_deadlines(
+        pool.clone(),
+        limits,
+        metrics.clone(),
+        Duration::from_secs(2),
+        Duration::from_millis(750),
+        Duration::from_millis(750),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut game_owner, mut game_peer, game_started, _, _) =
+        start_stroke_loading_pair(&pool, address, "DGame").await;
+    let _active = enter_stroke_playing(&mut game_owner, &mut game_peer, &game_started).await;
+    let mut game_standings = None;
+    for client in [&mut game_owner, &mut game_peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(game_started.match_id(), StrokePhaseKind::ResultsPending)
+        );
+        let standings = receive_typed::<StrokeStandings>(&mut client.stream, client.key).await;
+        if let Some(expected) = &game_standings {
+            assert_eq!(&standings, expected);
+        } else {
+            game_standings = Some(standings);
+        }
+        let _: StrokeBalanceUpdate = receive_typed(&mut client.stream, client.key).await;
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(game_started.match_id(), StrokePhaseKind::Finished)
+        );
+    }
+    assert!(
+        game_standings
+            .expect("game standings")
+            .entries()
+            .iter()
+            .all(|entry| entry.completion() == StrokeCompletion::GameTimeout)
+    );
+    assert_stroke_match_status(&pool, game_started.match_id(), "committed", "committed").await;
+    let game_ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1)",
+    )
+    .bind(game_started.match_id())
+    .fetch_one(&pool)
+    .await
+    .expect("game deadline ledgers");
+    assert_eq!(game_ledgers, 0);
+    assert_metric(
+        &metrics,
+        "pangya_game_matches_active{mode=\"stroke_two\"} 0",
+    )
+    .await;
+    shutdown.cancel();
+    task.await
+        .expect("game deadline join")
+        .expect("game deadline service");
+}
+
+async fn run_m6_shutdown_close_race(pool: &PgPool, suffix: &str, owner_closes_first: bool) {
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service(
+        pool.clone(),
+        GameRuntimeLimits {
+            global_connections: 4,
+            connections_per_source: 4,
+            auth_per_window: 20,
+            packets_per_window: 200,
+            room_commands_per_window: 100,
+            outbound_room_event_capacity: 16,
+            ..GameRuntimeLimits::default()
+        },
+        metrics.clone(),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut owner, mut peer, started, _, _) =
+        start_stroke_loading_pair(pool, address, suffix).await;
+    let _active = enter_stroke_playing(&mut owner, &mut peer, &started).await;
+    if owner_closes_first {
+        drop(owner);
+        shutdown.cancel();
+        drop(peer);
+    } else {
+        drop(peer);
+        shutdown.cancel();
+        drop(owner);
+    }
+    let service_result = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("bounded M6 shutdown race")
+        .expect("M6 shutdown race join");
+
+    let terminal: (String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT m.status, \
+         (SELECT count(*) FROM match_audit_events WHERE match_id = m.id AND event = 'aborted'), \
+         (SELECT count(*) FROM match_audit_events WHERE match_id = m.id AND event = 'committed'), \
+         (SELECT reason FROM match_audit_events WHERE match_id = m.id AND event = 'aborted') \
+         FROM matches m WHERE m.id = $1",
+    )
+    .bind(started.match_id())
+    .fetch_one(pool)
+    .await
+    .expect("shutdown terminal authority");
+    assert_eq!(service_result, Ok(()), "terminal at failure: {terminal:?}");
+    assert_eq!(
+        terminal,
+        ("aborted".to_owned(), 1, 0, Some("shutdown".to_owned()))
+    );
+    let rewards: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1)",
+    )
+    .bind(started.match_id())
+    .fetch_one(pool)
+    .await
+    .expect("shutdown has no ledgers");
+    assert_eq!(rewards, 0);
+    type AbortedPlayerRow = (Option<String>, Option<i16>, Option<i64>, Option<i64>);
+    let terminal_players: Vec<AbortedPlayerRow> = sqlx::query_as(
+        "SELECT completion, place, pang_reward, experience_reward FROM match_players \
+         WHERE match_id = $1 ORDER BY participant_order",
+    )
+    .bind(started.match_id())
+    .fetch_all(pool)
+    .await
+    .expect("shutdown player rows");
+    assert_eq!(
+        terminal_players,
+        vec![(None, None, None, None), (None, None, None, None)]
+    );
+    let incomplete: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM matches WHERE id = $1 AND status IN ('begun', 'loading', 'in_game')",
+    )
+    .bind(started.match_id())
+    .fetch_one(pool)
+    .await
+    .expect("startup recovery not needed");
+    assert_eq!(incomplete, 0);
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_matches_active{mode=\"stroke_two\"}",
+        ),
+        Some(0.0)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m6_shutdown_cancellation_beats_double_socket_close_in_either_order(pool: PgPool) {
+    run_m6_shutdown_close_race(&pool, "SOwn", true).await;
+    run_m6_shutdown_close_race(&pool, "SPeer", false).await;
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPool) {
+    let metrics = Arc::new(M2Metrics::default());
+    let repository = Arc::new(BlockingStrokeCommitRepository::new(pool.clone()));
+    let catalog = m5_catalog();
+    let course = catalog
+        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .expect("one-hole course");
+    let service = Arc::new(
+        GameService::new(
+            Arc::clone(&repository),
+            catalog.clone(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    global_connections: 4,
+                    connections_per_source: 4,
+                    auth_per_window: 20,
+                    packets_per_window: 200,
+                    room_commands_per_window: 100,
+                    outbound_room_event_capacity: 16,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: Some(StrokeRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout: Duration::from_secs(30),
+                    turn_timeout: Duration::from_secs(30),
+                    game_timeout: Duration::from_secs(120),
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window: 120,
+                }),
+            },
+            metrics.clone(),
+        )
+        .expect("stroke game"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (owner, peer, started, _, _) = start_stroke_loading_pair(&pool, address, "SClaim").await;
+    let (mut owner, mut peer) = (owner, peer);
+    let _active = enter_stroke_playing(&mut owner, &mut peer, &started).await;
+
+    drop(owner);
+    tokio::time::timeout(Duration::from_secs(2), repository.commit_started.notified())
+        .await
+        .expect("first disconnect claimed settlement and entered persistence");
+    shutdown.cancel();
+    drop(peer);
+
+    let service_result = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("bounded deterministic shutdown claim race")
+        .expect("deterministic shutdown join");
+    assert_eq!(service_result, Ok(()));
+    assert_eq!(repository.commit_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(repository.abort_calls.load(Ordering::Relaxed), 1);
+
+    let terminal: (String, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT m.status, \
+         (SELECT count(*) FROM match_audit_events WHERE match_id = m.id AND event = 'aborted'), \
+         (SELECT count(*) FROM match_audit_events WHERE match_id = m.id AND event = 'committed'), \
+         (SELECT reason FROM match_audit_events WHERE match_id = m.id AND event = 'aborted') \
+         FROM matches m WHERE m.id = $1",
+    )
+    .bind(started.match_id())
+    .fetch_one(&pool)
+    .await
+    .expect("single abort and acknowledgement");
+    assert_eq!(
+        terminal,
+        ("aborted".to_owned(), 1, 0, Some("shutdown".to_owned()))
+    );
+    let ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1)",
+    )
+    .bind(started.match_id())
+    .fetch_one(&pool)
+    .await
+    .expect("shutdown ledgers");
+    assert_eq!(ledgers, 0);
+    assert_eq!(
+        metric_sample(
+            &metrics.render(),
+            "pangya_game_matches_active{mode=\"stroke_two\"}",
+        ),
+        Some(0.0)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room(pool: PgPool) {
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service(
+        pool.clone(),
+        GameRuntimeLimits {
+            global_connections: 8,
+            connections_per_source: 8,
+            auth_per_window: 40,
+            packets_per_window: 300,
+            room_commands_per_window: 150,
+            outbound_room_event_capacity: 16,
+            ..GameRuntimeLimits::default()
+        },
+        metrics.clone(),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+
+    let (loading_owner, mut loading_peer, loading_started, _, _) =
+        start_stroke_loading_pair(&pool, address, "Load").await;
+    drop(loading_owner);
+    let loading_room =
+        receive_typed::<RoomStateResponse>(&mut loading_peer.stream, loading_peer.key).await;
+    assert_eq!(loading_room.room.members().len(), 1);
+    assert_eq!(
+        loading_room.room.members()[0].account_id(),
+        loading_peer.account_id
+    );
+    assert_eq!(
+        receive_typed::<StrokeMatchAborted>(&mut loading_peer.stream, loading_peer.key).await,
+        StrokeMatchAborted::new(
+            loading_started.match_id(),
+            StrokeAbortReason::LoadingDisconnect,
+        )
+    );
+    send_typed(
+        &mut loading_peer.stream,
+        loading_peer.key,
+        44,
+        &RoomStateRequest,
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<RoomStateResponse>(&mut loading_peer.stream, loading_peer.key).await,
+        loading_room
+    );
+    let loading_audit: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event, reason FROM match_audit_events WHERE match_id = $1 ORDER BY id",
+    )
+    .bind(loading_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("loading disconnect audit");
+    assert_eq!(
+        loading_audit,
+        vec![
+            ("started".to_owned(), None),
+            ("aborted".to_owned(), Some("disconnect".to_owned())),
+        ]
+    );
+    let loading_rewards: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1)",
+    )
+    .bind(loading_started.match_id())
+    .fetch_one(&pool)
+    .await
+    .expect("loading disconnect no rewards");
+    assert_eq!(loading_rewards, 0);
+
+    let (playing_owner, mut playing_peer, playing_started, owner_connection, peer_connection) =
+        start_stroke_loading_pair(&pool, address, "Play").await;
+    for client in [&mut playing_peer] {
+        send_typed(
+            &mut client.stream,
+            client.key,
+            45,
+            &StrokeLoadingComplete::new(100).expect("load"),
+        )
+        .await;
+        assert_eq!(
+            receive_typed::<StrokeCommandResult>(&mut client.stream, client.key).await,
+            StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+        );
+    }
+    let mut playing_owner = playing_owner;
+    send_typed(
+        &mut playing_owner.stream,
+        playing_owner.key,
+        46,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut playing_owner.stream, playing_owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut playing_owner, &mut playing_peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(playing_started.match_id(), StrokePhaseKind::Playing)
+        );
+        assert_eq!(
+            receive_typed::<StrokeTurnStarted>(&mut client.stream, client.key)
+                .await
+                .active_connection_id(),
+            owner_connection
+        );
+    }
+    let playing_owner_account = playing_owner.account_id;
+    drop(playing_owner);
+    assert_eq!(
+        receive_typed::<StrokePhase>(&mut playing_peer.stream, playing_peer.key).await,
+        StrokePhase::new(playing_started.match_id(), StrokePhaseKind::ResultsPending)
+    );
+    let playing_room =
+        receive_typed::<RoomStateResponse>(&mut playing_peer.stream, playing_peer.key).await;
+    assert_eq!(playing_room.room.members().len(), 1);
+    let standings =
+        receive_typed::<StrokeStandings>(&mut playing_peer.stream, playing_peer.key).await;
+    assert_eq!(standings.match_id(), playing_started.match_id());
+    let entries = standings.entries();
+    assert_eq!(entries[0].connection_id(), peer_connection);
+    assert_eq!(entries[0].completion(), StrokeCompletion::WinnerByForfeit);
+    assert_eq!((entries[0].pang(), entries[0].experience()), (10, 5));
+    assert_eq!(entries[1].connection_id(), owner_connection);
+    assert_eq!(entries[1].completion(), StrokeCompletion::Disconnect);
+    assert_eq!((entries[1].pang(), entries[1].experience()), (0, 0));
+    assert_eq!(
+        receive_typed::<StrokeBalanceUpdate>(&mut playing_peer.stream, playing_peer.key).await,
+        StrokeBalanceUpdate::new(10, 5)
+    );
+    assert_eq!(
+        receive_typed::<StrokePhase>(&mut playing_peer.stream, playing_peer.key).await,
+        StrokePhase::new(playing_started.match_id(), StrokePhaseKind::Finished)
+    );
+    send_typed(
+        &mut playing_peer.stream,
+        playing_peer.key,
+        47,
+        &RoomStateRequest,
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<RoomStateResponse>(&mut playing_peer.stream, playing_peer.key).await,
+        playing_room
+    );
+    let persisted: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, completion, pang_reward, experience_reward FROM match_players \
+         WHERE match_id = $1 ORDER BY participant_order",
+    )
+    .bind(playing_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("disconnect settlement");
+    assert_eq!(
+        persisted,
+        vec![
+            (playing_owner_account.get(), "disconnect".to_owned(), 0, 0),
+            (
+                playing_peer.account_id.get(),
+                "winner_by_forfeit".to_owned(),
+                10,
+                5,
+            ),
+        ],
+        "participant account authority is persisted exactly once"
+    );
+    let loser_ledgers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM currency_ledger WHERE match_id = $1 AND account_id = $2) + \
+         (SELECT count(*) FROM progression_ledger WHERE match_id = $1 AND account_id = $2)",
+    )
+    .bind(playing_started.match_id())
+    .bind(playing_owner_account.get())
+    .fetch_one(&pool)
+    .await
+    .expect("disconnect loser no ledgers");
+    assert_eq!(loser_ledgers, 0);
+
+    let (mut give_owner, mut give_peer, give_started, give_owner_connection, give_peer_connection) =
+        start_stroke_loading_pair(&pool, address, "Give").await;
+    send_typed(
+        &mut give_peer.stream,
+        give_peer.key,
+        48,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut give_peer.stream, give_peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    send_typed(
+        &mut give_owner.stream,
+        give_owner.key,
+        49,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut give_owner.stream, give_owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut give_owner, &mut give_peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(give_started.match_id(), StrokePhaseKind::Playing)
+        );
+        assert_eq!(
+            receive_typed::<StrokeTurnStarted>(&mut client.stream, client.key)
+                .await
+                .active_connection_id(),
+            give_owner_connection
+        );
+    }
+    send_typed(&mut give_peer.stream, give_peer.key, 50, &StrokeGiveUp).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut give_peer.stream, give_peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::GiveUp, StrokeCommandOutcome::Success)
+    );
+    for (client, own_balance) in [
+        (&mut give_owner, StrokeBalanceUpdate::new(10, 5)),
+        (&mut give_peer, StrokeBalanceUpdate::new(0, 0)),
+    ] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(give_started.match_id(), StrokePhaseKind::ResultsPending)
+        );
+        let standings = receive_typed::<StrokeStandings>(&mut client.stream, client.key).await;
+        assert_eq!(
+            standings.entries()[0].connection_id(),
+            give_owner_connection
+        );
+        assert_eq!(
+            standings.entries()[0].completion(),
+            StrokeCompletion::WinnerByForfeit
+        );
+        assert_eq!(standings.entries()[1].connection_id(), give_peer_connection);
+        assert_eq!(
+            standings.entries()[1].completion(),
+            StrokeCompletion::GiveUp
+        );
+        assert_eq!(
+            receive_typed::<StrokeBalanceUpdate>(&mut client.stream, client.key).await,
+            own_balance
+        );
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(give_started.match_id(), StrokePhaseKind::Finished)
+        );
+    }
+    let give_players: Vec<(i64, i16, String, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, place, completion, pang_reward, experience_reward \
+         FROM match_players WHERE match_id = $1 ORDER BY participant_order",
+    )
+    .bind(give_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("give-up exact players");
+    assert_eq!(
+        give_players,
+        vec![
+            (
+                give_owner.account_id.get(),
+                1,
+                "winner_by_forfeit".to_owned(),
+                10,
+                5,
+            ),
+            (give_peer.account_id.get(), 2, "give_up".to_owned(), 0, 0),
+        ]
+    );
+    let give_currency: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT account_id, delta FROM currency_ledger WHERE match_id = $1 ORDER BY account_id",
+    )
+    .bind(give_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("give-up currency ledger");
+    let give_progression: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT account_id, delta FROM progression_ledger WHERE match_id = $1 ORDER BY account_id",
+    )
+    .bind(give_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("give-up progression ledger");
+    assert_eq!(give_currency, vec![(give_owner.account_id.get(), 10)]);
+    assert_eq!(give_progression, vec![(give_owner.account_id.get(), 5)]);
+
+    let rendered = metrics.render();
+    assert!(rendered.contains(
+        "pangya_game_commit_outcomes_total{mode=\"stroke_two\",outcome=\"committed\"} 2"
+    ));
+    assert!(rendered.contains(
+        "pangya_game_commit_outcomes_total{mode=\"stroke_two\",outcome=\"idempotent\"} 0"
+    ));
+    assert!(rendered.contains("pangya_game_matches_active{mode=\"stroke_two\"} 0"));
+    let _live = connect_m4(&pool, address, "M6StillLive").await;
+    shutdown.cancel();
+    assert!(task.await.expect("disconnect join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPool) {
+    let metrics = Arc::new(M2Metrics::default());
+    let service = stroke_service(
+        pool.clone(),
+        GameRuntimeLimits {
+            global_connections: 4,
+            connections_per_source: 4,
+            auth_per_window: 20,
+            packets_per_window: 200,
+            room_commands_per_window: 100,
+            outbound_room_event_capacity: 16,
+            ..GameRuntimeLimits::default()
+        },
+        metrics.clone(),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let mut owner = connect_m4(&pool, address, "M6Owner").await;
+    let mut peer = connect_m4(&pool, address, "M6Peer").await;
+    sqlx::query("UPDATE profiles SET pang = 100, experience = 50 WHERE account_id = $1")
+        .bind(peer.account_id.get())
+        .execute(&pool)
+        .await
+        .expect("distinct peer starting projection");
+
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        3,
+        &RoomCreateRequest {
+            name: RoomName::parse("M6 Stroke").expect("room"),
+            password: None,
+            settings: RoomSettings::new(2).expect("settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let owner_state = receive_typed::<RoomStateResponse>(&mut owner.stream, owner.key).await;
+    let room_id = owner_state.room.summary().id();
+    let owner_connection = owner_state.room.members()[0].connection_id().get();
+
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        4,
+        &RoomJoinRequest {
+            room_id,
+            password: None,
+        },
+    )
+    .await;
+    receive_result(
+        &mut peer.stream,
+        peer.key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let joined = receive_typed::<RoomStateResponse>(&mut peer.stream, peer.key).await;
+    let peer_connection = joined.room.members()[1].connection_id().get();
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        5,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut owner.stream,
+        owner.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        6,
+        &RoomReadyRequest { ready: true },
+    )
+    .await;
+    receive_result(
+        &mut peer.stream,
+        peer.key,
+        RoomCommand::Ready,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+    let _: RoomStateResponse = receive_typed(&mut owner.stream, owner.key).await;
+    let _: RoomStateResponse = receive_typed(&mut peer.stream, peer.key).await;
+
+    send_typed(&mut owner.stream, owner.key, 7, &StartStrokeTwo).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Start, StrokeCommandOutcome::Success)
+    );
+    let owner_started = receive_typed::<StrokeMatchStarted>(&mut owner.stream, owner.key).await;
+    let peer_started = receive_typed::<StrokeMatchStarted>(&mut peer.stream, peer.key).await;
+    assert_eq!(owner_started, peer_started);
+    assert_eq!(owner_started.course_id(), 1);
+    assert_eq!(owner_started.hole(), 1);
+    assert_eq!(owner_started.par(), 3);
+    assert_eq!(owner_started.load_timeout_ms(), 30_000);
+    assert_eq!(owner_started.turn_timeout_ms(), 30_000);
+    assert_eq!(owner_started.game_timeout_ms(), 120_000);
+    assert_eq!(
+        owner_started.participant_connection_ids(),
+        [owner_connection, peer_connection]
+    );
+    assert!(owner_started.seed().iter().any(|byte| *byte != 0));
+    let (expected_weather, expected_wind) =
+        deterministic_conditions(MatchSeed::new(*owner_started.seed())).expect("conditions");
+    assert_eq!(
+        owner_started.weather(),
+        match expected_weather {
+            Weather::Clear => ProtocolWeather::Clear,
+            Weather::Cloudy => ProtocolWeather::Cloudy,
+            Weather::Rain => ProtocolWeather::Rain,
+        }
+    );
+    assert_eq!(
+        owner_started.wind().speed(),
+        f32::from(expected_wind.speed_tenths()) / 10.0
+    );
+    assert_eq!(
+        owner_started.wind().angle(),
+        f32::from(expected_wind.angle_degrees())
+    );
+    for client in [&mut owner, &mut peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(owner_started.match_id(), StrokePhaseKind::Loading)
+        );
+    }
+
+    send_typed(
+        &mut peer.stream,
+        peer.key,
+        8,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut peer.stream, peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    send_typed(
+        &mut owner.stream,
+        owner.key,
+        9,
+        &StrokeLoadingComplete::new(100).expect("load"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Load, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut owner, &mut peer] {
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(owner_started.match_id(), StrokePhaseKind::Playing)
+        );
+        let turn = receive_typed::<StrokeTurnStarted>(&mut client.stream, client.key).await;
+        assert_eq!(
+            turn,
+            StrokeTurnStarted::new(owner_started.match_id(), 1, owner_connection, 1, 30_000)
+                .expect("first turn")
+        );
+    }
+
+    type PersistenceSnapshot = (String, Vec<(i16, Option<i16>, Option<i16>, Option<String>)>);
+    let in_game_snapshot: PersistenceSnapshot = (
+        sqlx::query_scalar("SELECT status FROM matches WHERE id = $1")
+            .bind(owner_started.match_id())
+            .fetch_one(&pool)
+            .await
+            .expect("in-game status"),
+        sqlx::query_as(
+            "SELECT participant_order, strokes, place, completion FROM match_players \
+             WHERE match_id = $1 ORDER BY participant_order",
+        )
+        .bind(owner_started.match_id())
+        .fetch_all(&pool)
+        .await
+        .expect("in-game players"),
+    );
+    assert_eq!(in_game_snapshot.0, "in_game");
+    assert_eq!(
+        in_game_snapshot.1,
+        vec![(0, None, None, None), (1, None, None, None)]
+    );
+
+    let peer_action = StrokeShotAction::new(1, 1, 50.0, 0.0, 0.0, 0.0).expect("action");
+    send_typed(&mut peer.stream, peer.key, 10, &peer_action).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut peer.stream, peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Action, StrokeCommandOutcome::InvalidTurn)
+    );
+
+    let owner_action = StrokeShotAction::new(1, 1, 60.0, 0.0, 0.0, 0.0).expect("action");
+    send_typed(&mut owner.stream, owner.key, 11, &owner_action).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Action, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut owner, &mut peer] {
+        let relay = receive_typed::<StrokeActionRelay>(&mut client.stream, client.key).await;
+        assert_eq!(relay.connection_id(), owner_connection);
+        assert_eq!(relay.action(), owner_action);
+    }
+    send_typed(&mut owner.stream, owner.key, 12, &owner_action).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Action, StrokeCommandOutcome::Success)
+    );
+    let owner_result = StrokeShotResult::new(1, 1.0, 0.0, 0.0, Lie::Green, true).expect("result");
+    send_typed(&mut owner.stream, owner.key, 13, &owner_result).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut owner.stream, owner.key).await,
+        StrokeCommandResult::new(StrokeCommand::Result, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut owner, &mut peer] {
+        let relay = receive_typed::<StrokeResultRelay>(&mut client.stream, client.key).await;
+        assert_eq!(relay.connection_id(), owner_connection);
+        assert_eq!(relay.result(), owner_result);
+        let turn = receive_typed::<StrokeTurnStarted>(&mut client.stream, client.key).await;
+        assert_eq!(
+            turn,
+            StrokeTurnStarted::new(owner_started.match_id(), 2, peer_connection, 1, 30_000)
+                .expect("second turn")
+        );
+    }
+    let after_shot_snapshot: PersistenceSnapshot = (
+        sqlx::query_scalar("SELECT status FROM matches WHERE id = $1")
+            .bind(owner_started.match_id())
+            .fetch_one(&pool)
+            .await
+            .expect("post-shot status"),
+        sqlx::query_as(
+            "SELECT participant_order, strokes, place, completion FROM match_players \
+             WHERE match_id = $1 ORDER BY participant_order",
+        )
+        .bind(owner_started.match_id())
+        .fetch_all(&pool)
+        .await
+        .expect("post-shot players"),
+    );
+    assert_eq!(after_shot_snapshot, in_game_snapshot);
+
+    send_typed(&mut peer.stream, peer.key, 14, &peer_action).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut peer.stream, peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Action, StrokeCommandOutcome::Success)
+    );
+    for client in [&mut owner, &mut peer] {
+        let relay = receive_typed::<StrokeActionRelay>(&mut client.stream, client.key).await;
+        assert_eq!(relay.connection_id(), peer_connection);
+        assert_eq!(relay.action(), peer_action);
+    }
+    let peer_result = StrokeShotResult::new(1, 2.0, 0.0, 0.0, Lie::Green, true).expect("result");
+    send_typed(&mut peer.stream, peer.key, 15, &peer_result).await;
+    assert_eq!(
+        receive_typed::<StrokeCommandResult>(&mut peer.stream, peer.key).await,
+        StrokeCommandResult::new(StrokeCommand::Result, StrokeCommandOutcome::Success)
+    );
+    let mut standings = Vec::new();
+    let mut balances = Vec::new();
+    for client in [&mut owner, &mut peer] {
+        let relay = receive_typed::<StrokeResultRelay>(&mut client.stream, client.key).await;
+        assert_eq!(relay.connection_id(), peer_connection);
+        assert_eq!(relay.result(), peer_result);
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(owner_started.match_id(), StrokePhaseKind::ResultsPending)
+        );
+        standings.push(receive_typed::<StrokeStandings>(&mut client.stream, client.key).await);
+        balances.push(receive_typed::<StrokeBalanceUpdate>(&mut client.stream, client.key).await);
+        assert_eq!(
+            receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
+            StrokePhase::new(owner_started.match_id(), StrokePhaseKind::Finished)
+        );
+    }
+    assert_eq!(standings[0], standings[1]);
+    assert_eq!(standings[0].match_id(), owner_started.match_id());
+    let entries = standings[0].entries();
+    assert_eq!(entries[0].connection_id(), owner_connection);
+    assert_eq!(entries[0].place(), 1);
+    assert_eq!(entries[0].completion(), StrokeCompletion::Holed);
+    assert_eq!(entries[0].strokes(), 1);
+    assert_eq!(entries[0].score(), Some(-2));
+    assert_eq!((entries[0].pang(), entries[0].experience()), (14, 5));
+    assert_eq!(entries[1].connection_id(), peer_connection);
+    assert_eq!(entries[1].place(), 2);
+    assert_eq!(entries[1].completion(), StrokeCompletion::Holed);
+    assert_eq!(entries[1].strokes(), 1);
+    assert_eq!(entries[1].score(), Some(-2));
+    assert_eq!((entries[1].pang(), entries[1].experience()), (14, 5));
+    assert_ne!(entries[0].player_result_id(), entries[1].player_result_id());
+    assert_ne!(entries[0].player_result_id(), owner_started.match_id());
+    assert_ne!(entries[1].player_result_id(), owner_started.match_id());
+    assert_eq!(balances[0], StrokeBalanceUpdate::new(14, 5));
+    assert_eq!(balances[1], StrokeBalanceUpdate::new(114, 55));
+    assert_ne!(balances[0], balances[1]);
+    assert_eq!(
+        maybe_receive_opcode(&mut owner.stream, owner.key).await,
+        None
+    );
+    assert_eq!(maybe_receive_opcode(&mut peer.stream, peer.key).await, None);
+
+    let (matches, players, ledgers, records): (i64, i64, i64, i64) = tokio::try_join!(
+        sqlx::query_scalar("SELECT count(*) FROM matches WHERE mode = 'stroke_two' AND status = 'committed'").fetch_one(&pool),
+        sqlx::query_scalar("SELECT count(*) FROM match_players mp JOIN matches m ON m.id = mp.match_id WHERE m.mode = 'stroke_two' AND m.status = 'committed'").fetch_one(&pool),
+        sqlx::query_scalar("SELECT (SELECT count(*) FROM currency_ledger WHERE reason = 'stroke-two-v1') + (SELECT count(*) FROM progression_ledger WHERE reason = 'stroke-two-v1')").fetch_one(&pool),
+        sqlx::query_scalar("SELECT count(*) FROM course_records WHERE mode = 'stroke_two'").fetch_one(&pool),
+    )
+    .expect("M6 persisted counts");
+    assert_eq!((matches, players, ledgers, records), (1, 2, 4, 2));
+    type PlayerRow = (
+        i16,
+        i64,
+        uuid::Uuid,
+        i16,
+        String,
+        i16,
+        i16,
+        bool,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+    let persisted_players: Vec<PlayerRow> = sqlx::query_as(
+        "SELECT participant_order, account_id, player_result_key, place, completion, strokes, \
+         score, quit, pang_reward, experience_reward, pang_balance_after, \
+         experience_balance_after FROM match_players WHERE match_id = $1 \
+         ORDER BY participant_order",
+    )
+    .bind(owner_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("exact match players");
+    assert_eq!(
+        persisted_players,
+        vec![
+            (
+                0,
+                owner.account_id.get(),
+                entries[0].player_result_id(),
+                1,
+                "holed".to_owned(),
+                1,
+                -2,
+                false,
+                14,
+                5,
+                14,
+                5,
+            ),
+            (
+                1,
+                peer.account_id.get(),
+                entries[1].player_result_id(),
+                2,
+                "holed".to_owned(),
+                1,
+                -2,
+                false,
+                14,
+                5,
+                114,
+                55,
+            ),
+        ]
+    );
+    let currency: Vec<(i64, uuid::Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, idempotency_key, delta, balance_after FROM currency_ledger \
+         WHERE match_id = $1 ORDER BY account_id",
+    )
+    .bind(owner_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("currency authority");
+    assert_eq!(
+        currency,
+        vec![
+            (
+                owner.account_id.get(),
+                entries[0].player_result_id(),
+                14,
+                14
+            ),
+            (
+                peer.account_id.get(),
+                entries[1].player_result_id(),
+                14,
+                114
+            ),
+        ]
+    );
+    let progression: Vec<(i64, uuid::Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, idempotency_key, delta, balance_after FROM progression_ledger \
+         WHERE match_id = $1 ORDER BY account_id",
+    )
+    .bind(owner_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("progression authority");
+    assert_eq!(
+        progression,
+        vec![
+            (owner.account_id.get(), entries[0].player_result_id(), 5, 5),
+            (peer.account_id.get(), entries[1].player_result_id(), 5, 55),
+        ]
+    );
+    let audit: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event, outcome, reason FROM match_audit_events WHERE match_id = $1 \
+         ORDER BY id",
+    )
+    .bind(owner_started.match_id())
+    .fetch_all(&pool)
+    .await
+    .expect("audit rows");
+    assert_eq!(
+        audit,
+        vec![
+            ("started".to_owned(), "success".to_owned(), None),
+            ("committed".to_owned(), "success".to_owned(), None),
+        ]
+    );
+    let records: Vec<(i64, i16, i16, i64, uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        "SELECT account_id, best_score, best_strokes, rounds_completed, best_match_id, \
+         best_player_result_key FROM course_records WHERE mode = 'stroke_two' \
+         ORDER BY account_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("record authority");
+    assert_eq!(
+        records,
+        vec![
+            (
+                owner.account_id.get(),
+                -2,
+                1,
+                1,
+                owner_started.match_id(),
+                entries[0].player_result_id(),
+            ),
+            (
+                peer.account_id.get(),
+                -2,
+                1,
+                1,
+                owner_started.match_id(),
+                entries[1].player_result_id(),
+            ),
+        ]
+    );
+    let rendered = metrics.render();
+    assert!(rendered.contains("pangya_game_matches_active{mode=\"stroke_two\"} 0"));
+    assert!(rendered.contains("mode=\"stroke_two\",outcome=\"out_of_turn\"} 1"));
+    assert!(rendered.contains("mode=\"stroke_two\",outcome=\"duplicate\"} 1"));
+    for forbidden in ["match_id=", "result_key=", "seed=", "balance=", "x="] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+
+    let persisted_owner: (i64, i64) =
+        sqlx::query_as("SELECT pang, experience FROM profiles WHERE account_id = $1")
+            .bind(owner.account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("owner balances");
+    assert_eq!(
+        (
+            u64::try_from(persisted_owner.0).expect("pang"),
+            u64::try_from(persisted_owner.1).expect("experience")
+        ),
+        (balances[0].pang(), balances[0].experience())
+    );
+
+    let restart = stroke_service(
+        pool.clone(),
+        GameRuntimeLimits::default(),
+        Arc::new(M2Metrics::default()),
+    );
+    let (restart_address, restart_shutdown, restart_task) = start_service(restart).await;
+    let token = issue_token(
+        &pool,
+        owner.account_id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut restarted, restart_key) = connect_game(restart_address).await;
+    send_packet(
+        &mut restarted,
+        restart_key,
+        16,
+        2,
+        &auth_payload(owner.account_id.get(), &token),
+    )
+    .await;
+    let projection = read_player_info(&mut restarted, restart_key).await;
+    assert_eq!(
+        (projection.2, projection.4),
+        (balances[0].pang(), balances[0].experience())
+    );
+    let peer_token =
+        issue_token(&pool, peer.account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut restarted_peer, restarted_peer_key) = connect_game(restart_address).await;
+    send_packet(
+        &mut restarted_peer,
+        restarted_peer_key,
+        17,
+        2,
+        &auth_payload(peer.account_id.get(), &peer_token),
+    )
+    .await;
+    let peer_projection = read_player_info(&mut restarted_peer, restarted_peer_key).await;
+    assert_eq!(
+        (peer_projection.2, peer_projection.4),
+        (balances[1].pang(), balances[1].experience())
+    );
+    restart_shutdown.cancel();
+    assert!(restart_task.await.expect("restart join").is_ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

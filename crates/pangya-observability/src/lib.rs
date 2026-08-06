@@ -146,16 +146,20 @@ pub struct M2Metrics {
     game_auth_rejected: AtomicU64,
     game_auth_mismatch: AtomicU64,
     game_auth_duplicate: AtomicU64,
-    game_rate: [AtomicU64; 14],
+    game_rate: [AtomicU64; 15],
     game_room: [AtomicU64; 9],
     game_active_rooms: AtomicU64,
     game_queue: [AtomicU64; 2],
     game_chat: [AtomicU64; 3],
     game_unknown: [AtomicU64; 4],
     game_matches_active: AtomicU64,
-    game_match: [AtomicU64; 5],
+    game_match: [AtomicU64; 8],
     game_commit: [AtomicU64; 6],
-    game_shot: [AtomicU64; 4],
+    game_shot: [AtomicU64; 5],
+    game_stroke_matches_active: AtomicU64,
+    game_stroke_match: [AtomicU64; 8],
+    game_stroke_commit: [AtomicU64; 6],
+    game_stroke_shot: [AtomicU64; 5],
 }
 
 impl M2Metrics {
@@ -572,6 +576,11 @@ impl M2Metrics {
                 self.game_rate[13].load(Ordering::Relaxed),
             ),
             (
+                "pangya_game_rate_limit_total",
+                "class=\"stroke_packets_connection\"",
+                self.game_rate[14].load(Ordering::Relaxed),
+            ),
+            (
                 "pangya_game_room_events_total",
                 "event=\"listed\"",
                 self.game_room[0].load(Ordering::Relaxed),
@@ -673,82 +682,154 @@ impl M2Metrics {
             ),
             (
                 "pangya_game_match_events_total",
-                "event=\"started\"",
+                "mode=\"solo_practice\",event=\"started\"",
                 self.game_match[0].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_match_events_total",
-                "event=\"loading_complete\"",
+                "mode=\"solo_practice\",event=\"loading_complete\"",
                 self.game_match[1].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_match_events_total",
-                "event=\"finished\"",
+                "mode=\"solo_practice\",event=\"finished\"",
                 self.game_match[2].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_match_events_total",
-                "event=\"aborted\"",
+                "mode=\"solo_practice\",event=\"aborted\"",
                 self.game_match[3].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_match_events_total",
-                "event=\"loading_timeout\"",
+                "mode=\"solo_practice\",event=\"loading_timeout\"",
                 self.game_match[4].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"begun\"",
+                "mode=\"solo_practice\",outcome=\"begun\"",
                 self.game_commit[0].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"existing\"",
+                "mode=\"solo_practice\",outcome=\"existing\"",
                 self.game_commit[1].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"committed\"",
+                "mode=\"solo_practice\",outcome=\"committed\"",
                 self.game_commit[2].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"idempotent\"",
+                "mode=\"solo_practice\",outcome=\"idempotent\"",
                 self.game_commit[3].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"failed\"",
+                "mode=\"solo_practice\",outcome=\"failed\"",
                 self.game_commit[4].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_commit_outcomes_total",
-                "outcome=\"cancelled\"",
+                "mode=\"solo_practice\",outcome=\"cancelled\"",
                 self.game_commit[5].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_shot_outcomes_total",
-                "outcome=\"accepted\"",
+                "mode=\"solo_practice\",outcome=\"accepted\"",
                 self.game_shot[0].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_shot_outcomes_total",
-                "outcome=\"duplicate\"",
+                "mode=\"solo_practice\",outcome=\"duplicate\"",
                 self.game_shot[1].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_shot_outcomes_total",
-                "outcome=\"rejected\"",
+                "mode=\"solo_practice\",outcome=\"out_of_turn\"",
                 self.game_shot[2].load(Ordering::Relaxed),
             ),
             (
                 "pangya_game_shot_outcomes_total",
-                "outcome=\"rate_limited\"",
+                "mode=\"solo_practice\",outcome=\"rejected\"",
                 self.game_shot[3].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_shot_outcomes_total",
+                "mode=\"solo_practice\",outcome=\"rate_limited\"",
+                self.game_shot[4].load(Ordering::Relaxed),
             ),
         ];
         for (name, labels, value) in values {
             let _ = writeln!(output, "{name}{{{labels}}} {value}");
+        }
+        for (index, event) in ["turn_timeout", "game_timeout", "forfeit"]
+            .into_iter()
+            .enumerate()
+        {
+            let value = self.game_match[index + 5].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "pangya_game_match_events_total{{mode=\"solo_practice\",event=\"{event}\"}} {value}"
+            );
+        }
+        let stroke_active = self.game_stroke_matches_active.load(Ordering::Relaxed);
+        let _ = writeln!(
+            output,
+            "pangya_game_matches_active{{mode=\"stroke_two\"}} {stroke_active}"
+        );
+        for (index, event) in [
+            "started",
+            "loading_complete",
+            "finished",
+            "aborted",
+            "loading_timeout",
+            "turn_timeout",
+            "game_timeout",
+            "forfeit",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let value = self.game_stroke_match[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "pangya_game_match_events_total{{mode=\"stroke_two\",event=\"{event}\"}} {value}"
+            );
+        }
+        for (index, outcome) in [
+            "begun",
+            "existing",
+            "committed",
+            "idempotent",
+            "failed",
+            "cancelled",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let value = self.game_stroke_commit[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "pangya_game_commit_outcomes_total{{mode=\"stroke_two\",outcome=\"{outcome}\"}} {value}"
+            );
+        }
+        for (index, outcome) in [
+            "accepted",
+            "duplicate",
+            "out_of_turn",
+            "rejected",
+            "rate_limited",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let value = self.game_stroke_shot[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "pangya_game_shot_outcomes_total{{mode=\"stroke_two\",outcome=\"{outcome}\"}} {value}"
+            );
         }
         output
     }
@@ -939,6 +1020,7 @@ impl GameObserver for M2Metrics {
             GameRateClass::RoomCommandsConnection => 11,
             GameRateClass::ChatConnection => 12,
             GameRateClass::ShotPacketsConnection => 13,
+            GameRateClass::StrokePacketsConnection => 14,
         };
         self.game_rate[index].fetch_add(1, Ordering::Relaxed);
     }
@@ -1005,8 +1087,32 @@ impl GameObserver for M2Metrics {
             GameMatchObservation::Finished => 2,
             GameMatchObservation::Aborted => 3,
             GameMatchObservation::LoadingTimeout => 4,
+            GameMatchObservation::TurnTimeout => 5,
+            GameMatchObservation::GameTimeout => 6,
+            GameMatchObservation::Forfeit => 7,
         };
         self.game_match[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stroke_matches_active(&self, active: usize) {
+        self.game_stroke_matches_active.store(
+            u64::try_from(active).map_or(u64::MAX, |value| value),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn stroke_match_event(&self, event: GameMatchObservation) {
+        let index = match event {
+            GameMatchObservation::Started => 0,
+            GameMatchObservation::LoadingComplete => 1,
+            GameMatchObservation::Finished => 2,
+            GameMatchObservation::Aborted => 3,
+            GameMatchObservation::LoadingTimeout => 4,
+            GameMatchObservation::TurnTimeout => 5,
+            GameMatchObservation::GameTimeout => 6,
+            GameMatchObservation::Forfeit => 7,
+        };
+        self.game_stroke_match[index].fetch_add(1, Ordering::Relaxed);
     }
 
     fn commit(&self, outcome: GameCommitObservation) {
@@ -1021,14 +1127,38 @@ impl GameObserver for M2Metrics {
         self.game_commit[index].fetch_add(1, Ordering::Relaxed);
     }
 
+    fn stroke_commit(&self, outcome: GameCommitObservation) {
+        let index = match outcome {
+            GameCommitObservation::Begun => 0,
+            GameCommitObservation::Existing => 1,
+            GameCommitObservation::Committed => 2,
+            GameCommitObservation::Idempotent => 3,
+            GameCommitObservation::Failed => 4,
+            GameCommitObservation::Cancelled => 5,
+        };
+        self.game_stroke_commit[index].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn shot(&self, outcome: GameShotObservation) {
         let index = match outcome {
             GameShotObservation::Accepted => 0,
             GameShotObservation::Duplicate => 1,
-            GameShotObservation::Rejected => 2,
-            GameShotObservation::RateLimited => 3,
+            GameShotObservation::OutOfTurn => 2,
+            GameShotObservation::Rejected => 3,
+            GameShotObservation::RateLimited => 4,
         };
         self.game_shot[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stroke_shot(&self, outcome: GameShotObservation) {
+        let index = match outcome {
+            GameShotObservation::Accepted => 0,
+            GameShotObservation::Duplicate => 1,
+            GameShotObservation::OutOfTurn => 2,
+            GameShotObservation::Rejected => 3,
+            GameShotObservation::RateLimited => 4,
+        };
+        self.game_stroke_shot[index].fetch_add(1, Ordering::Relaxed);
     }
 
     fn authenticated(&self, account_id: AccountId) {
@@ -1334,17 +1464,46 @@ mod tests {
         let rendered = metrics.render();
         for expected in [
             "pangya_game_matches_active{mode=\"solo_practice\"} 0",
-            "pangya_game_match_events_total{event=\"started\"} 1",
-            "pangya_game_match_events_total{event=\"loading_complete\"} 1",
-            "pangya_game_commit_outcomes_total{outcome=\"begun\"} 1",
-            "pangya_game_commit_outcomes_total{outcome=\"committed\"} 1",
-            "pangya_game_shot_outcomes_total{outcome=\"accepted\"} 1",
-            "pangya_game_shot_outcomes_total{outcome=\"duplicate\"} 1",
+            "pangya_game_match_events_total{mode=\"solo_practice\",event=\"started\"} 1",
+            "pangya_game_match_events_total{mode=\"solo_practice\",event=\"loading_complete\"} 1",
+            "pangya_game_commit_outcomes_total{mode=\"solo_practice\",outcome=\"begun\"} 1",
+            "pangya_game_commit_outcomes_total{mode=\"solo_practice\",outcome=\"committed\"} 1",
+            "pangya_game_shot_outcomes_total{mode=\"solo_practice\",outcome=\"accepted\"} 1",
+            "pangya_game_shot_outcomes_total{mode=\"solo_practice\",outcome=\"duplicate\"} 1",
             "pangya_game_rate_limit_total{class=\"shot_packets_connection\"} 1",
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
         for forbidden in ["match_id=", "result_key=", "seed=", "balance=", "x="] {
+            assert!(!rendered.contains(forbidden), "found {forbidden}");
+        }
+    }
+
+    #[test]
+    fn game_m6_metrics_use_only_fixed_mode_and_outcome_buckets() {
+        let metrics = M2Metrics::default();
+        GameObserver::stroke_matches_active(&metrics, 1);
+        GameObserver::stroke_match_event(&metrics, GameMatchObservation::Started);
+        GameObserver::stroke_match_event(&metrics, GameMatchObservation::TurnTimeout);
+        GameObserver::stroke_match_event(&metrics, GameMatchObservation::Forfeit);
+        GameObserver::stroke_commit(&metrics, GameCommitObservation::Committed);
+        GameObserver::stroke_shot(&metrics, GameShotObservation::Rejected);
+        GameObserver::rate_limited(&metrics, GameRateClass::StrokePacketsConnection);
+        GameObserver::stroke_matches_active(&metrics, 0);
+
+        let rendered = metrics.render();
+        for expected in [
+            "pangya_game_matches_active{mode=\"stroke_two\"} 0",
+            "pangya_game_match_events_total{mode=\"stroke_two\",event=\"started\"} 1",
+            "pangya_game_match_events_total{mode=\"stroke_two\",event=\"turn_timeout\"} 1",
+            "pangya_game_match_events_total{mode=\"stroke_two\",event=\"forfeit\"} 1",
+            "pangya_game_commit_outcomes_total{mode=\"stroke_two\",outcome=\"committed\"} 1",
+            "pangya_game_shot_outcomes_total{mode=\"stroke_two\",outcome=\"rejected\"} 1",
+            "pangya_game_rate_limit_total{class=\"stroke_packets_connection\"} 1",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        for forbidden in ["account_id=", "room_id=", "match_id=", "seed=", "x="] {
             assert!(!rendered.contains(forbidden), "found {forbidden}");
         }
     }

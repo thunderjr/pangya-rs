@@ -849,7 +849,7 @@ impl RoomState {
         if matches!(outcome, StrokeLoadingOutcome::PersistenceRequired(_)) {
             self.deadlines.stroke_loading = None;
         }
-        if outcome != StrokeLoadingOutcome::Duplicate {
+        if matches!(outcome, StrokeLoadingOutcome::PersistenceRequired(_)) {
             let match_id = self
                 .stroke
                 .start_plan()
@@ -976,10 +976,14 @@ impl RoomState {
     fn abort_stroke(&mut self, reason: MatchAbortReason) -> Option<AbortStrokeMatch> {
         self.deadlines.clear_stroke();
         if let Some(pending) = self.pending_stroke_persistence {
-            return match pending {
-                PendingStrokePersistence::Abort(abort) => Some(abort),
-                PendingStrokePersistence::Settlement(_) => None,
-            };
+            match pending {
+                PendingStrokePersistence::Abort(abort) => return Some(abort),
+                PendingStrokePersistence::Settlement(_) => {
+                    self.pending_stroke_persistence = None;
+                    self.stroke_persistence_event_delivered = false;
+                    self.stroke_persistence_control_delivered = false;
+                }
+            }
         }
         let abort = self.stroke.abort(reason);
         if let Some(abort) = abort {
@@ -997,6 +1001,15 @@ impl RoomState {
             .roster()
             .copied()
             .ok_or(StrokeMatchError::InvalidPhase)?;
+        if self.stroke.pending_abort().is_none() {
+            let prepared = self
+                .stroke
+                .abort(abort.reason())
+                .ok_or(StrokeMatchError::InvalidPhase)?;
+            if prepared != abort {
+                return Err(StrokeMatchError::IdentityMismatch);
+            }
+        }
         self.stroke.acknowledge_abort(abort)?;
         self.pending_stroke_persistence = None;
         self.stroke_persistence_event_delivered = false;
@@ -1026,17 +1039,16 @@ impl RoomState {
         work: PendingStrokePersistence,
         excluded: Option<PlayerConnectionId>,
     ) -> bool {
-        match self.pending_stroke_persistence {
-            Some(current) if current != work => return false,
-            Some(_) => {}
-            None => {
-                self.pending_stroke_persistence = Some(work);
-                self.stroke_persistence_event_delivered = false;
-                self.stroke_persistence_control_delivered = false;
-            }
+        if !self.retain_stroke_persistence(work) {
+            return false;
         }
         if self.stroke_persistence_event_delivered {
             return true;
+        }
+        // Persistence authority is exclusive: once priority cleanup claimed the work, no
+        // connection may also receive a coordinator request for the same repository operation.
+        if self.stroke_persistence_control_delivered {
+            return false;
         }
 
         let mut candidates: Vec<_> = self
@@ -1069,8 +1081,22 @@ impl RoomState {
         false
     }
 
+    fn retain_stroke_persistence(&mut self, work: PendingStrokePersistence) -> bool {
+        match self.pending_stroke_persistence {
+            Some(current) => current == work,
+            None => {
+                self.pending_stroke_persistence = Some(work);
+                self.stroke_persistence_event_delivered = false;
+                self.stroke_persistence_control_delivered = false;
+                true
+            }
+        }
+    }
+
     fn claim_stroke_persistence(&mut self) -> RoomCloseOutcome {
-        if self.stroke_persistence_control_delivered {
+        // Automatic deadline/give-up work is owned by the one connection that received the
+        // coordinator event. Priority cleanup may claim only work that has not been enqueued.
+        if self.stroke_persistence_control_delivered || self.stroke_persistence_event_delivered {
             return RoomCloseOutcome::None;
         }
         let Some(work) = self.pending_stroke_persistence else {
@@ -1086,13 +1112,21 @@ impl RoomState {
         solo_reason: MatchAbortReason,
     ) -> RoomCloseOutcome {
         if self.stroke.is_active() {
+            if solo_reason == MatchAbortReason::Shutdown {
+                if self.stroke_persistence_control_delivered {
+                    return RoomCloseOutcome::None;
+                }
+                self.prepare_priority_stroke_abort(MatchAbortReason::Shutdown);
+                return self.claim_stroke_persistence();
+            }
             if self.pending_stroke_persistence.is_some() {
                 return self.claim_stroke_persistence();
             }
             match self.stroke.disconnect(caller) {
                 Ok(StrokeDeadlineOutcome::Aborted(abort)) => {
                     self.deadlines.clear_stroke();
-                    let _delivered = self.request_stroke_abort(abort, Some(caller));
+                    let _retained =
+                        self.retain_stroke_persistence(PendingStrokePersistence::Abort(abort));
                     self.claim_stroke_persistence()
                 }
                 Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
@@ -1101,7 +1135,8 @@ impl RoomState {
                         match_id: commit.match_id(),
                         phase: self.stroke.phase(),
                     });
-                    let _delivered = self.request_stroke_settlement(commit, Some(caller));
+                    let _retained = self
+                        .retain_stroke_persistence(PendingStrokePersistence::Settlement(commit));
                     self.claim_stroke_persistence()
                 }
                 Ok(StrokeDeadlineOutcome::Stale) | Err(_) => RoomCloseOutcome::None,
@@ -1115,12 +1150,43 @@ impl RoomState {
         }
     }
 
+    fn prepare_priority_stroke_abort(&mut self, reason: MatchAbortReason) {
+        self.deadlines.clear_stroke();
+        if matches!(
+            self.pending_stroke_persistence,
+            Some(PendingStrokePersistence::Abort(abort)) if abort.reason() == reason
+        ) {
+            return;
+        }
+        self.pending_stroke_persistence = None;
+        self.stroke_persistence_event_delivered = false;
+        self.stroke_persistence_control_delivered = false;
+        if let Some(abort) = self.stroke.prioritize_abort(reason) {
+            self.pending_stroke_persistence = Some(PendingStrokePersistence::Abort(abort));
+        }
+    }
+
+    fn prioritize_and_claim_stroke_abort(
+        &mut self,
+        reason: MatchAbortReason,
+    ) -> Option<AbortStrokeMatch> {
+        self.prepare_priority_stroke_abort(reason);
+        let Some(PendingStrokePersistence::Abort(abort)) = self.pending_stroke_persistence else {
+            return None;
+        };
+        // Replacement transfers the existing event/control claim to this control caller. Keep the
+        // claim marked until durable acknowledgement; concurrent cleanup must never retry it.
+        self.stroke_persistence_event_delivered = false;
+        self.stroke_persistence_control_delivered = true;
+        Some(abort)
+    }
+
     fn shutdown_outcome(&mut self) -> RoomCloseOutcome {
         if self.stroke.is_active() {
-            if self.pending_stroke_persistence.is_some() {
-                return self.claim_stroke_persistence();
+            if self.stroke_persistence_control_delivered {
+                return RoomCloseOutcome::None;
             }
-            let _abort = self.abort_stroke(MatchAbortReason::Shutdown);
+            self.prepare_priority_stroke_abort(MatchAbortReason::Shutdown);
             self.claim_stroke_persistence()
         } else {
             self.mark_aborted(MatchAbortReason::Shutdown)
@@ -1355,6 +1421,10 @@ enum RoomCommand {
         result: StrokeMatchResult,
         reply: oneshot::Sender<Result<StrokeMatchResult, StrokeMatchError>>,
     },
+    PrioritizeStrokeAbort {
+        reason: MatchAbortReason,
+        reply: oneshot::Sender<Option<AbortStrokeMatch>>,
+    },
     AbortStroke {
         reason: MatchAbortReason,
         reply: oneshot::Sender<Option<AbortStrokeMatch>>,
@@ -1420,8 +1490,10 @@ impl RoomCloseOutcome {
 /// Atomic priority-disconnect output used by the lobby registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoomDisconnect {
-    /// Post-removal room projection, or `None` when the room closed.
+    /// Post-removal room projection, or `None` when no members remain.
     pub snapshot: Option<RoomSnapshot>,
+    /// Whether the empty actor must remain alive for claimed, unacknowledged M6 persistence.
+    pub retain_for_persistence: bool,
     /// Closed persistence work with room/match authority.
     pub outcome: RoomCloseOutcome,
     /// Compatibility M5 abort projection.
@@ -1855,6 +1927,16 @@ impl RoomHandle {
         receive.await.map_err(|_| StrokeMatchError::Closed)?
     }
 
+    /// Replaces any unacknowledged aggregate outcome with a priority no-reward abort.
+    pub async fn prioritize_stroke_abort(
+        &self,
+        reason: MatchAbortReason,
+    ) -> Result<Option<AbortStrokeMatch>, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::PrioritizeStrokeAbort { reason, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)
+    }
+
     /// Converts any active stroke state to an exact no-reward abort.
     pub async fn abort_stroke(
         &self,
@@ -2039,10 +2121,19 @@ async fn run_room(
                             RoomCloseOutcome::M5Abort { request, .. } => Some(request),
                             _ => None,
                         };
-                        state.remove(caller).map(|snapshot| RoomDisconnect { snapshot, outcome, abort })
+                        state.remove(caller).map(|snapshot| {
+                            let retain_for_persistence = snapshot.is_none()
+                                && state.pending_stroke_persistence.is_some();
+                            RoomDisconnect {
+                                snapshot,
+                                retain_for_persistence,
+                                outcome,
+                                abort,
+                            }
+                        })
                     };
                     if let Ok(outcome) = &result {
-                        open = outcome.snapshot.is_some();
+                        open = outcome.snapshot.is_some() || outcome.retain_for_persistence;
                         after_mutation(&state, outcome.snapshot.as_ref(), events.as_ref());
                     }
                     let _ignored = reply.send(result);
@@ -2289,7 +2380,14 @@ fn handle_normal(
             true
         }
         RoomCommand::ApplyStrokeCommit { result, reply } => {
-            let _ignored = reply.send(state.apply_stroke_commit(result));
+            let result = state.apply_stroke_commit(result);
+            let open = result.is_err() || !state.members.is_empty();
+            let _ignored = reply.send(result);
+            open
+        }
+        RoomCommand::PrioritizeStrokeAbort { reason, reply } => {
+            let abort = state.prioritize_and_claim_stroke_abort(reason);
+            let _ignored = reply.send(abort);
             true
         }
         RoomCommand::AbortStroke { reason, reply } => {
@@ -2297,8 +2395,10 @@ fn handle_normal(
             true
         }
         RoomCommand::AcknowledgeStrokeAbort { abort, reply } => {
-            let _ignored = reply.send(state.acknowledge_stroke_abort(abort));
-            true
+            let result = state.acknowledge_stroke_abort(abort);
+            let open = result.is_err() || !state.members.is_empty();
+            let _ignored = reply.send(result);
+            open
         }
     }
 }
@@ -3219,8 +3319,87 @@ mod tests {
         assert_eq!(retained.apply_stroke_commit(persisted), Ok(persisted));
     }
 
+    #[test]
+    fn priority_abort_replacement_transfers_and_retains_the_control_claim() {
+        let first = identity(1);
+        let second = identity(2);
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        let (owner_tx, _owner_rx) = mpsc::channel(32);
+        let (second_tx, _second_rx) = mpsc::channel(32);
+        let mut state = RoomState::new(
+            RoomId::new(32).expect("room"),
+            RoomName::parse("claim-transfer").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            owner_tx,
+            CancellationToken::new(),
+        );
+        state
+            .join_with_cancellation(second.clone(), None, second_tx, CancellationToken::new())
+            .expect("join");
+        state
+            .set_ready(first.connection_id, true)
+            .expect("owner ready");
+        state
+            .set_ready(second.connection_id, true)
+            .expect("peer ready");
+        playing_stroke_room(&mut state, &plan);
+
+        let RoomCloseOutcome::M6Settlement {
+            request: settlement,
+            ..
+        } = state.disconnect_outcome(first.connection_id, MatchAbortReason::Disconnect)
+        else {
+            unreachable!()
+        };
+        assert!(state.stroke_persistence_control_delivered);
+        assert_eq!(
+            state.disconnect_outcome(second.connection_id, MatchAbortReason::Shutdown),
+            RoomCloseOutcome::None,
+            "shutdown cleanup cannot steal an existing control claim"
+        );
+        assert_eq!(
+            state.pending_stroke_persistence,
+            Some(PendingStrokePersistence::Settlement(settlement))
+        );
+        assert!(state.stroke_persistence_control_delivered);
+        let abort = state
+            .prioritize_and_claim_stroke_abort(MatchAbortReason::Shutdown)
+            .expect("priority abort");
+        assert_eq!(abort.reason(), MatchAbortReason::Shutdown);
+        assert_eq!(
+            state.pending_stroke_persistence,
+            Some(PendingStrokePersistence::Abort(abort))
+        );
+        assert!(!state.stroke_persistence_event_delivered);
+        assert!(state.stroke_persistence_control_delivered);
+        assert_eq!(
+            state.disconnect_outcome(second.connection_id, MatchAbortReason::Shutdown),
+            RoomCloseOutcome::None,
+            "the transferred claim is not available to concurrent cleanup"
+        );
+
+        assert_eq!(state.acknowledge_stroke_abort(abort), Ok(()));
+        assert_eq!(state.pending_stroke_persistence, None);
+        assert!(!state.stroke_persistence_event_delivered);
+        assert!(!state.stroke_persistence_control_delivered);
+        assert_eq!(
+            state.acknowledge_stroke_abort(abort),
+            Err(StrokeMatchError::InvalidPhase),
+            "the exact abort is acknowledged only once"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn stroke_turn_timer_fires_without_action_extension_and_shutdown_preserves_settlement() {
+    async fn stroke_turn_timer_fires_without_action_extension_and_shutdown_converts_to_abort() {
         let first = identity(1);
         let second = identity(2);
         let (owner_tx, mut owner_rx) = mpsc::channel(64);
@@ -3294,9 +3473,13 @@ mod tests {
         let outcome = handle.shutdown().await.unwrap_or_else(|_| unreachable!());
         assert_eq!(
             outcome,
-            RoomCloseOutcome::M6Settlement {
+            RoomCloseOutcome::M6Abort {
                 room_id: handle.id(),
-                request: commit,
+                request: AbortStrokeMatch::new(
+                    commit.match_id(),
+                    commit.result_key(),
+                    MatchAbortReason::Shutdown,
+                ),
             }
         );
     }
