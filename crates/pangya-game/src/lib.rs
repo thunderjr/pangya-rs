@@ -13,7 +13,6 @@ pub use room::{RoomActorLimits, RoomEvent, RoomHandle, RoomIdentity, spawn_room}
 
 use std::{
     collections::VecDeque,
-    future::Future,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -528,6 +527,7 @@ where
             || limits.outbound_room_event_capacity == 0
             || limits.outbound_room_event_capacity > 65_536
             || !limits.lobby.is_valid()
+            || limits.lobby.cleanup_capacity() < limits.global_connections.saturating_add(1)
             || limits.rate_window.is_zero()
             || limits.rate_window > Duration::from_secs(3_600)
             || limits.authentication_timeout.is_zero()
@@ -619,9 +619,19 @@ where
         shutdown: CancellationToken,
     ) -> Result<(), GameRuntimeError> {
         let mut tasks = JoinSet::new();
+        let mut room_closures = self.lobby.subscribe_room_closures();
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
+                closed = room_closures.recv() => match closed {
+                    Ok(_room_id) => self.observer.room(GameRoomObservation::Closed),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        for _ in 0..skipped {
+                            self.observer.room(GameRoomObservation::Closed);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| GameRuntimeError::Accept)?;
                     match self.admit(peer) {
@@ -651,8 +661,8 @@ where
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
         }
-        let lobby_result = timeout(self.config.limits.shutdown_grace, self.lobby.shutdown()).await;
-        if drain_timed_out || !matches!(lobby_result, Ok(Ok(()))) {
+        let lobby_result = self.lobby.shutdown().await;
+        if drain_timed_out || lobby_result.is_err() {
             return Err(GameRuntimeError::ShutdownTimeout);
         }
         Ok(())
@@ -756,7 +766,7 @@ where
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
-        let mut queue_drops = self.lobby.subscribe_queue_drops();
+        let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
 
         let result = loop {
@@ -770,19 +780,9 @@ where
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
-                dropped = queue_drops.recv() => {
-                    match dropped {
-                        Ok(dropped) if dropped == connection_id => {
-                            self.observer.queue(GameQueueObservation::OutboundDropped);
-                            break Err(GameRuntimeError::Limited);
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            self.observer.queue(GameQueueObservation::OutboundDropped);
-                            break Err(GameRuntimeError::Limited);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break Err(GameRuntimeError::Limited),
-                    }
+                () = room_cancellation.cancelled() => {
+                    self.observer.queue(GameQueueObservation::OutboundDropped);
+                    break Err(GameRuntimeError::Limited);
                 }
                 event = room_events.recv(), if state == GameState::InRoom => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
@@ -881,6 +881,7 @@ where
                                         state,
                                         established,
                                         outbound.clone(),
+                                        room_cancellation.clone(),
                                         &mut chats,
                                         frame.opcode,
                                         &frame.payload,
@@ -918,16 +919,10 @@ where
         };
 
         state = GameState::Closed;
-        let cleanup = timeout(
-            self.config.limits.command_timeout,
-            self.lobby.disconnect(connection_id),
-        )
-        .await;
-        if matches!(cleanup, Ok(Ok(None))) {
-            self.observer.room(GameRoomObservation::Closed);
-        } else if !matches!(
+        let cleanup = self.lobby.disconnect(connection_id).await;
+        if !matches!(
             cleanup,
-            Ok(Ok(Some(_))) | Ok(Err(RoomError::NotMember | RoomError::RoomNotFound))
+            Ok(Some(_)) | Ok(None) | Err(RoomError::NotMember | RoomError::RoomNotFound)
         ) {
             self.observer.queue(GameQueueObservation::LobbyRejected);
         }
@@ -1053,6 +1048,7 @@ where
         state: GameState,
         identity: &RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
+        room_cancellation: CancellationToken,
         chats: &mut LocalRateWindow,
         opcode: u16,
         payload: &[u8],
@@ -1063,7 +1059,7 @@ where
             (GameState::InChannel, SYNTHETIC_M4_C2S_LIST) => {
                 decode_packet_payload::<RoomListRequest>(payload, profile, ServiceKind::Game)
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                match self.lobby_call(self.lobby.list()).await {
+                match self.lobby.list().await {
                     Ok(rooms) => {
                         self.send(framed, &RoomListResponse { rooms }).await?;
                         self.observer.room(GameRoomObservation::Listed);
@@ -1080,31 +1076,49 @@ where
                     decode_packet_payload::<RoomCreateRequest>(payload, profile, ServiceKind::Game)
                         .map_err(|_| GameRuntimeError::Protocol)?;
                 let result = self
-                    .lobby_call(self.lobby.create(
+                    .lobby
+                    .create(
                         request.name,
                         request.password,
                         request.settings,
                         identity.clone(),
                         outbound,
-                    ))
+                        room_cancellation.clone(),
+                    )
                     .await;
                 match result {
                     Ok(summary) => {
-                        *room_id = Some(summary.id());
-                        self.send_result(framed, RoomCommand::Create, Ok(()))
-                            .await?;
-                        self.observer.room(GameRoomObservation::Created);
-                        if let Ok(LobbyRouteResult::Snapshot(snapshot)) = self
-                            .lobby_call(
-                                self.lobby
-                                    .route(identity.connection_id, LobbyRoomCommand::GetState),
-                            )
+                        let initial = match self
+                            .lobby
+                            .route(identity.connection_id, LobbyRoomCommand::GetState)
                             .await
                         {
-                            self.send(framed, &RoomStateResponse { room: snapshot })
-                                .await?;
+                            Ok(LobbyRouteResult::Snapshot(snapshot)) => Ok(snapshot),
+                            Ok(LobbyRouteResult::ChatAccepted) => Err(RoomError::Closed),
+                            Err(error) => Err(error),
+                        };
+                        match initial {
+                            Ok(snapshot) => {
+                                *room_id = Some(summary.id());
+                                self.send_result(framed, RoomCommand::Create, Ok(()))
+                                    .await?;
+                                self.send(framed, &RoomStateResponse { room: snapshot })
+                                    .await?;
+                                self.observer.room(GameRoomObservation::Created);
+                                Ok(GameState::InRoom)
+                            }
+                            Err(error) => {
+                                if !matches!(
+                                    self.lobby.disconnect(identity.connection_id).await,
+                                    Ok(_) | Err(RoomError::NotMember | RoomError::RoomNotFound)
+                                ) {
+                                    self.observer.queue(GameQueueObservation::LobbyRejected);
+                                }
+                                self.send_result(framed, RoomCommand::Create, Err(error))
+                                    .await?;
+                                Ok(GameState::InChannel)
+                            }
                         }
-                        Ok(GameState::InRoom)
                     }
                     Err(error) => {
                         self.send_result(framed, RoomCommand::Create, Err(error))
@@ -1119,12 +1133,14 @@ where
                         .map_err(|_| GameRuntimeError::Protocol)?;
                 let requested_room = request.room_id;
                 let result = self
-                    .lobby_call(self.lobby.join(
+                    .lobby
+                    .join(
                         requested_room,
                         identity.clone(),
                         request.password,
                         outbound,
-                    ))
+                        room_cancellation,
+                    )
                     .await;
                 match result {
                     Ok(snapshot) => {
@@ -1145,16 +1161,11 @@ where
             (GameState::InRoom, SYNTHETIC_M4_C2S_LEAVE) => {
                 decode_packet_payload::<RoomLeaveRequest>(payload, profile, ServiceKind::Game)
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                let result = self
-                    .lobby_call(self.lobby.leave(identity.connection_id))
-                    .await;
+                let result = self.lobby.leave(identity.connection_id).await;
                 match result {
-                    Ok(snapshot) => {
+                    Ok(_snapshot) => {
                         self.send_result(framed, RoomCommand::Leave, Ok(())).await?;
                         self.observer.room(GameRoomObservation::Left);
-                        if snapshot.is_none() {
-                            self.observer.room(GameRoomObservation::Closed);
-                        }
                         *room_id = None;
                         Ok(GameState::InChannel)
                     }
@@ -1206,10 +1217,8 @@ where
                     return Err(GameRuntimeError::Limited);
                 }
                 let result = self
-                    .lobby_call(
-                        self.lobby
-                            .route(identity.connection_id, LobbyRoomCommand::Chat(request.text)),
-                    )
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::Chat(request.text))
                     .await;
                 match result {
                     Ok(LobbyRouteResult::ChatAccepted) => {
@@ -1242,10 +1251,8 @@ where
                 decode_packet_payload::<RoomStateRequest>(payload, profile, ServiceKind::Game)
                     .map_err(|_| GameRuntimeError::Protocol)?;
                 let result = self
-                    .lobby_call(
-                        self.lobby
-                            .route(identity.connection_id, LobbyRoomCommand::GetState),
-                    )
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
                     .await;
                 match result {
                     Ok(LobbyRouteResult::Snapshot(snapshot)) => {
@@ -1273,9 +1280,7 @@ where
         route: LobbyRoomCommand,
         observation: GameRoomObservation,
     ) -> Result<(), GameRuntimeError> {
-        let result = self
-            .lobby_call(self.lobby.route(connection_id, route))
-            .await;
+        let result = self.lobby.route(connection_id, route).await;
         match result {
             Ok(LobbyRouteResult::Snapshot(snapshot)) => {
                 self.send_result(framed, command, Ok(())).await?;
@@ -1332,19 +1337,9 @@ where
             RoomEvent::Closed => {
                 self.send_result(framed, RoomCommand::State, Err(RoomError::Closed))
                     .await?;
-                self.observer.room(GameRoomObservation::Closed);
                 Ok(RoomEventEffect::EnterChannel)
             }
         }
-    }
-
-    async fn lobby_call<F, T>(&self, operation: F) -> Result<T, RoomError>
-    where
-        F: Future<Output = Result<T, RoomError>>,
-    {
-        timeout(self.config.limits.command_timeout, operation)
-            .await
-            .map_err(|_| RoomError::Timeout)?
     }
 
     async fn send_result(

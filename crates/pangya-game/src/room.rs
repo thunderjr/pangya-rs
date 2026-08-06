@@ -10,9 +10,10 @@ use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Identity established by the connection/authentication boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +133,7 @@ struct Member {
     ready: bool,
     joined_order: u64,
     outbound: mpsc::Sender<RoomEvent>,
+    cancellation: CancellationToken,
 }
 
 impl Member {
@@ -153,7 +155,6 @@ struct RoomState {
     settings: RoomSettings,
     members: Vec<Member>,
     next_join_order: u64,
-    queue_drops: Option<broadcast::Sender<PlayerConnectionId>>,
 }
 
 impl RoomState {
@@ -164,7 +165,7 @@ impl RoomState {
         settings: RoomSettings,
         owner: RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
-        queue_drops: Option<broadcast::Sender<PlayerConnectionId>>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             id,
@@ -177,19 +178,15 @@ impl RoomState {
                 ready: false,
                 joined_order: 0,
                 outbound,
+                cancellation,
             }],
             next_join_order: 1,
-            queue_drops,
         }
     }
 
     fn deliver(&self, member: &Member, event: RoomEvent) {
-        if matches!(
-            member.outbound.try_send(event),
-            Err(mpsc::error::TrySendError::Full(_))
-        ) && let Some(queue_drops) = &self.queue_drops
-        {
-            let _no_receivers = queue_drops.send(member.identity.connection_id);
+        if member.outbound.try_send(event).is_err() {
+            member.cancellation.cancel();
         }
     }
 
@@ -224,11 +221,22 @@ impl RoomState {
         )
     }
 
+    #[cfg(test)]
     fn join(
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
         outbound: mpsc::Sender<RoomEvent>,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
+    }
+
+    fn join_with_cancellation(
+        &mut self,
+        identity: RoomIdentity,
+        password: Option<&RoomPassword>,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.member_index(identity.connection_id).is_some() {
             return Err(RoomError::AlreadyMember);
@@ -251,6 +259,7 @@ impl RoomState {
             ready: false,
             joined_order,
             outbound,
+            cancellation,
         });
         Ok(self.snapshot())
     }
@@ -350,6 +359,7 @@ enum RoomCommand {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
     Leave {
@@ -431,11 +441,23 @@ impl RoomHandle {
         password: Option<RoomPassword>,
         outbound: mpsc::Sender<RoomEvent>,
     ) -> Result<RoomSnapshot, RoomError> {
+        self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn join_with_cancellation(
+        &self,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
         self.send_normal(RoomCommand::Join {
             identity,
             password,
             outbound,
+            cancellation,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -529,10 +551,7 @@ impl RoomHandle {
         let (reply, receive) = oneshot::channel();
         self.send_control(ControlCommand::Disconnect { caller, reply })
             .await?;
-        timeout(self.control_timeout, receive)
-            .await
-            .map_err(|_| RoomError::Timeout)?
-            .map_err(|_| RoomError::Closed)?
+        receive.await.map_err(|_| RoomError::Closed)?
     }
 
     /// Shuts down through the priority queue with a bounded deadline.
@@ -540,10 +559,7 @@ impl RoomHandle {
         let (reply, receive) = oneshot::channel();
         self.send_control(ControlCommand::Shutdown { reply })
             .await?;
-        timeout(self.control_timeout, receive)
-            .await
-            .map_err(|_| RoomError::Timeout)?
-            .map_err(|_| RoomError::Closed)
+        receive.await.map_err(|_| RoomError::Closed)
     }
 
     #[cfg(test)]
@@ -569,8 +585,8 @@ pub fn spawn_room(
         settings,
         owner,
         owner_outbound,
+        CancellationToken::new(),
         limits,
-        None,
         None,
     )
 }
@@ -583,9 +599,9 @@ pub(crate) fn spawn_room_with_events(
     settings: RoomSettings,
     owner: RoomIdentity,
     owner_outbound: mpsc::Sender<RoomEvent>,
+    owner_cancellation: CancellationToken,
     limits: RoomActorLimits,
     events: Option<mpsc::Sender<RoomActorEvent>>,
-    queue_drops: Option<broadcast::Sender<PlayerConnectionId>>,
 ) -> (RoomHandle, RoomSummary) {
     let state = RoomState::new(
         id,
@@ -594,7 +610,7 @@ pub(crate) fn spawn_room_with_events(
         settings,
         owner,
         owner_outbound,
-        queue_drops,
+        owner_cancellation,
     );
     let summary = state.summary();
     let (normal, normal_rx) = mpsc::channel(limits.normal_capacity.get());
@@ -667,9 +683,11 @@ fn handle_normal(
             identity,
             password,
             outbound,
+            cancellation,
             reply,
         } => {
-            let result = state.join(identity, password.as_ref(), outbound);
+            let result =
+                state.join_with_cancellation(identity, password.as_ref(), outbound, cancellation);
             if let Ok(snapshot) = &result {
                 after_mutation(state, Some(snapshot), events);
             }
@@ -784,7 +802,7 @@ mod tests {
                 RoomSettings::new(capacity).unwrap_or_else(|_| unreachable!()),
                 identity(1),
                 tx,
-                None,
+                CancellationToken::new(),
             ),
             rx,
         )

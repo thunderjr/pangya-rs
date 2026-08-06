@@ -591,7 +591,9 @@ fn game_runtime_limits(config: &AppConfig) -> Result<GameRuntimeLimits, ServerEr
     let lobby = LobbyLimits::new(
         nonzero(config.game_max_rooms)?,
         nonzero(config.game_lobby_command_capacity)?,
+        nonzero(global_connections.saturating_add(1))?,
         nonzero(config.game_lobby_event_capacity)?,
+        config.game_command_timeout,
         config.shutdown_grace,
         room,
     );
