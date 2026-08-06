@@ -13,8 +13,18 @@ use pangya_protocol::{
     SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M5_S2C_BALANCE_UPDATE, SYNTHETIC_M5_S2C_COMMAND_RESULT,
     SYNTHETIC_M5_S2C_HOLE_RESULT, SYNTHETIC_M5_S2C_MATCH_ABORTED, SYNTHETIC_M5_S2C_MATCH_PHASE,
     SYNTHETIC_M5_S2C_MATCH_STARTED, SYNTHETIC_M5_S2C_SHOT_ACTION_RELAY,
-    SYNTHETIC_M5_S2C_SHOT_RESULT_RELAY, SelectCharacter, SelectServer, ServiceKind, SetNickname,
-    ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommandResult, StartSolo,
+    SYNTHETIC_M5_S2C_SHOT_RESULT_RELAY, SYNTHETIC_M6_C2S_GIVE_UP,
+    SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
+    SYNTHETIC_M6_S2C_ACTION_RELAY, SYNTHETIC_M6_S2C_BALANCE_UPDATE,
+    SYNTHETIC_M6_S2C_COMMAND_RESULT, SYNTHETIC_M6_S2C_MATCH_ABORTED,
+    SYNTHETIC_M6_S2C_MATCH_STARTED, SYNTHETIC_M6_S2C_PHASE, SYNTHETIC_M6_S2C_RESULT_RELAY,
+    SYNTHETIC_M6_S2C_STANDINGS, SYNTHETIC_M6_S2C_TURN_STARTED, SelectCharacter, SelectServer,
+    ServiceKind, SetNickname, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
+    SoloCommandResult, StartSolo, StartStrokeTwo, StrokeActionRelay, StrokeBalanceUpdate,
+    StrokeCommandResult, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted,
+    StrokeMatchStarted, StrokePhase, StrokeResultRelay, StrokeShotAction, StrokeShotResult,
+    StrokeStandings, StrokeTurnStarted,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -29,12 +39,16 @@ fuzz_target!(|data: &[u8]| {
     let is_m5_c2s = (SYNTHETIC_M5_C2S_START_SOLO..=SYNTHETIC_M5_C2S_FINISH_HOLE).contains(&opcode);
     let is_m5_s2c =
         (SYNTHETIC_M5_S2C_MATCH_STARTED..=SYNTHETIC_M5_S2C_MATCH_ABORTED).contains(&opcode);
-    let service = if is_m4 || is_m5_c2s || is_m5_s2c {
+    let is_m6_c2s =
+        (SYNTHETIC_M6_C2S_START_STROKE_TWO..=SYNTHETIC_M6_C2S_GIVE_UP).contains(&opcode);
+    let is_m6_s2c =
+        (SYNTHETIC_M6_S2C_MATCH_STARTED..=SYNTHETIC_M6_S2C_BALANCE_UPDATE).contains(&opcode);
+    let service = if is_m4 || is_m5_c2s || is_m5_s2c || is_m6_c2s || is_m6_s2c {
         ServiceKind::Game
     } else {
         ServiceKind::Login
     };
-    let direction = if is_m5_s2c {
+    let direction = if is_m5_s2c || is_m6_s2c {
         Direction::ServerToClient
     } else {
         Direction::ClientToServer
@@ -121,6 +135,48 @@ fuzz_target!(|data: &[u8]| {
         }
         SYNTHETIC_M5_S2C_MATCH_ABORTED => {
             let _ = MatchAborted::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_C2S_START_STROKE_TWO => {
+            let _ = StartStrokeTwo::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_C2S_LOADING_COMPLETE => {
+            let _ = StrokeLoadingComplete::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_C2S_SHOT_ACTION => {
+            let _ = StrokeShotAction::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_C2S_SHOT_RESULT => {
+            let _ = StrokeShotResult::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_C2S_GIVE_UP => {
+            let _ = StrokeGiveUp::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_MATCH_STARTED => {
+            let _ = StrokeMatchStarted::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_PHASE => {
+            let _ = StrokePhase::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_TURN_STARTED => {
+            let _ = StrokeTurnStarted::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_ACTION_RELAY => {
+            let _ = StrokeActionRelay::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_RESULT_RELAY => {
+            let _ = StrokeResultRelay::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_STANDINGS => {
+            let _ = StrokeStandings::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_COMMAND_RESULT => {
+            let _ = StrokeCommandResult::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_MATCH_ABORTED => {
+            let _ = StrokeMatchAborted::decode(&mut reader, &CompatibilityProfile::US_852);
+        }
+        SYNTHETIC_M6_S2C_BALANCE_UPDATE => {
+            let _ = StrokeBalanceUpdate::decode(&mut reader, &CompatibilityProfile::US_852);
         }
         _ => {
             let _ = reader.pstring(4096);

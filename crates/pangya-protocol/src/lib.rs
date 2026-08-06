@@ -11,6 +11,7 @@ mod game;
 mod login;
 mod m4_room;
 mod m5_solo;
+mod m6_stroke;
 mod profile;
 mod reader;
 mod registry;
@@ -49,6 +50,18 @@ pub use m5_solo::{
     SYNTHETIC_M5_S2C_SHOT_ACTION_RELAY, SYNTHETIC_M5_S2C_SHOT_RESULT_RELAY, ShotAction,
     ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
     SoloCommandResult, SoloPhase, StartSolo, Weather, Wind, synthetic_m5_registry,
+};
+pub use m6_stroke::{
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M6_S2C_ACTION_RELAY,
+    SYNTHETIC_M6_S2C_BALANCE_UPDATE, SYNTHETIC_M6_S2C_COMMAND_RESULT,
+    SYNTHETIC_M6_S2C_MATCH_ABORTED, SYNTHETIC_M6_S2C_MATCH_STARTED, SYNTHETIC_M6_S2C_PHASE,
+    SYNTHETIC_M6_S2C_RESULT_RELAY, SYNTHETIC_M6_S2C_STANDINGS, SYNTHETIC_M6_S2C_TURN_STARTED,
+    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
+    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, synthetic_m6_registry,
 };
 pub use profile::{
     ClientVersion, CompatibilityProfile, ConnectionState, Direction, ProfileError, Region,

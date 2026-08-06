@@ -1,0 +1,12 @@
+source_project: pangya-rs local synthetic M6 model
+upstream_revision: generated-local-no-source
+upstream_url: none
+upstream_path: none
+license: MIT OR Apache-2.0
+client_version: local-synthetic-profile; retail acceptance not claimed
+service: game
+direction: client-to-server
+expected_opcode: 0x7f31
+redaction_status: generated-no-source; no proprietary, credential, bearer, personal, or client data
+expected_behavior: canonical loading progress 100
+sha256_fixture: 1a253cda01ec2c954196e713e7bab0a9dbd3ba2545cdd576dc81d3e04d115627
