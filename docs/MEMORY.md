@@ -8,13 +8,13 @@
 
 ## One-paragraph state
 
-M1–M3 remain intact. M4's **local synthetic lobby/room checkpoint is complete**: generated `0x7f00`/`0x7f80` contracts, one bounded lobby registry and sole-owner actor per room, authoritative create/list/join/leave/settings/ready/chat/kick/transfer/disconnect behavior, redacted salted password digests, state-aware dispatch, bounded queues/rates/shutdown, and metadata-digest-only unknown capture. Atomic command gates prevent timeout-after-mutation, a capacity-sized priority queue guarantees ordinary-saturation cleanup, per-member cancellation isolates slow clients, and room closure is observed once. Test inventory is 21 game actor/runtime, 11 protocol M4, and 10 real-PostgreSQL Game E2E tests including 3 M4 tests; the complete local validation matrix passed. This is not real U.S. 852 room compatibility: exact room opcodes/layouts/order/limits and real-client create/enter acceptance remain external. There is no M5 start/loading/gameplay/scoring/persistence/reward behavior. Evidence is in [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md).
+M1–M4 remain intact. M5's **local synthetic one-owner, one-member, one-hole solo checkpoint is complete**: generated `0x7f20`/`0x7fa0` contracts, sole room-actor match state, pinned `rand_chacha` 0.3.1 ChaCha12 deterministic weather/wind, strict action/result sequencing and float bounds, server-owned strokes/rewards, durable loading/in-game/results/terminal persistence, immutable exactly-once Pang/EXP ledgers, no-reward aborts, and bounded pre-bind recovery. Current inventory is 49 game tests, 10 M5 protocol tests, 14 real-PostgreSQL Game E2E tests, and 31 storage tests. The complete local format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/four-target-fuzz matrix passed. This is not real U.S. 852 M5 compatibility: room-to-match/solo opcodes, layouts, order, real Course/IFF interpretation, and one-hole client acceptance remain an external 12-step gate. There is no M6 multiplayer, turn arbitration, standings, items, or server physics. Evidence is in [`evidence/M5_SYNTHETIC_SOLO_2026-08-05.md`](evidence/M5_SYNTHETIC_SOLO_2026-08-05.md).
 
 ---
 
 ## Durable decisions in the proposed baseline
 
-These include accepted baseline decisions from ADR-0001 through ADR-0011 and should change only through a superseding ADR:
+These include accepted baseline decisions from ADR-0001 through ADR-0012 and should change only through a superseding ADR:
 
 - First client target: **PangYa U.S. 852.00 / GB.852**.
 - Project type: **clean-room Rust rewrite**, not a mechanical translation.
@@ -27,8 +27,11 @@ These include accepted baseline decisions from ADR-0001 through ADR-0011 and sho
 - Packet strategy: hand-reviewed, state-aware Rust packet types with a fixture per implemented opcode; PacketDoc is evidence, not blindly generated truth.
 - Data strategy: safe explicit little-endian IFF parser; operator mounts proprietary game data read-only. Local M3 uses ADR-0010's versioned synthetic header and interprets only `u32 type_id`; real layouts remain externally gated.
 - Shot model: client computes trajectory/result; server owns identity, membership, ordering, score, validation, inventory, currency, rewards and persistence.
-- M4 room model: provisional local-only C->S `0x7f00..=0x7f08` and S->C `0x7f80..=0x7f84`; one bounded lobby registry, one sole-owner actor per room, priority disconnect/shutdown control, and no durability or M5 behavior (ADR-0011).
+- M4 room model: provisional local-only C->S `0x7f00..=0x7f08` and S->C `0x7f80..=0x7f84`; one bounded lobby registry, one sole-owner actor per room, priority disconnect/shutdown control, and no room durability (ADR-0011).
 - M4 authority: authenticated connection supplies caller/sender; one room per connection; capacity `2..=30`; owner transfer is longest-present then lowest connection ID; passwords retain only random-salted SHA-256 and use constant-time verification.
+- M5 solo model: provisional local-only C->S `0x7f20..=0x7f24` and S->C `0x7fa0..=0x7fa7`; exactly one authenticated owner/member, hole 1, the room actor as sole match owner, and no multiplayer/turn/items/physics/M6 behavior (ADR-0012).
+- M5 deterministic conditions: 32-byte server seed; pinned `rand_chacha` 0.3.1 `ChaCha12Rng`; three consecutive `next_u32` values reduced modulo 3/151/360 for weather/speed-tenths/angle-degrees. Seed/config/conditions are persisted and observability-redacted.
+- M5 persistence: short reservation and settlement boundaries, idempotent loading mark/abort, `solo-v1` server formula (`score=strokes-par`, `Pang=10+2*max(par-strokes,0)`, `EXP=5`), one immutable Pang and EXP ledger row per result key, and bounded startup recovery before listener bind.
 - Unknown post-channel capture: fixed-capacity oldest-evicted process-local records of state/opcode/body length/SHA-256 only; no raw body. Known room opcodes in the wrong state always close regardless of policy.
 - LZO implementation: **`lzokay` 2.0.1** (pure Rust, MIT), proven for known PangCrypt vectors, generated round trips, and one independent go-lzo decode; real-client acceptance remains open.
 - Error policy: `thiserror` in libraries, `anyhow` only at binary composition boundary, no production `unwrap`/`expect`.
@@ -51,7 +54,8 @@ These include accepted baseline decisions from ADR-0001 through ADR-0011 and sho
 5. **Exact advertised ports/packet order/token field** — verify with the chosen client/capture before claiming compatibility.
 6. **Real IFF and GameService layouts** — validate legally held Character/ClubSet/Ball headers, record sizes, Game hello/auth/bootstrap/channel fields and ordering; never infer them from local synthetic M3.
 7. **Real M4 room exit** — validate exact U.S. 852 lobby/room opcodes, fields, limits, order, password/failure semantics, and real-client create/enter acceptance; never label `0x7f00` as U.S. 852.
-8. **Next M5 boundary** — local synthetic M5 work must remain explicitly provisional while real M4 compatibility evidence is still external; never claim the real M4 exit from synthetic tests.
+8. **Real M5 solo exit** — complete the evidence file's external 12-step legally held client/IFF gate; never label `0x7f20`/`0x7fa0`, the generated Course record, or `solo-v1` as U.S. 852.
+9. **Next M6 boundary** — local synthetic M6 design may proceed only with an explicit non-retail label while real M4/M5 compatibility remains external; do not widen M5 into multiplayer, turn arbitration, standings, items, or physics.
 
 ---
 
@@ -202,20 +206,20 @@ This is not legal advice; it is the conservative implementation policy.
 Modern source shows the client sends shot parameters and result coordinates/state, and servers broadcast or consume them. The server must still own the deterministic match state and validate order/ranges. The correct first-playable boundary is:
 
 - **Client:** trajectory simulation, visual ball flight, result synchronization.
-- **Server:** authenticated actor, room membership, active turn, hole sequence, score, item authorization, server-derived rewards, persistence.
+- **Server:** authenticated actor, room membership, hole/action-result sequence, score, validation, inventory, currency, rewards, and persistence.
 
-Never persist client-claimed Pang/EXP directly. Simplified Tier-B rewards are acceptable only if calculated server-side and documented.
+M5 implements only the solo subset: no active-turn arbitration, items, or server physics. Never persist client-claimed Pang/EXP directly. Its documented `solo-v1` reward is server-computed and synthetic, not a retail formula claim.
 
 ---
 
 ## Next-session checklist
 
-1. Read `docs/PROGRESS.md`, the M2 evidence file, and this file; check unstaged status.
+1. Read `docs/PROGRESS.md`, the M5 evidence file, and this file; check unstaged status.
 2. Preserve the fixture/provenance, SQLx offline, real-PostgreSQL, and no-proprietary-assets boundaries.
-3. Preserve the completed synthetic M2/M3/M4 evidence; do not infer external compatibility from it.
-4. Rerun and record the complete final format/Clippy/workspace/doc/deny/asset/fuzz validation matrix.
-5. Obtain the exact U.S. 852 build/hash privately and validate login/Game plus real lobby/room opcode/layout/order/create-enter behavior without committing it.
-6. Keep any M5 start/loading/gameplay/scoring/persistence/reward work explicitly synthetic until the real M4 client gate is independently evidenced.
+3. Preserve the completed synthetic M2-M5 evidence; do not infer external compatibility from it.
+4. Preserve the completed local format/Clippy/workspace/PostgreSQL/doc/SQLx/deny/asset/fuzz evidence at the M5 checkpoint.
+5. Obtain the exact U.S. 852 build/hash privately and complete the room plus M5 12-step client/IFF gate without committing protected material.
+6. Design only a clearly labeled local synthetic M6 boundary; preserve M5 as solo-only with no multiplayer, turn arbitration, standings, items, or physics.
 
 ---
 

@@ -2,10 +2,11 @@
 
 A clean-room, safe-Rust server compatibility project targeting the preserved
 PangYa U.S. 852.00 client. M2 provides a local synthetic LoginService slice, M3
-adds an opt-in local synthetic GameService bootstrap, and M4 adds a bounded local
-synthetic lobby/room checkpoint. These are not claims of real-client
-compatibility: real U.S. 852 room opcodes/layout/order and create/enter acceptance
-remain external, and M5 gameplay/start/loading/rewards are not implemented.
+adds an opt-in local synthetic GameService bootstrap, M4 adds a bounded local
+synthetic lobby/room checkpoint, and M5 adds an opt-in one-owner, one-hole solo
+practice flow with server-computed exactly-once Pang/EXP persistence. These are
+not claims of real-client compatibility: real U.S. 852 room and solo opcodes,
+layouts, ordering, IFF interpretation, and client acceptance remain external.
 
 Licensed under either MIT or Apache-2.0 at your option.
 
@@ -19,7 +20,7 @@ may be contributed. Operators must supply legally obtained client/data files.
 
 See `docs/PROVENANCE.md` and `THIRD_PARTY_NOTICES.md`.
 
-## Local M2/M3/M4 operations
+## Local M2/M3/M4/M5 operations
 
 ```bash
 cp config/local.example.toml config/local.toml
@@ -37,19 +38,24 @@ unset PANGYA_ACCOUNT_SECRET
 ```
 
 Enter exactly 32 hexadecimal characters at the silent prompt.
-Synthetic GameService remains disabled by default. To enable the M3 bootstrap and
-M4 local rooms, mount a legally obtained read-only IFF directory, create the
-versioned manifest described in
-[`docs/data/M3_SYNTHETIC_CATALOG.md`](docs/data/M3_SYNTHETIC_CATALOG.md), then set
-`game.enabled=true` and `data.catalog_required_m3=true`. See
+Synthetic GameService remains disabled by default. To enable the M3 bootstrap,
+M4 local rooms, and optionally M5 solo practice, mount a legally obtained
+read-only IFF directory, create the versioned manifest described in
+[`docs/data/M3_SYNTHETIC_CATALOG.md`](docs/data/M3_SYNTHETIC_CATALOG.md), and set
+`game.enabled=true` plus `data.catalog_required_m3=true`. M5 additionally needs a
+manifest Course record matching `game.solo_practice.course_id` and
+`game.solo_practice.enabled=true`; it remains disabled by default. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
 [`docs/protocol/M2_SYNTHETIC_LOGIN_FLOW.md`](docs/protocol/M2_SYNTHETIC_LOGIN_FLOW.md),
 [`docs/protocol/M3_SYNTHETIC_GAME_FLOW.md`](docs/protocol/M3_SYNTHETIC_GAME_FLOW.md),
+[`docs/protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md`](docs/protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md),
 and
-[`docs/protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md`](docs/protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md).
-Status and evidence are in [`docs/PROGRESS.md`](docs/PROGRESS.md) and
-[`docs/evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](docs/evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md).
-Admin endpoints are
+[`docs/protocol/M5_SYNTHETIC_SOLO_FLOW.md`](docs/protocol/M5_SYNTHETIC_SOLO_FLOW.md).
+The M5 decision and checkpoint evidence are
+[`docs/adr/0012-synthetic-m5-solo-practice.md`](docs/adr/0012-synthetic-m5-solo-practice.md)
+and
+[`docs/evidence/M5_SYNTHETIC_SOLO_2026-08-05.md`](docs/evidence/M5_SYNTHETIC_SOLO_2026-08-05.md).
+Current status is in [`docs/PROGRESS.md`](docs/PROGRESS.md). Admin endpoints are
 read-only: `/health/live`, `/health/ready`, and optional `/metrics`.
 
 ## Local validation
