@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, quantity, durability FROM inventory_items WHERE account_id = $1 AND item_type_id = $2 AND inventory_class = 'consumable' ORDER BY id FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "quantity",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "durability",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3b6f28fa7db793ed616ed7608c9674adee34f7ed2a5d8ae1cbb676b7d722f868"
+}

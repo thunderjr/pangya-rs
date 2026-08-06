@@ -18,15 +18,21 @@ use std::{
 
 use cap_std::{ambient_authority, fs::Dir};
 use pangya_domain::{
-    CatalogFingerprint, CourseId, ItemTypeId, OneHoleConfig, PlayerSnapshot, StarterGrant,
+    CatalogFingerprint, CourseId, InventoryClass, InventoryDurability, ItemCompatibility,
+    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId, OneHoleConfig,
+    PlayerSnapshot, StarterGrant,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unicode_normalization::is_nfc;
 
-/// Supported manifest schema version.
+/// Original M3-M6 manifest schema version (kept byte/fingerprint compatible).
 pub const MANIFEST_VERSION: u32 = 1;
+/// Exact typed synthetic M7 manifest schema version.
+pub const M7_MANIFEST_VERSION: u32 = 2;
+/// Hard catalog stack bound independent of operator input.
+pub const MAX_CATALOG_STACK: u32 = 10_000;
 /// Maximum manifest bytes read from an operator mount.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// Maximum bytes read from one synthetic IFF file.
@@ -48,6 +54,10 @@ pub enum CatalogKind {
     ClubSet,
     /// Ball inventory records.
     Ball,
+    /// Stackable consumable records (required by v2).
+    Consumable,
+    /// Character-compatible part records (required by v2).
+    CharacterPart,
     /// Optional locally generated one-hole course records.
     Course,
 }
@@ -87,9 +97,11 @@ pub struct CatalogManifest {
 pub struct CatalogRecord {
     /// First four record bytes interpreted as little-endian type ID.
     pub type_id: ItemTypeId,
-    /// Remaining unattested record bytes. For Course, this starts after the local par byte.
+    /// Remaining unattested v1 record bytes. Exact v2 records always leave this empty.
     pub opaque: Arc<[u8]>,
     local_one_hole_par: Option<u8>,
+    definition: Option<ItemDefinition>,
+    character_part_slot: Option<u8>,
 }
 
 impl CatalogRecord {
@@ -98,12 +110,26 @@ impl CatalogRecord {
     pub const fn local_one_hole_par(&self) -> Option<u8> {
         self.local_one_hole_par
     }
+
+    /// Returns the exact immutable v2 economy definition, if this is an item family.
+    #[must_use]
+    pub const fn definition(&self) -> Option<&ItemDefinition> {
+        self.definition.as_ref()
+    }
+
+    /// Returns the closed generated character-part slot (`0..=7`) when applicable.
+    #[must_use]
+    pub const fn character_part_slot(&self) -> Option<u8> {
+        self.character_part_slot
+    }
 }
 
 #[derive(Debug)]
 struct CatalogInner {
     records: BTreeMap<CatalogKind, BTreeMap<u32, CatalogRecord>>,
+    offers: Arc<[ItemDefinition]>,
     fingerprint: CatalogFingerprint,
+    manifest_version: u32,
 }
 
 /// Immutable validated catalog shared across GameService connections.
@@ -139,8 +165,10 @@ impl Catalog {
     }
 
     fn load_manifest_from_dir(root: &Dir, manifest: CatalogManifest) -> Result<Self, CatalogError> {
-        if manifest.manifest_version != MANIFEST_VERSION
-            || manifest.files.is_empty()
+        if !matches!(
+            manifest.manifest_version,
+            MANIFEST_VERSION | M7_MANIFEST_VERSION
+        ) || manifest.files.is_empty()
             || manifest.files.len() > MAX_MANIFEST_FILES
         {
             return Err(CatalogError::Manifest);
@@ -159,24 +187,46 @@ impl Catalog {
             if sha256_hex(&bytes) != entry.sha256 {
                 return Err(CatalogError::Digest);
             }
-            let parsed = parse_iff_bytes(entry, &bytes)?;
+            let parsed = parse_iff_bytes_for_schema(manifest.manifest_version, entry, &bytes)?;
             if parsed.keys().any(|type_id| !type_ids.insert(*type_id)) {
                 return Err(CatalogError::DuplicateTypeId);
             }
             records.insert(entry.kind, parsed);
         }
-        for required in [
-            CatalogKind::Character,
-            CatalogKind::ClubSet,
-            CatalogKind::Ball,
-        ] {
-            if !records.contains_key(&required) {
-                return Err(CatalogError::MissingKind);
-            }
+        let required: &[CatalogKind] = if manifest.manifest_version == M7_MANIFEST_VERSION {
+            &[
+                CatalogKind::Character,
+                CatalogKind::ClubSet,
+                CatalogKind::Ball,
+                CatalogKind::Consumable,
+                CatalogKind::CharacterPart,
+            ]
+        } else {
+            &[
+                CatalogKind::Character,
+                CatalogKind::ClubSet,
+                CatalogKind::Ball,
+            ]
+        };
+        if required.iter().any(|kind| !records.contains_key(kind)) {
+            return Err(CatalogError::MissingKind);
         }
+        if manifest.manifest_version == M7_MANIFEST_VERSION {
+            validate_v2_cross_references(&records)?;
+        }
+        let mut sold = records
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter_map(|record| record.definition)
+            .filter(|definition| matches!(definition.sale, ItemSale::Pang(_)))
+            .collect::<Vec<_>>();
+        sold.sort_by_key(|definition| definition.type_id);
+        let offers: Arc<[ItemDefinition]> = sold.into();
         Ok(Self(Arc::new(CatalogInner {
             records,
+            offers,
             fingerprint,
+            manifest_version: manifest.manifest_version,
         })))
     }
 
@@ -184,6 +234,53 @@ impl Catalog {
     #[must_use]
     pub fn fingerprint(&self) -> CatalogFingerprint {
         self.0.fingerprint
+    }
+
+    /// Returns the validated manifest schema version.
+    #[must_use]
+    pub fn manifest_version(&self) -> u32 {
+        self.0.manifest_version
+    }
+
+    /// Returns sold Pang offers in deterministic global type-ID order.
+    #[must_use]
+    pub fn shop_offers(&self) -> &[ItemDefinition] {
+        &self.0.offers
+    }
+
+    /// Looks up a sold Pang offer by globally unique type ID.
+    #[must_use]
+    pub fn shop_offer(&self, type_id: ItemTypeId) -> Option<&ItemDefinition> {
+        self.0
+            .offers
+            .binary_search_by_key(&type_id, |definition| definition.type_id)
+            .ok()
+            .map(|index| &self.0.offers[index])
+    }
+
+    /// Looks up any exact v2 item definition, including a not-sold item.
+    #[must_use]
+    pub fn item_definition(&self, type_id: ItemTypeId) -> Option<&ItemDefinition> {
+        self.0
+            .records
+            .values()
+            .find_map(|records| records.get(&type_id.get())?.definition())
+    }
+
+    /// Checks a generated character-part compatibility edge.
+    #[must_use]
+    pub fn part_is_compatible(
+        &self,
+        part_type_id: ItemTypeId,
+        character_type_id: ItemTypeId,
+    ) -> bool {
+        self.item_definition(part_type_id)
+            .is_some_and(|definition| {
+                matches!(
+                    definition.compatibility,
+                    ItemCompatibility::Character(expected) if expected == character_type_id
+                )
+            })
     }
 
     /// Returns whether a type ID exists in one declared family.
@@ -267,7 +364,9 @@ impl Catalog {
         for item in &snapshot.inventory {
             let is_club = self.contains(CatalogKind::ClubSet, item.item_type_id);
             let is_ball = self.contains(CatalogKind::Ball, item.item_type_id);
-            if !is_club && !is_ball {
+            let is_consumable = self.contains(CatalogKind::Consumable, item.item_type_id);
+            let is_part = self.contains(CatalogKind::CharacterPart, item.item_type_id);
+            if !is_club && !is_ball && !is_consumable && !is_part {
                 return Err(CatalogError::Binding);
             }
             if snapshot.equipment.club_item_id == Some(item.id) && !is_club {
@@ -275,6 +374,20 @@ impl Catalog {
             }
             if snapshot.equipment.ball_item_id == Some(item.id) && !is_ball {
                 return Err(CatalogError::Binding);
+            }
+            if self.0.manifest_version == M7_MANIFEST_VERSION {
+                let definition = self
+                    .item_definition(item.item_type_id)
+                    .ok_or(CatalogError::Binding)?;
+                let expected_class = inventory_class(definition.kind);
+                if item.class != InventoryClass::Legacy && item.class != expected_class {
+                    return Err(CatalogError::Binding);
+                }
+                match (definition.durability, item.durability) {
+                    (ItemDurability::Nondurable, InventoryDurability::Nondurable)
+                    | (ItemDurability::Durable { .. }, InventoryDurability::Durable(_)) => {}
+                    _ => return Err(CatalogError::Binding),
+                }
             }
         }
         Ok(())
@@ -305,6 +418,12 @@ pub enum CatalogError {
     /// A type ID appeared more than once anywhere across the required families.
     #[error("catalog type identifier is duplicated")]
     DuplicateTypeId,
+    /// Exact v2 sale/price/stack/durability/slot metadata is invalid.
+    #[error("catalog item semantics are invalid")]
+    Semantics,
+    /// A v2 character-part reference does not bind to Character.
+    #[error("catalog cross-reference is invalid")]
+    CrossReference,
     /// Starter/snapshot type IDs did not bind to the required catalog family.
     #[error("catalog binding is invalid")]
     Binding,
@@ -353,12 +472,206 @@ pub fn parse_iff_bytes(
             type_id: ItemTypeId::new(type_id),
             opaque: Arc::from(opaque),
             local_one_hole_par,
+            definition: None,
+            character_part_slot: None,
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
         }
     }
     Ok(records)
+}
+
+fn parse_iff_bytes_for_schema(
+    manifest_version: u32,
+    entry: &ManifestFile,
+    bytes: &[u8],
+) -> Result<BTreeMap<u32, CatalogRecord>, CatalogError> {
+    if manifest_version == MANIFEST_VERSION {
+        if matches!(
+            entry.kind,
+            CatalogKind::Consumable | CatalogKind::CharacterPart
+        ) {
+            return Err(CatalogError::Manifest);
+        }
+        return parse_iff_bytes(entry, bytes);
+    }
+    if manifest_version != M7_MANIFEST_VERSION {
+        return Err(CatalogError::Manifest);
+    }
+    let exact_size = match entry.kind {
+        CatalogKind::Character => 4,
+        CatalogKind::ClubSet => 21,
+        CatalogKind::Ball => 13,
+        CatalogKind::Consumable => 17,
+        CatalogKind::CharacterPart => 18,
+        CatalogKind::Course => 5,
+    };
+    if entry.record_size != exact_size {
+        return Err(CatalogError::Manifest);
+    }
+    // Reuse all bounded header/count/length/global-in-file checks, then replace the
+    // intentionally minimal v1 interpretation with exact v2 semantics.
+    let minimally_parsed = parse_iff_bytes(entry, bytes)?;
+    let mut parsed = BTreeMap::new();
+    for record_bytes in bytes[IFF_HEADER_BYTES..].chunks_exact(entry.record_size) {
+        let type_id = le_u32(record_bytes, 0)?;
+        let minimal = minimally_parsed
+            .get(&type_id)
+            .ok_or(CatalogError::Structure)?;
+        if type_id == 0 {
+            return Err(CatalogError::Semantics);
+        }
+        let (definition, slot) = parse_v2_definition(entry.kind, record_bytes)?;
+        let record = CatalogRecord {
+            type_id: minimal.type_id,
+            opaque: Arc::from([]),
+            local_one_hole_par: minimal.local_one_hole_par,
+            definition,
+            character_part_slot: slot,
+        };
+        parsed.insert(record.type_id.get(), record);
+    }
+    Ok(parsed)
+}
+
+fn parse_v2_definition(
+    kind: CatalogKind,
+    record: &[u8],
+) -> Result<(Option<ItemDefinition>, Option<u8>), CatalogError> {
+    let type_id = ItemTypeId::new(le_u32(record, 0)?);
+    let unique = ItemStacking::Unique;
+    let any = ItemCompatibility::Any;
+    let make = |kind, sale, stacking, durability, compatibility| {
+        Some(ItemDefinition {
+            type_id,
+            kind,
+            sale,
+            stacking,
+            durability,
+            compatibility,
+        })
+    };
+    let output = match kind {
+        CatalogKind::Character | CatalogKind::Course => (None, None),
+        CatalogKind::ClubSet => {
+            let sale = parse_sale(record[4], le_u64(record, 5)?)?;
+            let max = le_u32(record, 13)?;
+            let repair_pang_per_point = le_u32(record, 17)?;
+            let durability = match (max, repair_pang_per_point) {
+                (0, 0) => ItemDurability::Nondurable,
+                (1.., 1..) => ItemDurability::Durable {
+                    max,
+                    repair_pang_per_point,
+                },
+                _ => return Err(CatalogError::Semantics),
+            };
+            (make(ItemKind::ClubSet, sale, unique, durability, any), None)
+        }
+        CatalogKind::Ball => (
+            make(
+                ItemKind::Ball,
+                parse_sale(record[4], le_u64(record, 5)?)?,
+                unique,
+                ItemDurability::Nondurable,
+                any,
+            ),
+            None,
+        ),
+        CatalogKind::Consumable => {
+            let max_stack = le_u32(record, 13)?;
+            if !(1..=MAX_CATALOG_STACK).contains(&max_stack) {
+                return Err(CatalogError::Semantics);
+            }
+            (
+                make(
+                    ItemKind::Consumable,
+                    parse_sale(record[4], le_u64(record, 5)?)?,
+                    ItemStacking::Stackable { max_stack },
+                    ItemDurability::Nondurable,
+                    any,
+                ),
+                None,
+            )
+        }
+        CatalogKind::CharacterPart => {
+            let compatible = ItemTypeId::new(le_u32(record, 4)?);
+            let slot = record[8];
+            if slot > 7 || compatible.get() == 0 {
+                return Err(CatalogError::Semantics);
+            }
+            (
+                make(
+                    ItemKind::CharacterPart,
+                    parse_sale(record[9], le_u64(record, 10)?)?,
+                    unique,
+                    ItemDurability::Nondurable,
+                    ItemCompatibility::Character(compatible),
+                ),
+                Some(slot),
+            )
+        }
+    };
+    Ok(output)
+}
+
+fn parse_sale(tag: u8, pang_price: u64) -> Result<ItemSale, CatalogError> {
+    match tag {
+        0 if pang_price == 0 => Ok(ItemSale::NotSold),
+        1 if (1..=i64::MAX as u64).contains(&pang_price) => Ok(ItemSale::Pang(pang_price)),
+        _ => Err(CatalogError::Semantics),
+    }
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> Result<u32, CatalogError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(CatalogError::Structure)?
+        .try_into()
+        .map_err(|_| CatalogError::Structure)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> Result<u64, CatalogError> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(CatalogError::Structure)?
+        .try_into()
+        .map_err(|_| CatalogError::Structure)?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn validate_v2_cross_references(
+    records: &BTreeMap<CatalogKind, BTreeMap<u32, CatalogRecord>>,
+) -> Result<(), CatalogError> {
+    let characters = records
+        .get(&CatalogKind::Character)
+        .ok_or(CatalogError::MissingKind)?;
+    if records
+        .get(&CatalogKind::CharacterPart)
+        .ok_or(CatalogError::MissingKind)?
+        .values()
+        .any(|record| {
+            !matches!(
+                record.definition.map(|definition| definition.compatibility),
+                Some(ItemCompatibility::Character(character))
+                    if characters.contains_key(&character.get())
+            )
+        })
+    {
+        return Err(CatalogError::CrossReference);
+    }
+    Ok(())
+}
+
+const fn inventory_class(kind: ItemKind) -> InventoryClass {
+    match kind {
+        ItemKind::Character => InventoryClass::Legacy,
+        ItemKind::ClubSet => InventoryClass::ClubSet,
+        ItemKind::Ball => InventoryClass::Ball,
+        ItemKind::Consumable => InventoryClass::Consumable,
+        ItemKind::CharacterPart => InventoryClass::CharacterPart,
+    }
 }
 
 fn validate_manifest_entry(entry: &ManifestFile) -> Result<(), CatalogError> {
@@ -428,6 +741,8 @@ const fn catalog_kind_tag(kind: CatalogKind) -> u8 {
         CatalogKind::ClubSet => 2,
         CatalogKind::Ball => 3,
         CatalogKind::Course => 4,
+        CatalogKind::Consumable => 5,
+        CatalogKind::CharacterPart => 6,
     }
 }
 
@@ -577,6 +892,115 @@ mod tests {
     }
 
     #[test]
+    fn v2_semantics_are_closed_bounded_and_exact() {
+        fn declaration(kind: CatalogKind, size: usize) -> ManifestFile {
+            let mut value = entry(1, size);
+            value.kind = kind;
+            value.version = 2;
+            value
+        }
+        fn bytes(record: &[u8]) -> Vec<u8> {
+            let mut value = Vec::new();
+            value.extend_from_slice(&1_u16.to_le_bytes());
+            value.extend_from_slice(&7_u16.to_le_bytes());
+            value.extend_from_slice(&2_u32.to_le_bytes());
+            value.extend_from_slice(record);
+            value
+        }
+
+        let mut club = Vec::new();
+        club.extend_from_slice(&1_u32.to_le_bytes());
+        club.push(1);
+        club.extend_from_slice(&50_u64.to_le_bytes());
+        club.extend_from_slice(&100_u32.to_le_bytes());
+        club.extend_from_slice(&3_u32.to_le_bytes());
+        assert!(
+            parse_iff_bytes_for_schema(
+                M7_MANIFEST_VERSION,
+                &declaration(CatalogKind::ClubSet, 21),
+                &bytes(&club)
+            )
+            .is_ok()
+        );
+        for (offset, replacement) in [(4, 2_u8), (4, 0_u8)] {
+            let mut invalid = club.clone();
+            invalid[offset] = replacement;
+            assert_eq!(
+                parse_iff_bytes_for_schema(
+                    M7_MANIFEST_VERSION,
+                    &declaration(CatalogKind::ClubSet, 21),
+                    &bytes(&invalid)
+                ),
+                Err(CatalogError::Semantics)
+            );
+        }
+        let mut invalid_durability = club.clone();
+        invalid_durability[13..17].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            parse_iff_bytes_for_schema(
+                M7_MANIFEST_VERSION,
+                &declaration(CatalogKind::ClubSet, 21),
+                &bytes(&invalid_durability)
+            ),
+            Err(CatalogError::Semantics)
+        );
+        let mut consumable = Vec::new();
+        consumable.extend_from_slice(&2_u32.to_le_bytes());
+        consumable.push(1);
+        consumable.extend_from_slice(&1_u64.to_le_bytes());
+        consumable.extend_from_slice(&(MAX_CATALOG_STACK + 1).to_le_bytes());
+        assert_eq!(
+            parse_iff_bytes_for_schema(
+                M7_MANIFEST_VERSION,
+                &declaration(CatalogKind::Consumable, 17),
+                &bytes(&consumable)
+            ),
+            Err(CatalogError::Semantics)
+        );
+        assert_eq!(
+            parse_iff_bytes_for_schema(
+                M7_MANIFEST_VERSION,
+                &declaration(CatalogKind::Ball, 14),
+                &bytes(&[0; 14])
+            ),
+            Err(CatalogError::Manifest)
+        );
+    }
+
+    #[test]
+    fn v2_character_part_cross_reference_is_closed() {
+        let character = CatalogRecord {
+            type_id: ItemTypeId::new(10),
+            opaque: Arc::from([]),
+            local_one_hole_par: None,
+            definition: None,
+            character_part_slot: None,
+        };
+        let part = CatalogRecord {
+            type_id: ItemTypeId::new(20),
+            opaque: Arc::from([]),
+            local_one_hole_par: None,
+            definition: Some(ItemDefinition {
+                type_id: ItemTypeId::new(20),
+                kind: ItemKind::CharacterPart,
+                sale: ItemSale::NotSold,
+                stacking: ItemStacking::Unique,
+                durability: ItemDurability::Nondurable,
+                compatibility: ItemCompatibility::Character(ItemTypeId::new(11)),
+            }),
+            character_part_slot: Some(0),
+        };
+        let records = BTreeMap::from([
+            (CatalogKind::Character, BTreeMap::from([(10, character)])),
+            (CatalogKind::CharacterPart, BTreeMap::from([(20, part)])),
+        ]);
+        assert_eq!(
+            validate_v2_cross_references(&records),
+            Err(CatalogError::CrossReference)
+        );
+    }
+
+    #[test]
     fn catalog_fingerprint_is_invariant_to_manifest_declaration_order() {
         let mut character = entry(1, 8);
         character.filename = PathBuf::from("Character.bin");
@@ -671,6 +1095,33 @@ mod tests {
         #[test]
         fn arbitrary_iff_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096), count in any::<u16>(), size in 0usize..70000) {
             let _ = parse_iff_bytes(&entry(count, size), &bytes);
+        }
+
+        #[test]
+        fn arbitrary_v2_records_never_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+            count in any::<u16>(),
+            kind in prop_oneof![
+                Just(CatalogKind::Character),
+                Just(CatalogKind::ClubSet),
+                Just(CatalogKind::Ball),
+                Just(CatalogKind::Consumable),
+                Just(CatalogKind::CharacterPart),
+                Just(CatalogKind::Course),
+            ],
+        ) {
+            let size = match kind {
+                CatalogKind::Character => 4,
+                CatalogKind::ClubSet => 21,
+                CatalogKind::Ball => 13,
+                CatalogKind::Consumable => 17,
+                CatalogKind::CharacterPart => 18,
+                CatalogKind::Course => 5,
+            };
+            let mut declaration = entry(count, size);
+            declaration.kind = kind;
+            declaration.version = 2;
+            let _ = parse_iff_bytes_for_schema(M7_MANIFEST_VERSION, &declaration, &bytes);
         }
     }
 }

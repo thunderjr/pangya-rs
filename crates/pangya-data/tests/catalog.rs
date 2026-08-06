@@ -4,7 +4,8 @@ use std::{fs, path::Path};
 
 use pangya_data::{Catalog, CatalogError, CatalogKind};
 use pangya_domain::{
-    CourseId, ItemTypeId, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+    CourseId, ItemCompatibility, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -12,6 +13,13 @@ fn fixtures() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/synthetic-catalog"
+    ))
+}
+
+fn m7_fixtures() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/synthetic-catalog-v2"
     ))
 }
 
@@ -74,6 +82,57 @@ fn generated_golden_catalog_loads_and_cross_checks_starter() {
         equipped_ball_key: Some(key("ball")),
     };
     catalog.validate_starter(&starter).expect("starter");
+}
+
+#[test]
+fn generated_v2_catalog_exposes_exact_sorted_economy_semantics() {
+    let catalog = Catalog::load(m7_fixtures(), Path::new("manifest.toml")).expect("v2 catalog");
+    assert_eq!(catalog.manifest_version(), 2);
+    let offer_ids = catalog
+        .shop_offers()
+        .iter()
+        .map(|offer| offer.type_id.get())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        offer_ids,
+        vec![0x0800_0001, 0x1000_0001, 0x1800_0001, 0x1a00_0001]
+    );
+    let club = catalog
+        .shop_offer(ItemTypeId::new(0x1000_0001))
+        .expect("sold club");
+    assert_eq!(club.kind, ItemKind::ClubSet);
+    assert_eq!(club.sale, ItemSale::Pang(500));
+    assert_eq!(club.stacking, ItemStacking::Unique);
+    assert_eq!(
+        club.durability,
+        ItemDurability::Durable {
+            max: 100,
+            repair_pang_per_point: 3
+        }
+    );
+    let consumable = catalog
+        .shop_offer(ItemTypeId::new(0x1a00_0001))
+        .expect("sold consumable");
+    assert_eq!(
+        consumable.stacking,
+        ItemStacking::Stackable { max_stack: 99 }
+    );
+    let part = catalog
+        .item_definition(ItemTypeId::new(0x0800_0001))
+        .expect("part");
+    assert_eq!(
+        part.compatibility,
+        ItemCompatibility::Character(ItemTypeId::new(0x0400_0000))
+    );
+    assert!(catalog.part_is_compatible(ItemTypeId::new(0x0800_0001), ItemTypeId::new(0x0400_0000)));
+    assert!(catalog.shop_offer(ItemTypeId::new(0x1a00_0002)).is_none());
+    assert_eq!(
+        catalog
+            .item_definition(ItemTypeId::new(0x1a00_0002))
+            .expect("not sold")
+            .sale,
+        ItemSale::NotSold
+    );
 }
 
 #[test]

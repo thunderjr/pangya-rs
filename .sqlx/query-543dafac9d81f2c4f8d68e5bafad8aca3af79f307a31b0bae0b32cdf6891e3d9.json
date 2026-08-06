@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE equipment_sets SET character_id = $2, club_item_id = $3, ball_item_id = $4, version = $5, updated_at = now() WHERE account_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "543dafac9d81f2c4f8d68e5bafad8aca3af79f307a31b0bae0b32cdf6891e3d9"
+}

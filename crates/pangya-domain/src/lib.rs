@@ -161,6 +161,10 @@ uuid_id!(
     MatchResultKey,
     "A stable, server-generated match-result idempotency key."
 );
+uuid_id!(
+    EconomyOperationId,
+    "A client-generated idempotency key for one authenticated economy command."
+);
 
 /// Validation failure for a display/normalized account name.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -532,7 +536,32 @@ pub struct Character {
     pub starter_key: StarterKey,
 }
 
-/// Persisted starter inventory projection.
+/// Closed inventory classification persisted independently from mutable equipment.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InventoryClass {
+    /// Row created before M7; catalog validation resolves its effective family.
+    Legacy,
+    /// Unique club-set row.
+    ClubSet,
+    /// Unique ball row.
+    Ball,
+    /// Stackable consumable row.
+    Consumable,
+    /// Unique character-part row (purchase only in M7).
+    CharacterPart,
+}
+
+/// Current durability for an inventory row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InventoryDurability {
+    /// The catalog definition is not durable.
+    Nondurable,
+    /// Remaining points for a durable item, including zero when depleted.
+    Durable(u32),
+}
+
+/// Persisted inventory projection. `starter_key` remains the bounded acquisition key so
+/// existing starter construction/replay remains source- and data-compatible.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InventoryItem {
     /// Identifier.
@@ -543,8 +572,285 @@ pub struct InventoryItem {
     pub item_type_id: ItemTypeId,
     /// Quantity.
     pub quantity: u32,
-    /// Stable grant key.
+    /// Stable starter or `purchase.<uuid-simple>` acquisition key.
     pub starter_key: StarterKey,
+    /// Persisted closed classification (`Legacy` for all pre-M7 rows).
+    pub class: InventoryClass,
+    /// Closed current durability state.
+    pub durability: InventoryDurability,
+    /// Optional expiry instant; M7 does not create expiring purchases.
+    pub expires_at: Option<SystemTime>,
+}
+
+/// Closed catalog item family used by economy requests and validation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ItemKind {
+    /// Owned character.
+    Character,
+    /// Club set.
+    ClubSet,
+    /// Ball.
+    Ball,
+    /// Stackable consumable.
+    Consumable,
+    /// Character-compatible part (equip is deferred).
+    CharacterPart,
+}
+
+/// Closed shop sale policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemSale {
+    /// The definition cannot be bought.
+    NotSold,
+    /// Authoritative Pang unit price.
+    Pang(u64),
+}
+
+/// Closed quantity semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemStacking {
+    /// Exactly one owned row with quantity one per purchase.
+    Unique,
+    /// One owner/type stack capped at this positive quantity.
+    Stackable {
+        /// Positive catalog cap, bounded by the parser.
+        max_stack: u32,
+    },
+}
+
+/// Closed durability semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemDurability {
+    /// No durability column value and no repair.
+    Nondurable,
+    /// Positive maximum and positive Pang repair rate per missing point.
+    Durable {
+        /// Maximum and initial purchased durability.
+        max: u32,
+        /// Authoritative repair Pang per missing point.
+        repair_pang_per_point: u32,
+    },
+}
+
+/// Optional character compatibility for a character part.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ItemCompatibility {
+    /// No character restriction.
+    Any,
+    /// Exact compatible character catalog type.
+    Character(ItemTypeId),
+}
+
+/// Immutable server-resolved catalog definition crossing into storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItemDefinition {
+    /// Globally unique catalog type.
+    pub type_id: ItemTypeId,
+    /// Closed family.
+    pub kind: ItemKind,
+    /// Sale policy and authoritative price.
+    pub sale: ItemSale,
+    /// Quantity policy.
+    pub stacking: ItemStacking,
+    /// Durability policy.
+    pub durability: ItemDurability,
+    /// Character compatibility where applicable.
+    pub compatibility: ItemCompatibility,
+}
+
+impl ItemDefinition {
+    /// Returns the Pang price only when this is a sold Pang offer.
+    #[must_use]
+    pub const fn pang_price(self) -> Option<u64> {
+        match self.sale {
+            ItemSale::NotSold => None,
+            ItemSale::Pang(price) => Some(price),
+        }
+    }
+}
+
+/// One inventory selector paired with its server-resolved immutable definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EconomyItemSelector {
+    /// Owned inventory row.
+    pub inventory_id: InventoryItemId,
+    /// Definition resolved from the active catalog, never from the wire.
+    pub definition: ItemDefinition,
+}
+
+/// Atomic purchase input. Price/outcome/balance are deliberately absent from client input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurchaseRequest {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Stable command key.
+    pub operation_id: EconomyOperationId,
+    /// Active catalog fingerprint.
+    pub catalog: CatalogFingerprint,
+    /// Server-resolved definition containing authoritative price and rules.
+    pub definition: ItemDefinition,
+    /// Client-selected positive quantity; unique definitions require one.
+    pub quantity: u32,
+}
+
+/// Exact committed purchase result stored for replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurchaseResult {
+    /// Operation key.
+    pub operation_id: EconomyOperationId,
+    /// Granted or stacked inventory row.
+    pub inventory_id: InventoryItemId,
+    /// Catalog type.
+    pub item_type_id: ItemTypeId,
+    /// Quantity after commit.
+    pub quantity_after: u32,
+    /// Durability after commit, if durable.
+    pub durability: Option<u32>,
+    /// Pang balance after commit.
+    pub pang_balance: u64,
+}
+
+/// Owned-compatible equipment mutation input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EquipmentChange {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Stable command key.
+    pub operation_id: EconomyOperationId,
+    /// Active catalog fingerprint.
+    pub catalog: CatalogFingerprint,
+    /// Expected optimistic equipment version.
+    pub expected_version: u32,
+    /// Selected owned character row.
+    pub character_id: CharacterId,
+    /// Server-resolved character type used to reject drift/corruption.
+    pub character_type_id: ItemTypeId,
+    /// Optional selected owned club.
+    pub club: Option<EconomyItemSelector>,
+    /// Optional selected owned ball.
+    pub ball: Option<EconomyItemSelector>,
+}
+
+/// Exact committed equipment result stored for replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EquipmentChangeResult {
+    /// Operation key.
+    pub operation_id: EconomyOperationId,
+    /// Selected character.
+    pub character_id: CharacterId,
+    /// Selected club.
+    pub club_item_id: Option<InventoryItemId>,
+    /// Selected ball.
+    pub ball_item_id: Option<InventoryItemId>,
+    /// Incremented version.
+    pub version: u32,
+}
+
+/// Consume exactly one server-validated consumable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsumeItem {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Stable command key.
+    pub operation_id: EconomyOperationId,
+    /// Active catalog fingerprint.
+    pub catalog: CatalogFingerprint,
+    /// Owned row and authoritative definition.
+    pub item: EconomyItemSelector,
+}
+
+/// Exact committed consumption result stored for replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsumeItemResult {
+    /// Operation key.
+    pub operation_id: EconomyOperationId,
+    /// Consumed row (possibly deleted).
+    pub inventory_id: InventoryItemId,
+    /// Type identifier.
+    pub item_type_id: ItemTypeId,
+    /// Remaining quantity; zero means the row was deleted.
+    pub quantity_after: u32,
+}
+
+/// Restore one durable club to its catalog maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepairItem {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Stable command key.
+    pub operation_id: EconomyOperationId,
+    /// Active catalog fingerprint.
+    pub catalog: CatalogFingerprint,
+    /// Owned club and authoritative repair definition.
+    pub item: EconomyItemSelector,
+}
+
+/// Exact committed repair result stored for replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepairItemResult {
+    /// Operation key.
+    pub operation_id: EconomyOperationId,
+    /// Repaired row.
+    pub inventory_id: InventoryItemId,
+    /// Restored durability.
+    pub durability: u32,
+    /// Authoritative Pang cost.
+    pub pang_cost: u64,
+    /// Pang balance after commit.
+    pub pang_balance: u64,
+}
+
+/// Whether an exact successful result was newly committed or replayed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EconomyCommit<T> {
+    /// This call committed the mutation.
+    Committed(T),
+    /// This call returned an immutable prior successful result.
+    Replayed(T),
+}
+
+/// Stable economy failures safe for application outcome mapping.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum EconomyError {
+    /// Definition/quantity/operation identifier is invalid or the item is not sold.
+    #[error("economy request is invalid")]
+    Invalid,
+    /// Account is not active.
+    #[error("account is not active")]
+    AccountInactive,
+    /// Pang balance cannot cover the authoritative cost.
+    #[error("insufficient Pang")]
+    InsufficientPang,
+    /// Owned character or item does not exist for the authenticated account.
+    #[error("item is not owned")]
+    NotOwned,
+    /// Item family or part compatibility is wrong for this operation.
+    #[error("item is incompatible")]
+    Incompatible,
+    /// Item has expired.
+    #[error("item has expired")]
+    Expired,
+    /// Durable item has no usable durability.
+    #[error("item is depleted")]
+    Depleted,
+    /// Consumable stack would exceed its catalog cap.
+    #[error("item stack is full")]
+    StackFull,
+    /// Equipment optimistic version changed.
+    #[error("equipment version conflicts")]
+    VersionConflict,
+    /// A successful operation key was reused with different normalized client input.
+    #[error("economy operation input drifted")]
+    IdempotencyDrift,
+    /// Checked price, quantity, balance, durability, or version arithmetic overflowed.
+    #[error("economy arithmetic overflow")]
+    ArithmeticOverflow,
+    /// Persisted rows violate catalog/domain invariants.
+    #[error("persisted economy data is invalid")]
+    CorruptData,
+    /// PostgreSQL operation failed.
+    #[error("economy storage operation failed")]
+    Storage,
 }
 
 /// Persisted minimum equipment aggregate.
@@ -2404,6 +2710,33 @@ pub trait AccountRepository: Send + Sync {
         status: AccountStatus,
         now: SystemTime,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+}
+
+/// Technology-neutral transactional economy repository contract.
+pub trait EconomyRepository: Send + Sync {
+    /// Purchases or exactly replays a catalog-priced grant.
+    fn purchase(
+        &self,
+        request: PurchaseRequest,
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<PurchaseResult>, EconomyError>>;
+
+    /// Changes owned equipment or exactly replays the committed state.
+    fn equip(
+        &self,
+        request: EquipmentChange,
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<EquipmentChangeResult>, EconomyError>>;
+
+    /// Consumes exactly one unit or exactly replays the committed remainder.
+    fn consume_one(
+        &self,
+        request: ConsumeItem,
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<ConsumeItemResult>, EconomyError>>;
+
+    /// Repairs one durable club or exactly replays its committed result.
+    fn repair(
+        &self,
+        request: RepairItem,
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>>;
 }
 
 /// Technology-neutral coherent player-bootstrap repository contract.

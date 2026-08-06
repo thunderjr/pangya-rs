@@ -7,11 +7,14 @@ use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
     AccountRepository, AccountStatus, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
     BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole, CommitStrokeMatch,
-    ConsumeHandover, CourseId, CredentialHash, HandoverDigest, HandoverError, HandoverRepository,
-    IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame,
-    MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MatchAbortReason, MatchId,
-    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
-    NormalizedUsername, OneHoleConfig, PlayerRepository, RepositoryError, ServiceKind,
+    ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit, EconomyError,
+    EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange, HandoverDigest,
+    HandoverError, HandoverRepository, IncompleteMatchAbortLimit, ItemCompatibility,
+    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId,
+    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
+    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
+    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, ServiceKind,
     SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCompletion,
     StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
     WindConditions,
@@ -3099,4 +3102,865 @@ async fn database_checks_reject_range_sign_digest_and_status_violations(pool: Pg
             .await
             .is_err()
     );
+}
+
+fn economy_catalog() -> CatalogFingerprint {
+    CatalogFingerprint::new([0x77; 32])
+}
+
+fn durable_club_definition() -> ItemDefinition {
+    ItemDefinition {
+        type_id: ItemTypeId::new(0x1000_1001),
+        kind: ItemKind::ClubSet,
+        sale: ItemSale::Pang(500),
+        stacking: ItemStacking::Unique,
+        durability: ItemDurability::Durable {
+            max: 100,
+            repair_pang_per_point: 3,
+        },
+        compatibility: ItemCompatibility::Any,
+    }
+}
+
+fn consumable_definition() -> ItemDefinition {
+    ItemDefinition {
+        type_id: ItemTypeId::new(0x1a00_1001),
+        kind: ItemKind::Consumable,
+        sale: ItemSale::Pang(25),
+        stacking: ItemStacking::Stackable { max_stack: 3 },
+        durability: ItemDurability::Nondurable,
+        compatibility: ItemCompatibility::Any,
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn economy_purchase_replay_consume_repair_equip_and_audits_are_atomic(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyCore", Some("EconomyNick")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    sqlx::query("UPDATE profiles SET pang = 2000 WHERE account_id = $1")
+        .bind(account_id.get())
+        .execute(&pool)
+        .await
+        .expect("fund account");
+
+    let purchase = PurchaseRequest {
+        account_id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        definition: durable_club_definition(),
+        quantity: 1,
+    };
+    let committed = repository.purchase(purchase).await.expect("purchase");
+    let EconomyCommit::Committed(club) = committed else {
+        panic!("first purchase must commit");
+    };
+    assert_eq!((club.pang_balance, club.durability), (1500, Some(100)));
+
+    let mut changed_catalog = purchase;
+    changed_catalog.catalog = CatalogFingerprint::new([0x88; 32]);
+    assert_eq!(
+        repository.purchase(changed_catalog).await.expect("replay"),
+        EconomyCommit::Replayed(club)
+    );
+    let mut drift = purchase;
+    drift.quantity = 2;
+    assert_eq!(
+        repository.purchase(drift).await,
+        Err(EconomyError::IdempotencyDrift)
+    );
+
+    let stack_request = PurchaseRequest {
+        account_id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        definition: consumable_definition(),
+        quantity: 2,
+    };
+    let EconomyCommit::Committed(stack) = repository
+        .purchase(stack_request)
+        .await
+        .expect("stack purchase")
+    else {
+        panic!("stack purchase must commit");
+    };
+    assert_eq!((stack.quantity_after, stack.pang_balance), (2, 1450));
+    let cap_request = PurchaseRequest {
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        quantity: 2,
+        ..stack_request
+    };
+    assert_eq!(
+        repository.purchase(cap_request).await,
+        Err(EconomyError::StackFull)
+    );
+    let frozen_failure: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM economy_operations WHERE operation_id = $1")
+            .bind(cap_request.operation_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("operation count");
+    assert_eq!(frozen_failure, 0);
+
+    let consume_one = ConsumeItem {
+        account_id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        item: EconomyItemSelector {
+            inventory_id: stack.inventory_id,
+            definition: consumable_definition(),
+        },
+    };
+    let EconomyCommit::Committed(consumed) = repository
+        .consume_one(consume_one)
+        .await
+        .expect("consume first")
+    else {
+        panic!("consume must commit");
+    };
+    assert_eq!(consumed.quantity_after, 1);
+    assert_eq!(
+        repository
+            .consume_one(consume_one)
+            .await
+            .expect("consume replay"),
+        EconomyCommit::Replayed(consumed)
+    );
+    let consume_last = ConsumeItem {
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        ..consume_one
+    };
+    let EconomyCommit::Committed(removed) = repository
+        .consume_one(consume_last)
+        .await
+        .expect("consume last")
+    else {
+        panic!("last consume must commit");
+    };
+    assert_eq!(removed.quantity_after, 0);
+    let row_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM inventory_items WHERE id = $1)")
+            .bind(stack.inventory_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("inventory existence");
+    assert!(!row_exists);
+
+    sqlx::query("UPDATE inventory_items SET durability = 40 WHERE id = $1")
+        .bind(club.inventory_id.get())
+        .execute(&pool)
+        .await
+        .expect("synthetic wear setup");
+    let repair = RepairItem {
+        account_id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        item: EconomyItemSelector {
+            inventory_id: club.inventory_id,
+            definition: durable_club_definition(),
+        },
+    };
+    let EconomyCommit::Committed(repaired) = repository.repair(repair).await.expect("repair")
+    else {
+        panic!("repair must commit");
+    };
+    assert_eq!(
+        (
+            repaired.durability,
+            repaired.pang_cost,
+            repaired.pang_balance
+        ),
+        (100, 180, 1270)
+    );
+    assert_eq!(
+        repository.repair(repair).await.expect("repair replay"),
+        EconomyCommit::Replayed(repaired)
+    );
+
+    let equipment = EquipmentChange {
+        account_id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        expected_version: aggregate.equipment.version,
+        character_id: aggregate.character.id,
+        character_type_id: aggregate.character.item_type_id,
+        club: Some(EconomyItemSelector {
+            inventory_id: club.inventory_id,
+            definition: durable_club_definition(),
+        }),
+        ball: None,
+    };
+    let EconomyCommit::Committed(equipped) = repository.equip(equipment).await.expect("equip")
+    else {
+        panic!("equip must commit");
+    };
+    assert_eq!(equipped.version, 1);
+    let raced = EquipmentChange {
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        ..equipment
+    };
+    assert_eq!(
+        repository.equip(raced).await,
+        Err(EconomyError::VersionConflict)
+    );
+
+    let snapshot = repository
+        .load_player_snapshot(account_id)
+        .await
+        .expect("snapshot");
+    let projected = snapshot
+        .inventory
+        .iter()
+        .find(|item| item.id == club.inventory_id)
+        .expect("club projection");
+    assert_eq!(
+        projected.durability,
+        pangya_domain::InventoryDurability::Durable(100)
+    );
+    assert_eq!(projected.class, pangya_domain::InventoryClass::ClubSet);
+
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM economy_operations), \
+                (SELECT count(*) FROM shop_currency_ledger), \
+                (SELECT count(*) FROM item_ledger), \
+                (SELECT count(*) FROM equipment_ledger)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit counts");
+    assert_eq!(counts, (6, 3, 5, 1));
+    assert!(
+        sqlx::query("UPDATE economy_operations SET command = 'repair' WHERE operation_id = $1")
+            .bind(purchase.operation_id.get())
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn concurrent_same_key_purchases_commit_exactly_once(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyRace", Some("EconomyRaceNick")))
+        .await
+        .expect("account");
+    sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund account");
+    let request = PurchaseRequest {
+        account_id: aggregate.account.id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        definition: durable_club_definition(),
+        quantity: 1,
+    };
+    let (left, right) = tokio::join!(repository.purchase(request), repository.purchase(request));
+    let outcomes = [left.expect("left"), right.expect("right")];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, EconomyCommit::Committed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, EconomyCommit::Replayed(_)))
+            .count(),
+        1
+    );
+    let state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT p.pang, \
+                (SELECT count(*) FROM inventory_items i WHERE i.account_id = p.account_id AND i.item_type_id = 268439553), \
+                (SELECT count(*) FROM economy_operations o WHERE o.account_id = p.account_id), \
+                (SELECT count(*) FROM shop_currency_ledger l WHERE l.account_id = p.account_id) \
+         FROM profiles p WHERE p.account_id = $1",
+    )
+    .bind(aggregate.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert_eq!(state, (500, 1, 1, 1));
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn purchase_concurrent_with_m5_reward_preserves_exact_balance_arithmetic(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyReward", Some("EconReward")))
+        .await
+        .expect("account");
+    sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund account");
+    let begin = solo_begin(aggregate.account.id);
+    assert!(matches!(
+        repository.begin_solo(begin.clone()).await.expect("begin"),
+        BeginSoloMatchOutcome::Begun
+    ));
+    assert_eq!(
+        repository
+            .mark_solo_in_game(solo_mark(&begin))
+            .await
+            .expect("mark"),
+        MarkSoloInGameOutcome::Marked
+    );
+    let purchase = PurchaseRequest {
+        account_id: aggregate.account.id,
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        catalog: economy_catalog(),
+        definition: durable_club_definition(),
+        quantity: 1,
+    };
+    let commit = solo_commit(&begin, 2);
+    let (purchase_outcome, reward_outcome) = tokio::join!(
+        repository.purchase(purchase),
+        repository.commit_solo_hole(commit)
+    );
+    let EconomyCommit::Committed(purchased) = purchase_outcome.expect("purchase") else {
+        panic!("purchase must commit");
+    };
+    let reward = reward_outcome.expect("reward");
+    let final_balance: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("balance");
+    assert_eq!(
+        u64::try_from(final_balance).expect("nonnegative"),
+        1000 + reward.pang_reward() - 500
+    );
+    assert!(purchased.pang_balance == 500 || purchased.pang_balance == 500 + reward.pang_reward());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM shop_currency_ledger WHERE account_id = $1"
+        )
+        .bind(aggregate.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("economy ledger"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM currency_ledger WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("match ledger"),
+        1
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn m7_forward_migration_preserves_legacy_inventory_projection(pool: PgPool) {
+    for migration in [
+        include_str!("../migrations/0001_m2_account_foundation.sql"),
+        include_str!("../migrations/0002_operator_audit.sql"),
+        include_str!("../migrations/0003_m5_solo_matches.sql"),
+        include_str!("../migrations/0004_m5_match_wind.sql"),
+        include_str!("../migrations/0005_m5_persistence_failure_abort.sql"),
+        include_str!("../migrations/0006_m6_stroke_records.sql"),
+        include_str!("../migrations/0007_m6_winner_by_forfeit.sql"),
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("released migration");
+    }
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username_normalized, username_display) \
+         VALUES ('m7_upgrade', 'M7Upgrade') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("account");
+    let expires: DateTime<Utc> = "2030-01-02T03:04:05Z".parse().expect("time");
+    let inventory_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items \
+         (account_id, item_type_id, starter_key, quantity, durability, expires_at) \
+         VALUES ($1, 268435457, 'legacy.club', 7, 42, $2) RETURNING id",
+    )
+    .bind(account_id)
+    .bind(expires)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy inventory");
+    sqlx::raw_sql(include_str!("../migrations/0008_m7_synthetic_economy.sql"))
+        .execute(&pool)
+        .await
+        .expect("M7 migration");
+    let row: (i64, i64, Option<i64>, Option<DateTime<Utc>>, String) = sqlx::query_as(
+        "SELECT id, quantity, durability, expires_at, inventory_class \
+         FROM inventory_items WHERE id = $1",
+    )
+    .bind(inventory_id)
+    .fetch_one(&pool)
+    .await
+    .expect("preserved inventory");
+    assert_eq!(
+        row,
+        (
+            inventory_id,
+            7,
+            Some(42),
+            Some(expires),
+            "legacy".to_owned()
+        )
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn every_purchase_mutation_stage_failure_rolls_back_balance_grant_operation_and_ledgers(
+    pool: PgPool,
+) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyFailure", Some("EconFailure")))
+        .await
+        .expect("account");
+    sqlx::query("UPDATE profiles SET pang = 5000 WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund account");
+    sqlx::query(
+        "CREATE FUNCTION test_fail_economy_stage() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected economy stage failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function");
+    for (stage, table, operation) in [
+        ("grant", "inventory_items", "INSERT"),
+        ("deduction", "profiles", "UPDATE"),
+        ("operation", "economy_operations", "INSERT"),
+        ("currency", "shop_currency_ledger", "INSERT"),
+        ("item", "item_ledger", "INSERT"),
+    ] {
+        let trigger = format!(
+            "CREATE TRIGGER test_fail_economy BEFORE {operation} ON {table} \
+             FOR EACH ROW EXECUTE FUNCTION test_fail_economy_stage()"
+        );
+        sqlx::query(&trigger)
+            .execute(&pool)
+            .await
+            .expect("failure trigger");
+        let request = PurchaseRequest {
+            account_id: aggregate.account.id,
+            operation_id: EconomyOperationId::new(Uuid::new_v4()),
+            catalog: economy_catalog(),
+            definition: durable_club_definition(),
+            quantity: 1,
+        };
+        assert_eq!(
+            repository.purchase(request).await,
+            Err(EconomyError::Storage),
+            "stage {stage}"
+        );
+        sqlx::query(&format!("DROP TRIGGER test_fail_economy ON {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT pang, \
+                    (SELECT count(*) FROM inventory_items WHERE account_id = profiles.account_id), \
+                    (SELECT count(*) FROM economy_operations WHERE account_id = profiles.account_id), \
+                    (SELECT count(*) FROM shop_currency_ledger WHERE account_id = profiles.account_id), \
+                    (SELECT count(*) FROM item_ledger WHERE account_id = profiles.account_id) \
+             FROM profiles WHERE account_id = $1",
+        )
+        .bind(aggregate.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("rollback state");
+        assert_eq!(state, (5000, 2, 0, 0, 0), "stage {stage}");
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn equip_consume_and_repair_stage_failures_roll_back_all_authoritative_state(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyStages", Some("EconStages")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    sqlx::query("UPDATE profiles SET pang = 5000 WHERE account_id = $1")
+        .bind(account_id.get())
+        .execute(&pool)
+        .await
+        .expect("fund");
+    let club_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items \
+         (account_id, item_type_id, starter_key, quantity, durability, inventory_class) \
+         VALUES ($1, $2, 'test.m7.club', 1, 40, 'club_set') RETURNING id",
+    )
+    .bind(account_id.get())
+    .bind(i64::from(durable_club_definition().type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("club");
+    let consumable_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items \
+         (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.m7.consume', 2, 'consumable') RETURNING id",
+    )
+    .bind(account_id.get())
+    .bind(i64::from(consumable_definition().type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("consumable");
+    sqlx::query(
+        "CREATE FUNCTION test_fail_other_economy_stage() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected economy stage failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("function");
+
+    for (stage, table, operation) in [
+        ("profile", "profiles", "UPDATE"),
+        ("equipment", "equipment_sets", "UPDATE"),
+        ("operation", "economy_operations", "INSERT"),
+        ("ledger", "equipment_ledger", "INSERT"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER test_fail_other_economy BEFORE {operation} ON {table} \
+             FOR EACH ROW EXECUTE FUNCTION test_fail_other_economy_stage()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("equip trigger");
+        let request = EquipmentChange {
+            account_id,
+            operation_id: EconomyOperationId::new(Uuid::new_v4()),
+            catalog: economy_catalog(),
+            expected_version: 0,
+            character_id: aggregate.character.id,
+            character_type_id: aggregate.character.item_type_id,
+            club: Some(EconomyItemSelector {
+                inventory_id: pangya_domain::InventoryItemId::new(club_id).expect("club id"),
+                definition: durable_club_definition(),
+            }),
+            ball: None,
+        };
+        assert_eq!(
+            repository.equip(request).await,
+            Err(EconomyError::Storage),
+            "{stage}"
+        );
+        sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop equip trigger");
+        let state: (Option<i64>, i64, i64, i64) = sqlx::query_as(
+            "SELECT selected_character_id, \
+                    (SELECT version FROM equipment_sets WHERE account_id = profiles.account_id), \
+                    (SELECT count(*) FROM economy_operations WHERE account_id = profiles.account_id), \
+                    (SELECT count(*) FROM equipment_ledger WHERE account_id = profiles.account_id) \
+             FROM profiles WHERE account_id = $1",
+        )
+        .bind(account_id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("equip rollback");
+        assert_eq!(
+            state,
+            (Some(aggregate.character.id.get()), 0, 0, 0),
+            "{stage}"
+        );
+    }
+
+    for (stage, table, operation) in [
+        ("inventory", "inventory_items", "UPDATE"),
+        ("operation", "economy_operations", "INSERT"),
+        ("ledger", "item_ledger", "INSERT"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER test_fail_other_economy BEFORE {operation} ON {table} \
+             FOR EACH ROW EXECUTE FUNCTION test_fail_other_economy_stage()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("consume trigger");
+        let request = ConsumeItem {
+            account_id,
+            operation_id: EconomyOperationId::new(Uuid::new_v4()),
+            catalog: economy_catalog(),
+            item: EconomyItemSelector {
+                inventory_id: pangya_domain::InventoryItemId::new(consumable_id)
+                    .expect("consumable id"),
+                definition: consumable_definition(),
+            },
+        };
+        assert_eq!(
+            repository.consume_one(request).await,
+            Err(EconomyError::Storage),
+            "{stage}"
+        );
+        sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop consume trigger");
+        let state: (i64, i64, i64) = sqlx::query_as(
+            "SELECT quantity, \
+                    (SELECT count(*) FROM economy_operations WHERE account_id = inventory_items.account_id), \
+                    (SELECT count(*) FROM item_ledger WHERE account_id = inventory_items.account_id) \
+             FROM inventory_items WHERE id = $1",
+        )
+        .bind(consumable_id)
+        .fetch_one(&pool)
+        .await
+        .expect("consume rollback");
+        assert_eq!(state, (2, 0, 0), "{stage}");
+    }
+
+    for (stage, table, operation) in [
+        ("inventory", "inventory_items", "UPDATE"),
+        ("profile", "profiles", "UPDATE"),
+        ("operation", "economy_operations", "INSERT"),
+        ("currency", "shop_currency_ledger", "INSERT"),
+        ("item", "item_ledger", "INSERT"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER test_fail_other_economy BEFORE {operation} ON {table} \
+             FOR EACH ROW EXECUTE FUNCTION test_fail_other_economy_stage()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("repair trigger");
+        let request = RepairItem {
+            account_id,
+            operation_id: EconomyOperationId::new(Uuid::new_v4()),
+            catalog: economy_catalog(),
+            item: EconomyItemSelector {
+                inventory_id: pangya_domain::InventoryItemId::new(club_id).expect("club id"),
+                definition: durable_club_definition(),
+            },
+        };
+        assert_eq!(
+            repository.repair(request).await,
+            Err(EconomyError::Storage),
+            "{stage}"
+        );
+        sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
+            .execute(&pool)
+            .await
+            .expect("drop repair trigger");
+        let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT durability, \
+                    (SELECT pang FROM profiles WHERE account_id = inventory_items.account_id), \
+                    (SELECT count(*) FROM economy_operations WHERE account_id = inventory_items.account_id), \
+                    (SELECT count(*) FROM shop_currency_ledger WHERE account_id = inventory_items.account_id), \
+                    (SELECT count(*) FROM item_ledger WHERE account_id = inventory_items.account_id) \
+             FROM inventory_items WHERE id = $1",
+        )
+        .bind(club_id)
+        .fetch_one(&pool)
+        .await
+        .expect("repair rollback");
+        assert_eq!(state, (40, 5000, 0, 0, 0), "{stage}");
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn economy_rejects_not_sold_overflow_insufficient_expired_depleted_and_wrong_family(
+    pool: PgPool,
+) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyErrors", Some("EconErrors")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let mut not_sold = durable_club_definition();
+    not_sold.sale = ItemSale::NotSold;
+    let failed_id = EconomyOperationId::new(Uuid::new_v4());
+    assert_eq!(
+        repository
+            .purchase(PurchaseRequest {
+                account_id,
+                operation_id: failed_id,
+                catalog: economy_catalog(),
+                definition: not_sold,
+                quantity: 1,
+            })
+            .await,
+        Err(EconomyError::Invalid)
+    );
+    let insufficient = PurchaseRequest {
+        account_id,
+        operation_id: failed_id,
+        catalog: economy_catalog(),
+        definition: durable_club_definition(),
+        quantity: 1,
+    };
+    assert_eq!(
+        repository.purchase(insufficient).await,
+        Err(EconomyError::InsufficientPang)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM economy_operations WHERE operation_id = $1"
+        )
+        .bind(failed_id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("failed operation count"),
+        0
+    );
+    sqlx::query("UPDATE profiles SET pang = 2000 WHERE account_id = $1")
+        .bind(account_id.get())
+        .execute(&pool)
+        .await
+        .expect("fund retry");
+    assert!(matches!(
+        repository.purchase(insufficient).await,
+        Ok(EconomyCommit::Committed(_))
+    ));
+
+    let mut overflow_definition = consumable_definition();
+    overflow_definition.sale = ItemSale::Pang(i64::MAX as u64);
+    assert_eq!(
+        repository
+            .purchase(PurchaseRequest {
+                account_id,
+                operation_id: EconomyOperationId::new(Uuid::new_v4()),
+                catalog: economy_catalog(),
+                definition: overflow_definition,
+                quantity: 2,
+            })
+            .await,
+        Err(EconomyError::ArithmeticOverflow)
+    );
+
+    let expired_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items \
+         (account_id, item_type_id, starter_key, quantity, expires_at, inventory_class) \
+         VALUES ($1, $2, 'test.expired', 1, now() - interval '1 second', 'consumable') \
+         RETURNING id",
+    )
+    .bind(account_id.get())
+    .bind(i64::from(consumable_definition().type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("expired row");
+    assert_eq!(
+        repository
+            .consume_one(ConsumeItem {
+                account_id,
+                operation_id: EconomyOperationId::new(Uuid::new_v4()),
+                catalog: economy_catalog(),
+                item: EconomyItemSelector {
+                    inventory_id: pangya_domain::InventoryItemId::new(expired_id)
+                        .expect("expired id"),
+                    definition: consumable_definition(),
+                },
+            })
+            .await,
+        Err(EconomyError::Expired)
+    );
+
+    let depleted_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items \
+         (account_id, item_type_id, starter_key, quantity, durability, inventory_class) \
+         VALUES ($1, $2, 'test.depleted', 1, 0, 'club_set') RETURNING id",
+    )
+    .bind(account_id.get())
+    .bind(i64::from(durable_club_definition().type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("depleted row");
+    assert_eq!(
+        repository
+            .equip(EquipmentChange {
+                account_id,
+                operation_id: EconomyOperationId::new(Uuid::new_v4()),
+                catalog: economy_catalog(),
+                expected_version: 0,
+                character_id: aggregate.character.id,
+                character_type_id: aggregate.character.item_type_id,
+                club: Some(EconomyItemSelector {
+                    inventory_id: pangya_domain::InventoryItemId::new(depleted_id)
+                        .expect("depleted id"),
+                    definition: durable_club_definition(),
+                }),
+                ball: None,
+            })
+            .await,
+        Err(EconomyError::Depleted)
+    );
+    let wrong_family = EconomyItemSelector {
+        inventory_id: pangya_domain::InventoryItemId::new(depleted_id).expect("id"),
+        definition: consumable_definition(),
+    };
+    assert_eq!(
+        repository
+            .repair(RepairItem {
+                account_id,
+                operation_id: EconomyOperationId::new(Uuid::new_v4()),
+                catalog: economy_catalog(),
+                item: wrong_family,
+            })
+            .await,
+        Err(EconomyError::Incompatible)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn distinct_concurrent_purchases_serialize_without_lost_balance_updates(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("EconomyDistinct", Some("EconDistinct")))
+        .await
+        .expect("account");
+    sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
+        .bind(aggregate.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund");
+    let mut tasks = Vec::new();
+    for offset in 0..8_u32 {
+        let repository = repository.clone();
+        let mut definition = durable_club_definition();
+        definition.type_id = ItemTypeId::new(0x1000_2000 + offset);
+        definition.sale = ItemSale::Pang(25);
+        let request = PurchaseRequest {
+            account_id: aggregate.account.id,
+            operation_id: EconomyOperationId::new(Uuid::new_v4()),
+            catalog: economy_catalog(),
+            definition,
+            quantity: 1,
+        };
+        tasks.push(tokio::spawn(
+            async move { repository.purchase(request).await },
+        ));
+    }
+    for task in tasks {
+        assert!(matches!(
+            task.await.expect("join").expect("purchase"),
+            EconomyCommit::Committed(_)
+        ));
+    }
+    let state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT pang, \
+                (SELECT count(*) FROM economy_operations WHERE account_id = profiles.account_id), \
+                (SELECT count(*) FROM shop_currency_ledger WHERE account_id = profiles.account_id), \
+                (SELECT count(*) FROM item_ledger WHERE account_id = profiles.account_id) \
+         FROM profiles WHERE account_id = $1",
+    )
+    .bind(aggregate.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert_eq!(state, (800, 8, 8, 8));
 }

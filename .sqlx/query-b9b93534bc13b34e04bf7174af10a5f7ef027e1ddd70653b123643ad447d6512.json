@@ -1,0 +1,154 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT operation_id, account_id, command, request_type_id, request_quantity, request_inventory_id, request_expected_version, request_character_id, request_character_type_id, request_club_item_id, request_club_type_id, request_ball_item_id, request_ball_type_id, result_inventory_id, result_type_id, result_quantity, result_durability, result_pang_balance, result_pang_cost, result_character_id, result_club_item_id, result_ball_item_id, result_equipment_version FROM economy_operations WHERE operation_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "operation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "command",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "request_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "request_quantity",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "request_inventory_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "request_expected_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "request_character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "request_character_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "request_club_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "request_club_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "request_ball_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "request_ball_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "result_inventory_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "result_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "result_quantity",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 16,
+        "name": "result_durability",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 17,
+        "name": "result_pang_balance",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "result_pang_cost",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "result_character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 20,
+        "name": "result_club_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 21,
+        "name": "result_ball_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 22,
+        "name": "result_equipment_version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b9b93534bc13b34e04bf7174af10a5f7ef027e1ddd70653b123643ad447d6512"
+}

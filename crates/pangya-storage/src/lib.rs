@@ -17,15 +17,18 @@ use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository, AccountStatus, AuthenticatedSession,
     AuthenticationRecord, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
     BeginStrokeMatchOutcome, Character, CharacterId, CommitSoloHole, CommitStrokeMatch,
-    ConsumeHandover, CredentialHash, EquipmentSet, EquipmentSetId, HandoverDigest, HandoverError,
-    HandoverRepository, IncompleteMatchAbortLimit, InventoryItem, InventoryItemId, ItemTypeId,
-    MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS, MarkSoloInGame,
-    MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MatchAbortReason, MatchId,
-    MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount, NewHandover, Nickname,
-    NormalizedNickname, NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile,
-    RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState, SoloMatchResult,
-    StarterGrant, StarterKey, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
-    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
+    ConsumeHandover, ConsumeItem, ConsumeItemResult, CredentialHash, EconomyCommit, EconomyError,
+    EconomyOperationId, EconomyRepository, EquipmentChange, EquipmentChangeResult, EquipmentSet,
+    EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
+    InventoryClass, InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind,
+    ItemSale, ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY,
+    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
+    MatchResultKey, NewAccount, NewHandover, Nickname, NormalizedNickname, NormalizedUsername,
+    PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem,
+    RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState,
+    SoloMatchResult, StarterGrant, StarterKey, StrokeCompletion, StrokeCount, StrokeMatchResult,
+    StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
     WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
@@ -36,6 +39,8 @@ use sqlx::{
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
+
+mod economy;
 
 /// Embedded forward-only PostgreSQL migrations.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -389,7 +394,8 @@ impl PgRepository {
             i64::try_from(MAX_PLAYER_INVENTORY + 1).map_err(|_| RepositoryError::CorruptData)?;
         let inventory = sqlx::query_as!(
             InventoryRow,
-            "SELECT id, account_id, item_type_id, quantity, starter_key \
+            "SELECT id, account_id, item_type_id, quantity, starter_key, inventory_class, \
+                    durability, expires_at \
              FROM inventory_items WHERE account_id = $1 ORDER BY id LIMIT $2",
             account_id.get(),
             inventory_limit
@@ -1587,6 +1593,9 @@ struct InventoryRow {
     item_type_id: i64,
     quantity: i64,
     starter_key: String,
+    inventory_class: String,
+    durability: Option<i64>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow)]
@@ -2460,7 +2469,8 @@ async fn load_aggregate_in_transaction(
     .map_err(repository_db_error)?;
     let inventory = sqlx::query_as!(
         InventoryRow,
-        "SELECT id, account_id, item_type_id, quantity, starter_key \
+        "SELECT id, account_id, item_type_id, quantity, starter_key, inventory_class, \
+                durability, expires_at \
          FROM inventory_items WHERE account_id = $1 ORDER BY id",
         account_id.get()
     )
@@ -2537,7 +2547,26 @@ fn inventory_row_into_domain(row: InventoryRow) -> Result<InventoryItem, Reposit
         quantity: u32::try_from(row.quantity).map_err(|_| RepositoryError::CorruptData)?,
         starter_key: StarterKey::parse(&row.starter_key)
             .map_err(|_| RepositoryError::CorruptData)?,
+        class: parse_inventory_class(&row.inventory_class)?,
+        durability: match row.durability {
+            Some(value) => InventoryDurability::Durable(
+                u32::try_from(value).map_err(|_| RepositoryError::CorruptData)?,
+            ),
+            None => InventoryDurability::Nondurable,
+        },
+        expires_at: row.expires_at.map(SystemTime::from),
     })
+}
+
+fn parse_inventory_class(value: &str) -> Result<InventoryClass, RepositoryError> {
+    match value {
+        "legacy" => Ok(InventoryClass::Legacy),
+        "club_set" => Ok(InventoryClass::ClubSet),
+        "ball" => Ok(InventoryClass::Ball),
+        "consumable" => Ok(InventoryClass::Consumable),
+        "character_part" => Ok(InventoryClass::CharacterPart),
+        _ => Err(RepositoryError::CorruptData),
+    }
 }
 
 fn checked_u64(value: i64) -> Result<u64, RepositoryError> {

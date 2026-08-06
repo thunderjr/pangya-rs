@@ -1,0 +1,12 @@
+source_project: pangya-rs synthetic M7 fixture generator
+upstream_revision: local-synthetic-m7-2026-08-05
+upstream_url: https://example.invalid/pangya-rs-synthetic-m7
+upstream_path: crates/pangya-data/tests/fixtures/synthetic-catalog-v2
+license: MIT OR Apache-2.0
+client_version: synthetic-not-client-derived
+service: data
+direction: operator-input
+redaction_status: generated-no-proprietary-content
+expected_behavior: exact generated schema-v2 Character, ClubSet, Ball, Consumable, CharacterPart, and optional Course records; no retail assets or claims
+record_generation: little-endian layouts documented in .pi-subagents/artifacts/outputs/661ed657/context.md
+sha256_fixture: per-file SHA-256 values are recorded in manifest.toml

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, account_id, item_type_id, quantity, starter_key FROM inventory_items WHERE account_id = $1 ORDER BY id LIMIT $2",
+  "query": "SELECT id, account_id, item_type_id, quantity, starter_key, inventory_class, durability, expires_at FROM inventory_items WHERE account_id = $1 ORDER BY id LIMIT $2",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,21 @@
         "ordinal": 4,
         "name": "starter_key",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "inventory_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "durability",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -40,8 +55,11 @@
       false,
       false,
       false,
-      false
+      false,
+      false,
+      true,
+      true
     ]
   },
-  "hash": "f9a038b316f66a2ee7fce47897ae3af0e3dc72a18ffcde9f3c3a682eb945c215"
+  "hash": "ad1369703e4beb6964e8693f006e571e87e78481d87f5118a3d0ece1008a6f2e"
 }

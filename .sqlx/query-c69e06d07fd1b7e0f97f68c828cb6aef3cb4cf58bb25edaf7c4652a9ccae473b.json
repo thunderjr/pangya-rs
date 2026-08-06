@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, durability, inventory_class) VALUES ($1, $2, $3, 1, $4, $5) RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c69e06d07fd1b7e0f97f68c828cb6aef3cb4cf58bb25edaf7c4652a9ccae473b"
+}
