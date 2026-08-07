@@ -4805,6 +4805,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn economy_composition_rejects_out_of_range_bounds_and_catalogs_without_consumables() {
+        let economy_catalog = || {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../pangya-data/tests/fixtures/synthetic-catalog-v2");
+            Catalog::load(&root, std::path::Path::new("manifest.toml"))
+                .unwrap_or_else(|_| unreachable!())
+        };
+        let valid = EconomyRuntimeConfig {
+            command_timeout: Duration::from_secs(2),
+            commands_per_window: 30,
+            page_size: 25,
+            max_purchase_quantity: 50,
+        };
+        let compose = |catalog: Catalog, economy: EconomyRuntimeConfig| {
+            GameService::new(
+                Arc::new(FakeRepository::default()),
+                catalog,
+                GameRuntimeConfig {
+                    economy: Some(economy),
+                    ..GameRuntimeConfig::default()
+                },
+                Arc::new(NoopGameObserver),
+            )
+            .map(drop)
+        };
+
+        compose(economy_catalog(), valid).expect("valid economy composes");
+
+        let grace = GameRuntimeLimits::default().shutdown_grace;
+        for out_of_range in [
+            EconomyRuntimeConfig {
+                command_timeout: Duration::ZERO,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                command_timeout: grace + Duration::from_secs(1),
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                commands_per_window: 0,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                commands_per_window: 1_000_001,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                page_size: 0,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                page_size: pangya_protocol::MAX_SHOP_PAGE_ENTRIES + 1,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                max_purchase_quantity: 0,
+                ..valid
+            },
+            EconomyRuntimeConfig {
+                max_purchase_quantity: pangya_protocol::MAX_PURCHASE_QUANTITY + 1,
+                ..valid
+            },
+        ] {
+            assert!(
+                matches!(
+                    compose(economy_catalog(), out_of_range),
+                    Err(GameRuntimeError::InvalidConfig)
+                ),
+                "expected InvalidConfig for {out_of_range:?}"
+            );
+        }
+
+        // The M3 catalog carries no shop offers at all, so it cannot price an economy.
+        assert!(matches!(
+            compose(test_catalog(), valid),
+            Err(GameRuntimeError::Catalog)
+        ));
+    }
+
+    #[tokio::test]
     async fn solo_requires_two_event_slots_and_capacity_two_drains_start_pair() {
         let repository = Arc::new(FakeRepository::default());
         let catalog = test_catalog();

@@ -58,6 +58,19 @@ standings/own-balance/finished terminal burst. If either synthetic mode is enabl
 startup performs generic incomplete-match recovery exactly once using the larger enabled
 recovery cap and timeout before any listener binds.
 
+`[game.economy]` is the independent disabled-by-default synthetic M7 inventory/shop
+boundary and claims no retail compatibility. Enabling it requires `game.enabled=true` and
+a catalog that carries at least one shop offer, of which at least one is a consumable;
+composition fails closed otherwise. `command_timeout` is the repository command deadline:
+nonzero, capped at 60 seconds, and additionally capped by `server.shutdown_grace`, so an
+in-flight economy command can never outlive the grace that must cover it.
+`commands_per_window` is `1..=1000000` and bounds economy commands per connection within
+the shared rate window. `page_size` is `1..=50`, the protocol's maximum shop-page entry
+count. `max_purchase_quantity` is `1..=99` and is enforced against the wire before any
+repository work. Economy opcodes are accepted only from an authenticated connection that
+has entered a channel; when the section is disabled the opcodes still decode and receive
+an explicit disabled result rather than closing the connection.
+
 Catalog loading occurs before any listener bind. The blocking filesystem work is
 noncancellable, but it runs on one detached standard thread rather than Tokio's
 blocking pool; timeout therefore cannot retain the Tokio runtime or delay runtime/

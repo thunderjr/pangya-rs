@@ -2280,6 +2280,77 @@ mod tests {
     }
 
     #[test]
+    fn economy_defaults_disabled_and_validates_enablement_caps_and_timeout_relations() {
+        let defaults = test_load(None, &CliOverrides::default()).expect("defaults");
+        assert!(defaults.economy.is_none());
+
+        let path = file(
+            "[game.economy]\nenabled=true\ncommand_timeout='61s'\n\
+             commands_per_window=1000001\npage_size=51\nmax_purchase_quantity=100\n",
+        );
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("invalid economy")
+        else {
+            panic!("expected validation");
+        };
+        let fields = error
+            .issues
+            .iter()
+            .map(|issue| issue.field)
+            .collect::<HashSet<_>>();
+        for expected in [
+            "game.economy.enabled",
+            "game.economy.command_timeout",
+            "game.economy.commands_per_window",
+            "game.economy.page_size",
+            "game.economy.max_purchase_quantity",
+        ] {
+            assert!(fields.contains(expected), "missing {expected}: {fields:?}");
+        }
+        fs::remove_file(path).expect("remove");
+
+        // A zero command timeout is rejected before any cap relation is considered.
+        let path = file("[game.economy]\nenabled=true\ncommand_timeout='0s'\n");
+        let ConfigLoadError::Validation(error) =
+            test_load(Some(&path), &CliOverrides::default()).expect_err("zero timeout")
+        else {
+            panic!("expected validation");
+        };
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "game.economy.command_timeout")
+        );
+        fs::remove_file(path).expect("remove");
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog");
+        let config_text = |command_timeout: &str| {
+            format!(
+                "[server]\nshutdown_grace='5s'\n[game]\nenabled=true\n\
+                 [game.economy]\nenabled=true\ncommand_timeout='{command_timeout}'\n\
+                 commands_per_window=30\npage_size=25\nmax_purchase_quantity=50\n[data]\n\
+                 catalog_required_m3=true\niff_directory='{}'\nmanifest='manifest.toml'\n",
+                root.display()
+            )
+        };
+        // The command deadline may not outlive the shutdown grace that must cover it.
+        let path = file(&config_text("6s"));
+        assert!(test_load(Some(&path), &CliOverrides::default()).is_err());
+        fs::remove_file(path).expect("remove");
+
+        let path = file(&config_text("3s"));
+        let config = test_load(Some(&path), &CliOverrides::default()).expect("valid economy");
+        let economy = config.economy.expect("enabled economy");
+        assert_eq!(economy.command_timeout, Duration::from_secs(3));
+        assert_eq!(economy.commands_per_window, 30);
+        assert_eq!(economy.page_size, 25);
+        assert_eq!(economy.max_purchase_quantity, 50);
+        fs::remove_file(path).expect("remove");
+    }
+
+    #[test]
     fn production_profile_ignores_public_disabled_game_bind() {
         let path = file(
             "[server]\nprofile='production'\n[game]\nenabled=false\nbind='0.0.0.0:20201'\nchannel_id=0\n",
