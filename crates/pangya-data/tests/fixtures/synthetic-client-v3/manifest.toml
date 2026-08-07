@@ -1,0 +1,55 @@
+manifest_version = 3
+
+[[files]]
+filename = "character.bin"
+sha256 = "5db67c827a322dd025c6d7e140a4a48802ad0b9b0c3f80828a179562efa881c2"
+kind = "character"
+count = 2
+binding = 0
+version = 13
+record_size = 16
+
+[[files]]
+filename = "club_set.bin"
+sha256 = "462a988a0a0a125f68a2f279e5272b5de4478fb2b696a45a5da4af51db1bb585"
+kind = "club_set"
+count = 2
+binding = 0
+version = 13
+record_size = 16
+
+[[files]]
+filename = "ball.bin"
+sha256 = "9fefb664a23e3a91f2466c9e71c676de83b091e1dea9a21bdc10bdabc7bdc60f"
+kind = "ball"
+count = 1
+binding = 0
+version = 13
+record_size = 16
+
+[[files]]
+filename = "consumable.bin"
+sha256 = "d396490480250cd295be60937ba45d55d1ed5b2392b1dc53edd47956fb34437b"
+kind = "consumable"
+count = 3
+binding = 0
+version = 13
+record_size = 16
+
+[[files]]
+filename = "character_part.bin"
+sha256 = "ffd410a73a4644f0122f1a49d4f554394f3c298013344f50d05397ba922030ed"
+kind = "character_part"
+count = 1
+binding = 0
+version = 13
+record_size = 16
+
+[[files]]
+filename = "course.bin"
+sha256 = "eb4019c5adbc40c7c61ca12122a46ba94e1ba0d027b4c88155d8680030463857"
+kind = "course"
+count = 1
+binding = 0
+version = 13
+record_size = 16

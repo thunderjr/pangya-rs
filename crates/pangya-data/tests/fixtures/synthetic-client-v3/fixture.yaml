@@ -1,0 +1,11 @@
+source_project: pangya-rs synthetic client-schema fixture generator
+upstream_revision: not-applicable
+upstream_url: not-applicable
+upstream_path: not-applicable
+license: MIT OR Apache-2.0
+client_version: synthetic-not-client-derived
+service: game
+direction: not-applicable
+redaction_status: no-client-or-account-data
+expected_behavior: exercises the real-client catalog schema (type ID at record offset four, family tag from the high byte, inactive rows flagged by a zero at offset zero) without containing any client bytes
+sha256_fixture: per-file SHA-256 values are recorded in manifest.toml

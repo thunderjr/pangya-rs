@@ -213,3 +213,65 @@ fn digest_and_duplicate_kind_errors_are_redacted_and_typed() {
     );
     fs::remove_dir_all(base).expect("cleanup");
 }
+
+/// Loads the generated fixture that mirrors the real client's record schema.
+fn client_schema_catalog() -> Catalog {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic-client-v3");
+    Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("client-schema catalog")
+}
+
+#[test]
+fn client_schema_reads_type_ids_at_record_offset_four() {
+    let catalog = client_schema_catalog();
+    assert_eq!(
+        catalog.manifest_version(),
+        pangya_data::CLIENT_MANIFEST_VERSION
+    );
+    // A synthetic-schema loader would read the activity word at offset zero as the type
+    // ID and find 1 everywhere; these ids only appear if offset four is used.
+    for (kind, type_id) in [
+        (CatalogKind::Character, 0x0400_0000),
+        (CatalogKind::Character, 0x0400_0001),
+        (CatalogKind::ClubSet, 0x1000_0000),
+        (CatalogKind::Ball, 0x1400_0000),
+        (CatalogKind::Consumable, 0x1800_0000),
+        (CatalogKind::Consumable, 0x1a00_0001),
+        (CatalogKind::CharacterPart, 0x0800_0400),
+        (CatalogKind::Course, 0x2800_0000),
+    ] {
+        assert!(
+            catalog.contains(kind, ItemTypeId::new(type_id)),
+            "missing {kind:?} 0x{type_id:08x}"
+        );
+    }
+    assert!(!catalog.contains(CatalogKind::Character, ItemTypeId::new(1)));
+}
+
+#[test]
+fn client_schema_skips_rows_flagged_inactive_at_offset_zero() {
+    let catalog = client_schema_catalog();
+    // The generated tables carry 0x17ffffff sentinels whose family tag matches no
+    // declared family. They load only because the zero activity word excludes them.
+    assert!(!catalog.contains(CatalogKind::ClubSet, ItemTypeId::new(0x17ff_ffff)));
+    assert!(!catalog.contains(CatalogKind::Consumable, ItemTypeId::new(0x17ff_ffff)));
+}
+
+#[test]
+fn client_schema_rejects_a_record_whose_family_tag_is_wrong() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synthetic-client-v3");
+    let mut bytes = std::fs::read(root.join("ball.bin")).expect("ball");
+    // Retag the single active ball record as a character; the tag check must reject it.
+    bytes[8 + 4..8 + 8].copy_from_slice(&0x0400_0000_u32.to_le_bytes());
+    let entry = pangya_data::ManifestFile {
+        filename: "ball.bin".into(),
+        sha256: "0".repeat(64),
+        kind: CatalogKind::Ball,
+        count: 1,
+        binding: 0,
+        version: 13,
+        record_size: 16,
+    };
+    assert!(pangya_data::parse_client_iff_bytes(&entry, &bytes).is_err());
+}

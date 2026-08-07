@@ -31,6 +31,14 @@ use unicode_normalization::is_nfc;
 pub const MANIFEST_VERSION: u32 = 1;
 /// Exact typed synthetic M7 manifest schema version.
 pub const M7_MANIFEST_VERSION: u32 = 2;
+/// Real U.S. client catalog schema version.
+///
+/// Records carry a small-valued word at offset 0 and the type ID at offset 4, and family
+/// identity comes from the type ID's high byte rather than the header's binding value.
+/// Measured against the acquired client; see `docs/data/US_CLIENT_IFF_STRUCTURE.md`.
+pub const CLIENT_MANIFEST_VERSION: u32 = 3;
+/// Byte offset of the type ID inside a real client record.
+pub const CLIENT_TYPE_ID_OFFSET: usize = 4;
 /// Hard catalog stack bound independent of operator input.
 pub const MAX_CATALOG_STACK: u32 = 10_000;
 /// Maximum manifest bytes read from an operator mount.
@@ -167,7 +175,7 @@ impl Catalog {
     fn load_manifest_from_dir(root: &Dir, manifest: CatalogManifest) -> Result<Self, CatalogError> {
         if !matches!(
             manifest.manifest_version,
-            MANIFEST_VERSION | M7_MANIFEST_VERSION
+            MANIFEST_VERSION | M7_MANIFEST_VERSION | CLIENT_MANIFEST_VERSION
         ) || manifest.files.is_empty()
             || manifest.files.len() > MAX_MANIFEST_FILES
         {
@@ -193,7 +201,13 @@ impl Catalog {
             }
             records.insert(entry.kind, parsed);
         }
-        let required: &[CatalogKind] = if manifest.manifest_version == M7_MANIFEST_VERSION {
+        let required: &[CatalogKind] = if manifest.manifest_version == CLIENT_MANIFEST_VERSION {
+            &[
+                CatalogKind::Character,
+                CatalogKind::ClubSet,
+                CatalogKind::Ball,
+            ]
+        } else if manifest.manifest_version == M7_MANIFEST_VERSION {
             &[
                 CatalogKind::Character,
                 CatalogKind::ClubSet,
@@ -482,6 +496,94 @@ pub fn parse_iff_bytes(
     Ok(records)
 }
 
+/// Family tags accepted for a real client table, as the high byte of each type ID.
+///
+/// A single client table may legitimately span more than one tag, so this is a set rather
+/// than a single value. Measured from the acquired client.
+const fn client_family_tags(kind: CatalogKind) -> &'static [u8] {
+    match kind {
+        CatalogKind::Character => &[0x04],
+        CatalogKind::CharacterPart => &[0x08],
+        CatalogKind::ClubSet => &[0x10],
+        CatalogKind::Ball => &[0x14],
+        // The client's Item table carries both tags.
+        CatalogKind::Consumable => &[0x18, 0x1a],
+        CatalogKind::Course => &[0x28],
+    }
+}
+
+/// Parses one real U.S. client IFF table.
+///
+/// Differs from the synthetic schemas in three measured ways: the type ID lives at offset
+/// four rather than zero, the header's binding value carries no family meaning, and record
+/// width is whatever the header arithmetic yields rather than a fixed per-family constant.
+///
+/// # Errors
+/// Rejects a table whose header, length arithmetic, digest, family tags, or type IDs are
+/// inconsistent.
+pub fn parse_client_iff_bytes(
+    entry: &ManifestFile,
+    bytes: &[u8],
+) -> Result<BTreeMap<u32, CatalogRecord>, CatalogError> {
+    validate_manifest_entry(entry)?;
+    if bytes.len() > MAX_IFF_BYTES || bytes.len() < IFF_HEADER_BYTES {
+        return Err(CatalogError::Structure);
+    }
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let binding = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    // Binding is validated against the operator's manifest for change detection only; it
+    // is deliberately not used to derive family identity.
+    if count == 0 || count != entry.count || binding != entry.binding || version != entry.version {
+        return Err(CatalogError::Structure);
+    }
+    if entry.record_size < CLIENT_TYPE_ID_OFFSET + 4 {
+        return Err(CatalogError::Manifest);
+    }
+    let records_bytes = usize::from(count)
+        .checked_mul(entry.record_size)
+        .ok_or(CatalogError::Structure)?;
+    let expected = IFF_HEADER_BYTES
+        .checked_add(records_bytes)
+        .ok_or(CatalogError::Structure)?;
+    if bytes.len() != expected {
+        return Err(CatalogError::Structure);
+    }
+    let tags = client_family_tags(entry.kind);
+    let mut records = BTreeMap::new();
+    for record in bytes[IFF_HEADER_BYTES..].chunks_exact(entry.record_size) {
+        // A zero at offset zero marks an inactive row. Real tables carry them throughout,
+        // and their type IDs are sentinels that do not respect family tagging, so they are
+        // skipped rather than rejected. Measured across every client table: skipping these
+        // leaves every remaining record correctly tagged.
+        if le_u32(record, 0)? == 0 {
+            continue;
+        }
+        let type_id = le_u32(record, CLIENT_TYPE_ID_OFFSET)?;
+        if type_id == 0 {
+            return Err(CatalogError::Structure);
+        }
+        let tag = u8::try_from(type_id >> 24).map_err(|_| CatalogError::Structure)?;
+        if !tags.contains(&tag) {
+            return Err(CatalogError::Structure);
+        }
+        let value = CatalogRecord {
+            type_id: ItemTypeId::new(type_id),
+            opaque: Arc::from(&record[CLIENT_TYPE_ID_OFFSET + 4..]),
+            local_one_hole_par: None,
+            definition: None,
+            character_part_slot: None,
+        };
+        if records.insert(type_id, value).is_some() {
+            return Err(CatalogError::DuplicateTypeId);
+        }
+    }
+    if records.is_empty() {
+        return Err(CatalogError::Structure);
+    }
+    Ok(records)
+}
+
 fn parse_iff_bytes_for_schema(
     manifest_version: u32,
     entry: &ManifestFile,
@@ -495,6 +597,9 @@ fn parse_iff_bytes_for_schema(
             return Err(CatalogError::Manifest);
         }
         return parse_iff_bytes(entry, bytes);
+    }
+    if manifest_version == CLIENT_MANIFEST_VERSION {
+        return parse_client_iff_bytes(entry, bytes);
     }
     if manifest_version != M7_MANIFEST_VERSION {
         return Err(CatalogError::Manifest);
