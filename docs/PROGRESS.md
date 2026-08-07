@@ -280,7 +280,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 ## Immediate next actions
 
 1. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
-2. Route the retail match packets, which are implemented and unit-tested but not wired. Unlike rooms this is not a pure wire translation: the existing match actors encode the synthetic protocol's own semantics (one hole, exactly two ready players, a fixed reward formula) while the retail flow is multi-hole and variable-party. Decide first whether to generalize the existing actor or add a retail one beside it sharing the protocol-agnostic settlement layer.
+2. Extend the retail match beyond one player and one hole. The retail flow is now wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.
 2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
 3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
 4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
@@ -298,6 +298,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 - Recorded that three M3 bootstrap opcodes carry the wrong meaning today (`0x0070`, `0x0072`, `0x004d`), confirmed independently by PacketDoc and a working reference server.
 - Wired the retail bootstrap into the runtime behind `game.retail_bootstrap`, proven over encrypted TCP: progress ticks, the full reply announcing `852.00`, roster, caddie container, equipment, inventory, and channel list, in that order.
 - Accepted the retail `0x0002` auth packet inbound, completing the login-to-lobby path: a real client's own auth now drives the retail bootstrap end to end.
+- Routed the retail match onto the durable solo lifecycle: start, hole load, shot commit, and hole finish, with server-authoritative stroke counting and exactly-once Pang/EXP settlement, proven over encrypted TCP. A complete hole is playable through the retail protocol.
 - Added and routed the retail room packets: create, join, leave, list, and the 341-byte member census, proven over encrypted TCP including capacity accounting, the room-master flag, and a refused join. Room broadcasts are dropped in retail mode rather than emitted as synthetic packets, so the census does not yet update live.
 - Added an operator guide for pointing a real client at a local instance. Everything past the lobby still speaks the synthetic protocol, and no layout is client-verified.
 

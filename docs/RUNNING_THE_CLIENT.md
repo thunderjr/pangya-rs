@@ -15,10 +15,15 @@ builds and runs anywhere Rust and PostgreSQL do.
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** against a client. |
 | GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`. The retail `0x0002` auth packet is accepted inbound, and the reply sequence is progress ticks, the full `0x0044` reply announcing `852.00`, character roster, caddie container, equipment, inventory, and the channel list. Proven end to end over encrypted TCP in CI, **unverified** against a client. |
 | Rooms | Create (`0x0008`), join (`0x0009`), leave (`0x000f`), room list (`0x0047`), and member census (`0x0048`) are routed and proven over TCP, including capacity accounting and the room-master flag. |
-| Match / gameplay | Synthetic `0x7f20`/`0x7f30` families only. A real client cannot start or play a hole. |
+| Match / gameplay | Start match (`0x000e`), hole load (`0x0011`), shot commit (`0x0012`), and hole finish (`0x0031`) are routed onto the durable solo match lifecycle, with server-authoritative scoring and exactly-once Pang/EXP settlement. Proven over TCP. One hole, one player. |
 
 So today this should get you through login, server selection, the loading screen, the
-lobby, and into a room. Starting a match will not work. See `PROGRESS.md`.
+lobby, into a room, and through **a complete scored hole**. Requires
+`game.solo_practice.enabled = true` alongside `game.retail_bootstrap = true`, with a
+catalog Course record matching the configured `course_id`.
+
+Multiplayer holes, multi-hole matches, and tournament/battle modes are not wired. See
+`PROGRESS.md`.
 
 One deliberate behaviour worth knowing: in retail mode the server **drops** lobby/room
 broadcast events rather than sending them, because they are still encoded in the synthetic
@@ -156,7 +161,8 @@ Because none of this is client-verified yet, the useful signal is exactly where 
 - Does it reach the lobby? That is the bootstrap sequence working end to end.
 - If it hangs on the loading screen, the sequence is incomplete rather than malformed —
   the reply's sub-structures are reference-derived and some fields are still zeroed.
-- Reaching the lobby and then failing on room creation is the expected boundary today.
+- Reaching the lobby, creating a room, and finishing a hole is the full path that works
+  today. Failures past the hole result are the expected boundary.
 
 Packet-body logging stays off; `logging.packet_bodies = true` is rejected. Report opcodes
 and observed behavior rather than captures, and never commit a capture.
