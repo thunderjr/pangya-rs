@@ -1,0 +1,542 @@
+//! Reference-derived U.S. 852 retail GameService bootstrap packets.
+//!
+//! Every layout here is derived from the vendored `pangbox--packetdoc` definitions and
+//! corroborated against a GB.852-targeting reference server's observable protocol
+//! behavior. **None has been accepted by a real client.** These types supersede the
+//! synthetic `0x7f**` families for the bootstrap path; see
+//! `docs/protocol/US852_RETAIL_BOOTSTRAP.md` for the full contract and its provenance.
+
+use crate::{
+    CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError, PacketEncodeError,
+    PacketReader, PacketWriter,
+};
+use zeroize::Zeroizing;
+
+/// Retail server version string the client requires in the handover reply.
+pub const US852_SERVER_VERSION: &[u8] = b"852.00";
+/// Maximum bytes accepted for any bootstrap PString field.
+pub const MAX_BOOTSTRAP_STRING_BYTES: usize = 128;
+/// Entries per chunk of a rostered container packet.
+pub const IFF_CONTAINER_CHUNK_ENTRIES: usize = 50;
+/// Equipped item slots carried by the retail equipment block.
+pub const EQUIPPED_ITEM_SLOTS: usize = 10;
+/// Trailing zeroed equipment slots after the equipped item ids.
+const EQUIPMENT_TRAILING_SLOTS: usize = 11;
+/// Maximum channels the retail server channel list may advertise.
+pub const MAX_SERVER_CHANNELS: usize = 255;
+/// Fixed byte width of a retail channel name.
+pub const CHANNEL_NAME_BYTES: usize = 64;
+
+/// Client-visible handover rejection codes.
+///
+/// These are the client's own reactions, so they are the primary diagnostic during
+/// client bring-up: a wrong code sends the player somewhere confusing rather than
+/// showing a useful message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum HandoverRejection {
+    /// Returns the client to LoginService to reconnect.
+    ReconnectLoginServer = 1,
+    /// Client reports it cannot reach LoginService.
+    CannotConnectLoginServer = 3,
+    /// Permanent account block.
+    IdPermanentlyBlocked = 5,
+    /// Temporary account block.
+    IdBlocked = 7,
+    /// Client and server disagree on protocol version.
+    ServerVersionMismatch = 11,
+    /// Server admits only allowlisted users.
+    NonWhitelistedUser = 14,
+    /// Region-blocked.
+    GeoBlocked = 16,
+    /// Account moved to another service.
+    AccountTransferred = 19,
+}
+
+fn check_decode_profile(
+    profile: &CompatibilityProfile,
+    reader: &PacketReader<'_>,
+) -> Result<(), PacketDecodeError> {
+    profile
+        .require_us852()
+        .map_err(|error| reader.invalid(error.to_string()))
+}
+
+fn check_encode_profile(profile: &CompatibilityProfile) -> Result<(), PacketEncodeError> {
+    profile.require_us852().map_err(Into::into)
+}
+
+/// Retail GameService authentication, client opcode `0x0002`.
+///
+/// The client sends this immediately after LoginService hands it over. Identity is only
+/// ever established by consuming the handover; every field here is untrusted input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RetailGameAuth {
+    /// Claimed username; not authoritative.
+    pub username: Vec<u8>,
+    /// Claimed numeric user id; not authoritative.
+    pub user_id: u32,
+    /// Secret login-to-game bearer.
+    pub login_key: Zeroizing<Vec<u8>>,
+    /// Client-reported version string, expected to match [`US852_SERVER_VERSION`].
+    pub client_version: Vec<u8>,
+    /// Secret session bearer.
+    pub session_key: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for RetailGameAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetailGameAuth")
+            .field("user_id", &self.user_id)
+            .field("login_key", &"<redacted>")
+            .field("session_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecodePacket for RetailGameAuth {
+    const OPCODE: u16 = 0x0002;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let username = reader.pstring(MAX_BOOTSTRAP_STRING_BYTES)?.to_vec();
+        let user_id = reader.u32_le()?;
+        let _padding = reader.array::<4>()?;
+        let _unknown = reader.array::<2>()?;
+        let login_key = Zeroizing::new(reader.pstring(MAX_BOOTSTRAP_STRING_BYTES)?.to_vec());
+        let client_version = reader.pstring(MAX_BOOTSTRAP_STRING_BYTES)?.to_vec();
+        let _unknown_c = reader.u32_le()?;
+        let _unknown_d = reader.u32_le()?;
+        let session_key = Zeroizing::new(reader.pstring(MAX_BOOTSTRAP_STRING_BYTES)?.to_vec());
+        // Retail clients append further unread bytes here; the reference server ignores
+        // them, so trailing content is tolerated rather than treated as malformed.
+        Ok(Self {
+            username,
+            user_id,
+            login_key,
+            client_version,
+            session_key,
+        })
+    }
+}
+
+impl EncodePacket for RetailGameAuth {
+    const OPCODE: u16 = 0x0002;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.pstring(&self.username, MAX_BOOTSTRAP_STRING_BYTES)?;
+        writer.u32_le(self.user_id);
+        writer.bytes(&[0; 4]);
+        writer.bytes(&[0; 2]);
+        writer.pstring(&self.login_key, MAX_BOOTSTRAP_STRING_BYTES)?;
+        writer.pstring(&self.client_version, MAX_BOOTSTRAP_STRING_BYTES)?;
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.pstring(&self.session_key, MAX_BOOTSTRAP_STRING_BYTES)?;
+        Ok(())
+    }
+}
+
+/// Short-form handover control replies, server opcode `0x0044`.
+///
+/// The full success reply is a separate, much larger packet; these are the control
+/// frames the client consumes while the server loads player state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoverControl {
+    /// Loading progress, `0..=15`.
+    Progress(u8),
+    /// Authentication accepted.
+    Ok,
+    /// Authentication refused with a client-visible reason.
+    Rejected(HandoverRejection),
+}
+
+impl HandoverControl {
+    /// Highest progress step the client accepts.
+    pub const MAX_PROGRESS: u8 = 15;
+
+    /// Builds a bounded progress update.
+    ///
+    /// # Errors
+    /// Rejects a step above [`Self::MAX_PROGRESS`].
+    pub const fn progress(value: u8) -> Result<Self, PacketEncodeError> {
+        if value > Self::MAX_PROGRESS {
+            return Err(PacketEncodeError::Limit {
+                field: "handover progress",
+                actual: value as usize,
+                maximum: Self::MAX_PROGRESS as usize,
+            });
+        }
+        Ok(Self::Progress(value))
+    }
+}
+
+impl EncodePacket for HandoverControl {
+    const OPCODE: u16 = 0x0044;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        match self {
+            Self::Progress(value) => {
+                if *value > Self::MAX_PROGRESS {
+                    return Err(PacketEncodeError::Limit {
+                        field: "handover progress",
+                        actual: usize::from(*value),
+                        maximum: usize::from(Self::MAX_PROGRESS),
+                    });
+                }
+                writer.u8(0xd2);
+                writer.u8(*value);
+            }
+            Self::Ok => {
+                writer.u16_le(0x00d3);
+                writer.u8(0);
+            }
+            Self::Rejected(reason) => writer.u16_le(*reason as u16),
+        }
+        Ok(())
+    }
+}
+
+/// One retail equipment block.
+///
+/// Emitted standalone as server opcode `0x0072` and again inside the full handover
+/// reply, so it is modelled once and encoded in both places.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailEquipment {
+    /// Equipped caddie inventory id.
+    pub caddie_uid: u32,
+    /// Equipped character inventory id.
+    pub character_uid: u32,
+    /// Equipped club-set inventory id.
+    pub club_set_uid: u32,
+    /// Equipped ball catalog id.
+    pub comet_iff_id: u32,
+    /// Equipped consumable catalog ids.
+    pub item_iff_ids: [u32; EQUIPPED_ITEM_SLOTS],
+}
+
+impl RetailEquipment {
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u32_le(self.caddie_uid);
+        writer.u32_le(self.character_uid);
+        writer.u32_le(self.club_set_uid);
+        writer.u32_le(self.comet_iff_id);
+        for id in self.item_iff_ids {
+            writer.u32_le(id);
+        }
+        // Background, frame, sticker, slot, unknown, title, and the four skin variants
+        // plus one further unknown. All are cosmetic and unset by this server.
+        for _ in 0..EQUIPMENT_TRAILING_SLOTS {
+            writer.u32_le(0);
+        }
+    }
+}
+
+impl EncodePacket for RetailEquipment {
+    const OPCODE: u16 = 0x0072;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        self.encode_body(writer);
+        Ok(())
+    }
+}
+
+/// One advertised in-server channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailChannel {
+    /// Display name, zero-padded to [`CHANNEL_NAME_BYTES`].
+    pub name: Vec<u8>,
+    /// Maximum concurrent players.
+    pub capacity: u16,
+    /// Current occupancy.
+    pub player_count: u16,
+    /// Channel identifier.
+    pub id: u16,
+    /// Packed entry-restriction flags.
+    pub restrictions: u16,
+}
+
+/// Retail channel list, server opcode `0x004d`.
+///
+/// This is the packet the current synthetic build mislabels as equipment selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerChannelList {
+    /// Advertised channels.
+    pub channels: Vec<RetailChannel>,
+}
+
+impl EncodePacket for ServerChannelList {
+    const OPCODE: u16 = 0x004d;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        let count = u8::try_from(self.channels.len()).map_err(|_| PacketEncodeError::Limit {
+            field: "server channels",
+            actual: self.channels.len(),
+            maximum: MAX_SERVER_CHANNELS,
+        })?;
+        writer.u8(count);
+        for channel in &self.channels {
+            writer.fixed_nul(&channel.name, CHANNEL_NAME_BYTES)?;
+            writer.u16_le(channel.capacity);
+            writer.u16_le(channel.player_count);
+            writer.u16_le(channel.id);
+            writer.u16_le(channel.restrictions);
+            writer.bytes(&[0; 5]);
+        }
+        Ok(())
+    }
+}
+
+/// Which rostered container a chunk belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum IffContainerKind {
+    /// Owned characters. Mislabelled as a profile blob by the synthetic build.
+    CharacterRoster = 0x0070,
+    /// Owned caddies. Absent from the synthetic build entirely.
+    CaddieRoster = 0x0071,
+    /// Owned inventory items.
+    Inventory = 0x0073,
+}
+
+/// Header of one chunk of a rostered container.
+///
+/// The client reassembles chunks using `total_entries`, so every chunk of a container
+/// must repeat the same total while carrying only its own slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IffContainerChunk {
+    /// Container this chunk belongs to.
+    pub kind: IffContainerKind,
+    /// Entry count across every chunk of this container.
+    pub total_entries: u16,
+    /// Opaque pre-encoded entry bodies carried by this chunk.
+    pub entries: Vec<Vec<u8>>,
+}
+
+impl IffContainerChunk {
+    /// Splits pre-encoded entries into wire-sized chunks.
+    ///
+    /// An empty container still yields exactly one chunk, because the client waits for a
+    /// container packet rather than inferring emptiness from silence.
+    ///
+    /// # Errors
+    /// Rejects a container with more entries than the wire count can express.
+    pub fn split(
+        kind: IffContainerKind,
+        entries: Vec<Vec<u8>>,
+    ) -> Result<Vec<Self>, PacketEncodeError> {
+        let total_entries = u16::try_from(entries.len()).map_err(|_| PacketEncodeError::Limit {
+            field: "container entries",
+            actual: entries.len(),
+            maximum: usize::from(u16::MAX),
+        })?;
+        if entries.is_empty() {
+            return Ok(vec![Self {
+                kind,
+                total_entries: 0,
+                entries: Vec::new(),
+            }]);
+        }
+        Ok(entries
+            .chunks(IFF_CONTAINER_CHUNK_ENTRIES)
+            .map(|chunk| Self {
+                kind,
+                total_entries,
+                entries: chunk.to_vec(),
+            })
+            .collect())
+    }
+
+    /// Returns the opcode this chunk must be framed with.
+    #[must_use]
+    pub const fn opcode(&self) -> u16 {
+        self.kind as u16
+    }
+
+    /// Encodes this chunk's body.
+    ///
+    /// The opcode is carried by [`Self::opcode`] rather than a const, because one type
+    /// serves three container opcodes.
+    ///
+    /// # Errors
+    /// Rejects a chunk carrying more entries than the wire count can express.
+    pub fn encode_body(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        let chunk_entries =
+            u16::try_from(self.entries.len()).map_err(|_| PacketEncodeError::Limit {
+                field: "chunk entries",
+                actual: self.entries.len(),
+                maximum: usize::from(u16::MAX),
+            })?;
+        writer.u16_le(self.total_entries);
+        writer.u16_le(chunk_entries);
+        for entry in &self.entries {
+            writer.bytes(entry);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ServiceKind, decode_packet_payload, encode_packet_payload};
+
+    fn profile() -> CompatibilityProfile {
+        CompatibilityProfile::US_852
+    }
+
+    #[test]
+    fn retail_auth_round_trips_and_redacts_secrets() {
+        let auth = RetailGameAuth {
+            username: b"player".to_vec(),
+            user_id: 4242,
+            login_key: Zeroizing::new(b"login-secret".to_vec()),
+            client_version: US852_SERVER_VERSION.to_vec(),
+            session_key: Zeroizing::new(b"session-secret".to_vec()),
+        };
+        let payload = encode_packet_payload(&auth, &profile()).expect("encode");
+        let decoded =
+            decode_packet_payload::<RetailGameAuth>(&payload, &profile(), ServiceKind::Game)
+                .expect("decode");
+        assert_eq!(decoded, auth);
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains("login-secret"));
+        assert!(!debug.contains("session-secret"));
+    }
+
+    #[test]
+    fn retail_auth_tolerates_trailing_client_bytes() {
+        let auth = RetailGameAuth {
+            username: b"player".to_vec(),
+            user_id: 1,
+            login_key: Zeroizing::new(b"k".to_vec()),
+            client_version: US852_SERVER_VERSION.to_vec(),
+            session_key: Zeroizing::new(b"s".to_vec()),
+        };
+        let mut payload = encode_packet_payload(&auth, &profile()).expect("encode");
+        payload.extend_from_slice(&[0xaa; 12]);
+        let decoded =
+            decode_packet_payload::<RetailGameAuth>(&payload, &profile(), ServiceKind::Game)
+                .expect("decode");
+        assert_eq!(decoded.user_id, 1);
+    }
+
+    #[test]
+    fn handover_control_forms_are_exact() {
+        let progress =
+            encode_packet_payload(&HandoverControl::Progress(7), &profile()).expect("progress");
+        assert_eq!(progress.as_slice(), &[0xd2, 7]);
+        let ok = encode_packet_payload(&HandoverControl::Ok, &profile()).expect("ok");
+        assert_eq!(ok.as_slice(), &[0xd3, 0x00, 0]);
+        let rejected = encode_packet_payload(
+            &HandoverControl::Rejected(HandoverRejection::ServerVersionMismatch),
+            &profile(),
+        )
+        .expect("rejected");
+        assert_eq!(rejected.as_slice(), &[11, 0]);
+    }
+
+    #[test]
+    fn handover_progress_is_bounded() {
+        assert!(HandoverControl::progress(15).is_ok());
+        assert!(HandoverControl::progress(16).is_err());
+        assert!(encode_packet_payload(&HandoverControl::Progress(200), &profile()).is_err());
+    }
+
+    #[test]
+    fn equipment_block_is_fixed_width() {
+        let equipment = RetailEquipment {
+            caddie_uid: 1,
+            character_uid: 2,
+            club_set_uid: 3,
+            comet_iff_id: 0x1400_0000,
+            item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+        };
+        let payload = encode_packet_payload(&equipment, &profile()).expect("encode");
+        // Four ids, ten item slots, eleven cosmetic slots, all u32.
+        assert_eq!(payload.len(), (4 + EQUIPPED_ITEM_SLOTS + 11) * 4);
+        assert_eq!(&payload[12..16], &0x1400_0000_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn channel_list_pads_names_and_bounds_count() {
+        let list = ServerChannelList {
+            channels: vec![RetailChannel {
+                name: b"Lolo".to_vec(),
+                capacity: 200,
+                player_count: 3,
+                id: 1,
+                restrictions: 0,
+            }],
+        };
+        let payload = encode_packet_payload(&list, &profile()).expect("encode");
+        assert_eq!(payload.len(), 1 + CHANNEL_NAME_BYTES + 2 + 2 + 2 + 2 + 5);
+        assert_eq!(payload[0], 1);
+        assert_eq!(&payload[1..5], b"Lolo");
+        assert!(payload[5..1 + CHANNEL_NAME_BYTES].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn container_splits_at_fifty_and_repeats_the_total() {
+        let entries = (0..120_u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let chunks = IffContainerChunk::split(IffContainerKind::Inventory, entries).expect("split");
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].entries.len(), 50);
+        assert_eq!(chunks[2].entries.len(), 20);
+        for chunk in &chunks {
+            assert_eq!(chunk.total_entries, 120);
+            assert_eq!(chunk.opcode(), 0x0073);
+        }
+    }
+
+    #[test]
+    fn empty_container_still_emits_one_chunk() {
+        let chunks =
+            IffContainerChunk::split(IffContainerKind::CaddieRoster, Vec::new()).expect("split");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].total_entries, 0);
+        assert_eq!(chunks[0].opcode(), 0x0071);
+    }
+
+    #[test]
+    fn container_chunk_body_is_exact() {
+        let chunks =
+            IffContainerChunk::split(IffContainerKind::CharacterRoster, vec![vec![1, 2, 3, 4]])
+                .expect("split");
+        let mut writer = PacketWriter::default();
+        chunks[0]
+            .encode_body(&mut writer, &profile())
+            .expect("encode");
+        assert_eq!(writer.as_slice(), &[1, 0, 1, 0, 1, 2, 3, 4]);
+        assert_eq!(chunks[0].opcode(), 0x0070);
+    }
+}

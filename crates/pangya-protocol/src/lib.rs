@@ -16,6 +16,7 @@ mod m7_economy;
 mod profile;
 mod reader;
 mod registry;
+mod us852_bootstrap;
 mod writer;
 
 pub use codec::{CodecLimits, FrameCodec, FrameMetadata, InboundFrame, OutboundFrame};
@@ -80,6 +81,12 @@ pub use profile::{
 };
 pub use reader::PacketReader;
 pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
+pub use us852_bootstrap::{
+    CHANNEL_NAME_BYTES, EQUIPPED_ITEM_SLOTS, HandoverControl, HandoverRejection,
+    IFF_CONTAINER_CHUNK_ENTRIES, IffContainerChunk, IffContainerKind, MAX_BOOTSTRAP_STRING_BYTES,
+    MAX_SERVER_CHANNELS, RetailChannel, RetailEquipment, RetailGameAuth, ServerChannelList,
+    US852_SERVER_VERSION,
+};
 pub use writer::PacketWriter;
 
 /// Explicit storage for fields whose meaning is not established.
