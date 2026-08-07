@@ -62,11 +62,20 @@ Record sizes vary widely by family and are not multiples of a common stride — 
 `M3_SYNTHETIC_CATALOG.md` states: "The first four bytes of every record are a LE `u32`
 `type_id`, globally unique across all declared families."
 
-**Measurement contradicts this.** The real record begins with a small-valued `u32` at
+**Measurement contradicts this.** The real record begins with a `u32` activity word at
 offset 0, and the `type_id` is at offset **4**. Across all populated tables the offset-0
-word takes values 1 (7802 records), 0 (1279), and a long tail of 2, 4, 5, and 101. Its
-meaning is not established here; it is clearly not an identifier, since it is neither
-unique nor family-tagged. Records whose `type_id` is a dummy sentinel tend to carry 0.
+word takes values 1 (7802 records), 0 (1279), and a long tail of 2, 4, 5, and 101.
+
+**Zero means inactive.** This was confirmed by testing the rule across seven tables:
+skipping every record whose offset-0 word is zero leaves *all* remaining records correctly
+family-tagged, with no exceptions. Inactive rows carry sentinel type IDs that respect no
+family tag — `Item`'s dummy row is `0x17ffffff`, one family below the `0x18` it would
+otherwise need — so a loader that does not skip them will reject a valid table. The
+distinction between the non-zero values (1, 2, 4, 5, 101) is still unexplained; all of them
+mark active records.
+
+Per-table inactive counts: `ClubSet` 3 of 60, `Ball` 26 of 85, `Item` 106 of 316, `Part`
+724 of 6087, `Course` 1 of 21, `Caddie` 3 of 30, `Character` 0 of 10.
 
 A fixed-size name string follows at offset 8.
 
@@ -101,21 +110,29 @@ Checked against the `synthetic-catalog-v2` fixture:
 A single table may span more than one family tag, so a loader cannot assume one tag per
 table.
 
-## Consequences for `pangya-data`
+## Implemented
 
-1. Add a ZIP container step; the manifest must address tables inside `pangya_gb.iff`.
-2. Read `type_id` at record offset 4, not 0.
-3. Do not derive family identity from `binding`; derive it from the `type_id` high byte,
-   and allow a table to carry several tags.
-4. Correct the ball family tag in the synthetic fixture to `0x14` so generated fixtures
-   stop teaching a wrong tag, and keep the fixture's own hashes updated when doing so.
-5. Record sizes are per-family constants to be read from the header arithmetic, never
-   hardcoded.
+`CLIENT_MANIFEST_VERSION = 3` in `pangya-data` implements all of the above: `type_id` at
+record offset 4, family identity from the high byte with a table allowed to span several
+tags, inactive rows skipped on the offset-0 rule, and record width taken from header
+arithmetic rather than a per-family constant. `binding` is still compared against the
+manifest for change detection but is deliberately not used to derive family identity.
+
+The ZIP container is handled as an operator extraction step rather than in-process, which
+keeps a new decompressor out of the parsing path. See
+[`../RUNNING_THE_CLIENT.md`](../RUNNING_THE_CLIENT.md).
+
+Schema 3 is covered in CI by `tests/fixtures/synthetic-client-v3`, a generated fixture in
+the real record format containing no client bytes. It has been exercised against the real
+tables, which load with correct type IDs across all six declared families.
 
 ## Still unestablished
 
-The meaning of the offset-0 word, the full field layout inside each record beyond
-`type_id` and the name string, the semantics of `binding`, and the relationship between
-`pangya.iff` and `pangya_gb.iff` are all unmeasured. Nothing here says anything about
-packet layouts; catalog structure and wire protocol are independent questions, and the
-wire side remains gated on the retail layout port.
+Why the active word takes 2, 4, 5, or 101 rather than 1; the field layout inside each
+record beyond `type_id` and the name string — which is what real prices, stack limits, and
+durability need; the semantics of `binding`; and the relationship between `pangya.iff` and
+`pangya_gb.iff`. **Course par is not in `Course.iff`**, which is only an id-to-name table,
+so one-hole configuration for real courses still has no source.
+
+Nothing here says anything about packet layouts; catalog structure and wire protocol are
+independent questions, and the wire side remains gated on the retail layout port.

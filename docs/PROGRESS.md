@@ -4,7 +4,7 @@
 >
 > Current stage: **M7 — local synthetic inventory/shop/equipment checkpoint complete; every real U.S. client exit remains open**
 >
-> Next gate: **replace the synthetic `0x7f**` families with reference-derived retail layouts and prove them against the acquired U.S. client; no retail M3–M7 claim**
+> Next gate: **wire the reference-derived retail bootstrap into the runtime, then replace the remaining synthetic `0x7f**` families and prove them against the acquired U.S. client; no retail M3–M7 claim**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -279,14 +279,23 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. Extract the `gb`-suffixed PAK series from the acquired client and get the `pangya-data` catalog loader onto real IFF instead of generated fixtures.
-2. Port retail GameService layouts from the vendored PacketDoc definitions, starting with the bootstrap set, and correct the three mismatched M3 opcodes.
-3. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
-4. Resolve a Windows/Wine/VM host so the acquired client can be run under Rugburn against a local listener.
+1. Wire the retail bootstrap into the `pangya-game` runtime: accept `RetailGameAuth`, build the roster/equipment/inventory containers from the catalog and player snapshot, and emit the documented sequence in place of the synthetic bootstrap.
+2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
+3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
+4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
 
 ---
 
 ## Change log
+
+### 2026-08-07 — retail pivot begins: client acquired, catalog and bootstrap contract established
+
+- Acquired and characterized the final U.S. client; settled the 851-vs-852 question from the wire, where the server must identify as `852.00` or the client raises a version mismatch.
+- Measured the real catalog: `pangya_gb.iff` is a ZIP of 39 per-family tables, the documented `count`/`binding`/`version` header is confirmed exactly, and the documented record layout is not — `type_id` is at record offset four and a zero at offset zero marks an inactive row.
+- Added `pangya-data` schema 3, which loads the real client catalog across all six declared families, covered in CI by a generated fixture containing no client bytes.
+- Added reference-derived retail bootstrap packets: `0x0002` auth, `0x0044` in all four forms including the full handover reply, `0x0072` equipment, `0x004d` channel list, and the `0x0070`/`0x0071`/`0x0073` chunked containers.
+- Recorded that three M3 bootstrap opcodes carry the wrong meaning today (`0x0070`, `0x0072`, `0x004d`), confirmed independently by PacketDoc and a working reference server.
+- The retail packets are not yet wired into the runtime, so no real client can complete bootstrap; no layout is client-verified.
 
 ### 2026-08-07 — local synthetic M7 inventory, shop, and equipment checkpoint
 
