@@ -13,7 +13,7 @@ builds and runs anywhere Rust and PostgreSQL do.
 | Stage | State |
 |---|---|
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** against a client. |
-| GameService bootstrap | Implemented and emitted when `game.retail_bootstrap = true`: progress ticks, the full `0x0044` reply announcing `852.00`, character roster, caddie container, equipment, inventory, and the channel list. Proven over encrypted TCP in CI, **unverified** against a client. |
+| GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`. The retail `0x0002` auth packet is accepted inbound, and the reply sequence is progress ticks, the full `0x0044` reply announcing `852.00`, character roster, caddie container, equipment, inventory, and the channel list. Proven end to end over encrypted TCP in CI, **unverified** against a client. |
 | Lobby, rooms, match | Synthetic `0x7f**` families only. A real client cannot use them. |
 
 So today this should get you through login, server selection, and the loading screen into
