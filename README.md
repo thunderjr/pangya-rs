@@ -4,10 +4,11 @@ A clean-room, safe-Rust server compatibility project targeting the preserved
 PangYa U.S. 852.00 client. M2-M5 provide the local synthetic login, bootstrap,
 room, and one-hole solo slices. M6 adds an opt-in exactly-two-ready-player,
 one-hole stroke flow with actor-owned turns, truthful forfeits, standings,
-atomic settlement, and course records. These are generated synthetic/non-retail
-contracts, not real-client compatibility: exact U.S. 852 room/match opcodes,
-layouts, order, Course/IFF interpretation, and one-/two-client acceptance remain
-external gates.
+atomic settlement, and course records. M7 adds an opt-in catalog-priced economy
+with exactly-once purchases, equipment, consumables, and repair. These are
+generated synthetic/non-retail contracts, not real-client compatibility: exact
+U.S. 852 room/match/shop opcodes, layouts, order, Course/IFF interpretation, and
+one-/two-client acceptance remain external gates.
 
 Licensed under either MIT or Apache-2.0 at your option.
 
@@ -45,8 +46,9 @@ directory, create the versioned manifest described in
 [`docs/data/M3_SYNTHETIC_CATALOG.md`](docs/data/M3_SYNTHETIC_CATALOG.md), and set
 `game.enabled=true` plus `data.catalog_required_m3=true`. M5 and M6 each require
 a manifest Course record matching their configured course ID and explicit
-`game.solo_practice.enabled=true` or `game.stroke_two.enabled=true`; both remain
-disabled by default. See
+`game.solo_practice.enabled=true` or `game.stroke_two.enabled=true`; M7 requires
+`game.economy.enabled=true` and a catalog carrying shop offers including at least
+one consumable. All three remain disabled by default. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md),
 [`docs/protocol/M2_SYNTHETIC_LOGIN_FLOW.md`](docs/protocol/M2_SYNTHETIC_LOGIN_FLOW.md),
 [`docs/protocol/M3_SYNTHETIC_GAME_FLOW.md`](docs/protocol/M3_SYNTHETIC_GAME_FLOW.md),
@@ -54,11 +56,13 @@ disabled by default. See
 and
 [`docs/protocol/M5_SYNTHETIC_SOLO_FLOW.md`](docs/protocol/M5_SYNTHETIC_SOLO_FLOW.md),
 and
-[`docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md`](docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md).
-The M6 decision and checkpoint evidence are
-[`docs/adr/0013-synthetic-m6-two-player-stroke.md`](docs/adr/0013-synthetic-m6-two-player-stroke.md)
+[`docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md`](docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md),
 and
-[`docs/evidence/M6_SYNTHETIC_STROKE_2026-08-05.md`](docs/evidence/M6_SYNTHETIC_STROKE_2026-08-05.md).
+[`docs/protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](docs/protocol/M7_SYNTHETIC_ECONOMY_FLOW.md).
+The M7 decision and checkpoint evidence are
+[`docs/adr/0014-synthetic-m7-economy.md`](docs/adr/0014-synthetic-m7-economy.md)
+and
+[`docs/evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](docs/evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md).
 Current status is in [`docs/PROGRESS.md`](docs/PROGRESS.md). Admin endpoints are
 read-only: `/health/live`, `/health/ready`, and optional `/metrics`.
 

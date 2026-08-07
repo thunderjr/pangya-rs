@@ -1,10 +1,10 @@
 # PangYa-RS progress
 
-> Last updated: **2026-08-05**
+> Last updated: **2026-08-07**
 >
-> Current stage: **M6 — local synthetic exactly-two stroke checkpoint complete; real U.S. 852 M6 exit remains open**
+> Current stage: **M7 — local synthetic inventory/shop/equipment checkpoint complete; every real U.S. client exit remains open**
 >
-> Next gate: **the legally held two-client/Course retail gate and a clearly labeled local synthetic M7 slice; no retail M6 claim**
+> Next gate: **replace the synthetic `0x7f**` families with reference-derived retail layouts and prove them against the acquired U.S. client; no retail M3–M7 claim**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -37,7 +37,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
 | Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
 | Gameplay | 🟡 | Local synthetic M5 solo and M6 exactly-two-ready-player stroke/turn/standings/settlement checkpoints pass the complete local matrix; real U.S. 852 one-/two-client gates remain open |
-| Economy/social/parity | ⬜ | M7+; no M7 implementation or checkpoint claim |
+| Economy | 🟡 | Local synthetic M7 checkpoint complete; not retail-validated |
+| Social/parity | ⬜ | M8+; no M8 implementation or checkpoint claim |
 
 ---
 
@@ -124,7 +125,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
 | M5 — Solo first playable | 🟡 | Local synthetic one-hole solo finishes and persists exactly one reward; real-client hole remains open |
 | M6 — Multiplayer stroke | 🟡 | Local synthetic exactly-two one-hole flow and complete matrix pass; real two-client/Course acceptance remains open |
-| M7 — Inventory/shop depth | ⬜ | Catalog-derived transactional purchases and equipment validation |
+| M7 — Inventory/shop depth | 🟡 | Local synthetic catalog-priced, exactly-once purchases/equipment/consume/repair pass the full outcome matrix; real-client acceptance remains open |
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
 
@@ -220,10 +221,27 @@ Evidence: [`adr/0012-synthetic-m5-solo-practice.md`](adr/0012-synthetic-m5-solo-
 - [x] Pass the complete release matrix: format, strict Clippy, workspace/all-target/all-feature PostgreSQL tests, docs, SQLx online/offline, deny, asset guard, links/diff, and four bounded fuzz targets at 10,000 runs each.
 - [ ] Validate exact retail ready/start/loading/turn/action/result/give-up/disconnect/standings/reward/record behavior with two legally held U.S. 852 clients and legally supplied Course/IFF data.
 
-This checkpoint is generated synthetic/non-retail and contains no M7 inventory,
-shop, equipment, social/ranking, or parity implementation.
+This checkpoint is generated synthetic/non-retail and contains no social/ranking or
+parity implementation.
 
 Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-two-player-stroke.md), [`protocol/M6_SYNTHETIC_STROKE_FLOW.md`](protocol/M6_SYNTHETIC_STROKE_FLOW.md), and [`evidence/M6_SYNTHETIC_STROKE_2026-08-05.md`](evidence/M6_SYNTHETIC_STROKE_2026-08-05.md).
+
+## M7 — synthetic inventory, shop, and equipment
+
+**Status: 🟡 local synthetic exit complete; external retail gates remain open**
+- [x] Add generated `0x7f40..=0x7f44` / `0x7fc0..=0x7fc5` layouts, 11 generated fixture/provenance pairs, and closed command/outcome discriminator validation.
+- [x] Make the immutable catalog the sole price, stack, durability, and repair-rate authority; the wire never carries a price, and catalog items that are not shop offers are refused.
+- [x] Add migration 0008 for the operation, currency, item, and equipment ledgers with exactly-once commits keyed by a client-chosen operation id that survives process restart.
+- [x] Treat a replay with different parameters as `IdempotencyDrift` rather than a replay, and gate equipment changes on optimistic `expected_version`.
+- [x] Keep storage/overflow/corrupt-data repository errors off the wire entirely; they terminate the connection so no client is ever told a failed write succeeded.
+- [x] Bound the slice twice — in configuration and again at composition — and require `game.enabled` plus a consumable-bearing catalog before composing.
+- [x] Prove all ten wire outcomes, per-connection rate limiting, and pre-auth/pre-channel rejection over encrypted TCP against real PostgreSQL.
+- [x] Add fixed-label economy metrics bounded to 15 series carrying no account, item, inventory, or operation identifier.
+- [x] Verify current compiled inventories: 74 game tests, 5 M7 protocol tests, 26 real-PostgreSQL Game E2E tests, 53 storage tests, and 27 server tests; workspace total 330 passed.
+- [x] Pass the local release matrix: format, strict Clippy, SQLx migrate/prepare with no drift, workspace/all-target/all-feature PostgreSQL tests, and the asset guard.
+- [ ] Validate catalog-priced purchase, equip, consume, and repair behavior against a legally held U.S. client with legally supplied data, after the synthetic family is replaced by retail layouts.
+
+Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md), [`protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](protocol/M7_SYNTHETIC_ECONOMY_FLOW.md), and [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md).
 
 ## Research proof ledger
 
@@ -253,18 +271,30 @@ Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-t
 6. **Real M5 solo exit** — complete the evidence file's external 12-step gate for real Course/IFF interpretation and start/loading/action/result/finish/reward acceptance; never identify `0x7f20`/`0x7fa0` or `solo-v1` as retail behavior.
 7. **M6 local validation** — the complete format/Clippy/workspace/PostgreSQL/doc/SQLx/deny/asset/link/diff/fuzz matrix passed; preserve this evidence.
 8. **Real M6 two-client/Course exit** — complete the M6 evidence file's external gate with two legally held clients and legally supplied data; never identify `0x7f30`/`0x7fb0`, `stroke-two-v1`, generated standings, or record rules as retail behavior.
+9. **Real M7 economy exit** — validate catalog-priced purchase/equip/consume/repair against a legally held client; never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
+10. **Synthetic-to-retail protocol pivot** — the `0x7f**` families are placeholders no real client will ever send. Every M3–M7 real-client gate is blocked behind replacing them with layouts derived from the vendored PacketDoc definitions, and behind correcting the three M3 bootstrap opcodes whose current meanings disagree with PacketDoc (`0x0070`, `0x0072`, `0x004d`).
+11. **Client runtime host** — the acquired client is a Windows x86 binary; extraction and parsing are host-agnostic, but running it under Rugburn needs Windows, Wine, or a VM. Unresolved.
 
 ---
 
 ## Immediate next actions
 
-1. Design only a clearly labeled local synthetic M7 inventory/shop boundary; preserve M6 semantics.
-2. Preserve the validated synthetic M2-M6 evidence and complete local matrix.
-3. Complete the legally held U.S. 852 room/M5 gates and the M6 two-client/Course gate without committing proprietary artifacts.
+1. Extract the `gb`-suffixed PAK series from the acquired client and get the `pangya-data` catalog loader onto real IFF instead of generated fixtures.
+2. Port retail GameService layouts from the vendored PacketDoc definitions, starting with the bootstrap set, and correct the three mismatched M3 opcodes.
+3. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
+4. Resolve a Windows/Wine/VM host so the acquired client can be run under Rugburn against a local listener.
 
 ---
 
 ## Change log
+
+### 2026-08-07 — local synthetic M7 inventory, shop, and equipment checkpoint
+
+- Added generated `0x7f40`/`0x7fc0` catalog-priced purchase, equip, consume, and repair with the catalog as sole price/stack/durability authority and no price on the wire.
+- Added migration 0008 with operation/currency/item/equipment ledgers, exactly-once commits keyed by client-chosen operation id that survive restart, drift detection on mismatched replays, and optimistic equipment versioning.
+- Kept storage/overflow/corrupt-data failures off the wire so no client is told a failed write succeeded; proved all ten outcomes, rate limiting, and state gating over encrypted TCP.
+- Recorded 11 generated fixture hashes and inventories of 74 game, 5 M7 protocol, 26 Game E2E, 53 storage, and 27 server tests; workspace total 330 passed.
+- Acquired and characterized the U.S. client for the retail pivot; added no retail claim and no M8 behavior.
 
 ### 2026-08-05 — local synthetic M6 exactly-two stroke checkpoint
 

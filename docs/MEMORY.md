@@ -8,7 +8,11 @@
 
 ## One-paragraph state
 
-M1-M5 remain intact. M6's **local synthetic exactly-two-ready-player, one-hole stroke checkpoint is complete**: generated `0x7f30`/`0x7fb0` contracts, owner-only start, sole room-actor loading/turn/game authority, independent sequences, any-participant give-up, truthful winner-by-forfeit 10/5 versus zero loser, loading abort versus in-game forfeit, shutdown priority abort, atomic two-player settlement, normal four-ledger history, holed-only Course records, retained race authority, and bounded generic pre-bind recovery. Current inventory is 73 game tests, 11 M6 protocol tests, 19 real-PostgreSQL Game E2E tests, and 45 storage tests. The complete local format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/link/diff/four-target-fuzz matrix passed. This is generated synthetic/non-retail, not U.S. 852 M6 compatibility: exact two-client packet/order/behavior and real Course/IFF acceptance remain external. No M7 behavior exists yet. Evidence is in [`evidence/M6_SYNTHETIC_STROKE_2026-08-05.md`](evidence/M6_SYNTHETIC_STROKE_2026-08-05.md).
+M1-M5 remain intact. M6's **local synthetic exactly-two-ready-player, one-hole stroke checkpoint is complete**: generated `0x7f30`/`0x7fb0` contracts, owner-only start, sole room-actor loading/turn/game authority, independent sequences, any-participant give-up, truthful winner-by-forfeit 10/5 versus zero loser, loading abort versus in-game forfeit, shutdown priority abort, atomic two-player settlement, normal four-ledger history, holed-only Course records, retained race authority, and bounded generic pre-bind recovery. Current inventory is 73 game tests, 11 M6 protocol tests, 19 real-PostgreSQL Game E2E tests, and 45 storage tests. The complete local format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/link/diff/four-target-fuzz matrix passed. This is generated synthetic/non-retail, not U.S. 852 M6 compatibility: exact two-client packet/order/behavior and real Course/IFF acceptance remain external. Evidence is in [`evidence/M6_SYNTHETIC_STROKE_2026-08-05.md`](evidence/M6_SYNTHETIC_STROKE_2026-08-05.md).
+
+M7's **local synthetic inventory/shop/equipment checkpoint is also complete**: generated `0x7f40`/`0x7fc0` contracts, the immutable catalog as sole price/stack/durability/repair authority with no price on the wire, migration 0008's operation/currency/item/equipment ledgers, exactly-once commits keyed by a client-chosen operation id that survive restart, `IdempotencyDrift` on mismatched replays, optimistic equipment versioning, and storage/overflow/corrupt-data failures deliberately kept off the wire so no client is told a failed write succeeded. All ten wire outcomes plus rate limiting and pre-auth/pre-channel gating are proven over encrypted TCP. Inventory is 74 game, 5 M7 protocol, 26 Game E2E, 53 storage, 27 server; workspace 330 passed. Evidence is in [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md).
+
+**The next work is the synthetic-to-retail pivot.** The `0x7f**` families are placeholders no real client will ever send, so every M3-M7 real-client gate is blocked behind porting layouts from the vendored PacketDoc definitions. Three M3 bootstrap opcodes currently disagree with PacketDoc outright: `0x0070` is User Character Roster (not a profile blob), `0x0072` is User Equipment (not a character list), and `0x004d` is Sub-Server List (not equipment selection). A U.S. client has been acquired for this work and characterized in [`evidence/US_CLIENT_ACQUISITION_2026-08-07.md`](evidence/US_CLIENT_ACQUISITION_2026-08-07.md); it lives only under gitignored `local-data/`.
 
 ---
 
@@ -220,12 +224,13 @@ M5 implements the solo subset. M6 adds only actor-owned exactly-two turn arbitra
 
 ## Next-session checklist
 
-1. Read `docs/PROGRESS.md`, the M6 evidence file, and this file; check unstaged status.
+1. Read `docs/PROGRESS.md`, the M7 and client-acquisition evidence files, and this file; check unstaged status.
 2. Preserve the fixture/provenance, SQLx offline, real-PostgreSQL, and no-proprietary-assets boundaries.
-3. Preserve the completed synthetic M2-M6 evidence; do not infer external compatibility from it.
-4. Preserve the completed M6 format/Clippy/workspace PostgreSQL/doc/SQLx/deny/asset/link/diff/fuzz evidence.
-5. Complete the room/M5 external gates and M6 two-client/Course gate without committing protected material.
-6. Implement only a clearly labeled local synthetic M7 inventory/shop slice; do not infer retail behavior.
+3. Preserve the completed synthetic M2-M7 evidence; do not infer external compatibility from it.
+4. Never commit the client, its PAK archives, or extracted IFF; they stay under gitignored `local-data/` and the asset guard prunes that path.
+5. Extract the `gb`-suffixed PAK series and move the `pangya-data` catalog loader onto real IFF instead of generated fixtures.
+6. Port retail GameService layouts from vendored PacketDoc, starting with the bootstrap set and the three mismatched opcodes; label them reference-derived and unverified until the client proves them.
+7. Resolve a Windows/Wine/VM host so the client can run under Rugburn against a local listener.
 
 ---
 

@@ -65,3 +65,21 @@ bound. Player snapshots are checked again before bootstrap packets are emitted.
 U.S. 852 production headers, bindings, versions, and record sizes remain
 unattested and must be supplied through future legal evidence rather than inferred
 from this synthetic format.
+
+## Synthetic catalog v2 (M7)
+
+`crates/pangya-data/tests/fixtures/synthetic-catalog-v2` extends the same generated
+format with the shop metadata M7 requires: sale price, stacking, durability, repair
+rate, and character-part compatibility. It declares four shop offers — `0x0800_0001`
+character part, `0x1000_0001` club set (500 Pang, unique, durable 100 at 3 Pang per
+point), `0x1800_0001` ball, and `0x1a00_0001` consumable (stackable to 99) — plus
+`0x1a00_0002`, a consumable that exists in the catalog and is deliberately **not**
+sold, which is what makes the not-an-offer rejection path testable.
+
+Composing the economy requires a catalog with at least one shop offer including at
+least one consumable, so the M3 fixture above cannot price an economy and is refused
+at composition. Per-file SHA-256 values are recorded in the fixture's own
+`manifest.toml`. Prices, stack limits, durability maxima, and repair rates in this
+fixture are generated project values and are not retail claims. Real values must come
+from legally supplied client data; see
+[`../evidence/US_CLIENT_ACQUISITION_2026-08-07.md`](../evidence/US_CLIENT_ACQUISITION_2026-08-07.md).
