@@ -62,9 +62,15 @@ the exact fingerprint used by a match is persisted. Each manifest file digest
 still covers the complete file. Starter character, items, and
 explicit club/ball equipment bindings are cross-checked before any listener is
 bound. Player snapshots are checked again before bootstrap packets are emitted.
-U.S. 852 production headers, bindings, versions, and record sizes remain
-unattested and must be supplied through future legal evidence rather than inferred
-from this synthetic format.
+U.S. 852 production headers, bindings, versions, and record sizes were unattested
+when this format was designed. They have since been measured against the acquired
+client and are recorded in
+[`US_CLIENT_IFF_STRUCTURE.md`](US_CLIENT_IFF_STRUCTURE.md). The `count`/`binding`/
+`version` header and the `8 + count * record_size` length rule above are confirmed
+by that measurement. **The record-layout claim above is not:** real records carry a
+small-valued `u32` at offset 0 and the `type_id` at offset 4, and `binding` is not a
+family discriminator. The synthetic format is retained as-is for existing fixtures;
+the real layout governs any loader pointed at client data.
 
 ## Synthetic catalog v2 (M7)
 
