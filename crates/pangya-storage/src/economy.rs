@@ -585,28 +585,28 @@ impl EconomyRepository for PgRepository {
         &self,
         request: PurchaseRequest,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<PurchaseResult>, EconomyError>> {
-        Box::pin(self.purchase_economy(request))
+        Box::pin(self.observed(self.purchase_economy(request)))
     }
 
     fn equip(
         &self,
         request: EquipmentChange,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<EquipmentChangeResult>, EconomyError>> {
-        Box::pin(self.equip_economy(request))
+        Box::pin(self.observed(self.equip_economy(request)))
     }
 
     fn consume_one(
         &self,
         request: ConsumeItem,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<ConsumeItemResult>, EconomyError>> {
-        Box::pin(self.consume_economy(request))
+        Box::pin(self.observed(self.consume_economy(request)))
     }
 
     fn repair(
         &self,
         request: RepairItem,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>> {
-        Box::pin(self.repair_economy(request))
+        Box::pin(self.observed(self.repair_economy(request)))
     }
 }
 
@@ -653,7 +653,8 @@ async fn lock_economy_account(
             RepositoryError::NotFound => EconomyError::NotOwned,
             RepositoryError::AccountInactive => EconomyError::AccountInactive,
             RepositoryError::CorruptData => EconomyError::CorruptData,
-            _ => EconomyError::Storage,
+            RepositoryError::Storage(fault) => EconomyError::Storage(fault),
+            _ => EconomyError::Storage(StorageFault::Other),
         })
 }
 
@@ -745,8 +746,8 @@ fn validate_owned_item(
     }
 }
 
-fn economy_db_error(_error: sqlx::Error) -> EconomyError {
-    EconomyError::Storage
+fn economy_db_error(error: sqlx::Error) -> EconomyError {
+    EconomyError::Storage(super::storage_fault(&error))
 }
 
 fn same_account_command(row: &OperationRow, account: AccountId, command: &str) -> bool {

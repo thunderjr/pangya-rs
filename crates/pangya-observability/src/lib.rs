@@ -21,7 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use pangya_domain::{AccountId, SourceAddressPrefix};
+use pangya_domain::{AccountId, SourceAddressPrefix, StorageFault, StorageObserver};
 use pangya_game::{
     GameChatObservation, GameCommitObservation, GameConnectionId, GameEconomyCommand,
     GameEconomyOutcome, GameMatchObservation, GameObserver, GameQueueObservation, GameRateClass,
@@ -162,6 +162,7 @@ pub struct M2Metrics {
     game_stroke_match: [AtomicU64; 8],
     game_stroke_commit: [AtomicU64; 6],
     game_stroke_shot: [AtomicU64; 5],
+    storage_fault: [AtomicU64; StorageFault::ALL.len()],
 }
 
 impl M2Metrics {
@@ -841,6 +842,14 @@ impl M2Metrics {
         for (name, labels, value) in values {
             let _ = writeln!(output, "{name}{{{labels}}} {value}");
         }
+        for fault in StorageFault::ALL {
+            let value = self.storage_fault[fault.index()].load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "pangya_storage_faults_total{{fault=\"{}\"}} {value}",
+                fault.as_str()
+            );
+        }
         for (index, event) in ["turn_timeout", "game_timeout", "forfeit"]
             .into_iter()
             .enumerate()
@@ -1030,6 +1039,14 @@ impl LoginObserver for M2Metrics {
             RateLimitClass::BytesSource => &self.rate_bytes_source,
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl StorageObserver for M2Metrics {
+    fn storage_fault(&self, fault: StorageFault) {
+        // `index` is dense over `ALL`, so the counter array can never be indexed
+        // out of range and the label set stays exactly as wide as the enum.
+        self.storage_fault[fault.index()].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1637,5 +1654,46 @@ mod tests {
         assert!(rendered.contains("pangya_game_rooms_active{service=\"game\"} 0"));
         assert!(rendered.contains("pangya_game_room_events_total{event=\"created\"} 1"));
         assert!(rendered.contains("pangya_game_room_events_total{event=\"closed\"} 1"));
+    }
+
+    #[test]
+    fn storage_faults_render_one_bounded_series_each_and_count_independently() {
+        let metrics = M2Metrics::default();
+        let baseline = metrics.render();
+        for fault in StorageFault::ALL {
+            let series = format!(
+                "pangya_storage_faults_total{{fault=\"{}\"}} 0",
+                fault.as_str()
+            );
+            assert!(
+                baseline.contains(&series),
+                "every fault is exported from the start: {series}"
+            );
+        }
+        // Exactly one series per fault, so the dimension can never grow at runtime.
+        assert_eq!(
+            baseline
+                .lines()
+                .filter(|line| line.starts_with("pangya_storage_faults_total{"))
+                .count(),
+            StorageFault::ALL.len()
+        );
+
+        metrics.storage_fault(StorageFault::Deadlock);
+        metrics.storage_fault(StorageFault::Deadlock);
+        metrics.storage_fault(StorageFault::UnexpectedRowCount);
+        let rendered = metrics.render();
+        assert!(rendered.contains("pangya_storage_faults_total{fault=\"deadlock\"} 2"));
+        assert!(rendered.contains("pangya_storage_faults_total{fault=\"unexpected_row_count\"} 1"));
+        // An unrelated fault stays untouched, proving the counters are not aliased.
+        assert!(rendered.contains("pangya_storage_faults_total{fault=\"serialization\"} 0"));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("pangya_storage_faults_total{"))
+                .count(),
+            StorageFault::ALL.len(),
+            "observing a fault never adds a series"
+        );
     }
 }

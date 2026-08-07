@@ -1,6 +1,9 @@
 //! Real PostgreSQL acceptance tests for the M2 storage foundation.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use chrono::{DateTime, Utc};
 use pangya_domain::{
@@ -15,9 +18,9 @@ use pangya_domain::{
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
     MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
     PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StrokeCompletion,
-    StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
-    WindConditions,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -403,7 +406,7 @@ async fn operator_success_audit_failure_rolls_back_whole_aggregate(pool: PgPool)
         repository
             .create_operator_account(account("AuditRollback", Some("AuditNick")))
             .await,
-        Err(RepositoryError::Storage)
+        Err(RepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     assert_no_aggregate_rows(&pool).await;
     let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_audit_events")
@@ -506,7 +509,11 @@ async fn every_aggregate_mutation_stage_rolls_back_everything(pool: PgPool) {
                 Some(&format!("RollNick{index}")),
             ))
             .await;
-        assert_eq!(result, Err(RepositoryError::Storage), "stage {stage}");
+        assert_eq!(
+            result,
+            Err(RepositoryError::Storage(StorageFault::PlPgSqlRaise)),
+            "stage {stage}"
+        );
         assert_no_aggregate_rows(&pool).await;
         let drop_trigger = format!("DROP TRIGGER test_fail_stage ON {table}");
         sqlx::query(&drop_trigger)
@@ -875,7 +882,7 @@ async fn status_and_revocation_mutations_roll_back_together(pool: PgPool) {
         repository
             .set_status(aggregate.account.id, AccountStatus::Banned, now)
             .await,
-        Err(RepositoryError::Storage)
+        Err(RepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     let status: String = sqlx::query_scalar("SELECT status FROM accounts WHERE id = $1")
         .bind(aggregate.account.id.get())
@@ -1250,7 +1257,7 @@ async fn solo_in_game_transition_is_checked_idempotent_and_atomic(pool: PgPool) 
     .expect("mark failure trigger");
     assert_eq!(
         repository.mark_solo_in_game(solo_mark(&rollback)).await,
-        Err(MatchRepositoryError::Storage)
+        Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     let status: String = sqlx::query_scalar("SELECT status FROM matches WHERE id = $1")
         .bind(rollback.match_id().get())
@@ -1632,7 +1639,7 @@ async fn startup_recovery_second_row_failure_rolls_back_first_row(pool: PgPool) 
         repository
             .abort_incomplete_matches(IncompleteMatchAbortLimit::new(2).expect("limit"))
             .await,
-        Err(MatchRepositoryError::Storage)
+        Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     let state: (i64, i64, i64) = sqlx::query_as(
         "SELECT \
@@ -1707,7 +1714,7 @@ async fn begin_and_abort_stage_failures_leave_no_partial_lifecycle(pool: PgPool)
         sqlx::query(&trigger).execute(&pool).await.expect("trigger");
         assert_eq!(
             repository.begin_solo(begin.clone()).await,
-            Err(MatchRepositoryError::Storage),
+            Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise)),
             "begin stage {stage}"
         );
         sqlx::query(&format!(
@@ -1760,7 +1767,7 @@ async fn begin_and_abort_stage_failures_leave_no_partial_lifecycle(pool: PgPool)
         );
         assert_eq!(
             repository.abort(abort).await,
-            Err(MatchRepositoryError::Storage),
+            Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise)),
             "abort stage {stage}"
         );
         sqlx::query(&format!(
@@ -1845,7 +1852,7 @@ async fn every_solo_commit_mutation_stage_failure_rolls_back_transaction(pool: P
             .expect("failure trigger");
         assert_eq!(
             repository.commit_solo_hole(solo_commit(&begin, 2)).await,
-            Err(MatchRepositoryError::Storage),
+            Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise)),
             "stage {stage}"
         );
         let drop_trigger = format!("DROP TRIGGER test_fail_match_stage ON {table}");
@@ -2868,7 +2875,7 @@ async fn every_stroke_commit_stage_failure_rolls_back_both_players(pool: PgPool)
                     (4, StrokePlace::Second, StrokeCompletion::Holed),
                 ))
                 .await,
-            Err(MatchRepositoryError::Storage),
+            Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise)),
             "stage {stage}"
         );
         sqlx::query(&format!("DROP TRIGGER test_fail_stroke_stage ON {table}"))
@@ -2927,7 +2934,7 @@ async fn stroke_begin_and_abort_failures_leave_no_partial_aggregate(pool: PgPool
     .expect("begin failure trigger");
     assert_eq!(
         repository.begin_stroke(failed_begin.clone()).await,
-        Err(MatchRepositoryError::Storage)
+        Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     let failed_begin_rows: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM matches WHERE id = $1) + \
@@ -2965,7 +2972,7 @@ async fn stroke_begin_and_abort_failures_leave_no_partial_aggregate(pool: PgPool
                 MatchAbortReason::Shutdown,
             ))
             .await,
-        Err(MatchRepositoryError::Storage)
+        Err(MatchRepositoryError::Storage(StorageFault::PlPgSqlRaise))
     );
     let failed_abort_state: (String, i64, i64) = sqlx::query_as(
         "SELECT m.status, \
@@ -3563,7 +3570,7 @@ async fn every_purchase_mutation_stage_failure_rolls_back_balance_grant_operatio
         };
         assert_eq!(
             repository.purchase(request).await,
-            Err(EconomyError::Storage),
+            Err(EconomyError::Storage(StorageFault::PlPgSqlRaise)),
             "stage {stage}"
         );
         sqlx::query(&format!("DROP TRIGGER test_fail_economy ON {table}"))
@@ -3655,7 +3662,7 @@ async fn equip_consume_and_repair_stage_failures_roll_back_all_authoritative_sta
         };
         assert_eq!(
             repository.equip(request).await,
-            Err(EconomyError::Storage),
+            Err(EconomyError::Storage(StorageFault::PlPgSqlRaise)),
             "{stage}"
         );
         sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
@@ -3704,7 +3711,7 @@ async fn equip_consume_and_repair_stage_failures_roll_back_all_authoritative_sta
         };
         assert_eq!(
             repository.consume_one(request).await,
-            Err(EconomyError::Storage),
+            Err(EconomyError::Storage(StorageFault::PlPgSqlRaise)),
             "{stage}"
         );
         sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
@@ -3749,7 +3756,7 @@ async fn equip_consume_and_repair_stage_failures_roll_back_all_authoritative_sta
         };
         assert_eq!(
             repository.repair(request).await,
-            Err(EconomyError::Storage),
+            Err(EconomyError::Storage(StorageFault::PlPgSqlRaise)),
             "{stage}"
         );
         sqlx::query(&format!("DROP TRIGGER test_fail_other_economy ON {table}"))
@@ -3963,4 +3970,118 @@ async fn distinct_concurrent_purchases_serialize_without_lost_balance_updates(po
     .await
     .expect("state");
     assert_eq!(state, (800, 8, 8, 8));
+}
+
+/// Records every fault a repository reports, so a test can assert the observed stream.
+#[derive(Debug, Default)]
+struct RecordingStorageObserver {
+    faults: std::sync::Mutex<Vec<StorageFault>>,
+}
+
+impl RecordingStorageObserver {
+    fn taken(&self) -> Vec<StorageFault> {
+        self.faults.lock().expect("fault lock").clone()
+    }
+}
+
+impl StorageObserver for RecordingStorageObserver {
+    fn storage_fault(&self, fault: StorageFault) {
+        self.faults.lock().expect("fault lock").push(fault);
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn real_sqlstates_classify_and_reach_the_observer_without_changing_outcomes(pool: PgPool) {
+    // Each case raises a genuine SQLSTATE through PostgreSQL and the driver, so this pins
+    // the whole chain: server error -> sqlx -> classifier -> error variant -> observer.
+    for (errcode, expected) in [
+        ("40P01", StorageFault::Deadlock),
+        ("40001", StorageFault::Serialization),
+        ("53300", StorageFault::InsufficientResources),
+        ("57014", StorageFault::OperatorIntervention),
+        ("08006", StorageFault::Connection),
+        ("XX001", StorageFault::InternalError),
+    ] {
+        let observer = Arc::new(RecordingStorageObserver::default());
+        let repository = PgRepository::with_observer(pool.clone(), Arc::clone(&observer) as Arc<_>);
+        sqlx::query(&format!(
+            "CREATE OR REPLACE FUNCTION test_sqlstate() RETURNS trigger LANGUAGE plpgsql AS $$              BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '{errcode}'; END $$"
+        ))
+        .execute(&pool)
+        .await
+        .expect("sqlstate function");
+        sqlx::query(
+            "CREATE TRIGGER test_sqlstate BEFORE INSERT ON accounts              FOR EACH ROW EXECUTE FUNCTION test_sqlstate()",
+        )
+        .execute(&pool)
+        .await
+        .expect("sqlstate trigger");
+
+        let outcome = repository
+            .create_operator_account(account(
+                &format!("S{errcode}"),
+                Some(&format!("N{errcode}")),
+            ))
+            .await;
+        assert_eq!(
+            outcome,
+            Err(RepositoryError::Storage(expected)),
+            "SQLSTATE {errcode} classifies as {expected}"
+        );
+        assert_eq!(
+            observer.taken(),
+            vec![expected],
+            "SQLSTATE {errcode} is observed exactly once"
+        );
+        assert_no_aggregate_rows(&pool).await;
+
+        sqlx::query("DROP TRIGGER test_sqlstate ON accounts")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+    }
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn successful_operations_report_no_fault_and_a_missing_observer_changes_nothing(
+    pool: PgPool,
+) {
+    let observer = Arc::new(RecordingStorageObserver::default());
+    let observed = PgRepository::with_observer(pool.clone(), Arc::clone(&observer) as Arc<_>);
+    let created = observed
+        .create_operator_account(account("QuietPath", Some("QuietNick")))
+        .await
+        .expect("account creates");
+    assert!(
+        observer.taken().is_empty(),
+        "a successful path reports no fault"
+    );
+
+    // A non-storage failure is not a fault: it must stay off the storage dimension.
+    let duplicate = observed
+        .create_operator_account(account("QuietPath", Some("OtherNick")))
+        .await;
+    assert_eq!(duplicate, Err(RepositoryError::DuplicateUsername));
+    assert!(
+        observer.taken().is_empty(),
+        "a typed domain rejection is not a storage fault"
+    );
+
+    // The observer is purely a side channel: the unobserved repository agrees exactly.
+    let plain = PgRepository::new(pool.clone());
+    assert_eq!(
+        plain
+            .create_operator_account(account("QuietPath", Some("ThirdNick")))
+            .await,
+        Err(RepositoryError::DuplicateUsername)
+    );
+    assert_eq!(
+        plain
+            .load_player_snapshot(created.account.id)
+            .await
+            .expect("snapshot loads")
+            .account
+            .id,
+        created.account.id
+    );
 }

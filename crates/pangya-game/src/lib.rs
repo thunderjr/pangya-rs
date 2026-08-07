@@ -1904,7 +1904,7 @@ where
             EconomyError::AccountInactive => EconomyOutcome::NotOwned,
             EconomyError::ArithmeticOverflow
             | EconomyError::CorruptData
-            | EconomyError::Storage => return Err(GameRuntimeError::EconomyPersistence),
+            | EconomyError::Storage(_) => return Err(GameRuntimeError::EconomyPersistence),
         };
         self.send_economy_result(framed, command, outcome).await
     }
@@ -5131,6 +5131,7 @@ pub const fn crate_boundary() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use pangya_domain::StorageFault;
     use std::sync::atomic::AtomicUsize;
 
     use pangya_domain::{
@@ -5205,7 +5206,7 @@ mod tests {
                 stroke_abort_delay: Mutex::new(Duration::ZERO),
                 begin_outcome: Mutex::new(Ok(BeginSoloMatchOutcome::Begun)),
                 mark_outcome: Mutex::new(Ok(MarkSoloInGameOutcome::Marked)),
-                commit_outcome: Mutex::new(Err(MatchRepositoryError::Storage)),
+                commit_outcome: Mutex::new(Err(MatchRepositoryError::Storage(StorageFault::Other))),
                 abort_outcome: Mutex::new(Ok(AbortMatchOutcome::Aborted)),
                 stroke_commit_outcome: Mutex::new(None),
                 stroke_abort_outcome: Mutex::new(None),
@@ -5215,14 +5216,14 @@ mod tests {
 
     impl HandoverRepository for FakeRepository {
         fn issue(&self, _handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
-            Box::pin(async { Err(HandoverError::Storage) })
+            Box::pin(async { Err(HandoverError::Storage(StorageFault::Other)) })
         }
 
         fn consume(
             &self,
             _request: ConsumeHandover,
         ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
-            Box::pin(async { Err(HandoverError::Storage) })
+            Box::pin(async { Err(HandoverError::Storage(StorageFault::Other)) })
         }
     }
 
@@ -5231,7 +5232,7 @@ mod tests {
             &self,
             _account_id: AccountId,
         ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
-            Box::pin(async { Err(RepositoryError::Storage) })
+            Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
         }
     }
 
@@ -5245,10 +5246,10 @@ mod tests {
                 .begin_delay
                 .lock()
                 .map_or(Duration::ZERO, |value| *value);
-            let outcome = self
-                .begin_outcome
-                .lock()
-                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            let outcome = self.begin_outcome.lock().map_or(
+                Err(MatchRepositoryError::Storage(StorageFault::Other)),
+                |value| *value,
+            );
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5264,10 +5265,10 @@ mod tests {
                 .mark_delay
                 .lock()
                 .map_or(Duration::ZERO, |value| *value);
-            let outcome = self
-                .mark_outcome
-                .lock()
-                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            let outcome = self.mark_outcome.lock().map_or(
+                Err(MatchRepositoryError::Storage(StorageFault::Other)),
+                |value| *value,
+            );
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5283,10 +5284,10 @@ mod tests {
                 .abort_delay
                 .lock()
                 .map_or(Duration::ZERO, |value| *value);
-            let outcome = self
-                .abort_outcome
-                .lock()
-                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            let outcome = self.abort_outcome.lock().map_or(
+                Err(MatchRepositoryError::Storage(StorageFault::Other)),
+                |value| *value,
+            );
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5302,10 +5303,10 @@ mod tests {
                 .commit_delay
                 .lock()
                 .map_or(Duration::ZERO, |value| *value);
-            let outcome = self
-                .commit_outcome
-                .lock()
-                .map_or(Err(MatchRepositoryError::Storage), |value| *value);
+            let outcome = self.commit_outcome.lock().map_or(
+                Err(MatchRepositoryError::Storage(StorageFault::Other)),
+                |value| *value,
+            );
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5326,7 +5327,7 @@ mod tests {
                 .lock()
                 .ok()
                 .and_then(|value| *value)
-                .unwrap_or(Err(MatchRepositoryError::Storage));
+                .unwrap_or(Err(MatchRepositoryError::Storage(StorageFault::Other)));
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5347,7 +5348,7 @@ mod tests {
                 .lock()
                 .ok()
                 .and_then(|value| *value)
-                .unwrap_or(Err(MatchRepositoryError::Storage));
+                .unwrap_or(Err(MatchRepositoryError::Storage(StorageFault::Other)));
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
                 outcome
@@ -5368,7 +5369,7 @@ mod tests {
             _request: PurchaseRequest,
         ) -> RepositoryFuture<'_, Result<EconomyCommit<pangya_domain::PurchaseResult>, EconomyError>>
         {
-            Box::pin(async { Err(EconomyError::Storage) })
+            Box::pin(async { Err(EconomyError::Storage(StorageFault::Other)) })
         }
         fn equip(
             &self,
@@ -5377,7 +5378,7 @@ mod tests {
             '_,
             Result<EconomyCommit<pangya_domain::EquipmentChangeResult>, EconomyError>,
         > {
-            Box::pin(async { Err(EconomyError::Storage) })
+            Box::pin(async { Err(EconomyError::Storage(StorageFault::Other)) })
         }
         fn consume_one(
             &self,
@@ -5386,7 +5387,7 @@ mod tests {
             '_,
             Result<EconomyCommit<pangya_domain::ConsumeItemResult>, EconomyError>,
         > {
-            Box::pin(async { Err(EconomyError::Storage) })
+            Box::pin(async { Err(EconomyError::Storage(StorageFault::Other)) })
         }
         fn repair(
             &self,
@@ -5395,7 +5396,7 @@ mod tests {
             '_,
             Result<EconomyCommit<pangya_domain::RepairItemResult>, EconomyError>,
         > {
-            Box::pin(async { Err(EconomyError::Storage) })
+            Box::pin(async { Err(EconomyError::Storage(StorageFault::Other)) })
         }
     }
 
@@ -5881,7 +5882,7 @@ mod tests {
             if delay.is_zero()
                 && let Ok(mut configured) = repository.begin_outcome.lock()
             {
-                *configured = Err(MatchRepositoryError::Storage);
+                *configured = Err(MatchRepositoryError::Storage(StorageFault::Other));
             }
             let service = test_service(Arc::clone(&repository), Duration::from_millis(5));
             let plan = test_plan(&service, if delay.is_zero() { 1 } else { 2 });
@@ -6050,7 +6051,7 @@ mod tests {
     async fn in_game_mark_failure_aborts_actor_and_durable_match() {
         let repository = Arc::new(FakeRepository::default());
         if let Ok(mut outcome) = repository.mark_outcome.lock() {
-            *outcome = Err(MatchRepositoryError::Storage);
+            *outcome = Err(MatchRepositoryError::Storage(StorageFault::Other));
         }
         let service = test_service(Arc::clone(&repository), Duration::from_millis(50));
         let plan = test_plan(&service, 13);
@@ -6106,10 +6107,10 @@ mod tests {
     async fn abort_persistence_failure_is_retained_and_already_committed_race_applies() {
         let repository = Arc::new(FakeRepository::default());
         if let Ok(mut begin) = repository.begin_outcome.lock() {
-            *begin = Err(MatchRepositoryError::Storage);
+            *begin = Err(MatchRepositoryError::Storage(StorageFault::Other));
         }
         if let Ok(mut abort) = repository.abort_outcome.lock() {
-            *abort = Err(MatchRepositoryError::Storage);
+            *abort = Err(MatchRepositoryError::Storage(StorageFault::Other));
         }
         let service = test_service(Arc::clone(&repository), Duration::from_millis(20));
         let plan = test_plan(&service, 10);
@@ -6741,7 +6742,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| unreachable!());
         if let Ok(mut abort) = repository.abort_outcome.lock() {
-            *abort = Err(MatchRepositoryError::Storage);
+            *abort = Err(MatchRepositoryError::Storage(StorageFault::Other));
         }
         let client = TcpStream::connect(address)
             .await
@@ -6784,7 +6785,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| unreachable!());
         if let Ok(mut abort) = repository.abort_outcome.lock() {
-            *abort = Err(MatchRepositoryError::Storage);
+            *abort = Err(MatchRepositoryError::Storage(StorageFault::Other));
         }
         shutdown.cancel();
         assert_eq!(

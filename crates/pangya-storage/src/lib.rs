@@ -8,6 +8,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    future::Future,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -24,11 +26,12 @@ use pangya_domain::{
     ItemSale, ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY,
     MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, NewAccount, NewHandover, Nickname, NormalizedNickname, NormalizedUsername,
-    PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem,
-    RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState,
-    SoloMatchResult, StarterGrant, StarterKey, StrokeCompletion, StrokeCount, StrokeMatchResult,
-    StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
+    MatchResultKey, NewAccount, NewHandover, Nickname, NoopStorageObserver, NormalizedNickname,
+    NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult,
+    RepairItem, RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind,
+    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
     WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
@@ -147,13 +150,42 @@ pub async fn migrate(pool: &PgPool) -> Result<(), StorageBootstrapError> {
 #[derive(Clone)]
 pub struct PgRepository {
     pool: PgPool,
+    observer: Arc<dyn StorageObserver>,
 }
 
 impl PgRepository {
-    /// Wraps a configured pool.
+    /// Wraps a configured pool and discards fault observations.
     #[must_use]
-    pub const fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            observer: Arc::new(NoopStorageObserver),
+        }
+    }
+
+    /// Wraps a configured pool and reports every classified fault to `observer`.
+    #[must_use]
+    pub fn with_observer(pool: PgPool, observer: Arc<dyn StorageObserver>) -> Self {
+        Self { pool, observer }
+    }
+
+    /// Reports the classified fault an inner call produced, then returns it unchanged.
+    ///
+    /// Observation is the only side effect: the result is passed through untouched, so
+    /// control flow and every caller-visible outcome are identical with and without an
+    /// observer installed.
+    async fn observed<T, E, F>(&self, inner: F) -> Result<T, E>
+    where
+        E: StorageFaulted,
+        F: Future<Output = Result<T, E>>,
+    {
+        let result = inner.await;
+        if let Err(error) = &result
+            && let Some(fault) = error.storage_fault()
+        {
+            self.observer.storage_fault(fault);
+        }
+        result
     }
 
     /// Atomically creates an operator account aggregate and its success audit event.
@@ -164,7 +196,8 @@ impl PgRepository {
         &self,
         request: NewAccount,
     ) -> Result<AccountAggregate, RepositoryError> {
-        self.create_account_inner(request, true).await
+        self.observed(self.create_account_inner(request, true))
+            .await
     }
 
     /// Records a durable, nonsecret operator audit event after DB availability.
@@ -186,7 +219,13 @@ impl PgRepository {
         )
         .execute(&self.pool)
         .await
-        .map_err(repository_db_error)?;
+        .map_err(|error| {
+            let mapped = repository_db_error(error);
+            if let Some(fault) = mapped.storage_fault() {
+                self.observer.storage_fault(fault);
+            }
+            mapped
+        })?;
         Ok(())
     }
 
@@ -469,7 +508,8 @@ impl PgRepository {
         .await
         .map_err(handover_db_error)?
         .ok_or(HandoverError::Invalid)?;
-        if parse_account_status(&status).map_err(|_| HandoverError::Storage)?
+        if parse_account_status(&status)
+            .map_err(|_| HandoverError::Storage(StorageFault::Decode))?
             != AccountStatus::Active
         {
             return Err(HandoverError::AccountInactive);
@@ -513,12 +553,13 @@ impl PgRepository {
         .map_err(handover_db_error)?
         .ok_or(HandoverError::Invalid)?;
 
-        let expected =
-            HandoverDigest::from_slice(&row.token_digest).map_err(|_| HandoverError::Storage)?;
+        let expected = HandoverDigest::from_slice(&row.token_digest)
+            .map_err(|_| HandoverError::Storage(StorageFault::Decode))?;
         if !bool::from(expected.as_bytes().ct_eq(request.digest.as_bytes())) {
             return Err(HandoverError::Invalid);
         }
-        let target = parse_service_kind(&row.target).map_err(|_| HandoverError::Storage)?;
+        let target = parse_service_kind(&row.target)
+            .map_err(|_| HandoverError::Storage(StorageFault::Decode))?;
         if target != request.target {
             return Err(HandoverError::WrongTarget);
         }
@@ -526,7 +567,8 @@ impl PgRepository {
         if now < row.issued_at || now >= row.expires_at {
             return Err(HandoverError::Expired);
         }
-        if parse_account_status(&row.status).map_err(|_| HandoverError::Storage)?
+        if parse_account_status(&row.status)
+            .map_err(|_| HandoverError::Storage(StorageFault::Decode))?
             != AccountStatus::Active
         {
             return Err(HandoverError::AccountInactive);
@@ -544,7 +586,8 @@ impl PgRepository {
         .map_err(handover_db_error)?;
         transaction.commit().await.map_err(handover_db_error)?;
         Ok(AuthenticatedSession {
-            account_id: AccountId::new(row.account_id).map_err(|_| HandoverError::Storage)?,
+            account_id: AccountId::new(row.account_id)
+                .map_err(|_| HandoverError::Storage(StorageFault::Decode))?,
             handover_id: request.id,
         })
     }
@@ -669,7 +712,9 @@ impl PgRepository {
                 .await
                 .map_err(match_db_error)?;
                 if updated.rows_affected() != 1 {
-                    return Err(MatchRepositoryError::Storage);
+                    return Err(MatchRepositoryError::Storage(
+                        StorageFault::UnexpectedRowCount,
+                    ));
                 }
                 MarkSoloInGameOutcome::Marked
             }
@@ -771,7 +816,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if pending.rows_affected() != 1 {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::UnexpectedRowCount,
+            ));
         }
 
         let balances = sqlx::query!(
@@ -806,7 +853,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if updated.rows_affected() != 1 {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::UnexpectedRowCount,
+            ));
         }
         sqlx::query!(
             "INSERT INTO currency_ledger \
@@ -877,7 +926,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if (persisted_balances.pang, persisted_balances.experience) != (new_pang, new_experience) {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::WriteVerification,
+            ));
         }
         let result = SoloMatchResult::new(
             request.match_id(),
@@ -1017,7 +1068,9 @@ impl PgRepository {
                 .await
                 .map_err(match_db_error)?;
                 if updated.rows_affected() != 1 {
-                    return Err(MatchRepositoryError::Storage);
+                    return Err(MatchRepositoryError::Storage(
+                        StorageFault::UnexpectedRowCount,
+                    ));
                 }
                 MarkStrokeInGameOutcome::Marked
             }
@@ -1071,7 +1124,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if updated_match.rows_affected() != 1 {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::UnexpectedRowCount,
+            ));
         }
         sqlx::query!(
             "INSERT INTO match_audit_events \
@@ -1117,7 +1172,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if pending.rows_affected() != 1 {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::UnexpectedRowCount,
+            ));
         }
 
         let mut account_ids = request
@@ -1176,7 +1233,9 @@ impl PgRepository {
                 .await
                 .map_err(match_db_error)?;
                 if updated.rows_affected() != 1 {
-                    return Err(MatchRepositoryError::Storage);
+                    return Err(MatchRepositoryError::Storage(
+                        StorageFault::UnexpectedRowCount,
+                    ));
                 }
                 sqlx::query!(
                     "INSERT INTO currency_ledger \
@@ -1303,7 +1362,9 @@ impl PgRepository {
         .await
         .map_err(match_db_error)?;
         if committed.rows_affected() != 1 {
-            return Err(MatchRepositoryError::Storage);
+            return Err(MatchRepositoryError::Storage(
+                StorageFault::UnexpectedRowCount,
+            ));
         }
         let [first, second] = results.as_slice() else {
             return Err(MatchRepositoryError::CorruptData);
@@ -1360,7 +1421,9 @@ impl PgRepository {
             if updated_players.rows_affected()
                 != u64::try_from(players.len()).map_err(|_| MatchRepositoryError::CorruptData)?
             {
-                return Err(MatchRepositoryError::Storage);
+                return Err(MatchRepositoryError::Storage(
+                    StorageFault::UnexpectedRowCount,
+                ));
             }
             sqlx::query!(
                 "UPDATE matches SET status = 'aborted', abort_reason = 'startup_recovery', \
@@ -1393,14 +1456,14 @@ impl AccountRepository for PgRepository {
         &self,
         request: NewAccount,
     ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>> {
-        Box::pin(self.create_account_inner(request, false))
+        Box::pin(self.observed(self.create_account_inner(request, false)))
     }
 
     fn load_authentication<'a>(
         &'a self,
         username: &'a NormalizedUsername,
     ) -> RepositoryFuture<'a, Result<Option<AuthenticationRecord>, RepositoryError>> {
-        Box::pin(self.load_authentication_inner(username))
+        Box::pin(self.observed(self.load_authentication_inner(username)))
     }
 
     fn set_nickname(
@@ -1408,14 +1471,14 @@ impl AccountRepository for PgRepository {
         account_id: AccountId,
         nickname: Nickname,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
-        Box::pin(self.set_nickname_inner(account_id, nickname))
+        Box::pin(self.observed(self.set_nickname_inner(account_id, nickname)))
     }
 
     fn nickname_available<'a>(
         &'a self,
         nickname: &'a NormalizedNickname,
     ) -> RepositoryFuture<'a, Result<bool, RepositoryError>> {
-        Box::pin(self.nickname_available_inner(nickname))
+        Box::pin(self.observed(self.nickname_available_inner(nickname)))
     }
 
     fn grant_starter(
@@ -1423,7 +1486,7 @@ impl AccountRepository for PgRepository {
         account_id: AccountId,
         grant: StarterGrant,
     ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>> {
-        Box::pin(self.grant_starter_inner(account_id, grant))
+        Box::pin(self.observed(self.grant_starter_inner(account_id, grant)))
     }
 
     fn set_status(
@@ -1432,7 +1495,7 @@ impl AccountRepository for PgRepository {
         status: AccountStatus,
         now: SystemTime,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
-        Box::pin(self.set_status_inner(account_id, status, now))
+        Box::pin(self.observed(self.set_status_inner(account_id, status, now)))
     }
 }
 
@@ -1441,20 +1504,20 @@ impl PlayerRepository for PgRepository {
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
-        Box::pin(self.load_player_snapshot_inner(account_id))
+        Box::pin(self.observed(self.load_player_snapshot_inner(account_id)))
     }
 }
 
 impl HandoverRepository for PgRepository {
     fn issue(&self, handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
-        Box::pin(self.issue_handover_inner(handover))
+        Box::pin(self.observed(self.issue_handover_inner(handover)))
     }
 
     fn consume(
         &self,
         request: ConsumeHandover,
     ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
-        Box::pin(self.consume_handover_inner(request))
+        Box::pin(self.observed(self.consume_handover_inner(request)))
     }
 }
 
@@ -1463,63 +1526,63 @@ impl MatchRepository for PgRepository {
         &self,
         request: BeginStrokeMatch,
     ) -> RepositoryFuture<'_, Result<BeginStrokeMatchOutcome, MatchRepositoryError>> {
-        Box::pin(self.begin_stroke_inner(request))
+        Box::pin(self.observed(self.begin_stroke_inner(request)))
     }
 
     fn mark_stroke_in_game(
         &self,
         request: MarkStrokeInGame,
     ) -> RepositoryFuture<'_, Result<MarkStrokeInGameOutcome, MatchRepositoryError>> {
-        Box::pin(self.mark_stroke_in_game_inner(request))
+        Box::pin(self.observed(self.mark_stroke_in_game_inner(request)))
     }
 
     fn abort_stroke(
         &self,
         request: AbortStrokeMatch,
     ) -> RepositoryFuture<'_, Result<AbortStrokeMatchOutcome, MatchRepositoryError>> {
-        Box::pin(self.abort_stroke_inner(request))
+        Box::pin(self.observed(self.abort_stroke_inner(request)))
     }
 
     fn commit_stroke_match(
         &self,
         request: CommitStrokeMatch,
     ) -> RepositoryFuture<'_, Result<StrokeMatchResult, MatchRepositoryError>> {
-        Box::pin(self.commit_stroke_match_inner(request))
+        Box::pin(self.observed(self.commit_stroke_match_inner(request)))
     }
 
     fn begin_solo(
         &self,
         request: BeginSoloMatch,
     ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
-        Box::pin(self.begin_solo_inner(request))
+        Box::pin(self.observed(self.begin_solo_inner(request)))
     }
 
     fn mark_solo_in_game(
         &self,
         request: MarkSoloInGame,
     ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>> {
-        Box::pin(self.mark_solo_in_game_inner(request))
+        Box::pin(self.observed(self.mark_solo_in_game_inner(request)))
     }
 
     fn abort(
         &self,
         request: AbortMatch,
     ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>> {
-        Box::pin(self.abort_match_inner(request))
+        Box::pin(self.observed(self.abort_match_inner(request)))
     }
 
     fn commit_solo_hole(
         &self,
         request: CommitSoloHole,
     ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>> {
-        Box::pin(self.commit_solo_hole_inner(request))
+        Box::pin(self.observed(self.commit_solo_hole_inner(request)))
     }
 
     fn abort_incomplete_matches(
         &self,
         limit: IncompleteMatchAbortLimit,
     ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>> {
-        Box::pin(self.abort_incomplete_matches_inner(limit))
+        Box::pin(self.observed(self.abort_incomplete_matches_inner(limit)))
     }
 }
 
@@ -2628,16 +2691,41 @@ fn repository_db_error(error: sqlx::Error) -> RepositoryError {
         Some("uq_characters_starter_key" | "uq_inventory_starter_key") => {
             RepositoryError::InvalidStarterGrant
         }
-        _ => RepositoryError::Storage,
+        _ => RepositoryError::Storage(storage_fault(&error)),
     }
 }
 
-fn handover_db_error(_error: sqlx::Error) -> HandoverError {
-    HandoverError::Storage
+/// Classifies a driver failure into a bounded, nonsensitive fault.
+///
+/// Only the `SQLSTATE` and the driver's own error kind are read. Server message text,
+/// statement text, bound parameters, and row values are never inspected, so the result
+/// cannot carry caller data into a log line, a metric label, or a returned error.
+fn storage_fault(error: &sqlx::Error) -> StorageFault {
+    if let Some(database_error) = error.as_database_error() {
+        return database_error.code().map_or(StorageFault::Other, |code| {
+            StorageFault::from_sqlstate(&code)
+        });
+    }
+    match error {
+        sqlx::Error::PoolTimedOut => StorageFault::PoolTimedOut,
+        sqlx::Error::PoolClosed => StorageFault::PoolClosed,
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) => StorageFault::Io,
+        sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::TypeNotFound { .. } => StorageFault::Decode,
+        sqlx::Error::Protocol(_) => StorageFault::DriverProtocol,
+        _ => StorageFault::Other,
+    }
 }
 
-fn match_db_error(_error: sqlx::Error) -> MatchRepositoryError {
-    MatchRepositoryError::Storage
+fn handover_db_error(error: sqlx::Error) -> HandoverError {
+    HandoverError::Storage(storage_fault(&error))
+}
+
+fn match_db_error(error: sqlx::Error) -> MatchRepositoryError {
+    MatchRepositoryError::Storage(storage_fault(&error))
 }
 
 fn stroke_begin_db_error(error: sqlx::Error) -> MatchRepositoryError {
@@ -2648,7 +2736,7 @@ fn stroke_begin_db_error(error: sqlx::Error) -> MatchRepositoryError {
     {
         MatchRepositoryError::InputDrift
     } else {
-        MatchRepositoryError::Storage
+        MatchRepositoryError::Storage(storage_fault(&error))
     }
 }
 

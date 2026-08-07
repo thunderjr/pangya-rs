@@ -225,7 +225,9 @@ impl pangya_domain::EconomyRepository for BlockingStrokeCommitRepository {
         if self.stall_economy {
             return Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                Err(pangya_domain::EconomyError::Storage)
+                Err(pangya_domain::EconomyError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
             });
         }
         pangya_domain::EconomyRepository::purchase(&self.inner, request)

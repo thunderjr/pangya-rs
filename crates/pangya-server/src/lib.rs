@@ -22,7 +22,7 @@ use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::Catalog;
 use pangya_domain::{
     EconomyRepository, HandoverRepository, MatchRepository, NewAccount, Nickname, PlayerRepository,
-    RepositoryError, Username,
+    RepositoryError, StorageObserver, Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -295,7 +295,13 @@ where
 
 async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let pool = connect_and_migrate(&config).await?;
-    let repository = Arc::new(PgRepository::new(pool.clone()));
+    // Built before the repository so that every classified storage fault, including any
+    // raised during startup recovery and public-bind recording, reaches the exporter.
+    let metrics = Arc::new(M2Metrics::default());
+    let repository = Arc::new(PgRepository::with_observer(
+        pool.clone(),
+        Arc::clone(&metrics) as Arc<dyn StorageObserver>,
+    ));
     prepare_public_bind(&repository, config.public_bind_enabled).await?;
     let catalog = if config.game_enabled {
         let directory = config.iff_directory.clone().ok_or(ServerError::Data)?;
@@ -328,7 +334,6 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         page_size: value.page_size,
         max_purchase_quantity: value.max_purchase_quantity,
     });
-    let metrics = Arc::new(M2Metrics::default());
     let game = match catalog {
         Some(catalog) => Some(compose_game_service(
             Arc::clone(&repository),
@@ -988,14 +993,14 @@ mod tests {
 
     impl HandoverRepository for RecoveryGate {
         fn issue(&self, _handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
-            Box::pin(async { Err(HandoverError::Storage) })
+            Box::pin(async { Err(HandoverError::Storage(pangya_domain::StorageFault::Other)) })
         }
 
         fn consume(
             &self,
             _request: ConsumeHandover,
         ) -> RepositoryFuture<'_, Result<AuthenticatedSession, HandoverError>> {
-            Box::pin(async { Err(HandoverError::Storage) })
+            Box::pin(async { Err(HandoverError::Storage(pangya_domain::StorageFault::Other)) })
         }
     }
 
@@ -1004,7 +1009,7 @@ mod tests {
             &self,
             _account_id: AccountId,
         ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
-            Box::pin(async { Err(RepositoryError::Storage) })
+            Box::pin(async { Err(RepositoryError::Storage(pangya_domain::StorageFault::Other)) })
         }
     }
 
@@ -1013,28 +1018,44 @@ mod tests {
             &self,
             _request: BeginSoloMatch,
         ) -> RepositoryFuture<'_, Result<BeginSoloMatchOutcome, MatchRepositoryError>> {
-            Box::pin(async { Err(MatchRepositoryError::Storage) })
+            Box::pin(async {
+                Err(MatchRepositoryError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
 
         fn mark_solo_in_game(
             &self,
             _request: MarkSoloInGame,
         ) -> RepositoryFuture<'_, Result<MarkSoloInGameOutcome, MatchRepositoryError>> {
-            Box::pin(async { Err(MatchRepositoryError::Storage) })
+            Box::pin(async {
+                Err(MatchRepositoryError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
 
         fn abort(
             &self,
             _request: AbortMatch,
         ) -> RepositoryFuture<'_, Result<AbortMatchOutcome, MatchRepositoryError>> {
-            Box::pin(async { Err(MatchRepositoryError::Storage) })
+            Box::pin(async {
+                Err(MatchRepositoryError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
 
         fn commit_solo_hole(
             &self,
             _request: CommitSoloHole,
         ) -> RepositoryFuture<'_, Result<SoloMatchResult, MatchRepositoryError>> {
-            Box::pin(async { Err(MatchRepositoryError::Storage) })
+            Box::pin(async {
+                Err(MatchRepositoryError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
 
         fn abort_incomplete_matches(
@@ -1061,7 +1082,11 @@ mod tests {
                 pangya_domain::EconomyError,
             >,
         > {
-            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+            Box::pin(async {
+                Err(pangya_domain::EconomyError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
         fn equip(
             &self,
@@ -1073,7 +1098,11 @@ mod tests {
                 pangya_domain::EconomyError,
             >,
         > {
-            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+            Box::pin(async {
+                Err(pangya_domain::EconomyError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
         fn consume_one(
             &self,
@@ -1085,7 +1114,11 @@ mod tests {
                 pangya_domain::EconomyError,
             >,
         > {
-            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+            Box::pin(async {
+                Err(pangya_domain::EconomyError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
         fn repair(
             &self,
@@ -1097,7 +1130,11 @@ mod tests {
                 pangya_domain::EconomyError,
             >,
         > {
-            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+            Box::pin(async {
+                Err(pangya_domain::EconomyError::Storage(
+                    pangya_domain::StorageFault::Other,
+                ))
+            })
         }
     }
 

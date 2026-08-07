@@ -849,8 +849,8 @@ pub enum EconomyError {
     #[error("persisted economy data is invalid")]
     CorruptData,
     /// PostgreSQL operation failed.
-    #[error("economy storage operation failed")]
-    Storage,
+    #[error("economy storage operation failed: {0}")]
+    Storage(StorageFault),
 }
 
 /// Persisted minimum equipment aggregate.
@@ -2548,8 +2548,8 @@ pub enum MatchRepositoryError {
     #[error("incomplete match recovery limit was exceeded")]
     RecoveryLimitExceeded,
     /// PostgreSQL operation failed.
-    #[error("match storage operation failed")]
-    Storage,
+    #[error("match storage operation failed: {0}")]
+    Storage(StorageFault),
 }
 
 /// Technology-neutral match persistence contract.
@@ -2559,7 +2559,7 @@ pub trait MatchRepository: Send + Sync {
         &self,
         _request: BeginStrokeMatch,
     ) -> RepositoryFuture<'_, Result<BeginStrokeMatchOutcome, MatchRepositoryError>> {
-        Box::pin(async { Err(MatchRepositoryError::Storage) })
+        Box::pin(async { Err(MatchRepositoryError::Storage(StorageFault::Unsupported)) })
     }
 
     /// Marks an exact loaded stroke aggregate in-game, idempotently.
@@ -2567,7 +2567,7 @@ pub trait MatchRepository: Send + Sync {
         &self,
         _request: MarkStrokeInGame,
     ) -> RepositoryFuture<'_, Result<MarkStrokeInGameOutcome, MatchRepositoryError>> {
-        Box::pin(async { Err(MatchRepositoryError::Storage) })
+        Box::pin(async { Err(MatchRepositoryError::Storage(StorageFault::Unsupported)) })
     }
 
     /// Aborts a noncommitted stroke aggregate and every captured participant.
@@ -2575,7 +2575,7 @@ pub trait MatchRepository: Send + Sync {
         &self,
         _request: AbortStrokeMatch,
     ) -> RepositoryFuture<'_, Result<AbortStrokeMatchOutcome, MatchRepositoryError>> {
-        Box::pin(async { Err(MatchRepositoryError::Storage) })
+        Box::pin(async { Err(MatchRepositoryError::Storage(StorageFault::Unsupported)) })
     }
 
     /// Atomically settles both authoritative stroke participants.
@@ -2583,7 +2583,7 @@ pub trait MatchRepository: Send + Sync {
         &self,
         _request: CommitStrokeMatch,
     ) -> RepositoryFuture<'_, Result<StrokeMatchResult, MatchRepositoryError>> {
-        Box::pin(async { Err(MatchRepositoryError::Storage) })
+        Box::pin(async { Err(MatchRepositoryError::Storage(StorageFault::Unsupported)) })
     }
 
     /// Starts or exactly replays immutable solo-match input.
@@ -2617,6 +2617,237 @@ pub trait MatchRepository: Send + Sync {
     ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>>;
 }
 
+/// Bounded, nonsensitive classification of a storage failure.
+///
+/// Every value is derived from a `SQLSTATE` class, a driver-level failure kind, or a
+/// server-side consistency check. None of them is derived from server message text,
+/// statement text, bound parameters, or row contents, so a fault is always safe to log,
+/// export as a metric label, and return to a caller.
+///
+/// The set is deliberately closed and fixed: it is used as a metric label, so its
+/// cardinality is a hard bound rather than an implementation detail. Unrecognized
+/// `SQLSTATE` values collapse into [`StorageFault::Other`] rather than widening it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StorageFault {
+    /// `SQLSTATE` class `08` — the connection failed or was lost.
+    Connection,
+    /// `SQLSTATE` class `22` — a value was out of range or otherwise invalid.
+    DataException,
+    /// `SQLSTATE` class `23` — a constraint rejected the write.
+    IntegrityConstraint,
+    /// `SQLSTATE` class `25` — the transaction was in the wrong state.
+    TransactionState,
+    /// `SQLSTATE` `40001` — the transaction lost a serialization race.
+    Serialization,
+    /// `SQLSTATE` `40P01` — PostgreSQL chose this transaction to break a lock cycle.
+    Deadlock,
+    /// `SQLSTATE` class `40` other than serialization or deadlock.
+    TransactionRollback,
+    /// `SQLSTATE` class `42` — the statement was rejected as invalid or unauthorized.
+    SyntaxOrAccess,
+    /// `SQLSTATE` class `53` — the server ran out of connections, memory, or disk.
+    InsufficientResources,
+    /// `SQLSTATE` class `54` — a program limit such as row or column count was exceeded.
+    ProgramLimitExceeded,
+    /// `SQLSTATE` class `55` — a required object was not in a usable state, including
+    /// `55P03` lock-not-available.
+    ObjectNotInPrerequisiteState,
+    /// `SQLSTATE` class `57` — the operator or a timeout cancelled the statement.
+    OperatorIntervention,
+    /// `SQLSTATE` class `58` — the server hit an external system error.
+    SystemError,
+    /// `SQLSTATE` class `P0` — a `PL/pgSQL` `RAISE`, which the suite uses to inject faults.
+    PlPgSqlRaise,
+    /// `SQLSTATE` class `XX` — the server reported internal corruption.
+    InternalError,
+    /// The pool did not hand out a connection within its acquire timeout.
+    PoolTimedOut,
+    /// The pool was already closed when a connection was requested.
+    PoolClosed,
+    /// A socket or TLS failure interrupted the exchange.
+    Io,
+    /// A row could not be decoded into its expected Rust type.
+    Decode,
+    /// The driver and server disagreed about the protocol.
+    DriverProtocol,
+    /// A statement affected a row count the surrounding invariant forbids. This is a
+    /// server-side consistency failure, not a database error.
+    UnexpectedRowCount,
+    /// A value read back after a write did not match what was written. This is a
+    /// server-side consistency failure, not a database error.
+    WriteVerification,
+    /// The repository does not implement the requested operation at all. This is a
+    /// composition error rather than a runtime failure.
+    Unsupported,
+    /// Any failure that does not match a classified case above.
+    Other,
+}
+
+impl StorageFault {
+    /// Fixed metric-label and log token for this fault.
+    ///
+    /// The returned set is closed, so it is safe as a bounded-cardinality label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::DataException => "data_exception",
+            Self::IntegrityConstraint => "integrity_constraint",
+            Self::TransactionState => "transaction_state",
+            Self::Serialization => "serialization",
+            Self::Deadlock => "deadlock",
+            Self::TransactionRollback => "transaction_rollback",
+            Self::SyntaxOrAccess => "syntax_or_access",
+            Self::InsufficientResources => "insufficient_resources",
+            Self::ProgramLimitExceeded => "program_limit_exceeded",
+            Self::ObjectNotInPrerequisiteState => "object_not_in_prerequisite_state",
+            Self::OperatorIntervention => "operator_intervention",
+            Self::SystemError => "system_error",
+            Self::PlPgSqlRaise => "plpgsql_raise",
+            Self::InternalError => "internal_error",
+            Self::PoolTimedOut => "pool_timed_out",
+            Self::PoolClosed => "pool_closed",
+            Self::Io => "io",
+            Self::Decode => "decode",
+            Self::DriverProtocol => "driver_protocol",
+            Self::UnexpectedRowCount => "unexpected_row_count",
+            Self::WriteVerification => "write_verification",
+            Self::Unsupported => "unsupported",
+            Self::Other => "other",
+        }
+    }
+
+    /// Every fault in declaration order, so exporters can bound their own storage.
+    pub const ALL: [Self; 24] = [
+        Self::Connection,
+        Self::DataException,
+        Self::IntegrityConstraint,
+        Self::TransactionState,
+        Self::Serialization,
+        Self::Deadlock,
+        Self::TransactionRollback,
+        Self::SyntaxOrAccess,
+        Self::InsufficientResources,
+        Self::ProgramLimitExceeded,
+        Self::ObjectNotInPrerequisiteState,
+        Self::OperatorIntervention,
+        Self::SystemError,
+        Self::PlPgSqlRaise,
+        Self::InternalError,
+        Self::PoolTimedOut,
+        Self::PoolClosed,
+        Self::Io,
+        Self::Decode,
+        Self::DriverProtocol,
+        Self::UnexpectedRowCount,
+        Self::WriteVerification,
+        Self::Unsupported,
+        Self::Other,
+    ];
+
+    /// Dense index matching [`StorageFault::ALL`], for fixed-size counter arrays.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Classifies a `SQLSTATE` without inspecting any other part of the server reply.
+    ///
+    /// `SQLSTATE` is a five-character identifier defined by the SQL standard and by
+    /// PostgreSQL; it never carries caller data, which is why it is the only part of a
+    /// database error this type is allowed to read.
+    #[must_use]
+    pub fn from_sqlstate(code: &str) -> Self {
+        match code {
+            "40001" => return Self::Serialization,
+            "40P01" => return Self::Deadlock,
+            _ => {}
+        }
+        match code.as_bytes() {
+            [b'0', b'8', ..] => Self::Connection,
+            [b'2', b'2', ..] => Self::DataException,
+            [b'2', b'3', ..] => Self::IntegrityConstraint,
+            [b'2', b'5', ..] => Self::TransactionState,
+            [b'4', b'0', ..] => Self::TransactionRollback,
+            [b'4', b'2', ..] => Self::SyntaxOrAccess,
+            [b'5', b'3', ..] => Self::InsufficientResources,
+            [b'5', b'4', ..] => Self::ProgramLimitExceeded,
+            [b'5', b'5', ..] => Self::ObjectNotInPrerequisiteState,
+            [b'5', b'7', ..] => Self::OperatorIntervention,
+            [b'5', b'8', ..] => Self::SystemError,
+            [b'P', b'0', ..] => Self::PlPgSqlRaise,
+            [b'X', b'X', ..] => Self::InternalError,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl fmt::Display for StorageFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Exposes the classified fault carried by a storage failure, if it is one.
+///
+/// Implemented by every repository error that can report a storage failure, so a caller
+/// can observe faults uniformly without matching each enum separately.
+pub trait StorageFaulted {
+    /// Returns the fault when this error is a storage failure, otherwise `None`.
+    fn storage_fault(&self) -> Option<StorageFault>;
+}
+
+impl StorageFaulted for RepositoryError {
+    fn storage_fault(&self) -> Option<StorageFault> {
+        match self {
+            Self::Storage(fault) => Some(*fault),
+            _ => None,
+        }
+    }
+}
+
+impl StorageFaulted for HandoverError {
+    fn storage_fault(&self) -> Option<StorageFault> {
+        match self {
+            Self::Storage(fault) => Some(*fault),
+            _ => None,
+        }
+    }
+}
+
+impl StorageFaulted for MatchRepositoryError {
+    fn storage_fault(&self) -> Option<StorageFault> {
+        match self {
+            Self::Storage(fault) => Some(*fault),
+            _ => None,
+        }
+    }
+}
+
+impl StorageFaulted for EconomyError {
+    fn storage_fault(&self) -> Option<StorageFault> {
+        match self {
+            Self::Storage(fault) => Some(*fault),
+            _ => None,
+        }
+    }
+}
+
+/// Receives every classified storage failure at the point it is produced.
+///
+/// Implementations must stay allocation-free and nonblocking: they run inside repository
+/// error paths, including those taken while a transaction is unwinding.
+pub trait StorageObserver: Send + Sync + 'static {
+    /// Records one classified failure.
+    fn storage_fault(&self, _fault: StorageFault) {}
+}
+
+/// Discards every fault, so a repository can be built without an exporter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoopStorageObserver;
+
+impl StorageObserver for NoopStorageObserver {}
+
 /// Typed repository failures safe to map to user-facing outcomes.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RepositoryError {
@@ -2639,8 +2870,8 @@ pub enum RepositoryError {
     #[error("persisted data is invalid")]
     CorruptData,
     /// Storage is temporarily or permanently unavailable.
-    #[error("storage operation failed")]
-    Storage,
+    #[error("storage operation failed: {0}")]
+    Storage(StorageFault),
 }
 
 /// Typed handover consumption failures that do not reveal bearer material.
@@ -2662,8 +2893,8 @@ pub enum HandoverError {
     #[error("account is not active")]
     AccountInactive,
     /// Storage failure.
-    #[error("handover storage operation failed")]
-    Storage,
+    #[error("handover storage operation failed: {0}")]
+    Storage(StorageFault),
 }
 
 /// Heap-allocated repository future used to keep domain contracts runtime-neutral.
@@ -3480,5 +3711,107 @@ mod tests {
         assert_eq!(RoomPassword::parse(""), Err(RoomValueError::InvalidLength));
         assert_eq!(RoomSettings::new(1), Err(RoomValueError::InvalidCapacity));
         assert_eq!(RoomSettings::new(30).map(RoomSettings::max_members), Ok(30));
+    }
+
+    #[test]
+    fn storage_fault_labels_are_unique_dense_and_bounded() {
+        // The label set is a metric dimension, so its width is a contract: duplicates
+        // would silently merge two causes, and a sparse index would read the wrong slot.
+        let mut labels: Vec<&str> = StorageFault::ALL.iter().map(|f| f.as_str()).collect();
+        let total = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "every fault label is distinct");
+        for (position, fault) in StorageFault::ALL.into_iter().enumerate() {
+            assert_eq!(fault.index(), position, "index is dense over ALL");
+        }
+        for label in labels {
+            assert!(!label.is_empty());
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "label {label} stays a bare Prometheus-safe token"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlstate_classification_pins_every_class_and_the_two_specific_codes() {
+        for (code, expected) in [
+            ("08006", StorageFault::Connection),
+            ("22003", StorageFault::DataException),
+            ("23505", StorageFault::IntegrityConstraint),
+            ("25P02", StorageFault::TransactionState),
+            ("40001", StorageFault::Serialization),
+            ("40P01", StorageFault::Deadlock),
+            ("40002", StorageFault::TransactionRollback),
+            ("42601", StorageFault::SyntaxOrAccess),
+            ("53300", StorageFault::InsufficientResources),
+            ("54001", StorageFault::ProgramLimitExceeded),
+            ("55P03", StorageFault::ObjectNotInPrerequisiteState),
+            ("57014", StorageFault::OperatorIntervention),
+            ("58030", StorageFault::SystemError),
+            ("P0001", StorageFault::PlPgSqlRaise),
+            ("XX001", StorageFault::InternalError),
+        ] {
+            assert_eq!(
+                StorageFault::from_sqlstate(code),
+                expected,
+                "SQLSTATE {code}"
+            );
+        }
+        // Serialization and deadlock must win over their shared `40` class.
+        assert_ne!(
+            StorageFault::from_sqlstate("40001"),
+            StorageFault::from_sqlstate("40002")
+        );
+        assert_ne!(
+            StorageFault::from_sqlstate("40P01"),
+            StorageFault::from_sqlstate("40002")
+        );
+        // Unknown and malformed input collapses instead of widening the label set.
+        for code in ["", "9", "99999", "zz", "\u{1f600}"] {
+            assert_eq!(StorageFault::from_sqlstate(code), StorageFault::Other);
+        }
+    }
+
+    #[test]
+    fn storage_errors_expose_their_fault_and_never_widen_other_variants() {
+        assert_eq!(
+            RepositoryError::Storage(StorageFault::Deadlock).storage_fault(),
+            Some(StorageFault::Deadlock)
+        );
+        assert_eq!(
+            HandoverError::Storage(StorageFault::Io).storage_fault(),
+            Some(StorageFault::Io)
+        );
+        assert_eq!(
+            MatchRepositoryError::Storage(StorageFault::UnexpectedRowCount).storage_fault(),
+            Some(StorageFault::UnexpectedRowCount)
+        );
+        assert_eq!(
+            EconomyError::Storage(StorageFault::PoolTimedOut).storage_fault(),
+            Some(StorageFault::PoolTimedOut)
+        );
+        assert_eq!(RepositoryError::NotFound.storage_fault(), None);
+        assert_eq!(HandoverError::Expired.storage_fault(), None);
+        assert_eq!(MatchRepositoryError::Aborted.storage_fault(), None);
+        assert_eq!(EconomyError::StackFull.storage_fault(), None);
+    }
+
+    #[test]
+    fn rendered_storage_errors_carry_only_the_bounded_fault_token() {
+        // A fault is exported as a metric label and returned to callers, so its rendering
+        // must stay inside the closed token set and must not gain free-form text.
+        for fault in StorageFault::ALL {
+            let displayed = MatchRepositoryError::Storage(fault).to_string();
+            assert!(
+                displayed.ends_with(fault.as_str()),
+                "{displayed} ends with its bounded token"
+            );
+            assert_eq!(fault.to_string(), fault.as_str());
+            assert!(!format!("{fault:?}").is_empty());
+        }
     }
 }
