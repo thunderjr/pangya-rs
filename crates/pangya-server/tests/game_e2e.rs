@@ -5866,3 +5866,123 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
+    let owner = create_account(&pool, "RetailOwner", 1, 0x1000_0000).await;
+    let guest = create_account(&pool, "RetailGuest", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+
+    async fn connect_retail(
+        pool: &PgPool,
+        address: std::net::SocketAddr,
+        account_id: pangya_domain::AccountId,
+        username: &str,
+    ) -> (TcpStream, u8) {
+        let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+        let (mut stream, key) = connect_game(address).await;
+        send_typed(
+            &mut stream,
+            key,
+            1,
+            &pangya_protocol::RetailGameAuth {
+                username: username.as_bytes().to_vec(),
+                user_id: u32::try_from(account_id.get()).expect("user id"),
+                login_key: zeroize::Zeroizing::new(token.into_bytes()),
+                client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+                session_key: zeroize::Zeroizing::new(Vec::new()),
+            },
+        )
+        .await;
+        // Drain the nine bootstrap frames.
+        for _ in 0..9 {
+            let _ = receive_packet(&mut stream, key).await;
+        }
+        // Enter the channel so room commands are in-state.
+        send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        (stream, key)
+    }
+
+    let (mut host, host_key) =
+        connect_retail(&pool, address, owner.account.id, "RetailOwner").await;
+
+    // Create a room with the retail packet the client actually sends.
+    let mut writer = pangya_protocol::PacketWriter::default();
+    writer.u8(0);
+    writer.u32_le(30_000);
+    writer.u32_le(600_000);
+    writer.u8(4);
+    writer.u8(0);
+    writer.u8(3);
+    writer.u8(1);
+    writer.bytes(&[0; 5]);
+    writer.pstring(b"Retail Room", 64).expect("name");
+    writer.pstring(b"", 64).expect("password");
+    send_packet(&mut host, host_key, 3, 0x0008, &writer.into_inner()).await;
+
+    let (opcode, body) = receive_packet(&mut host, host_key).await;
+    assert_eq!(opcode, 0x0049);
+    // Accepted carries a u16 status then the 210-byte room record.
+    assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0);
+    assert_eq!(body.len(), 2 + pangya_protocol::ROOM_RECORD_BYTES);
+    assert_eq!(&body[2..13], b"Retail Room");
+    let room_id = u16::from_le_bytes([body[2 + 64 + 5 + 17 + 3], body[2 + 64 + 5 + 17 + 4]]);
+    assert_eq!(body[2 + 64 + 3], 4, "capacity");
+    assert_eq!(body[2 + 64 + 4], 1, "occupancy");
+
+    // A second client joins the same room by number.
+    let (mut visitor, visitor_key) =
+        connect_retail(&pool, address, guest.account.id, "RetailGuest").await;
+    let mut join = pangya_protocol::PacketWriter::default();
+    join.u16_le(room_id);
+    join.pstring(b"", 64).expect("password");
+    send_packet(&mut visitor, visitor_key, 3, 0x0009, &join.into_inner()).await;
+    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x0049);
+    assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0);
+    assert_eq!(body[2 + 64 + 4], 2, "room now holds both players");
+
+    // Leaving returns the client to the lobby and re-lists rooms.
+    send_packet(&mut visitor, visitor_key, 4, 0x000f, &[]).await;
+    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x004c);
+    assert_eq!(body, vec![0xff, 0xff]);
+    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x0047);
+    assert_eq!(body[0], 1, "the host's room is still listed");
+
+    // Joining a room number that does not exist is refused, not fatal.
+    let mut bad = pangya_protocol::PacketWriter::default();
+    bad.u16_le(4242);
+    bad.pstring(b"", 64).expect("password");
+    send_packet(&mut visitor, visitor_key, 5, 0x0009, &bad.into_inner()).await;
+    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x0049);
+    assert_eq!(body, vec![18]);
+
+    drop(visitor);
+    drop(host);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}

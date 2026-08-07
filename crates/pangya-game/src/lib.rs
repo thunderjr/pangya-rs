@@ -46,9 +46,10 @@ use pangya_domain::{
     MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig,
     PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
-    RepositoryError, RoomError, RoomId, ServiceKind as DomainServiceKind, SoloMatchResult,
-    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
-    StrokeParticipant, StrokeRosterOrder,
+    RepositoryError, RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot,
+    RoomSummary, ServiceKind as DomainServiceKind, SoloMatchResult, SourceAddressPrefix,
+    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
+    StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -64,10 +65,12 @@ use pangya_protocol::{
     LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailCharacter, RetailEquipment, RetailGameAuth, RetailPlayerIdentity, RetailPlayerStatistics,
-    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
-    RoomCreateRequest, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest,
-    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
+    RetailCharacter, RetailEquipment, RetailGameAuth, RetailHoleProgression, RetailPlayerIdentity,
+    RetailPlayerStatistics, RetailRoom, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomLeave, RetailRoomList, RetailRoomState, RetailRoomType, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
+    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
     SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
     SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
@@ -1269,6 +1272,36 @@ where
                                     .await;
                                 if let Err(error) = handled {
                                     break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && is_retail_room_opcode(frame.opcode)
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if !commands.admit_count(self.config.limits.room_commands_per_window)
+                                {
+                                    self.observer
+                                        .rate_limited(GameRateClass::RoomCommandsConnection);
+                                    break Err(GameRuntimeError::Limited);
+                                }
+                                let handled = tokio::select! {
+                                    biased;
+                                    () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
+                                    handled = self.handle_retail_room_command(
+                                        &mut framed,
+                                        state,
+                                        established,
+                                        outbound.clone(),
+                                        room_cancellation.clone(),
+                                        frame.opcode,
+                                        &frame.payload,
+                                        &mut room_id,
+                                    ) => handled,
+                                };
+                                match handled {
+                                    Ok(next) => state = next,
+                                    Err(error) => break Err(error),
                                 }
                             } else if is_known_room_opcode(frame.opcode) {
                                 let Some(established) = identity.as_ref() else {
@@ -3180,6 +3213,24 @@ where
         {
             return Err(GameRuntimeError::Protocol);
         }
+        // Lobby/room broadcasts are still encoded in the synthetic family. Emitting one
+        // into a retail stream would desynchronize the client far more badly than the
+        // missing information does, so in retail mode they are dropped while their state
+        // effect is preserved. Room census (`0x0048`) is the retail replacement and is not
+        // implemented yet; see `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
+        if self.config.retail_bootstrap {
+            match &event {
+                RoomEvent::Snapshot(_) | RoomEvent::Chat { .. } => {
+                    return Ok(RoomEventEffect::Remain);
+                }
+                RoomEvent::Kicked { .. } => {
+                    self.observer.room(GameRoomObservation::Kicked);
+                    return Ok(RoomEventEffect::EnterChannel);
+                }
+                RoomEvent::Closed => return Ok(RoomEventEffect::EnterChannel),
+                _ => {}
+            }
+        }
         match event {
             RoomEvent::Snapshot(room) => {
                 self.send(framed, &RoomStateResponse { room }).await?;
@@ -3822,6 +3873,169 @@ where
         .await
     }
 
+    /// Handles one retail lobby/room command.
+    ///
+    /// The lobby actor is protocol-agnostic, so this is a wire translation only: retail
+    /// requests map onto the same commands the synthetic path uses, and the actor's
+    /// authoritative results map back onto retail replies.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_retail_room_command(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+        identity: &RoomIdentity,
+        outbound: mpsc::Sender<RoomEvent>,
+        room_cancellation: CancellationToken,
+        opcode: u16,
+        payload: &[u8],
+        room_id: &mut Option<RoomId>,
+    ) -> Result<GameState, GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        match (state, opcode) {
+            (GameState::InChannel, RetailRoomCreate::OPCODE) => {
+                let request =
+                    decode_packet_payload::<RetailRoomCreate>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let Ok(name) = std::str::from_utf8(&request.name)
+                    .map_err(drop)
+                    .and_then(|value| RoomName::parse(value).map_err(drop))
+                else {
+                    return self.reject_retail_join(framed, state).await;
+                };
+                let password = if request.password.is_empty() {
+                    None
+                } else {
+                    match std::str::from_utf8(&request.password)
+                        .map_err(drop)
+                        .and_then(|value| RoomPassword::parse(value).map_err(drop))
+                    {
+                        Ok(value) => Some(value),
+                        Err(()) => return self.reject_retail_join(framed, state).await,
+                    }
+                };
+                let Ok(settings) = RoomSettings::new(request.max_players) else {
+                    return self.reject_retail_join(framed, state).await;
+                };
+                let created = self
+                    .lobby
+                    .create(
+                        name,
+                        password,
+                        settings,
+                        identity.clone(),
+                        outbound,
+                        room_cancellation,
+                    )
+                    .await;
+                match created {
+                    Ok(summary) => {
+                        *room_id = Some(summary.id());
+                        self.observer.room(GameRoomObservation::Created);
+                        let room = retail_room_from_summary(&summary, &request);
+                        self.send(framed, &RetailRoomJoinResult::Accepted(Box::new(room)))
+                            .await?;
+                        Ok(GameState::InRoom)
+                    }
+                    Err(_) => self.reject_retail_join(framed, state).await,
+                }
+            }
+            (GameState::InChannel, RetailRoomJoin::OPCODE) => {
+                let request =
+                    decode_packet_payload::<RetailRoomJoin>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let Ok(target) = RoomId::new(u32::from(request.room_number)) else {
+                    return self.reject_retail_join(framed, state).await;
+                };
+                let password = if request.password.is_empty() {
+                    None
+                } else {
+                    match std::str::from_utf8(&request.password)
+                        .map_err(drop)
+                        .and_then(|value| RoomPassword::parse(value).map_err(drop))
+                    {
+                        Ok(value) => Some(value),
+                        Err(()) => return self.reject_retail_join(framed, state).await,
+                    }
+                };
+                let joined = self
+                    .lobby
+                    .join(
+                        target,
+                        identity.clone(),
+                        password,
+                        outbound,
+                        room_cancellation,
+                    )
+                    .await;
+                match joined {
+                    Ok(snapshot) => {
+                        *room_id = Some(snapshot.summary().id());
+                        self.observer.room(GameRoomObservation::Joined);
+                        self.send(
+                            framed,
+                            &RetailRoomJoinResult::Accepted(Box::new(retail_room_from_snapshot(
+                                &snapshot,
+                            ))),
+                        )
+                        .await?;
+                        Ok(GameState::InRoom)
+                    }
+                    Err(_) => self.reject_retail_join(framed, state).await,
+                }
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE) => {
+                self.lobby
+                    .leave(identity.connection_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                *room_id = None;
+                self.observer.room(GameRoomObservation::Left);
+                self.send(framed, &RetailRoomLeave::to_lobby()).await?;
+                self.send_retail_room_list(framed).await?;
+                Ok(GameState::InChannel)
+            }
+            // A room opcode in the wrong state is a protocol violation, matching the
+            // synthetic path rather than silently tolerating it.
+            _ => Err(GameRuntimeError::Protocol),
+        }
+    }
+
+    /// Refuses a create or join attempt without disclosing which check failed.
+    async fn reject_retail_join(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+    ) -> Result<GameState, GameRuntimeError> {
+        self.send(
+            framed,
+            &RetailRoomJoinResult::Rejected(RoomJoinRejection::CannotCreate),
+        )
+        .await?;
+        Ok(state)
+    }
+
+    /// Sends the lobby's current room list.
+    async fn send_retail_room_list(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+    ) -> Result<(), GameRuntimeError> {
+        let rooms = self
+            .lobby
+            .list()
+            .await
+            .map_err(|_| GameRuntimeError::Protocol)?;
+        let rooms = rooms.iter().map(retail_room_from_summary_only).collect();
+        self.observer.room(GameRoomObservation::Listed);
+        self.send(
+            framed,
+            &RetailRoomList {
+                kind: RoomListKind::Initial,
+                rooms,
+            },
+        )
+        .await
+    }
+
     /// Emits the reference-derived retail bootstrap sequence.
     ///
     /// Order is load-bearing: the client stays on its loading screen until the full
@@ -4335,6 +4549,83 @@ const fn protocol_abort_reason(reason: MatchAbortReason) -> ProtocolMatchAbortRe
         | MatchAbortReason::StartupRecovery
         | MatchAbortReason::PersistenceFailure => ProtocolMatchAbortReason::ServerShutdown,
     }
+}
+
+/// Retail room-leave client opcode.
+const RETAIL_C2S_ROOM_LEAVE: u16 = 0x000f;
+
+/// Builds a retail room record from a lobby summary plus the settings the creator asked
+/// for. The lobby model stores capacity and identity only, so course, timers, and hole
+/// count are echoed from the request rather than invented.
+fn retail_room_from_summary(summary: &RoomSummary, request: &RetailRoomCreate) -> RetailRoom {
+    RetailRoom {
+        name: summary.name().as_str().as_bytes().to_vec(),
+        public: !summary.password_protected(),
+        state: RetailRoomState::Lobby,
+        max_players: summary.max_members(),
+        player_count: summary.members(),
+        hole_count: request.hole_count,
+        room_type: RetailRoomType::from_wire(request.room_type).unwrap_or(RetailRoomType::Versus),
+        id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
+        hole_progression: RetailHoleProgression::FrontStart,
+        course: request.course,
+        shot_timer_ms: request.shot_timer_ms,
+        game_timer_ms: request.game_timer_ms,
+        owner_uid: 0,
+        natural_wind: false,
+    }
+}
+
+/// Builds a retail room record from a summary alone, for the lobby list.
+fn retail_room_from_summary_only(summary: &RoomSummary) -> RetailRoom {
+    RetailRoom {
+        name: summary.name().as_str().as_bytes().to_vec(),
+        public: !summary.password_protected(),
+        state: RetailRoomState::Lobby,
+        max_players: summary.max_members(),
+        player_count: summary.members(),
+        hole_count: 1,
+        room_type: RetailRoomType::Versus,
+        id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
+        hole_progression: RetailHoleProgression::FrontStart,
+        course: 0,
+        shot_timer_ms: 30_000,
+        game_timer_ms: 600_000,
+        owner_uid: 0,
+        natural_wind: false,
+    }
+}
+
+/// Builds a retail room record from a joined room's authoritative snapshot.
+fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
+    let summary = snapshot.summary();
+    RetailRoom {
+        name: summary.name().as_str().as_bytes().to_vec(),
+        public: !summary.password_protected(),
+        state: RetailRoomState::Lobby,
+        max_players: summary.max_members(),
+        player_count: u8::try_from(snapshot.members().len()).unwrap_or(u8::MAX),
+        hole_count: 1,
+        room_type: RetailRoomType::Versus,
+        id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
+        hole_progression: RetailHoleProgression::FrontStart,
+        course: 0,
+        shot_timer_ms: 30_000,
+        game_timer_ms: 600_000,
+        owner_uid: 0,
+        natural_wind: false,
+    }
+}
+
+/// Retail lobby/room client opcodes.
+///
+/// Deliberately disjoint from the synthetic family, so enabling the retail path cannot
+/// silently reinterpret a synthetic frame.
+fn is_retail_room_opcode(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        RetailRoomCreate::OPCODE | RetailRoomJoin::OPCODE | RETAIL_C2S_ROOM_LEAVE
+    )
 }
 
 fn is_known_room_opcode(opcode: u16) -> bool {
