@@ -527,6 +527,86 @@ mod tests {
         assert_eq!(chunks[0].opcode(), 0x0071);
     }
 
+    fn sample_reply() -> HandoverReply {
+        HandoverReply {
+            server_name: b"pangya-rs".to_vec(),
+            identity: RetailPlayerIdentity {
+                username: b"player".to_vec(),
+                nickname: b"Nick".to_vec(),
+                connection_id: 7,
+                user_id: 42,
+            },
+            statistics: RetailPlayerStatistics::default(),
+            equipment: RetailEquipment {
+                caddie_uid: 0,
+                character_uid: 1,
+                club_set_uid: 2,
+                comet_iff_id: 0x1400_0000,
+                item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+            },
+            character: RetailCharacter {
+                iff_id: 0x0400_0000,
+                uid: 1,
+                hair_color: 0,
+                part_iff_ids: [0; CHARACTER_PARTS],
+                part_uids: [0; CHARACTER_PARTS],
+                stats: [0; CHARACTER_STATS],
+                mastery: 0,
+            },
+            caddie: RetailCaddie::default(),
+            server_time: [0; 16],
+            disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
+        }
+    }
+
+    #[test]
+    fn statistics_block_is_exactly_the_reference_width() {
+        let mut writer = PacketWriter::default();
+        RetailPlayerStatistics::default().encode_body(&mut writer);
+        assert_eq!(writer.as_slice().len(), PLAYER_STATISTICS_BYTES);
+    }
+
+    #[test]
+    fn course_statistics_block_is_forty_three_bytes() {
+        let mut writer = PacketWriter::default();
+        RetailCourseStatistics { course: 3 }.encode_body(&mut writer);
+        assert_eq!(writer.as_slice().len(), 43);
+        assert_eq!(writer.as_slice()[0], 3);
+    }
+
+    #[test]
+    fn character_block_is_five_hundred_thirteen_bytes() {
+        let mut writer = PacketWriter::default();
+        sample_reply().character.encode_body(&mut writer);
+        assert_eq!(writer.as_slice().len(), 513);
+    }
+
+    #[test]
+    fn caddie_block_is_twenty_five_bytes() {
+        let mut writer = PacketWriter::default();
+        RetailCaddie::default().encode_body(&mut writer);
+        assert_eq!(writer.as_slice().len(), 25);
+    }
+
+    #[test]
+    fn handover_reply_announces_852_and_carries_the_full_history_block() {
+        let payload = encode_packet_payload(&sample_reply(), &profile()).expect("encode");
+        // Subtype byte, then the version PString the client checks. PStrings carry a
+        // little-endian u16 length, so the text itself starts at offset 3.
+        assert_eq!(payload[0], 0x00);
+        assert_eq!(
+            u16::from_le_bytes([payload[1], payload[2]]),
+            US852_SERVER_VERSION.len() as u16
+        );
+        assert_eq!(
+            &payload[3..3 + US852_SERVER_VERSION.len()],
+            US852_SERVER_VERSION
+        );
+        // The 12x21 history block dominates the packet; a reply that omits it would be
+        // more than ten kilobytes short and would strand the client on its loading screen.
+        assert!(payload.len() > HISTORY_SEASONS * HISTORY_COURSES * 43);
+    }
+
     #[test]
     fn container_chunk_body_is_exact() {
         let chunks =
@@ -538,5 +618,312 @@ mod tests {
             .expect("encode");
         assert_eq!(writer.as_slice(), &[1, 0, 1, 0, 1, 2, 3, 4]);
         assert_eq!(chunks[0].opcode(), 0x0070);
+    }
+}
+
+/// Exact wire width of the retail player-statistics block.
+pub const PLAYER_STATISTICS_BYTES: usize = 239;
+/// Exact wire width of the retail trophy block.
+pub const PLAYER_TROPHIES_BYTES: usize = 78;
+/// Seasons carried by the historical statistics block.
+pub const HISTORY_SEASONS: usize = 12;
+/// Courses carried per season by the historical statistics block.
+pub const HISTORY_COURSES: usize = 21;
+/// Character part slots.
+pub const CHARACTER_PARTS: usize = 24;
+/// Character auxiliary part slots.
+pub const CHARACTER_AUX_PARTS: usize = 5;
+/// Character stat slots: power, control, accuracy, spin, curve.
+pub const CHARACTER_STATS: usize = 5;
+/// Character card slots.
+pub const CHARACTER_CARDS: usize = 12;
+/// Fixed guild-info tail width.
+const GUILD_INFO_BYTES: usize = 277;
+
+/// Retail cumulative player statistics.
+///
+/// The client renders several of these directly, so the named fields are the ones worth
+/// getting right; every remaining byte in the block is deliberately zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailPlayerStatistics {
+    /// Lifetime shots.
+    pub total_shots: u32,
+    /// Lifetime putts.
+    pub total_putts: u32,
+    /// Lifetime play time in seconds.
+    pub play_time_seconds: u32,
+    /// Lifetime holes.
+    pub total_holes: u32,
+    /// Lifetime hole-in-ones.
+    pub hole_in_ones: u32,
+    /// Accumulated experience.
+    pub experience: u32,
+    /// Current level.
+    pub level: u8,
+    /// Sum of final scores; under par is negative.
+    pub total_score: i32,
+    /// Completed games, used by the client's quit-rate display.
+    pub games_played: u32,
+    /// Abandoned games, the other half of the quit rate.
+    pub games_quit: u32,
+}
+
+impl RetailPlayerStatistics {
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        let start = writer.as_slice().len();
+        writer.u32_le(self.total_shots);
+        writer.u32_le(self.total_putts);
+        writer.u32_le(self.play_time_seconds);
+        writer.u32_le(0); // shot time seconds
+        writer.f32_le(0.0); // longest drive
+        writer.u32_le(0); // pangya shots
+        writer.u32_le(0); // timeouts
+        writer.u32_le(0); // out-of-bounds shots
+        writer.u32_le(0); // total distance
+        writer.u32_le(self.total_holes);
+        writer.u32_le(0); // unfinished holes
+        writer.u32_le(self.hole_in_ones);
+        writer.u16_le(0); // bunker shots
+        writer.u32_le(0); // fairway shots
+        writer.u32_le(0); // albatross
+        writer.u32_le(0);
+        writer.u32_le(0); // successful putts
+        writer.f32_le(0.0); // longest putt
+        writer.f32_le(0.0); // longest chip-in
+        writer.u32_le(self.experience);
+        writer.u8(self.level);
+        writer.u64_le(0); // lifetime Pang earned
+        writer.u32_le(self.total_score as u32);
+        writer.bytes(&[0; 5]);
+        writer.u8(0);
+        for _ in 0..6 {
+            writer.u64_le(0);
+        }
+        writer.u32_le(self.games_played);
+        writer.u32_le(0); // team holes
+        writer.u32_le(0); // team wins
+        writer.u32_le(0); // team games
+        for _ in 0..5 {
+            writer.u32_le(0); // ladder point/hole/win/lose/draw
+        }
+        writer.u32_le(0); // combo current streak
+        writer.u32_le(0); // combo best streak
+        writer.u32_le(self.games_quit);
+        writer.u32_le(0); // Pang won in battle
+        for _ in 0..5 {
+            writer.u32_le(0);
+        }
+        writer.bytes(&[0; 10]);
+        writer.u32_le(0);
+        writer.bytes(&[0; 8]);
+        debug_assert_eq!(writer.as_slice().len() - start, PLAYER_STATISTICS_BYTES);
+    }
+}
+
+/// Retail per-course historical statistics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailCourseStatistics {
+    /// Course ordinal within the fixed 21-course table.
+    pub course: u8,
+}
+
+impl RetailCourseStatistics {
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u8(self.course);
+        for _ in 0..6 {
+            writer.u32_le(0); // strokes, putts, holes, fairway, hole-in-ones, unknown
+        }
+        writer.u32_le(0); // total score
+        writer.u8(0); // best score
+        writer.u64_le(0); // best Pang earned
+        writer.u32_le(0); // character used for the best score
+        writer.u8(0);
+    }
+}
+
+/// Retail equipped-character block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailCharacter {
+    /// Catalog id.
+    pub iff_id: u32,
+    /// Inventory id.
+    pub uid: u32,
+    /// Selected hair colour.
+    pub hair_color: u32,
+    /// Catalog ids of fitted parts.
+    pub part_iff_ids: [u32; CHARACTER_PARTS],
+    /// Inventory ids of fitted parts.
+    pub part_uids: [u32; CHARACTER_PARTS],
+    /// Stat points: power, control, accuracy, spin, curve.
+    pub stats: [u8; CHARACTER_STATS],
+    /// Accumulated character mastery.
+    pub mastery: u32,
+}
+
+impl RetailCharacter {
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u32_le(self.iff_id);
+        writer.u32_le(self.uid);
+        writer.u32_le(self.hair_color);
+        for id in self.part_iff_ids {
+            writer.u32_le(id);
+        }
+        for id in self.part_uids {
+            writer.u32_le(id);
+        }
+        writer.bytes(&[0; 216]);
+        for _ in 0..CHARACTER_AUX_PARTS {
+            writer.u32_le(0);
+        }
+        writer.u32_le(0); // cut-in catalog id
+        writer.bytes(&[0; 12]);
+        for stat in self.stats {
+            writer.u8(stat);
+        }
+        writer.u32_le(self.mastery);
+        for _ in 0..CHARACTER_CARDS {
+            writer.u32_le(0);
+        }
+    }
+}
+
+/// Retail equipped-caddie block. A zeroed value encodes "no caddie".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailCaddie {
+    /// Inventory id.
+    pub uid: u32,
+    /// Catalog id.
+    pub iff_id: u32,
+    /// Current level.
+    pub level: u8,
+    /// Accumulated experience.
+    pub experience: u32,
+}
+
+impl RetailCaddie {
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u32_le(self.uid);
+        writer.u32_le(self.iff_id);
+        writer.u32_le(0);
+        writer.u8(self.level);
+        writer.u32_le(self.experience);
+        writer.u64_le(0);
+    }
+}
+
+/// Identity fields the client shows in the lobby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailPlayerIdentity {
+    /// Authentication name.
+    pub username: Vec<u8>,
+    /// Display nickname.
+    pub nickname: Vec<u8>,
+    /// Per-connection identifier.
+    pub connection_id: u32,
+    /// Durable numeric account identifier.
+    pub user_id: u32,
+}
+
+impl RetailPlayerIdentity {
+    fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
+        writer.u16_le(0xffff); // room id; 0xffff means "not in a room"
+        writer.fixed_nul(&self.username, 22)?;
+        writer.fixed_nul(&self.nickname, 22)?;
+        writer.fixed_nul(&[], 17)?; // guild name
+        writer.fixed_nul(&[], 24)?; // guild image
+        writer.u32_le(self.connection_id);
+        writer.bytes(&[0; 12]);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u16_le(0);
+        writer.bytes(&[0; 6]);
+        writer.bytes(&[0; 16]);
+        writer.fixed_nul(&[], 128)?; // global id
+        writer.u32_le(self.user_id);
+        Ok(())
+    }
+}
+
+/// Full retail handover reply, server opcode `0x0044` subtype `0x00`.
+///
+/// This is the packet that releases the client from its loading screen into the lobby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoverReply {
+    /// Server display name.
+    pub server_name: Vec<u8>,
+    /// Lobby identity fields.
+    pub identity: RetailPlayerIdentity,
+    /// Cumulative statistics.
+    pub statistics: RetailPlayerStatistics,
+    /// Equipment selections.
+    pub equipment: RetailEquipment,
+    /// Equipped character.
+    pub character: RetailCharacter,
+    /// Equipped caddie.
+    pub caddie: RetailCaddie,
+    /// Packed server time.
+    pub server_time: [u8; 16],
+    /// Feature-disable flags; `1 << 18` is the known-good baseline.
+    pub disabled_features: u64,
+}
+
+impl HandoverReply {
+    /// Feature-flag value the reference server uses.
+    pub const DEFAULT_DISABLED_FEATURES: u64 = 1 << 18;
+}
+
+impl EncodePacket for HandoverReply {
+    const OPCODE: u16 = 0x0044;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(0x00); // full-reply subtype
+        writer.pstring(US852_SERVER_VERSION, MAX_BOOTSTRAP_STRING_BYTES)?;
+        writer.pstring(&self.server_name, MAX_BOOTSTRAP_STRING_BYTES)?;
+        self.identity.encode_body(writer)?;
+        self.statistics.encode_body(writer);
+        // Trophies: amateur 6..1 then pro 1..7, each gold/silver/bronze.
+        writer.u16_le(1);
+        writer.bytes(&[0; PLAYER_TROPHIES_BYTES - 4]);
+        writer.u16_le(1);
+        self.equipment.encode_body(writer);
+        for _ in 0..HISTORY_SEASONS {
+            for course in 0..HISTORY_COURSES {
+                RetailCourseStatistics {
+                    course: u8::try_from(course).unwrap_or(0),
+                }
+                .encode_body(writer);
+            }
+        }
+        self.character.encode_body(writer);
+        self.caddie.encode_body(writer);
+        // Active club set; the client appears to ignore this block entirely.
+        writer.u32_le(self.equipment.club_set_uid);
+        writer.u32_le(0);
+        for _ in 0..10 {
+            writer.u16_le(0);
+        }
+        // Active mascot.
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u8(0);
+        writer.u32_le(0);
+        writer.fixed_nul(b"0", 16)?;
+        writer.bytes(&[0; 33]);
+        writer.bytes(&self.server_time);
+        writer.u16_le(0);
+        for _ in 0..3 {
+            writer.u16_le(0); // papel shop
+        }
+        writer.u32_le(0);
+        writer.u64_le(self.disabled_features);
+        writer.u32_le(0); // login count
+        writer.u32_le(0); // server flags
+        writer.bytes(&[0; GUILD_INFO_BYTES]);
+        Ok(())
     }
 }

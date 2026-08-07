@@ -82,10 +82,13 @@ pub use profile::{
 pub use reader::PacketReader;
 pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
 pub use us852_bootstrap::{
-    CHANNEL_NAME_BYTES, EQUIPPED_ITEM_SLOTS, HandoverControl, HandoverRejection,
-    IFF_CONTAINER_CHUNK_ENTRIES, IffContainerChunk, IffContainerKind, MAX_BOOTSTRAP_STRING_BYTES,
-    MAX_SERVER_CHANNELS, RetailChannel, RetailEquipment, RetailGameAuth, ServerChannelList,
-    US852_SERVER_VERSION,
+    CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_CARDS, CHARACTER_PARTS, CHARACTER_STATS,
+    EQUIPPED_ITEM_SLOTS, HISTORY_COURSES, HISTORY_SEASONS, HandoverControl, HandoverRejection,
+    HandoverReply, IFF_CONTAINER_CHUNK_ENTRIES, IffContainerChunk, IffContainerKind,
+    MAX_BOOTSTRAP_STRING_BYTES, MAX_SERVER_CHANNELS, PLAYER_STATISTICS_BYTES,
+    PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter, RetailCourseStatistics,
+    RetailEquipment, RetailGameAuth, RetailPlayerIdentity, RetailPlayerStatistics,
+    ServerChannelList, US852_SERVER_VERSION,
 };
 pub use writer::PacketWriter;
 
