@@ -9,6 +9,7 @@ scan_files() {
     -path "$root/target" -prune -o \
     -path "$root/fuzz/target" -prune -o \
     -path "$root/opensource-references" -prune -o \
+    -path "$root/local-data" -prune -o \
     -type f "$@" -print
 }
 
