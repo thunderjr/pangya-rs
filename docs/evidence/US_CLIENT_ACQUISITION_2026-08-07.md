@@ -66,10 +66,16 @@ names the protocol generation, is corroborated five ways, and is the discriminat
 vendored reference uses. The artifact this project actually targets and tests against is the
 one recorded above.
 
-**This reconciliation is inference from converging sources, not proof.** It is falsifiable
-by the client itself: the first retail layout exchange that the client accepts or rejects
-tests it directly. Until then no layout in this repository may be described as
-client-verified.
+**Update — the wire settles it.** The retail `0x0044` handover reply requires the server to
+send its version as the PString `"852.00"`, and the client has a dedicated
+`SERVER_VERSION_MISSMATCH` error for a mismatch. A client whose content patches run to 851
+therefore expects a server identifying as 852.00. Archive "851" is the content patch level;
+"852.00" is the protocol/build version carried on the wire. `CompatibilityProfile::US_852`
+is correct and stays. See
+[`../protocol/US852_RETAIL_BOOTSTRAP.md`](../protocol/US852_RETAIL_BOOTSTRAP.md).
+
+This resolves the naming question but proves nothing about layout correctness. No layout in
+this repository may be described as client-verified until the client accepts it.
 
 ## Tooling implications
 
