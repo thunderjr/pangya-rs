@@ -264,9 +264,14 @@ With everything above in place the client:
 - then, roughly 20 seconds in, throws a C++ exception and exits.
 
 It writes its own crash report next to the executable — `exception.log`, `stack.log`, and
-`exception.dmp`. The top frames are inside `ProjectG.exe`; the nearest symbols are its
-window/render factory (`RFWindowFactoryManager`). No socket is ever opened to LoginService,
-so nothing about the game protocol has been exercised yet.
+`exception.dmp`. No socket is ever opened to LoginService, so nothing about the game protocol
+has been exercised yet.
+
+Do not read the symbol names in that report as a location. `ProjectG.exe` is packed with
+randomized section names, so every frame resolves to the nearest export plus an offset in the
+hundreds of kilobytes; they say nothing about which subsystem failed. Attaching `cdb` does not
+help either — the packer's anti-debugging raises streams of privileged-instruction,
+illegal-instruction, and `int 1` faults long before the real throw.
 
 Ruled out as causes: the audio device, all three HTTP prerequisites, `IntegratedPak`,
 GameGuard (disabled, and confirmed not loaded), Rugburn's cosmetic US 852 patches (a build

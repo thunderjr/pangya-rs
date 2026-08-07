@@ -98,9 +98,26 @@ Both were real and are fixed.
 
 The client exits about **20 seconds** in, consistently, throwing a C++ exception
 (`0xE06D7363`) from inside `ProjectG.exe`. It writes its own `exception.log`, `stack.log`, and
-`exception.dmp`; the nearest symbols to the throwing frames are its window/render factory
-(`RFWindowFactoryManager`). **No socket is ever opened to LoginService**, so no part of the
-game protocol has been exercised by a real client yet.
+`exception.dmp`. **No socket is ever opened to LoginService**, so no part of the game protocol
+has been exercised by a real client yet.
+
+Two things about that crash report are worth stating so they are not over-read:
+
+- **The symbol names in it mean nothing.** Every frame resolves to
+  `RFSingleton<RFWindowFactoryManager>::_singleton+0x…` or
+  `RFMatrixTransform2DPoint+0x…` with offsets in the hundreds of kilobytes. `ProjectG.exe` is
+  packed with randomized section names, so those are simply the nearest exports before a large
+  unpacked region. They are not evidence that the fault is in the window or render subsystem,
+  and an earlier reading of them as such was wrong.
+- **The minidump holds only stack memory.** The throwing frame's `_CxxThrowException` arguments
+  show an exception object carrying a `std::string` of 23 characters, but the heap buffer it
+  points at is not in the dump, so the message itself is not recoverable from it.
+
+Attaching a debugger does not currently help: under `cdb` the client raises a stream of
+first-chance privileged-instruction (`0xC0000096`), illegal-instruction (`0xC000001D`), and
+`int 1` faults before reaching the original failure. That is the packer's anti-debugging, so
+getting a first-chance report for the real throw needs anti-anti-debug tooling, not just a
+debugger.
 
 Eliminated as causes, each by direct observation:
 
@@ -119,7 +136,7 @@ Eliminated as causes, each by direct observation:
 | Missing launcher argument | Rugburn sets `PANGYA_ARG`; also passed explicitly on the command line |
 | A `.dat` string-table mismatch | `english.dat` and `korea.dat` both read successfully and both hold exactly 3,994 index-aligned entries |
 
-The remaining work is client-side reverse engineering of a packed, stripped binary and is
+The remaining work is client-side reverse engineering of a packed, anti-debugged binary and is
 recorded as an open blocker in `PROGRESS.md`, not as a server defect.
 
 ## 6. Test-harness note
