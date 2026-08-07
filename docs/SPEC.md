@@ -1154,9 +1154,33 @@ Minimum metrics:
 - active rooms and matches;
 - room command queue utilization/drops;
 - DB pool utilization and query latency classes;
-- match start/finish/abort and reward-commit outcomes.
+- match start/finish/abort and reward-commit outcomes;
+- storage faults by classified cause.
 
 Never label metrics with username, nickname, token, arbitrary IP, room name, or message text.
+
+#### Storage faults
+
+`pangya_storage_faults_total{fault="..."}` counts every storage failure a repository
+produces, classified by cause. The label set is the closed `StorageFault` enum, so the
+dimension's width is fixed at compile time and every series is exported from process
+start rather than appearing on first failure.
+
+A fault is derived only from the `SQLSTATE` class, the driver's own failure kind, or a
+server-side consistency check. Server message text, statement text, bound parameters, and
+row values are never read, so a fault is safe to export, log, and return to a caller.
+This is what makes the classification safe to attach to the error itself: `Storage`
+variants carry their fault, so a failure explains its own cause at every layer that
+handles it, including test assertions.
+
+Three faults are server-side rather than database-reported and are worth distinguishing
+when reading a dashboard: `unexpected_row_count` and `write_verification` mean a statement
+succeeded but violated an invariant the repository enforces, and `unsupported` means a
+composed repository has no implementation for the operation at all. `plpgsql_raise`
+(`SQLSTATE` class `P0`) is what the test suite's fault injection produces.
+
+Bootstrap remains outside this dimension: pool construction and migration run before the
+exporter exists, and their failures are already fatal and typed.
 
 ### 17.3 Health semantics
 

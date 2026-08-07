@@ -274,7 +274,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 9. **Real M7 economy exit** — validate catalog-priced purchase/equip/consume/repair against a legally held client; never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
 10. **Synthetic-to-retail protocol pivot** — the `0x7f**` families are placeholders no real client will ever send. Every M3–M7 real-client gate is blocked behind replacing them with layouts derived from the vendored PacketDoc definitions, and behind correcting the three M3 bootstrap opcodes whose current meanings disagree with PacketDoc (`0x0070`, `0x0072`, `0x004d`).
 11. **Client runtime host** — the acquired client is a Windows x86 binary; extraction and parsing are host-agnostic, but running it under Rugburn needs Windows, Wine, or a VM. Unresolved.
-12. **Undiagnosed storage flake** — `concurrent_stroke_matches_with_shared_accounts_are_deadlock_free` has failed once in CI with `MatchRepositoryError::Storage`, and passes on re-run. It did not reproduce in 67 isolated runs or in repeated full-suite runs under heavy contention, and a lock cycle is not reachable: both commits sort their account ids and take `FOR UPDATE` on the same shared profile row, so one simply waits. `match_db_error` discards the `sqlx::Error` outright, so the SQLSTATE that would settle this is never observed. Recording rather than guessing: making it diagnosable means either giving a deliberately logging-free crate a `tracing` dependency or widening `MatchRepositoryError::Storage` to carry the code — a design decision, not a test fix.
+12. **Undiagnosed storage flake** — `concurrent_stroke_matches_with_shared_accounts_are_deadlock_free` has failed once in CI with `MatchRepositoryError::Storage`, and passes on re-run. It did not reproduce in 67 isolated runs or in repeated full-suite runs under heavy contention, and a lock cycle is not reachable: both commits sort their account ids and take `FOR UPDATE` on the same shared profile row, so one simply waits. **Now instrumented rather than open**: `Storage` carries a classified `StorageFault`, so the next occurrence names its own cause in the panic message — `deadlock` and `serialization` would disprove the analysis above, `unexpected_row_count` or `write_verification` would move the fault to the repository's own invariants, and `insufficient_resources` or `pool_timed_out` would make it contention rather than a defect. No guess was committed; the recurrence now identifies itself.
 
 ---
 
@@ -289,6 +289,14 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 ---
 
 ## Change log
+
+### 2026-08-07 — storage failures became self-describing
+
+- Storage failures now carry a classified `StorageFault` instead of collapsing into an opaque `Storage` variant. The classification reads only the `SQLSTATE`, the driver's failure kind, or a server-side consistency check — never message text, statement text, bound parameters, or row values — so it is safe to return to a caller, log, and export.
+- `pangya_storage_faults_total{fault="..."}` exports the closed fault set. Every series is present from process start, so the dimension's width is fixed at compile time rather than growing on first failure; a test pins uniqueness, density, and label shape against the enum itself.
+- Every repository entry point reports faults: all twenty-two trait methods plus both inherent public methods. Observation is a pure side channel, proven by a test that runs the same operations with and without an observer and asserts identical outcomes.
+- Six real `SQLSTATE`s are raised through PostgreSQL and the driver in an integration test, pinning the whole chain from server error to classified fault to observer. This is what makes blocker 12 self-identifying on its next occurrence rather than open.
+- Separating `unexpected_row_count` and `write_verification` from database-reported faults means a repository-invariant violation can no longer hide inside the same counter as a genuine database error.
 
 ### 2026-08-07 — retail pivot begins: client acquired, catalog and bootstrap contract established
 
