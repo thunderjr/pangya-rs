@@ -5,6 +5,7 @@
 
 //! Testable configuration and M2/M3 modular-monolith composition.
 
+pub mod client_web;
 pub mod configuration;
 
 use std::{
@@ -19,10 +20,10 @@ use std::{
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
-use pangya_data::Catalog;
+use pangya_data::{Catalog, CatalogKind};
 use pangya_domain::{
-    EconomyRepository, HandoverRepository, MatchRepository, NewAccount, Nickname, PlayerRepository,
-    RepositoryError, StorageObserver, Username,
+    CourseId, EconomyRepository, HandoverRepository, ItemTypeId, MatchRepository, NewAccount,
+    Nickname, OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver, Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -159,6 +160,15 @@ pub enum ServerError {
     /// Bounded catalog load or starter cross-check failed.
     #[error("catalog loading or validation failed")]
     Data,
+    /// The client patch/theme web content could not be prepared.
+    #[error("the client web service content could not be prepared")]
+    ClientWeb,
+    /// The loaded catalog carries no par and configuration declared none either.
+    #[error(
+        "the configured catalog carries no course par, so course_par must be declared for \
+         every enabled game mode"
+    )]
+    MissingCoursePar,
 }
 
 /// Executes a parsed command.
@@ -234,14 +244,38 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
     Ok((login, http, game))
 }
 
+/// Resolves the one-hole course a mode will play, preferring an operator-declared par.
+///
+/// A declared par wins over a catalog-derived one so that an operator can always override a
+/// generated catalog's value; a catalog with no par of its own then requires the declaration.
+fn resolve_one_hole_course(
+    catalog: &Catalog,
+    course_id: CourseId,
+    declared_par: Option<u8>,
+) -> Result<OneHoleConfig, ServerError> {
+    match declared_par {
+        Some(par) => catalog
+            .declared_one_hole_course(course_id, par)
+            .map_err(|_| ServerError::Data),
+        None => catalog.one_hole_course(course_id).map_err(|error| {
+            // Distinguish "this catalog has no par to give" from "this course is not in the
+            // catalog", because only the first one is fixed by editing configuration.
+            if catalog.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {
+                ServerError::MissingCoursePar
+            } else {
+                let _ = error;
+                ServerError::Data
+            }
+        }),
+    }
+}
+
 fn resolve_solo_runtime_config(
     catalog: &Catalog,
     solo: Option<configuration::ValidatedSoloPractice>,
 ) -> Result<Option<SoloRuntimeConfig>, ServerError> {
     solo.map(|solo| {
-        let course = catalog
-            .one_hole_course(solo.course_id)
-            .map_err(|_| ServerError::Data)?;
+        let course = resolve_one_hole_course(catalog, solo.course_id, solo.course_par)?;
         Ok(SoloRuntimeConfig {
             course,
             catalog_fingerprint: catalog.fingerprint(),
@@ -261,9 +295,7 @@ fn resolve_stroke_runtime_config(
 ) -> Result<Option<StrokeRuntimeConfig>, ServerError> {
     stroke
         .map(|stroke| {
-            let course = catalog
-                .one_hole_course(stroke.course_id)
-                .map_err(|_| ServerError::Data)?;
+            let course = resolve_one_hole_course(catalog, stroke.course_id, stroke.course_par)?;
             Ok(StrokeRuntimeConfig {
                 course,
                 catalog_fingerprint: catalog.fingerprint(),
@@ -290,7 +322,10 @@ where
 {
     GameService::new(repository, catalog, config, observer)
         .map(Arc::new)
-        .map_err(|_| ServerError::Runtime)
+        .map_err(|error| {
+            tracing::error!(service = "game", %error, "service composition rejected the configuration");
+            ServerError::Runtime
+        })
 }
 
 async fn serve(config: AppConfig) -> Result<(), ServerError> {
@@ -366,6 +401,44 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     )
     .await?;
 
+    // Prepared before readiness is claimed and before any client can ask for it. Building the
+    // update list checksums the whole client directory, so it runs on a blocking worker rather
+    // than stalling the runtime, and a directory that cannot be read fails startup here with an
+    // actionable message instead of becoming the client's "please re-install the game" dialog.
+    let client_web = match config.client_web.clone() {
+        Some(settings) => {
+            let prepared = tokio::task::spawn_blocking(move || {
+                let state = client_web::ClientWebState::prepare(&client_web::ClientWebSettings {
+                    advertise: settings.advertise,
+                    region: settings.region,
+                    client_directory: settings.client_directory.clone(),
+                    entries: settings.entries,
+                    patch_version: settings.patch_version.clone(),
+                    patch_number: settings.patch_number,
+                    translation_catalog: settings.translation_catalog.clone(),
+                    theme_directory: settings.theme_directory.clone(),
+                })?;
+                Ok::<_, client_web::ClientWebError>((settings.bind, state))
+            })
+            .await
+            .map_err(|_| ServerError::Runtime)?
+            .map_err(|error| {
+                tracing::error!(%error, "client web service preparation failed");
+                ServerError::ClientWeb
+            })?;
+            let (bind, state) = prepared;
+            let listener = TcpListener::bind(bind)
+                .await
+                .map_err(|_| ServerError::Bind)?;
+            tracing::info!(
+                update_list_bytes = state.update_list_bytes().len(),
+                "client patch web service ready"
+            );
+            Some((listener, state))
+        }
+        None => None,
+    };
+
     let health = Arc::new(HealthState::new(
         Arc::clone(&metrics),
         config.heartbeat_stale_after,
@@ -420,23 +493,33 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
             },
             metrics.clone(),
         )
-        .map_err(|_| ServerError::Runtime)?,
+        .map_err(|error| {
+            tracing::error!(service = "login", %error, "service composition rejected the configuration");
+            ServerError::Runtime
+        })?,
     );
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let login_shutdown = shutdown.child_token();
     tasks.spawn(async move {
+        // The typed listener error is recorded before it collapses into the supervisor's
+        // single Runtime outcome. Without this a listener that dies during startup takes the
+        // whole process down while saying only "required runtime task exited".
         login
             .serve(login_listener, login_shutdown)
             .await
-            .map_err(|_| ServerError::Runtime)
+            .map_err(|error| {
+                tracing::error!(service = "login", %error, "listener stopped with an error");
+                ServerError::Runtime
+            })
     });
     if let (Some(game), Some(listener)) = (game, game_listener) {
         let game_shutdown = shutdown.child_token();
         tasks.spawn(async move {
-            game.serve(listener, game_shutdown)
-                .await
-                .map_err(|_| ServerError::Runtime)
+            game.serve(listener, game_shutdown).await.map_err(|error| {
+                tracing::error!(service = "game", %error, "listener stopped with an error");
+                ServerError::Runtime
+            })
         });
     }
     let http_shutdown = shutdown.child_token();
@@ -444,8 +527,26 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     tasks.spawn(async move {
         serve_admin(http_listener, http_health, http_shutdown)
             .await
-            .map_err(|_| ServerError::Runtime)
+            .map_err(|error| {
+                tracing::error!(service = "admin_http", %error, "listener stopped with an error");
+                ServerError::Runtime
+            })
     });
+    if let Some((listener, state)) = client_web {
+        let client_web_shutdown = shutdown.child_token();
+        tasks.spawn(async move {
+            client_web::serve_client_web(listener, state, client_web_shutdown)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        service = "client_web",
+                        %error,
+                        "listener stopped with an error"
+                    );
+                    ServerError::Runtime
+                })
+        });
+    }
     let heartbeat_shutdown = shutdown.child_token();
     let heartbeat_health = Arc::clone(&health);
     tasks.spawn(async move {
@@ -1154,6 +1255,7 @@ mod tests {
             .join("../pangya-data/tests/fixtures/synthetic-catalog");
         let catalog = Catalog::load(&root, Path::new("manifest.toml")).expect("catalog");
         let invalid_course = configuration::ValidatedSoloPractice {
+            course_par: None,
             course_id: CourseId::new(u32::MAX).expect("course"),
             loading_timeout: Duration::from_secs(5),
             commit_timeout: Duration::from_secs(1),
@@ -1213,6 +1315,7 @@ mod tests {
             bind_after_startup_recovery(
                 task_repository.as_ref(),
                 Some(configuration::ValidatedSoloPractice {
+                    course_par: None,
                     course_id: CourseId::new(7).expect("course"),
                     loading_timeout: Duration::from_secs(5),
                     commit_timeout: Duration::from_secs(1),
@@ -1221,6 +1324,7 @@ mod tests {
                     shot_packets_per_window: 80,
                 }),
                 Some(configuration::ValidatedStrokeTwo {
+                    course_par: None,
                     course_id: CourseId::new(7).expect("course"),
                     loading_timeout: Duration::from_secs(4),
                     turn_timeout: Duration::from_secs(5),

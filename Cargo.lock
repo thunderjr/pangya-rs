@@ -1337,6 +1337,8 @@ dependencies = [
 name = "pangya-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "cap-std",
  "clap",
  "config",
  "humantime",
@@ -1348,6 +1350,7 @@ dependencies = [
  "pangya-observability",
  "pangya-protocol",
  "pangya-storage",
+ "pangya-updater",
  "serde",
  "serde_json",
  "sqlx",
@@ -1372,6 +1375,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pangya-updater"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cap-std",
+ "chrono",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

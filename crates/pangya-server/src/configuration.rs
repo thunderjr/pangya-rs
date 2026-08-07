@@ -11,8 +11,8 @@ use std::{
 
 use config::{Config, Environment, File};
 use pangya_domain::{
-    CourseId, IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, StarterCharacter,
-    StarterGrant, StarterItem, StarterKey,
+    CourseId, IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, OneHoleConfig,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey,
 };
 use pangya_game::UnknownOpcodePolicy;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,7 @@ struct RawConfig {
     login: LoginSection,
     game: GameSection,
     http: HttpSection,
+    client_web: ClientWebSection,
     database: DatabaseSection,
     protocol: ProtocolSection,
     logging: LoggingSection,
@@ -101,6 +102,9 @@ section_default!(LoginSection {
 section_default!(SoloPracticeSection {
     enabled: bool = false,
     course_id: u32 = 7,
+    // Zero means undeclared: par then comes from the generated catalog's par byte. A real
+    // client catalog has no such byte, so it requires an explicit value here.
+    course_par: u8 = 0,
     loading_timeout: String = "30s".to_owned(),
     commit_timeout: String = "3s".to_owned(),
     max_strokes: u8 = 30,
@@ -110,6 +114,7 @@ section_default!(SoloPracticeSection {
 section_default!(StrokeTwoSection {
     enabled: bool = false,
     course_id: u32 = 7,
+    course_par: u8 = 0,
     loading_timeout: String = "30s".to_owned(),
     turn_timeout: String = "30s".to_owned(),
     game_timeout: String = "10m".to_owned(),
@@ -153,6 +158,26 @@ section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
     metrics: bool = true,
     heartbeat_stale_after: String = "5s".to_owned()
+});
+section_default!(ClientWebSection {
+    // Off by default: it publishes an operator's client directory listing, and a server with no
+    // real client pointed at it has nothing to serve.
+    enabled: bool = false,
+    bind: String = "127.0.0.1:8090".to_owned(),
+    // What the client is told to fetch theme images from. It is a separate value from `bind`
+    // because the client resolves it on its own machine, so a container-internal or wildcard
+    // bind address would be unusable there.
+    advertise: String = "127.0.0.1:8090".to_owned(),
+    region: String = "us".to_owned(),
+    client_directory: Option<PathBuf> = None,
+    // "paks" lists only the PAK series, which is what the client needs to mount its data.
+    // "all" mirrors a retail patch server and also lists executables and DLLs.
+    entries: String = "paks".to_owned(),
+    patch_version: String = "PangYa-RS".to_owned(),
+    patch_number: u32 = 9999,
+    // Plaintext catalog XML; the service base64-encodes it as the client expects.
+    translation_catalog: Option<PathBuf> = None,
+    theme_directory: Option<PathBuf> = None
 });
 section_default!(DatabaseSection {
     url_env: String = "DATABASE_URL".to_owned(),
@@ -324,6 +349,8 @@ pub struct AppConfig {
     pub retail_bootstrap: bool,
     /// Admin HTTP listener.
     pub http_bind: SocketAddr,
+    /// Optional validated client patch/theme web service.
+    pub client_web: Option<ValidatedClientWeb>,
     /// Enables read-only metrics exposition.
     pub metrics_enabled: bool,
     /// Event-loop heartbeat stale threshold.
@@ -383,6 +410,8 @@ pub struct AppConfig {
 pub struct ValidatedSoloPractice {
     /// Catalog course to resolve after loading.
     pub course_id: CourseId,
+    /// Operator-declared par, required when the catalog carries none.
+    pub course_par: Option<u8>,
     /// Actor loading deadline.
     pub loading_timeout: Duration,
     /// Repository deadline.
@@ -393,6 +422,33 @@ pub struct ValidatedSoloPractice {
     pub startup_recovery_limit: IncompleteMatchAbortLimit,
     /// Per-connection shot packet budget.
     pub shot_packets_per_window: u32,
+}
+
+/// Validated client web-service policy.
+///
+/// Present only when `client_web.enabled` is set; the address and paths are checked here so a
+/// missing client directory is a startup configuration error rather than a 404 the client
+/// reports as "please re-install the game".
+#[derive(Clone, Debug)]
+pub struct ValidatedClientWeb {
+    /// Listener address.
+    pub bind: SocketAddr,
+    /// Address the client is told to fetch theme content from.
+    pub advertise: SocketAddr,
+    /// Region key used for the update list.
+    pub region: pangya_updater::UpdateListRegion,
+    /// Directory holding the client's PAK series.
+    pub client_directory: PathBuf,
+    /// Which files to list.
+    pub entries: pangya_updater::EntrySelection,
+    /// Human-readable patch version reported to the client.
+    pub patch_version: String,
+    /// Numeric patch number reported to the client.
+    pub patch_number: u32,
+    /// Optional plaintext translation catalog.
+    pub translation_catalog: Option<PathBuf>,
+    /// Optional theme image directory.
+    pub theme_directory: Option<PathBuf>,
 }
 
 /// Validated local-only synthetic economy policy.
@@ -413,6 +469,8 @@ pub struct ValidatedEconomy {
 pub struct ValidatedStrokeTwo {
     /// Catalog course to resolve after loading.
     pub course_id: CourseId,
+    /// Operator-declared par, required when the catalog carries none.
+    pub course_par: Option<u8>,
     /// Actor loading barrier deadline.
     pub loading_timeout: Duration,
     /// Actor active-turn deadline.
@@ -545,6 +603,12 @@ fn validate(
         .flatten();
     let game_advertise = socket(&raw.game.advertise, "game.advertise", &mut issues);
     let http_bind = socket(&raw.http.bind, "http.bind", &mut issues);
+    let client_web_bind = raw
+        .client_web
+        .enabled
+        .then(|| socket(&raw.client_web.bind, "client_web.bind", &mut issues))
+        .flatten();
+    let client_web = validated_client_web(&raw.client_web, &mut issues);
     if let Some(address) = game_advertise {
         if !matches!(address.ip(), IpAddr::V4(_)) {
             issue(
@@ -588,12 +652,13 @@ fn validate(
         ("login.bind", login_bind),
         ("game.bind", game_bind),
         ("http.bind", http_bind),
+        ("client_web.bind", client_web_bind),
     ] {
         if address.is_some_and(|value| value.port() == 0) {
             issue(&mut issues, field, "listener port must be nonzero");
         }
     }
-    let binds = [login_bind, game_bind, http_bind]
+    let binds = [login_bind, game_bind, http_bind, client_web_bind]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -601,7 +666,7 @@ fn validate(
     if unique.len() != binds.len() {
         issue(&mut issues, "binds", "listener binds must be unique");
     }
-    let public_bind_enabled = [login_bind, game_bind, http_bind]
+    let public_bind_enabled = [login_bind, game_bind, http_bind, client_web_bind]
         .into_iter()
         .flatten()
         .any(|address| !address.ip().is_loopback());
@@ -1415,6 +1480,11 @@ fn validate(
             None
         }
     };
+    let solo_course_par = declared_course_par(
+        raw.game.solo_practice.course_par,
+        "game.solo_practice.course_par",
+        &mut issues,
+    );
     let solo_recovery =
         match IncompleteMatchAbortLimit::new(raw.game.solo_practice.startup_recovery_limit) {
             Ok(value) => Some(value),
@@ -1436,6 +1506,7 @@ fn validate(
                 |(((course_id, loading_timeout), commit_timeout), startup_recovery_limit)| {
                     ValidatedSoloPractice {
                         course_id,
+                        course_par: solo_course_par,
                         loading_timeout,
                         commit_timeout,
                         max_strokes: raw.game.solo_practice.max_strokes,
@@ -1459,6 +1530,11 @@ fn validate(
             None
         }
     };
+    let stroke_course_par = declared_course_par(
+        raw.game.stroke_two.course_par,
+        "game.stroke_two.course_par",
+        &mut issues,
+    );
     let stroke_recovery =
         match IncompleteMatchAbortLimit::new(raw.game.stroke_two.startup_recovery_limit) {
             Ok(value) => Some(value),
@@ -1485,6 +1561,7 @@ fn validate(
                 )| {
                     ValidatedStrokeTwo {
                         course_id,
+                        course_par: stroke_course_par,
                         loading_timeout,
                         turn_timeout,
                         game_timeout,
@@ -1536,6 +1613,7 @@ fn validate(
         economy,
         retail_bootstrap: raw.game.retail_bootstrap,
         http_bind: required(http_bind)?,
+        client_web,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
         database_url: required(database_url)?,
@@ -1618,6 +1696,94 @@ fn duration(value: &str, field: &'static str, issues: &mut Vec<ConfigIssue>) -> 
             None
         }
     }
+}
+
+/// Validates an optionally declared course par.
+///
+/// Zero means undeclared, which is valid here and only becomes an error once the loaded
+/// catalog turns out to carry no par of its own. Any other out-of-domain value is rejected
+/// now, so an operator learns about `course_par = 40` at startup rather than at match start.
+fn declared_course_par(raw: u8, field: &'static str, issues: &mut Vec<ConfigIssue>) -> Option<u8> {
+    if raw == 0 {
+        return None;
+    }
+    if OneHoleConfig::par_in_range(raw) {
+        Some(raw)
+    } else {
+        issue(issues, field, "must be within 1..=10 when declared");
+        None
+    }
+}
+
+/// Validates the client web-service section, or reports why it cannot start.
+fn validated_client_web(
+    raw: &ClientWebSection,
+    issues: &mut Vec<ConfigIssue>,
+) -> Option<ValidatedClientWeb> {
+    if !raw.enabled {
+        return None;
+    }
+    let bind = socket(&raw.bind, "client_web.bind", issues);
+    let advertise = socket(&raw.advertise, "client_web.advertise", issues);
+    if let Some(address) = advertise
+        && address.port() == 0
+    {
+        issue(issues, "client_web.advertise", "port must be nonzero");
+    }
+    let region = match pangya_updater::UpdateListRegion::from_code(&raw.region) {
+        Some(region) => Some(region),
+        None => {
+            issue(
+                issues,
+                "client_web.region",
+                "must be one of us, jp, th, eu, id, kr",
+            );
+            None
+        }
+    };
+    let entries = match raw.entries.as_str() {
+        "paks" => Some(pangya_updater::EntrySelection::PakSeriesOnly),
+        "all" => Some(pangya_updater::EntrySelection::AllFiles),
+        _ => {
+            issue(
+                issues,
+                "client_web.entries",
+                "must be either \"paks\" or \"all\"",
+            );
+            None
+        }
+    };
+    let client_directory = match &raw.client_directory {
+        Some(path) => Some(path.clone()),
+        None => {
+            issue(
+                issues,
+                "client_web.client_directory",
+                "is required when the client web service is enabled",
+            );
+            None
+        }
+    };
+    if raw.patch_version.is_empty() || raw.patch_version.len() > 64 || !raw.patch_version.is_ascii()
+    {
+        issue(
+            issues,
+            "client_web.patch_version",
+            "must be nonempty ASCII of at most 64 bytes",
+        );
+        return None;
+    }
+    Some(ValidatedClientWeb {
+        bind: bind?,
+        advertise: advertise?,
+        region: region?,
+        client_directory: client_directory?,
+        entries: entries?,
+        patch_version: raw.patch_version.clone(),
+        patch_number: raw.patch_number,
+        translation_catalog: raw.translation_catalog.clone(),
+        theme_directory: raw.theme_directory.clone(),
+    })
 }
 
 fn starter(raw: &StarterSection, issues: &mut Vec<ConfigIssue>) -> Option<StarterGrant> {

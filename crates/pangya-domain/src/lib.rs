@@ -1152,12 +1152,26 @@ pub struct OneHoleConfig {
 }
 
 impl OneHoleConfig {
+    /// Lowest accepted par.
+    pub const MIN_PAR: u8 = 1;
+    /// Highest accepted par.
+    pub const MAX_PAR: u8 = 10;
+
+    /// Reports whether a par is inside the accepted range.
+    ///
+    /// Exposed so a caller that has a par but no course yet — configuration validation, for
+    /// one — can check the value against this one definition instead of restating the bound.
+    #[must_use]
+    pub const fn par_in_range(par: u8) -> bool {
+        par >= Self::MIN_PAR && par <= Self::MAX_PAR
+    }
+
     /// Validates a local one-hole course configuration.
     ///
     /// # Errors
     /// Returns [`MatchValueError::InvalidPar`] unless par is in `1..=10`.
     pub const fn new(course_id: CourseId, par: u8) -> Result<Self, MatchValueError> {
-        if par >= 1 && par <= 10 {
+        if Self::par_in_range(par) {
             Ok(Self { course_id, par })
         } else {
             Err(MatchValueError::InvalidPar)

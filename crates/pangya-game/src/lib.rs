@@ -873,10 +873,22 @@ where
                     .map(|value| (value.course, value.catalog_fingerprint)),
             )
         {
+            // The course must be one this catalog actually has, and the fingerprint must be
+            // the one the configuration was resolved against, so a stale mode configuration
+            // cannot start a match against a course the client cannot load.
+            //
+            // Par is only re-checked when the catalog has a par of its own. A real client
+            // catalog does not: its Course table is a presentation row with no par field, so
+            // par is operator-declared and there is nothing here to compare it against.
             let catalog_course = catalog
-                .one_hole_course(course.course_id())
+                .declared_one_hole_course(course.course_id(), course.par())
                 .map_err(|_| GameRuntimeError::Catalog)?;
             if catalog_course != course || catalog.fingerprint() != fingerprint {
+                return Err(GameRuntimeError::Catalog);
+            }
+            if let Ok(derived) = catalog.one_hole_course(course.course_id())
+                && derived != course
+            {
                 return Err(GameRuntimeError::Catalog);
             }
         }

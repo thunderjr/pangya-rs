@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="euc-kr" standalone="yes" ?>
+<patchVer value="FakeVer" />
+<patchNum value="9999" />
+<updatelistVer value="20090331" />
+<updatefiles count="2">
+        <fileinfo fname="projectg700gb+.pak" fdir="" fsize="1131201576" fcrc="-1234567" fdate="2016-04-15" ftime="09:41:58" pname="projectg700gb+.pak.zip" psize="1131201576" />
+        <fileinfo fname="projectg851gb.pak" fdir="" fsize="690331" fcrc="42" fdate="2016-11-02" ftime="00:30:00" pname="projectg851gb.pak.zip" psize="690331" />
+</updatefiles>

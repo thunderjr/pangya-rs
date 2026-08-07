@@ -314,6 +314,9 @@ impl Catalog {
 
     /// Returns a checked local one-hole configuration from the optional Course family.
     ///
+    /// Only the generated schemas carry a par byte. A real client catalog has none, so this
+    /// rejects it rather than inventing one; use [`Self::declared_one_hole_course`] there.
+    ///
     /// # Errors
     /// Rejects a missing course, a zero/out-of-range course ID, or invalid generated par.
     pub fn one_hole_course(&self, course_id: CourseId) -> Result<OneHoleConfig, CatalogError> {
@@ -321,6 +324,29 @@ impl Catalog {
             .record(CatalogKind::Course, ItemTypeId::new(course_id.get()))
             .ok_or(CatalogError::Binding)?;
         let par = record.local_one_hole_par().ok_or(CatalogError::Structure)?;
+        OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)
+    }
+
+    /// Returns a checked one-hole configuration whose par the operator declared.
+    ///
+    /// The real U.S. client's `Course.iff` record is a presentation row: identifier, display
+    /// and Korean names, map directory, short name, a length-prefixed property XML filename,
+    /// and one float. Per-hole par is not in it — it lives in the course's own data inside the
+    /// PAK series. So the catalog can prove a course *exists* but cannot supply its par, and
+    /// par has to come from configuration. The catalog check is still what makes the value
+    /// meaningful: a par declared for a course the client does not have is rejected here
+    /// rather than surfacing later as a match against a course that cannot load.
+    ///
+    /// # Errors
+    /// Rejects a course absent from the Course family, or a par outside the domain's range.
+    pub fn declared_one_hole_course(
+        &self,
+        course_id: CourseId,
+        par: u8,
+    ) -> Result<OneHoleConfig, CatalogError> {
+        if !self.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {
+            return Err(CatalogError::Binding);
+        }
         OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)
     }
 

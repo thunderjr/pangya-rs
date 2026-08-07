@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 config.workspace = true
 humantime.workspace = true
@@ -16,6 +18,7 @@ pangya-login = { version = "0.1.0", path = "../pangya-login" }
 pangya-observability = { version = "0.1.0", path = "../pangya-observability" }
 pangya-protocol = { version = "0.1.0", path = "../pangya-protocol" }
 pangya-storage = { version = "0.1.0", path = "../pangya-storage" }
+pangya-updater = { version = "0.1.0", path = "../pangya-updater" }
 serde.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
