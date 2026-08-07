@@ -92,10 +92,11 @@ pub use us852_bootstrap::{
     ServerChannelList, US852_SERVER_VERSION,
 };
 pub use us852_room::{
-    MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, ROOM_NAME_BYTES, ROOM_RECORD_BYTES,
-    RetailHoleProgression, RetailRoom, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomState, RetailRoomType, RoomCensusKind,
-    RoomJoinRejection, RoomListKind,
+    MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES,
+    ROOM_RECORD_BYTES, RetailHoleProgression, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomType, RoomCensusKind, RoomJoinRejection, RoomListKind,
+    RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 

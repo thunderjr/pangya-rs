@@ -66,11 +66,12 @@ use pangya_protocol::{
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
     RetailCharacter, RetailEquipment, RetailGameAuth, RetailHoleProgression, RetailPlayerIdentity,
-    RetailPlayerStatistics, RetailRoom, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomState, RetailRoomType, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
-    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
+    RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomType, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
     SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
     SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
@@ -3934,6 +3935,8 @@ where
                         let room = retail_room_from_summary(&summary, &request);
                         self.send(framed, &RetailRoomJoinResult::Accepted(Box::new(room)))
                             .await?;
+                        self.send_retail_census(framed, identity.connection_id)
+                            .await?;
                         Ok(GameState::InRoom)
                     }
                     Err(_) => self.reject_retail_join(framed, state).await,
@@ -3978,6 +3981,8 @@ where
                             ))),
                         )
                         .await?;
+                        self.send(framed, &retail_census_from_snapshot(&snapshot))
+                            .await?;
                         Ok(GameState::InRoom)
                     }
                     Err(_) => self.reject_retail_join(framed, state).await,
@@ -4012,6 +4017,24 @@ where
         )
         .await?;
         Ok(state)
+    }
+
+    /// Sends the current room roster, so the client can populate its member list.
+    async fn send_retail_census(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        connection_id: PlayerConnectionId,
+    ) -> Result<(), GameRuntimeError> {
+        let snapshot = match self
+            .lobby
+            .route(connection_id, LobbyRoomCommand::GetState)
+            .await
+        {
+            Ok(LobbyRouteResult::Snapshot(snapshot)) => snapshot,
+            _ => return Ok(()),
+        };
+        self.send(framed, &retail_census_from_snapshot(&snapshot))
+            .await
     }
 
     /// Sends the lobby's current room list.
@@ -4549,6 +4572,25 @@ const fn protocol_abort_reason(reason: MatchAbortReason) -> ProtocolMatchAbortRe
         | MatchAbortReason::StartupRecovery
         | MatchAbortReason::PersistenceFailure => ProtocolMatchAbortReason::ServerShutdown,
     }
+}
+
+/// Builds a retail census roster from a room's authoritative snapshot.
+fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
+    let players = snapshot
+        .members()
+        .iter()
+        .enumerate()
+        .map(|(slot, member)| RetailRoomPlayer {
+            connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
+            nickname: member.nickname().as_bytes().to_vec(),
+            slot: u8::try_from(slot).unwrap_or(u8::MAX),
+            character_uid: 0,
+            flags: RoomPlayerFlags::new(member.is_owner(), member.is_ready()),
+            level: 1,
+            user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
+        })
+        .collect();
+    RetailRoomCensus::List(players)
 }
 
 /// Retail room-leave client opcode.

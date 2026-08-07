@@ -5945,6 +5945,18 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     assert_eq!(opcode, 0x0049);
     // Accepted carries a u16 status then the 210-byte room record.
     assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0);
+    // Creating a room immediately yields a census listing the creator as master.
+    let (census_opcode, census) = receive_packet(&mut host, host_key).await;
+    assert_eq!(census_opcode, 0x0048);
+    assert_eq!(census[0], 0, "census kind = list");
+    assert_eq!(census[3], 1, "one player in the room");
+    // Owner flag is bit 3, written after the fixed identity block.
+    let flags_at = 4 + 4 + 22 + 17 + 1 + 4 + 4 + 4 + 16 + 4 + 4;
+    assert_eq!(
+        u16::from_le_bytes([census[flags_at], census[flags_at + 1]]) & (1 << 3),
+        1 << 3,
+        "creator is room master"
+    );
     assert_eq!(body.len(), 2 + pangya_protocol::ROOM_RECORD_BYTES);
     assert_eq!(&body[2..13], b"Retail Room");
     let room_id = u16::from_le_bytes([body[2 + 64 + 5 + 17 + 3], body[2 + 64 + 5 + 17 + 4]]);
@@ -5962,6 +5974,13 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     assert_eq!(opcode, 0x0049);
     assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0);
     assert_eq!(body[2 + 64 + 4], 2, "room now holds both players");
+    let (census_opcode, census) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(census_opcode, 0x0048);
+    assert_eq!(census[3], 2, "census lists both occupants");
+    assert_eq!(
+        census.len(),
+        4 + 2 * pangya_protocol::ROOM_PLAYER_RECORD_BYTES + 1
+    );
 
     // Leaving returns the client to the lobby and re-lists rooms.
     send_packet(&mut visitor, visitor_key, 4, 0x000f, &[]).await;

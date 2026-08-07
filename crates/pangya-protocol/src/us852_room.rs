@@ -367,6 +367,169 @@ pub enum RoomCensusKind {
     Update = 3,
 }
 
+/// Exact wire width of one room census player record.
+pub const ROOM_PLAYER_RECORD_BYTES: usize = 341;
+
+/// Room status bits the client renders next to each player.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoomPlayerFlags(u16);
+
+impl RoomPlayerFlags {
+    /// Room owner.
+    pub const MASTER: u16 = 1 << 3;
+    /// Marked away.
+    pub const AWAY: u16 = 1 << 2;
+    /// Marked ready.
+    pub const READY: u16 = 1 << 9;
+
+    /// Builds flags from owner and ready state.
+    #[must_use]
+    pub const fn new(is_owner: bool, is_ready: bool) -> Self {
+        let mut bits = 0;
+        if is_owner {
+            bits |= Self::MASTER;
+        }
+        if is_ready {
+            bits |= Self::READY;
+        }
+        Self(bits)
+    }
+
+    /// Returns the packed bits.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// One player as the room census describes them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomPlayer {
+    /// Per-connection identifier the client uses to address this player.
+    pub connection_id: u32,
+    /// Display nickname.
+    pub nickname: Vec<u8>,
+    /// Zero-based seat within the room.
+    pub slot: u8,
+    /// Equipped character inventory id.
+    pub character_uid: u32,
+    /// Room status bits.
+    pub flags: RoomPlayerFlags,
+    /// Player level.
+    pub level: u8,
+    /// Durable numeric account identifier.
+    pub user_id: u32,
+}
+
+impl RetailRoomPlayer {
+    fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
+        let start = writer.as_slice().len();
+        writer.u32_le(self.connection_id);
+        writer.fixed_nul(&self.nickname, 22)?;
+        writer.fixed_nul(&[], 17)?; // guild name
+        writer.u8(self.slot);
+        writer.u32_le(0);
+        writer.u32_le(0); // title
+        writer.u32_le(self.character_uid);
+        for _ in 0..4 {
+            writer.u32_le(0); // skin background, frame, sticker, slot
+        }
+        writer.u32_le(0);
+        writer.u32_le(0); // duplicated title
+        writer.u16_le(self.flags.bits());
+        writer.u8(self.level);
+        // Constant the reference server always sends here; meaning unestablished.
+        writer.u16_le(0x2560);
+        writer.u32_le(0); // guild id
+        writer.fixed_nul(&[], 12)?; // guild mark
+        writer.u32_le(self.user_id);
+        // Lounge pose and position.
+        writer.u32_le(0);
+        writer.u16_le(0);
+        writer.u32_le(0);
+        writer.f32_le(0.0);
+        writer.f32_le(0.0);
+        writer.f32_le(0.0);
+        // Lounge shop.
+        writer.u32_le(0);
+        writer.fixed_nul(&[], 64)?;
+        writer.u32_le(0); // mascot
+        writer.u16_le(0); // item boost
+        writer.u32_le(0);
+        writer.fixed_nul(&[], 22)?;
+        writer.bytes(&[0; 105]);
+        writer.u8(0); // invited
+        writer.f32_le(0.0); // average score
+        writer.f32_le(0.0);
+        debug_assert_eq!(writer.as_slice().len() - start, ROOM_PLAYER_RECORD_BYTES);
+        Ok(())
+    }
+}
+
+/// Room member census, server opcode `0x0048`.
+///
+/// This is what populates the room's player list. Note the frame shapes differ per kind:
+/// `Remove` carries only a connection id, and `Update` writes that id twice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailRoomCensus {
+    /// Full roster replacing whatever the client holds.
+    List(Vec<RetailRoomPlayer>),
+    /// One player joined.
+    Add(Box<RetailRoomPlayer>),
+    /// One player left, addressed by connection id.
+    Remove(u32),
+    /// One player changed.
+    Update(Box<RetailRoomPlayer>),
+}
+
+impl EncodePacket for RetailRoomCensus {
+    const OPCODE: u16 = 0x0048;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        match self {
+            Self::List(players) => {
+                let count = u8::try_from(players.len()).map_err(|_| PacketEncodeError::Limit {
+                    field: "room players",
+                    actual: players.len(),
+                    maximum: usize::from(MAX_ROOM_PLAYERS),
+                })?;
+                writer.u8(RoomCensusKind::List as u8);
+                writer.u16_le(0xffff);
+                writer.u8(count);
+                for player in players {
+                    player.encode_body(writer)?;
+                }
+                writer.u8(0);
+            }
+            Self::Add(player) => {
+                writer.u8(RoomCensusKind::Add as u8);
+                writer.u16_le(0xffff);
+                writer.u8(1);
+                player.encode_body(writer)?;
+            }
+            Self::Remove(connection_id) => {
+                writer.u8(RoomCensusKind::Remove as u8);
+                writer.u16_le(0xffff);
+                writer.u32_le(*connection_id);
+            }
+            Self::Update(player) => {
+                writer.u8(RoomCensusKind::Update as u8);
+                // The connection id is intentionally repeated: once here and again as the
+                // first field of the record itself.
+                writer.u32_le(player.connection_id);
+                player.encode_body(writer)?;
+                writer.u8(0);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +654,70 @@ mod tests {
         let payload =
             encode_packet_payload(&RetailRoomLeave::to_lobby(), &profile()).expect("encode");
         assert_eq!(payload.as_slice(), &[0xff, 0xff]);
+    }
+
+    fn sample_player() -> RetailRoomPlayer {
+        RetailRoomPlayer {
+            connection_id: 11,
+            nickname: b"Nick".to_vec(),
+            slot: 0,
+            character_uid: 5,
+            flags: RoomPlayerFlags::new(true, false),
+            level: 3,
+            user_id: 42,
+        }
+    }
+
+    #[test]
+    fn census_player_record_is_exactly_three_hundred_forty_one_bytes() {
+        let payload = encode_packet_payload(
+            &RetailRoomCensus::Add(Box::new(sample_player())),
+            &profile(),
+        )
+        .expect("encode");
+        // kind, the 0xffff marker, the count, then one record.
+        assert_eq!(payload.len(), 4 + ROOM_PLAYER_RECORD_BYTES);
+        assert_eq!(payload[0], RoomCensusKind::Add as u8);
+        assert_eq!(payload[3], 1);
+    }
+
+    #[test]
+    fn census_frame_shapes_differ_per_kind() {
+        let list = encode_packet_payload(
+            &RetailRoomCensus::List(vec![sample_player(), sample_player()]),
+            &profile(),
+        )
+        .expect("list");
+        // List carries a trailing terminator byte that Add does not.
+        assert_eq!(list.len(), 4 + 2 * ROOM_PLAYER_RECORD_BYTES + 1);
+
+        let remove =
+            encode_packet_payload(&RetailRoomCensus::Remove(11), &profile()).expect("remove");
+        assert_eq!(remove.as_slice(), &[2, 0xff, 0xff, 11, 0, 0, 0]);
+
+        let update = encode_packet_payload(
+            &RetailRoomCensus::Update(Box::new(sample_player())),
+            &profile(),
+        )
+        .expect("update");
+        // Update writes the connection id, then the record which repeats it.
+        assert_eq!(update.len(), 1 + 4 + ROOM_PLAYER_RECORD_BYTES + 1);
+        assert_eq!(
+            u32::from_le_bytes([update[1], update[2], update[3], update[4]]),
+            11
+        );
+        assert_eq!(
+            u32::from_le_bytes([update[5], update[6], update[7], update[8]]),
+            11
+        );
+    }
+
+    #[test]
+    fn owner_and_ready_flags_pack_into_distinct_bits() {
+        assert_eq!(RoomPlayerFlags::new(false, false).bits(), 0);
+        assert_eq!(RoomPlayerFlags::new(true, false).bits(), 1 << 3);
+        assert_eq!(RoomPlayerFlags::new(false, true).bits(), 1 << 9);
+        assert_eq!(RoomPlayerFlags::new(true, true).bits(), (1 << 3) | (1 << 9));
     }
 
     #[test]
