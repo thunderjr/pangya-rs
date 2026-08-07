@@ -334,8 +334,50 @@ pub enum GameUnknownObservation {
     StrikeLimit,
 }
 
+/// Fixed synthetic economy command kinds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameEconomyCommand {
+    /// Catalog shop page request.
+    ShopPage,
+    /// Purchase request.
+    Purchase,
+    /// Equipment change request.
+    Equip,
+    /// Single-unit consume request.
+    Consume,
+    /// Durability repair request.
+    Repair,
+}
+
+/// Fixed synthetic economy command outcomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameEconomyOutcome {
+    /// Command committed or replayed an identical commit.
+    Success,
+    /// Economy is not composed; the request decoded but was refused.
+    Disabled,
+    /// Request failed a bound, catalog, or identifier check.
+    Invalid,
+    /// Referenced inventory or character is not owned.
+    NotOwned,
+    /// Referenced item cannot satisfy the command.
+    Incompatible,
+    /// Balance could not cover the catalog price.
+    InsufficientPang,
+    /// Stack limit would be exceeded.
+    StackFull,
+    /// Equipment version did not match.
+    VersionConflict,
+    /// Replay carried different parameters than the original commit.
+    IdempotencyDrift,
+    /// Repository command exceeded its deadline.
+    Timeout,
+}
+
 /// Low-cardinality GameService observation boundary.
 pub trait GameObserver: Send + Sync + 'static {
+    /// Fixed synthetic economy command and outcome.
+    fn economy(&self, _command: GameEconomyCommand, _outcome: GameEconomyOutcome) {}
     /// Accepted connection with masked source only.
     fn accepted(&self, _id: GameConnectionId, _source: &SourceAddressPrefix) {}
     /// Fixed terminal outcome.
@@ -1361,10 +1403,7 @@ where
             let command = economy_command_for_opcode(opcode).ok_or(GameRuntimeError::Protocol)?;
             decode_economy_request_shape(opcode, payload)?;
             return self
-                .send(
-                    framed,
-                    &EconomyCommandResult::new(command, EconomyOutcome::Disabled),
-                )
+                .send_economy_result(framed, command, EconomyOutcome::Disabled)
                 .await;
         };
         match opcode {
@@ -1396,6 +1435,9 @@ where
                     .copied()
                     .map(protocol_shop_offer)
                     .collect::<Result<Vec<_>, _>>()?;
+                // The page itself is the success reply, so observe it here rather than in
+                // `send_economy_result`, which this arm never reaches.
+                self.observe_economy(EconomyCommand::ShopPage, EconomyOutcome::Success);
                 self.send(
                     framed,
                     &ShopPage::new(request.page(), total_pages, entries)
@@ -1740,8 +1782,33 @@ where
         command: EconomyCommand,
         outcome: EconomyOutcome,
     ) -> Result<(), GameRuntimeError> {
+        self.observe_economy(command, outcome);
         self.send(framed, &EconomyCommandResult::new(command, outcome))
             .await
+    }
+
+    /// Records one fixed-label economy command outcome; never carries identifiers.
+    fn observe_economy(&self, command: EconomyCommand, outcome: EconomyOutcome) {
+        let command = match command {
+            EconomyCommand::ShopPage => GameEconomyCommand::ShopPage,
+            EconomyCommand::Purchase => GameEconomyCommand::Purchase,
+            EconomyCommand::Equip => GameEconomyCommand::Equip,
+            EconomyCommand::Consume => GameEconomyCommand::Consume,
+            EconomyCommand::Repair => GameEconomyCommand::Repair,
+        };
+        let outcome = match outcome {
+            EconomyOutcome::Success => GameEconomyOutcome::Success,
+            EconomyOutcome::Disabled => GameEconomyOutcome::Disabled,
+            EconomyOutcome::Invalid => GameEconomyOutcome::Invalid,
+            EconomyOutcome::NotOwned => GameEconomyOutcome::NotOwned,
+            EconomyOutcome::Incompatible => GameEconomyOutcome::Incompatible,
+            EconomyOutcome::InsufficientPang => GameEconomyOutcome::InsufficientPang,
+            EconomyOutcome::StackFull => GameEconomyOutcome::StackFull,
+            EconomyOutcome::VersionConflict => GameEconomyOutcome::VersionConflict,
+            EconomyOutcome::IdempotencyDrift => GameEconomyOutcome::IdempotencyDrift,
+            EconomyOutcome::Timeout => GameEconomyOutcome::Timeout,
+        };
+        self.observer.economy(command, outcome);
     }
 
     async fn send_economy_error(

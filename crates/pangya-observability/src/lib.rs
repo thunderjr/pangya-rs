@@ -23,9 +23,9 @@ use axum::{
 };
 use pangya_domain::{AccountId, SourceAddressPrefix};
 use pangya_game::{
-    GameChatObservation, GameCommitObservation, GameConnectionId, GameMatchObservation,
-    GameObserver, GameQueueObservation, GameRateClass, GameRoomObservation, GameShotObservation,
-    GameTermination, GameUnknownObservation,
+    GameChatObservation, GameCommitObservation, GameConnectionId, GameEconomyCommand,
+    GameEconomyOutcome, GameMatchObservation, GameObserver, GameQueueObservation, GameRateClass,
+    GameRoomObservation, GameShotObservation, GameTermination, GameUnknownObservation,
 };
 use pangya_login::{
     ConnectionId, ConnectionTermination, CredentialWorkerOutcome, DbQueryClass, LoginObserver,
@@ -152,6 +152,8 @@ pub struct M2Metrics {
     game_queue: [AtomicU64; 2],
     game_chat: [AtomicU64; 3],
     game_unknown: [AtomicU64; 4],
+    game_economy_command: [AtomicU64; 5],
+    game_economy_outcome: [AtomicU64; 10],
     game_matches_active: AtomicU64,
     game_match: [AtomicU64; 8],
     game_commit: [AtomicU64; 6],
@@ -656,6 +658,81 @@ impl M2Metrics {
                 self.game_chat[2].load(Ordering::Relaxed),
             ),
             (
+                "pangya_game_economy_commands_total",
+                "command=\"shop_page\"",
+                self.game_economy_command[0].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_commands_total",
+                "command=\"purchase\"",
+                self.game_economy_command[1].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_commands_total",
+                "command=\"equip\"",
+                self.game_economy_command[2].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_commands_total",
+                "command=\"consume\"",
+                self.game_economy_command[3].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_commands_total",
+                "command=\"repair\"",
+                self.game_economy_command[4].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"success\"",
+                self.game_economy_outcome[0].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"disabled\"",
+                self.game_economy_outcome[1].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"invalid\"",
+                self.game_economy_outcome[2].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"not_owned\"",
+                self.game_economy_outcome[3].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"incompatible\"",
+                self.game_economy_outcome[4].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"insufficient_pang\"",
+                self.game_economy_outcome[5].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"stack_full\"",
+                self.game_economy_outcome[6].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"version_conflict\"",
+                self.game_economy_outcome[7].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"idempotency_drift\"",
+                self.game_economy_outcome[8].load(Ordering::Relaxed),
+            ),
+            (
+                "pangya_game_economy_outcomes_total",
+                "outcome=\"timeout\"",
+                self.game_economy_outcome[9].load(Ordering::Relaxed),
+            ),
+            (
                 "pangya_game_unknown_opcode_actions_total",
                 "action=\"disconnected\"",
                 self.game_unknown[0].load(Ordering::Relaxed),
@@ -1063,6 +1140,30 @@ impl GameObserver for M2Metrics {
         self.game_chat[index].fetch_add(1, Ordering::Relaxed);
     }
 
+    fn economy(&self, command: GameEconomyCommand, outcome: GameEconomyOutcome) {
+        let command = match command {
+            GameEconomyCommand::ShopPage => 0,
+            GameEconomyCommand::Purchase => 1,
+            GameEconomyCommand::Equip => 2,
+            GameEconomyCommand::Consume => 3,
+            GameEconomyCommand::Repair => 4,
+        };
+        let outcome = match outcome {
+            GameEconomyOutcome::Success => 0,
+            GameEconomyOutcome::Disabled => 1,
+            GameEconomyOutcome::Invalid => 2,
+            GameEconomyOutcome::NotOwned => 3,
+            GameEconomyOutcome::Incompatible => 4,
+            GameEconomyOutcome::InsufficientPang => 5,
+            GameEconomyOutcome::StackFull => 6,
+            GameEconomyOutcome::VersionConflict => 7,
+            GameEconomyOutcome::IdempotencyDrift => 8,
+            GameEconomyOutcome::Timeout => 9,
+        };
+        self.game_economy_command[command].fetch_add(1, Ordering::Relaxed);
+        self.game_economy_outcome[outcome].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn unknown(&self, event: GameUnknownObservation) {
         let index = match event {
             GameUnknownObservation::Disconnected => 0,
@@ -1421,6 +1522,16 @@ mod tests {
         GameObserver::queue(&metrics, GameQueueObservation::OutboundDropped);
         GameObserver::chat(&metrics, GameChatObservation::Delivered);
         GameObserver::unknown(&metrics, GameUnknownObservation::Captured);
+        GameObserver::economy(
+            &metrics,
+            GameEconomyCommand::Purchase,
+            GameEconomyOutcome::InsufficientPang,
+        );
+        GameObserver::economy(
+            &metrics,
+            GameEconomyCommand::Repair,
+            GameEconomyOutcome::Success,
+        );
 
         let rendered = metrics.render();
         for expected in [
@@ -1433,6 +1544,12 @@ mod tests {
             "pangya_game_queue_events_total{event=\"outbound_dropped\"} 1",
             "pangya_game_chat_events_total{event=\"delivered\"} 1",
             "pangya_game_unknown_opcode_actions_total{action=\"captured\"} 1",
+            "pangya_game_economy_commands_total{command=\"purchase\"} 1",
+            "pangya_game_economy_commands_total{command=\"repair\"} 1",
+            "pangya_game_economy_commands_total{command=\"equip\"} 0",
+            "pangya_game_economy_outcomes_total{outcome=\"insufficient_pang\"} 1",
+            "pangya_game_economy_outcomes_total{outcome=\"success\"} 1",
+            "pangya_game_economy_outcomes_total{outcome=\"idempotency_drift\"} 0",
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
