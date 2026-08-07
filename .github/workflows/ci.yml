@@ -22,6 +22,8 @@ jobs:
     env:
       DATABASE_URL: postgres://pangya:pangya-ci-test@127.0.0.1:5432/pangya_test
     strategy:
+      # Both toolchains must report; cancelling the other leg hides half the signal.
+      fail-fast: false
       matrix:
         toolchain: ["1.93.0", stable]
     steps:
@@ -49,7 +51,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deny
+      # Name the tool explicitly: the @<tool> tag form resolves to an empty tool input
+      # under some action-ref pinning, which installs nothing and fails at first use.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
       - run: cargo deny --locked check
       - run: cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --locked check
   fuzz:
@@ -57,7 +63,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - run: cargo fuzz build
       - run: cargo fuzz run client-codec -- -seed=1 -max_total_time=5
       - run: cargo fuzz run server-decompression -- -seed=1 -max_total_time=5
