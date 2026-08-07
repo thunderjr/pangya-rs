@@ -94,50 +94,97 @@ Both were real and are fixed.
   failure collapsed into "required runtime task exited". The typed cause is now logged first;
   that is how the catalog defect above was identified at all.
 
-## 5. Where it stops
+## 5. Where it stops, and how it was narrowed
 
-The client exits about **20 seconds** in, consistently, throwing a C++ exception
-(`0xE06D7363`) from inside `ProjectG.exe`. It writes its own `exception.log`, `stack.log`, and
-`exception.dmp`. **No socket is ever opened to LoginService**, so no part of the game protocol
-has been exercised by a real client yet.
+### The client is WinLicense-protected
 
-Two things about that crash report are worth stating so they are not over-read:
+Attaching `cdb` prints the protector's own banner and then the process is terminated:
 
-- **The symbol names in it mean nothing.** Every frame resolves to
-  `RFSingleton<RFWindowFactoryManager>::_singleton+0x…` or
-  `RFMatrixTransform2DPoint+0x…` with offsets in the hundreds of kilobytes. `ProjectG.exe` is
-  packed with randomized section names, so those are simply the nearest exports before a large
-  unpacked region. They are not evidence that the fault is in the window or render subsystem,
-  and an earlier reading of them as such was wrong.
-- **The minidump holds only stack memory.** The throwing frame's `_CxxThrowException` arguments
-  show an exception object carrying a `std::string` of 23 characters, but the heap buffer it
-  points at is not in the dump, so the message itself is not recoverable from it.
+```
+---        WinLicense Professional           ---
+---      (c)2012 Oreans Technologies         ---
+```
 
-Attaching a debugger does not currently help: under `cdb` the client raises a stream of
-first-chance privileged-instruction (`0xC0000096`), illegal-instruction (`0xC000001D`), and
-`int 1` faults before reaching the original failure. That is the packer's anti-debugging, so
-getting a first-chance report for the real throw needs anti-anti-debug tooling, not just a
-debugger.
+followed by `ntdll!NtTerminateProcess`. That explains every earlier debugging dead end, and two
+things follow from it:
 
-Eliminated as causes, each by direct observation:
+- **The crash report's symbol names mean nothing.** Every frame resolves to
+  `RFSingleton<RFWindowFactoryManager>::_singleton+0x…` or `RFMatrixTransform2DPoint+0x…` with
+  offsets in the hundreds of kilobytes, because the image is packed with randomized section
+  names and those are simply the nearest preceding exports. An earlier reading of them as
+  "the fault is in the window/render subsystem" was wrong.
+- **A debugger cannot be used**, so first-chance information has to come from inside the
+  process.
+
+### The technique that worked: a vectored handler inside Rugburn
+
+Rugburn is already injected as `ijl15.dll`, so a `AddVectoredExceptionHandler(1, …)` in its
+`DllMain` sees every exception first-chance, returns `EXCEPTION_CONTINUE_SEARCH` so behaviour is
+unchanged, and the protector never notices. For an MSVC throw
+(`0xE06D7363`) the record carries `magic`, the thrown object, and its `ThrowInfo`, so the handler
+can walk `ThrowInfo → CatchableTypeArray → CatchableType → TypeDescriptor+8` for the RTTI name
+and print any readable ASCII the object's fields point at. Every dereference is guarded by
+`VirtualQuery` first, so a bad pointer cannot fault the handler.
+
+That produced the answer immediately:
+
+```
+[veh] C++ throw #1 at 75ff3184 params=3
+[veh]   magic=19930520 obj=0019df70 throwinfo=00d7358c
+[veh]   rtti-type -> ".?AVWAppException@@"
+[veh]       points-at -> "Cannot open file."
+[veh]       points-at -> "chat.bin"
+```
+
+### Three loose client files were missing
+
+The client opens `chat.bin`, `nick.bin`, and `bbh.bin` **as real files in its own directory**,
+not through its PAK filesystem. All three exist inside the PAK series — `pangfiles` extracts
+them to `data/` — but a bare-name lookup does not find them there, and placing them under
+`data/` on disk does not satisfy it either. Copying the three into the client root does. Each
+one was found by fixing the previous and re-reading the handler's output, so the chain is
+`chat.bin → nick.bin → bbh.bin`. Adding the other eight top-level extracted files changes
+nothing, so three is the minimum and the maximum that matters.
+
+With them in place the C++ exception is gone entirely and the client gets measurably further —
+its crash report now includes an `Inst Dir` line it never reached before.
+
+### What remains
+
+A deterministic access violation, at the same address on every run:
+
+```
+[av] #1 at 00888d08 accessing 00000030
+[av]   eax=0d1f4790 ebx=00000000 ecx=00000000 edx=0d1f4790
+[av]   esi=0d5e0fd0 edi=00000000
+```
+
+`ecx` is zero and the instruction reads `[ecx+0x30]`: a method called on a null `this`. The
+object in `esi` has a vtable at `0x00d06c94`, and the object `eax`/`edx` both point at is
+entirely zero-filled — something that should have been constructed was not. No filename or
+other string appears anywhere on the stack, so unlike the previous failure this one is not a
+missing file.
+
+Additionally ruled out for **this** failure, each by direct observation:
 
 | Hypothesis | How it was ruled out |
 |---|---|
-| Audio device | Fixed; Miles no longer errors, crash unchanged |
-| Any of the three HTTP prerequisites | All satisfied; 33/33 requests answered |
-| `IntegratedPak` | Set; client now mounts every PAK |
-| GameGuard | Rugburn patches it out; no GG module or process present in the client |
-| Rugburn's cosmetic US 852 patches | A rebuild with only the GameGuard patches crashes identically |
-| DNS | `Clear-DnsClientCache` then run: the client resolves nothing |
-| Direct3D availability | `dxdiag`: D3D enabled, feature levels to 12_1, `d3d9`/`d3d9on12`/`d3d10warp` all present and loaded |
-| Client graphics settings | Windowed and fullscreen, 800×600 and 1024×768, lowest quality preset, software T&L, shadows and effects off — all identical |
-| Missing theme images | All 30 served and fetched successfully |
-| Client file corruption | Full name-and-size manifest diff against the source install |
-| Missing launcher argument | Rugburn sets `PANGYA_ARG`; also passed explicitly on the command line |
-| A `.dat` string-table mismatch | `english.dat` and `korea.dat` both read successfully and both hold exactly 3,994 index-aligned entries |
+| Theme JPEG decoding | Serving an empty theme document, so the client downloads no images at all, produces the identical AV at the identical address |
+| Loose files shadowing PAK content | Reducing the root additions from 11 files to only the three the client demands produces the identical AV |
+| The translation catalog's content | An empty catalog body produces the identical AV |
+| Hypervisor detection | The guest now reports `HypervisorPresent: False` with real-looking SMBIOS strings; unchanged |
 
-The remaining work is client-side reverse engineering of a packed, anti-debugged binary and is
-recorded as an open blocker in `PROGRESS.md`, not as a server defect.
+Getting further needs static analysis of an unpacked image (the faulting address is
+`ProjectG.exe+0x488d08`), which is a different kind of work from anything above and is not
+attempted here.
+
+Also still eliminated from the original 20-second exit, and unchanged by any of the above:
+audio, all three HTTP prerequisites, `IntegratedPak`, GameGuard, Rugburn's cosmetic US 852
+patches, DNS, Direct3D availability, the client's graphics settings, client file integrity, the
+launcher argument, and `.dat` string-table alignment.
+
+**No socket is ever opened to LoginService**, so no part of the game protocol has been exercised
+by a real client yet.
 
 ## 6. Test-harness note
 

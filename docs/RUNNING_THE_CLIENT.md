@@ -13,7 +13,7 @@ builds and runs anywhere Rust and PostgreSQL do.
 | Stage | State |
 |---|---|
 | Client startup: string catalog, patch `updatelist`, theme content | **Verified against the real client.** It performs 33 HTTP requests against this server, accepts all of them, and mounts its full 84-file PAK series. |
-| Client reaches its login screen | **Blocked.** The client exits about 20 seconds in, throwing a C++ exception, without ever opening a socket. See [Where it stops](#7-where-it-stops-today). |
+| Client reaches its login screen | **Blocked.** The client dies about 20 seconds in on a deterministic null-pointer access violation, without ever opening a socket. See [Where it stops](#7-where-it-stops-today). |
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** — no client has reached it. |
 | GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`, proven end to end over encrypted TCP in CI, **unverified** against a client. |
 | Rooms, one scored hole | Routed and proven over TCP in CI, **unverified** against a client. |
@@ -227,6 +227,22 @@ backend does it:
 -audiodev none,id=snd0 -device intel-hda -device hda-output,audiodev=snd0
 ```
 
+### Three loose data files must sit in the client directory
+
+The client opens `chat.bin`, `nick.bin`, and `bbh.bin` as real files in its own directory. All
+three are inside the PAK series — `pangfiles` extracts them to `data/` — but the client's
+bare-name lookup does not find them there, and putting them under `data/` on disk does not
+help either. Copy them to the client root:
+
+```powershell
+copy local-data\us851-data\data\chat.bin  C:\pangya\us851\
+copy local-data\us851-data\data\nick.bin  C:\pangya\us851\
+copy local-data\us851-data\data\bbh.bin   C:\pangya\us851\
+```
+
+Without them the client raises `WAppException("Cannot open file.")` and exits. The other
+top-level extracted files make no difference, so these three are the whole requirement.
+
 ### `IntegratedPak` must exist in the registry
 
 Retail's updater writes `HKLM\SOFTWARE\WOW6432Node\Ntreev USA\Pangya\IntegratedPak`. A copied
@@ -261,17 +277,28 @@ With everything above in place the client:
 - fetches the string catalog, the `updatelist`, `extracontents.xml`, the theme document, and
   all 30 theme images from this server — 33 requests, all answered;
 - mounts its complete PAK series (about 130,000 file operations);
-- then, roughly 20 seconds in, throws a C++ exception and exits.
+- then, roughly 20 seconds in, dies on a deterministic access violation at `ProjectG.exe`
+  `+0x488d08`, reading `[ecx+0x30]` with `ecx` zero: a method called on a null `this`.
 
 It writes its own crash report next to the executable — `exception.log`, `stack.log`, and
 `exception.dmp`. No socket is ever opened to LoginService, so nothing about the game protocol
 has been exercised yet.
 
-Do not read the symbol names in that report as a location. `ProjectG.exe` is packed with
-randomized section names, so every frame resolves to the nearest export plus an offset in the
-hundreds of kilobytes; they say nothing about which subsystem failed. Attaching `cdb` does not
-help either — the packer's anti-debugging raises streams of privileged-instruction,
-illegal-instruction, and `int 1` faults long before the real throw.
+Two things to know before spending time on it:
+
+- **The client is protected with WinLicense** (Oreans). Attaching a debugger prints its banner
+  and then the process is terminated, so a debugger is not usable.
+- **The symbol names in the crash report are meaningless.** The image is packed with randomized
+  section names, so every frame resolves to the nearest preceding export plus an offset in the
+  hundreds of kilobytes.
+
+What does work is a first-chance vectored exception handler inside Rugburn — it is already
+injected as `ijl15.dll`, so `AddVectoredExceptionHandler(1, …)` in its `DllMain` sees every
+exception before the client's own handler, returns `EXCEPTION_CONTINUE_SEARCH` so nothing
+changes, and the protector never notices. For an MSVC throw it can walk the exception record's
+`ThrowInfo` for the RTTI type name and print readable strings the thrown object points at,
+guarding each dereference with `VirtualQuery`. That is how the three missing files above were
+found; see `evidence/REAL_CLIENT_STARTUP_2026-08-07.md` for the handler's shape and output.
 
 Ruled out as causes: the audio device, all three HTTP prerequisites, `IntegratedPak`,
 GameGuard (disabled, and confirmed not loaded), Rugburn's cosmetic US 852 patches (a build

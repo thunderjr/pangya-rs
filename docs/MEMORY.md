@@ -42,9 +42,19 @@ full PAK series, but still exits before opening any socket. Durable facts:
   rejects empty objects and arrays.
 - **The theme `url` attribute must be an absolute URL.** The client passes it to WinINet
   verbatim, so a leading-slash path produces a request with no host.
-- **Open blocker 13**: the client throws a C++ exception from its own window/render factory
-  about 20 s in and exits, without connecting. Twelve causes were eliminated by direct
-  observation; see `evidence/REAL_CLIENT_STARTUP_2026-08-07.md` before re-testing any of them.
+- **The client needs three loose files in its own directory**: `chat.bin`, `nick.bin`, `bbh.bin`.
+  They exist in the PAK series but the client's bare-name lookup does not find them there, and
+  `data/` on disk does not satisfy it. Without them: `WAppException("Cannot open file.")`.
+- **The client is WinLicense-protected (Oreans).** A debugger is terminated on attach, and the
+  crash report's symbol names are meaningless because the image is packed. Diagnose from inside
+  the process instead: a vectored exception handler in Rugburn (already injected as `ijl15.dll`)
+  sees throws first-chance, can read the RTTI type name from the record's `ThrowInfo` and any
+  strings the thrown object points at, and the protector never notices. That technique is what
+  found the three files; its shape is in `evidence/REAL_CLIENT_STARTUP_2026-08-07.md`.
+- **Open blocker 13**: a deterministic AV at `ProjectG.exe+0x488d08`, `[ecx+0x30]` with `ecx`
+  zero. Not a missing file. Theme JPEGs, loose-file shadowing, the translation catalog, and
+  hypervisor detection are all ruled out for it. Read the evidence file before re-testing any
+  hypothesis; a dozen are already eliminated.
 - **macOS harness trap**: the Application Firewall gates incoming connections per application,
   so an unsigned `pangya-server` completes a TCP handshake and then sends nothing to a remote
   peer while answering fine on loopback. `python3` is allow-listed, which makes this look like
