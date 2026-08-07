@@ -17,6 +17,7 @@ mod profile;
 mod reader;
 mod registry;
 mod us852_bootstrap;
+mod us852_match;
 mod us852_room;
 mod writer;
 
@@ -90,6 +91,11 @@ pub use us852_bootstrap::{
     PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter, RetailCourseStatistics,
     RetailEquipment, RetailGameAuth, RetailPlayerIdentity, RetailPlayerStatistics,
     ServerChannelList, US852_SERVER_VERSION,
+};
+pub use us852_match::{
+    MAX_MATCH_HOLES, RetailAimRotate, RetailFinishHole, RetailHole, RetailHoleWeather,
+    RetailHoleWind, RetailMatchInfo, RetailMatchStart, RetailPlayerStartHole,
+    RetailShotCommitRelay, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
     MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES,
