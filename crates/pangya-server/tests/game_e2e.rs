@@ -63,6 +63,8 @@ struct BlockingStrokeCommitRepository {
     commit_started: Notify,
     commit_calls: AtomicUsize,
     abort_calls: AtomicUsize,
+    /// When set, economy purchases stall past any sane command deadline.
+    stall_economy: bool,
 }
 
 impl BlockingStrokeCommitRepository {
@@ -72,6 +74,14 @@ impl BlockingStrokeCommitRepository {
             commit_started: Notify::new(),
             commit_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
+            stall_economy: false,
+        }
+    }
+
+    fn stalling_economy(pool: PgPool) -> Self {
+        Self {
+            stall_economy: true,
+            ..Self::new(pool)
         }
     }
 }
@@ -212,6 +222,12 @@ impl pangya_domain::EconomyRepository for BlockingStrokeCommitRepository {
             pangya_domain::EconomyError,
         >,
     > {
+        if self.stall_economy {
+            return Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Err(pangya_domain::EconomyError::Storage)
+            });
+        }
         pangya_domain::EconomyRepository::purchase(&self.inner, request)
     }
     fn equip(
@@ -340,6 +356,23 @@ fn economy_catalog() -> Catalog {
 }
 
 fn economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
+    economy_service_with(pool, metrics, Some(default_economy()))
+}
+
+fn default_economy() -> EconomyRuntimeConfig {
+    EconomyRuntimeConfig {
+        command_timeout: Duration::from_secs(2),
+        commands_per_window: 50,
+        page_size: 50,
+        max_purchase_quantity: 99,
+    }
+}
+
+fn economy_service_with(
+    pool: PgPool,
+    metrics: Arc<M2Metrics>,
+    economy: Option<EconomyRuntimeConfig>,
+) -> Arc<GameService<PgRepository>> {
     Arc::new(
         GameService::new(
             Arc::new(PgRepository::new(pool)),
@@ -353,17 +386,34 @@ fn economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgR
                 },
                 solo_practice: None,
                 stroke_two: None,
-                economy: Some(EconomyRuntimeConfig {
-                    command_timeout: Duration::from_secs(2),
-                    commands_per_window: 50,
-                    page_size: 50,
-                    max_purchase_quantity: 99,
-                }),
+                economy,
             },
             metrics,
         )
         .expect("economy service"),
     )
+}
+
+/// Authenticates a funded account and enters the channel, ready for economy commands.
+async fn connect_economy_client(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    account_id: pangya_domain::AccountId,
+) -> (TcpStream, u8) {
+    let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut stream, key) = connect_game(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        2,
+        &auth_payload(account_id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut stream, key, 1).await;
+    send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    (stream, key)
 }
 
 /// Builds a test-only generated catalog whose local Course record is course 1, hole 1, par 3.
@@ -5238,6 +5288,478 @@ async fn game_m7_encrypted_economy_is_catalog_priced_idempotent_and_restart_safe
     }
     assert_eq!(receive_packet(&mut restarted, key).await.0, 0x004d);
     drop(restarted);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_disabled_economy_refuses_each_command_without_closing(pool: PgPool) {
+    let account = create_account(&pool, "EconomyOff", 1, 0x1000_0000).await;
+    let (address, shutdown, task) = start_service(economy_service_with(
+        pool.clone(),
+        Arc::new(M2Metrics::default()),
+        None,
+    ))
+    .await;
+    let (mut stream, key) = connect_economy_client(&pool, address, account.account.id).await;
+
+    // Every command decodes and is refused explicitly; none of them closes the connection.
+    send_typed(&mut stream, key, 3, &ShopPageRequest::new(0)).await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::ShopPage, EconomyOutcome::Disabled)
+    );
+    send_typed(
+        &mut stream,
+        key,
+        4,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 1).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Purchase, EconomyOutcome::Disabled)
+    );
+    send_typed(
+        &mut stream,
+        key,
+        5,
+        &EquipRequest::new(uuid::Uuid::new_v4(), 0, 1, None, None).expect("equip"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Equip, EconomyOutcome::Disabled)
+    );
+    send_typed(
+        &mut stream,
+        key,
+        6,
+        &ConsumeOneRequest::new(uuid::Uuid::new_v4(), 1).expect("consume"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Consume, EconomyOutcome::Disabled)
+    );
+    send_typed(
+        &mut stream,
+        key,
+        7,
+        &RepairRequest::new(uuid::Uuid::new_v4(), 1).expect("repair"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Repair, EconomyOutcome::Disabled)
+    );
+
+    // Nothing was persisted by a disabled economy.
+    let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM economy_operations")
+        .fetch_one(&pool)
+        .await
+        .expect("operations");
+    assert_eq!(operations, 0);
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_economy_reports_each_rejection_outcome_without_persisting(pool: PgPool) {
+    let account = create_account(&pool, "EconomyReject", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 5000 WHERE account_id = $1")
+        .bind(account.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund profile");
+    let metrics = Arc::new(M2Metrics::default());
+    // Configure the purchase cap below the protocol's own hard cap of 99 so the runtime
+    // policy check is reachable; `PurchaseRequestPacket::new` already refuses to build
+    // anything above 99, so the wire type can never carry an over-protocol quantity.
+    let (address, shutdown, task) = start_service(economy_service_with(
+        pool.clone(),
+        metrics.clone(),
+        Some(EconomyRuntimeConfig {
+            max_purchase_quantity: 50,
+            ..default_economy()
+        }),
+    ))
+    .await;
+    let (mut stream, key) = connect_economy_client(&pool, address, account.account.id).await;
+    let mut salt = 3_u8;
+
+    // The v2 catalog sells exactly four offers, so page 1 is past the only page.
+    send_typed(&mut stream, key, salt, &ShopPageRequest::new(1)).await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::ShopPage, EconomyOutcome::Invalid)
+    );
+
+    // Quantity above the configured cap is refused before any repository work.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 51).expect("purchase"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Invalid
+    );
+
+    // 0x1a00_0002 exists in the catalog but is not sold, so it is not a shop offer.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0002, 1).expect("purchase"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Invalid
+    );
+
+    // An inventory row the account does not hold.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &ConsumeOneRequest::new(uuid::Uuid::new_v4(), 999_999).expect("consume"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::NotOwned
+    );
+
+    // Buy a consumable so a real inventory row exists for the incompatible-slot check.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 1).expect("purchase"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let consumable = receive_typed::<PurchaseCommitted>(&mut stream, key).await;
+
+    let character_id: i64 = sqlx::query_scalar("SELECT id FROM characters WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("character");
+    let character = u64::try_from(character_id).expect("character id");
+
+    // A consumable is not a club set, so the club slot rejects it on kind.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &EquipRequest::new(
+            uuid::Uuid::new_v4(),
+            0,
+            character,
+            Some(consumable.inventory_id()),
+            None,
+        )
+        .expect("equip"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Incompatible
+    );
+
+    // A stale optimistic version cannot commit an equipment change.
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &EquipRequest::new(uuid::Uuid::new_v4(), 7, character, None, None).expect("equip"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::VersionConflict
+    );
+
+    // Replaying one operation id with different parameters is drift, not a replay.
+    let reused = uuid::Uuid::new_v4();
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &PurchaseRequestPacket::new(reused, 0x1a00_0001, 2).expect("purchase"),
+    )
+    .await;
+    salt += 1;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let _ = receive_typed::<PurchaseCommitted>(&mut stream, key).await;
+    send_typed(
+        &mut stream,
+        key,
+        salt,
+        &PurchaseRequestPacket::new(reused, 0x1a00_0001, 3).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::IdempotencyDrift
+    );
+
+    // Only the two successful purchases moved money; every rejection was inert.
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("pang");
+    assert_eq!(pang, 5000 - 25 - 50);
+
+    let rendered = metrics.render();
+    for expected in [
+        "pangya_game_economy_outcomes_total{outcome=\"invalid\"} 3",
+        "pangya_game_economy_outcomes_total{outcome=\"not_owned\"} 1",
+        "pangya_game_economy_outcomes_total{outcome=\"incompatible\"} 1",
+        "pangya_game_economy_outcomes_total{outcome=\"version_conflict\"} 1",
+        "pangya_game_economy_outcomes_total{outcome=\"idempotency_drift\"} 1",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected}");
+    }
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_economy_reports_insufficient_pang_and_stack_limits(pool: PgPool) {
+    let account = create_account(&pool, "EconomyLimits", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 2500 WHERE account_id = $1")
+        .bind(account.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund profile");
+    let (address, shutdown, task) = start_service(economy_service(
+        pool.clone(),
+        Arc::new(M2Metrics::default()),
+    ))
+    .await;
+    let (mut stream, key) = connect_economy_client(&pool, address, account.account.id).await;
+
+    // 2500 Pang cannot cover a 500-Pang club after 99 consumables cost 2475.
+    send_typed(
+        &mut stream,
+        key,
+        3,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 99).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let stacked = receive_typed::<PurchaseCommitted>(&mut stream, key).await;
+    assert_eq!((stacked.quantity_after(), stacked.pang_balance()), (99, 25));
+
+    // The stack is at its catalog maximum of 99.
+    send_typed(
+        &mut stream,
+        key,
+        4,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 1).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::StackFull
+    );
+
+    // 25 Pang cannot cover the 500-Pang club set.
+    send_typed(
+        &mut stream,
+        key,
+        5,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1000_0001, 1).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::InsufficientPang
+    );
+
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("pang");
+    assert_eq!(pang, 25);
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_economy_commands_are_bounded_per_connection(pool: PgPool) {
+    let account = create_account(&pool, "EconomyRate", 1, 0x1000_0000).await;
+    let (address, shutdown, task) = start_service(economy_service_with(
+        pool.clone(),
+        Arc::new(M2Metrics::default()),
+        Some(EconomyRuntimeConfig {
+            commands_per_window: 2,
+            ..default_economy()
+        }),
+    ))
+    .await;
+    let (mut stream, key) = connect_economy_client(&pool, address, account.account.id).await;
+
+    for salt in 3..5 {
+        send_typed(&mut stream, key, salt, &ShopPageRequest::new(0)).await;
+        let _ = receive_typed::<ShopPage>(&mut stream, key).await;
+    }
+    // The third command exhausts the per-connection budget and closes the connection.
+    send_typed(&mut stream, key, 5, &ShopPageRequest::new(0)).await;
+    assert_closed(&mut stream).await;
+
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_economy_opcodes_require_authentication_and_channel_entry(pool: PgPool) {
+    let account = create_account(&pool, "EconomyGate", 1, 0x1000_0000).await;
+    let (address, shutdown, task) = start_service(economy_service(
+        pool.clone(),
+        Arc::new(M2Metrics::default()),
+    ))
+    .await;
+
+    // Before authentication the connection has no identity to charge.
+    let (mut unauthenticated, key) = connect_game(address).await;
+    send_typed(&mut unauthenticated, key, 1, &ShopPageRequest::new(0)).await;
+    assert_closed(&mut unauthenticated).await;
+
+    // Authenticated but still outside a channel is equally refused.
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut lobbyless, key) = connect_game(address).await;
+    send_packet(
+        &mut lobbyless,
+        key,
+        1,
+        2,
+        &auth_payload(account.account.id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut lobbyless, key, 1).await;
+    send_typed(&mut lobbyless, key, 2, &ShopPageRequest::new(0)).await;
+    assert_closed(&mut lobbyless).await;
+
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(pool: PgPool) {
+    let account = create_account(&pool, "EconomySlow", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 5000 WHERE account_id = $1")
+        .bind(account.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund profile");
+    let repository = Arc::new(BlockingStrokeCommitRepository::stalling_economy(
+        pool.clone(),
+    ));
+    let service = Arc::new(
+        GameService::new(
+            repository,
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: Some(EconomyRuntimeConfig {
+                    command_timeout: Duration::from_millis(100),
+                    ..default_economy()
+                }),
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("stalling economy service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut stream, key) = connect_economy_client(&pool, address, account.account.id).await;
+
+    // The repository never answers, so the deadline decides the outcome.
+    send_typed(
+        &mut stream,
+        key,
+        3,
+        &PurchaseRequestPacket::new(uuid::Uuid::new_v4(), 0x1a00_0001, 1).expect("purchase"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Purchase, EconomyOutcome::Timeout)
+    );
+
+    // A timed-out command leaves the connection usable and the balance untouched.
+    send_typed(&mut stream, key, 4, &ShopPageRequest::new(0)).await;
+    let _ = receive_typed::<ShopPage>(&mut stream, key).await;
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("pang");
+    assert_eq!(pang, 5000);
+
+    drop(stream);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
