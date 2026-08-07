@@ -2,9 +2,11 @@
 
 > Last updated: **2026-08-07**
 >
-> Current stage: **M7 — local synthetic inventory/shop/equipment checkpoint complete; every real U.S. client exit remains open**
+> Last updated: **2026-08-07**
 >
-> Next gate: **wire the reference-derived retail bootstrap into the runtime, then replace the remaining synthetic `0x7f**` families and prove them against the acquired U.S. client; no retail M3–M7 claim**
+> Current stage: **Real client startup is served and proven; the client mounts its full PAK series but stops before opening any socket**
+>
+> Next gate: **diagnose the client-side startup crash recorded as blocker 13. Until a client reaches LoginService, no real U.S. 852 protocol claim can be made at any milestone**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -32,6 +34,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | Cross-session memory | ✅ | Durable handoff in [`MEMORY.md`](MEMORY.md) |
 | Final project license | ✅ | Dual MIT OR Apache-2.0; ADR-0001, root license files |
 | Cargo workspace | ✅ | Ten required Rust 2024 crates, MSRV 1.93.0, Cargo.lock, lints and CI |
+| Client startup contract | ✅ | Real U.S. 852 client answered 33/33 HTTP requests from `[client_web]` and mounted all 84 PAK archives; `updatelist` byte-identical to an independent encoder for the real directory. [`evidence/REAL_CLIENT_STARTUP_2026-08-07.md`](evidence/REAL_CLIENT_STARTUP_2026-08-07.md), ADR-0015 |
+| Real client reaches LoginService | ⛔ | Blocker 13: client throws a C++ exception ~20 s in, from its own window/render factory, without opening a socket. Twelve causes eliminated by direct observation |
 | Protocol/crypto | 🟡 | All local M1 vectors, fixtures, transport boundaries, audits, and bounded fuzz checks pass; real-client acceptance remains |
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
@@ -273,22 +277,52 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 8. **Real M6 two-client/Course exit** — complete the M6 evidence file's external gate with two legally held clients and legally supplied data; never identify `0x7f30`/`0x7fb0`, `stroke-two-v1`, generated standings, or record rules as retail behavior.
 9. **Real M7 economy exit** — validate catalog-priced purchase/equip/consume/repair against a legally held client; never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
 10. **Synthetic-to-retail protocol pivot** — the `0x7f**` families are placeholders no real client will ever send. Every M3–M7 real-client gate is blocked behind replacing them with layouts derived from the vendored PacketDoc definitions, and behind correcting the three M3 bootstrap opcodes whose current meanings disagree with PacketDoc (`0x0070`, `0x0072`, `0x004d`).
-11. **Client runtime host** — the acquired client is a Windows x86 binary; extraction and parsing are host-agnostic, but running it under Rugburn needs Windows, Wine, or a VM. Unresolved.
+11. **Client runtime host** — **resolved 2026-08-07.** The client runs on Windows 11 under QEMU/KVM with Rugburn, which identifies it as US 852 and patches GameGuard out. Two host prerequisites were found: the host must expose at least one audio device, and `IntegratedPak` must exist in the registry. Both are in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 12. **Undiagnosed storage flake** — `concurrent_stroke_matches_with_shared_accounts_are_deadlock_free` has failed once in CI with `MatchRepositoryError::Storage`, and passes on re-run. It did not reproduce in 67 isolated runs or in repeated full-suite runs under heavy contention, and a lock cycle is not reachable: both commits sort their account ids and take `FOR UPDATE` on the same shared profile row, so one simply waits. **Now instrumented rather than open**: `Storage` carries a classified `StorageFault`, so the next occurrence names its own cause in the panic message — `deadlock` and `serialization` would disprove the analysis above, `unexpected_row_count` or `write_verification` would move the fault to the repository's own invariants, and `insufficient_resources` or `pool_timed_out` would make it contention rather than a defect. No guess was committed; the recurrence now identifies itself.
+
+13. **Client-side startup crash before any socket** — with every server-side prerequisite satisfied and its full PAK series mounted, the client throws a C++ exception (`0xE06D7363`) from inside `ProjectG.exe` about 20 seconds in and exits, without ever connecting to LoginService. The nearest symbols to the throwing frames are its window/render factory. This gates **every** real-client milestone exit, because no U.S. 852 protocol byte has yet been exchanged with a real client. Twelve hypotheses were eliminated by direct observation, not argument — audio, all three HTTP prerequisites, `IntegratedPak`, GameGuard, Rugburn's cosmetic patches, DNS, Direct3D availability, the client's own graphics settings, missing theme images, client file integrity, the launcher argument, and a `.dat` string-table mismatch. Full detail in [`evidence/REAL_CLIENT_STARTUP_2026-08-07.md`](evidence/REAL_CLIENT_STARTUP_2026-08-07.md). Next step is client-side: the crash is in a packed, stripped binary, so it needs symbol-free analysis of `exception.dmp` or a debugger that catches the first-chance throw and reports its type.
 
 ---
 
 ## Immediate next actions
 
-1. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
-2. Extend the retail match beyond one player and one hole. The retail flow is now wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.
-2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
-3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
-4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
+1. **Diagnose blocker 13.** Nothing else on the real-client path can be proven until a client reaches LoginService, so this outranks all protocol work.
+2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
+3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.
+4. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy. Course par is now settled as operator-declared: the client's `Course.iff` record carries none, and per-hole par lives in the course's own PAK data.
+5. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
+6. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
 
 ---
 
 ## Change log
+
+### 2026-08-07 — the real client's startup contract, served and proven
+
+- Executed the acquired U.S. 852 client against this server for the first time. It answered
+  every one of its 33 startup HTTP requests and mounted its complete 84-archive PAK series,
+  where previously it opened none.
+- Proved `SPEC.md` §13.4's conditional: the client requires a string catalog, an
+  XTEA-encrypted patch `updatelist`, and theme documents plus images **before it opens any
+  socket**. Each failure mode was isolated by satisfying the previous prerequisite. §13.4 and
+  the system-context diagram now record this; ADR-0015 records the design.
+- Added `pangya-updater` with PangYa's `updatelist` XTEA variant, its nonstandard file CRC-32,
+  and the document layout, all ISC-attributed and reproduced exactly rather than normalised.
+  The generated list for the real client directory is byte-identical to an independent
+  encoder's, pinned in CI by a golden fixture generated from that encoder.
+- Added a `[client_web]` listener separate from `[http]`, so the client-reachable patch surface
+  never carries health, readiness, or metrics — verified by 404s on `/metrics` and
+  `/health/ready` from the client's own machine, and on a theme file the document does not name.
+- Fixed two real defects the run exposed: a real-client catalog carries no course par, so solo
+  practice could never resolve a course and startup died with a generic catalog error; and every
+  listener or composition failure collapsed into "required runtime task exited" with no cause.
+  Par is now operator-declared and cross-checked, with a typed error that names the problem.
+- Recorded two host prerequisites no server can supply: an audio device must exist, and
+  `IntegratedPak` must be present in the registry.
+- Opened blocker 13 for the remaining client-side startup crash, with twelve hypotheses
+  eliminated by direct observation rather than argument.
+- Workspace total 402 tests passed, up from 330; fmt, Clippy with `-D warnings`, doc tests,
+  SQLx offline check, `cargo deny`, and the asset guard all pass.
 
 ### 2026-08-07 — storage failures became self-describing
 

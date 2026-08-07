@@ -183,6 +183,7 @@ Before the first stable release, protocol API changes are allowed. After `1.0`:
 │  │ Game TCP  :20201                                                  │    │
 │  │ Message TCP :30303 (later)                                        │    │
 │  │ Health/metrics HTTP :8080                                         │    │
+│  │ Client patch/theme HTTP :8090 (required before client startup)    │    │
 │  │                                                                   │    │
 │  │ protocol → application services → domain/room actors → storage    │    │
 │  └───────────────────────────┬───────────────────────────────────────┘    │
@@ -838,6 +839,7 @@ The parser MUST:
 ### 13.3 Static vs mutable data
 
 - Static catalog: item definitions, characters, courses, shop metadata.
+- A real U.S. client `Course` record is a presentation row and carries **no par**; per-hole par lives in the course's own PAK data. Where a mode needs par, it MUST be operator-declared and cross-checked against the catalog for course existence. A catalog MUST NOT be made to invent one.
 - Mutable state: owned inventory rows, equipment selections, balances, progression.
 - Inventory rows reference `ItemTypeId`; startup readiness verifies critical referenced IDs exist.
 - Catalog version/hash used for a match is recorded with results.
@@ -845,6 +847,23 @@ The parser MUST:
 ### 13.4 PAK/updater
 
 PAK/XTEA/updatelist support is Tier D unless a real client startup path proves it is required earlier. It belongs in `pangya-data`/`pangya-updater`, not the game domain.
+
+**This condition fired on 2026-08-07.** Running the U.S. 852 client proved `updatelist` support is required before Tier B, not at Tier D: the client makes three HTTP requests before it opens any socket, and failing any one of them ends the run.
+
+| Request | Failure when absent |
+|---|---|
+| `GET /Translation/Read.aspx` | client aborts with "string load failed." |
+| `GET .../S4_Patch/updatelist` | client aborts asking for a re-install or the update program |
+| `GET .../S4_Patch/extracontents/extracontents.xml`, then the theme document and every image it names | client exits silently |
+
+Only afterwards does the client mount its PAK series. Consequences, recorded in ADR-0015:
+
+- `pangya-updater` is now a required crate, holding PangYa's `updatelist` XTEA variant, its nonstandard file CRC-32, and the document layout. Both algorithms MUST be reproduced exactly rather than normalised to their textbook forms.
+- The service MUST run on a listener separate from `[http]`. The patch surface has to be reachable by the machine running the client; health, readiness, and metrics MUST NOT be.
+- The theme base URL MUST be an absolute URL derived from a configured advertised address, for the same reason as FR-LOGIN-008: the client passes it to the OS HTTP client verbatim.
+- Translation catalogs and theme images are client content and MUST remain operator-supplied.
+
+Independent of any server, the client also requires the registry value `HKLM\SOFTWARE\WOW6432Node\Ntreev USA\Pangya\IntegratedPak`, and a host with at least one audio device. Both are documented in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 
 ---
 

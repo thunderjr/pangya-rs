@@ -2,7 +2,7 @@
 
 > Durable handoff for the next coding session
 >
-> Last updated: **2026-08-05**
+> Last updated: **2026-08-07**
 >
 > Read first: [`PROGRESS.md`](PROGRESS.md), then [`SPEC.md`](SPEC.md)
 
@@ -17,6 +17,38 @@ M7's **local synthetic inventory/shop/equipment checkpoint is also complete**: g
 **Remaining pivot work.** The `0x7f**` families are placeholders no real client will ever send, so every M3-M7 real-client gate is blocked behind porting layouts from the vendored PacketDoc definitions. Three M3 bootstrap opcodes currently disagree with PacketDoc outright: `0x0070` is User Character Roster (not a profile blob), `0x0072` is User Equipment (not a character list), and `0x004d` is Sub-Server List (not equipment selection). A U.S. client has been acquired for this work and characterized in [`evidence/US_CLIENT_ACQUISITION_2026-08-07.md`](evidence/US_CLIENT_ACQUISITION_2026-08-07.md); it lives only under gitignored `local-data/`.
 
 ---
+
+## Real client startup (2026-08-07)
+
+The U.S. 852 client has been run against this server. It now completes startup and mounts its
+full PAK series, but still exits before opening any socket. Durable facts:
+
+- **The client needs three HTTP responses before it opens any socket**: `/Translation/Read.aspx`
+  (base64 string catalog), `.../S4_Patch/updatelist` (XTEA-encrypted patch manifest), and
+  `.../S4_Patch/extracontents/extracontents.xml` plus the theme document and every image it
+  names. Missing the first gives "string load failed."; the second, a re-install prompt; the
+  third, a silent exit. Served by `[client_web]`; see ADR-0015.
+- **Two host prerequisites no server can supply**: the host must expose at least one audio
+  device (Miles Sound System aborts otherwise; a null-backend QEMU HDA device suffices), and
+  `HKLM\SOFTWARE\WOW6432Node\Ntreev USA\Pangya\IntegratedPak` must exist (set it to the
+  string `0`). Retail's updater writes the latter; a copied install has no such value.
+- **The client's `Course.iff` carries no par.** It is a presentation row. Par is
+  operator-declared via `course_par` and cross-checked against the catalog for course
+  existence. Do not try to derive par from the catalog.
+- **Two algorithm quirks are deliberate, not bugs.** The `updatelist` checksum builds a
+  reflected table from the normal-form constant `0x04C11DB7`, so it is not CRC-32/ISO-HDLC;
+  the XTEA variant subtracts its delta while encrypting. The client is the specification.
+- **Rugburn's `$0` is the first capture group**, not the whole match. Its JSON parser also
+  rejects empty objects and arrays.
+- **The theme `url` attribute must be an absolute URL.** The client passes it to WinINet
+  verbatim, so a leading-slash path produces a request with no host.
+- **Open blocker 13**: the client throws a C++ exception from its own window/render factory
+  about 20 s in and exits, without connecting. Twelve causes were eliminated by direct
+  observation; see `evidence/REAL_CLIENT_STARTUP_2026-08-07.md` before re-testing any of them.
+- **macOS harness trap**: the Application Firewall gates incoming connections per application,
+  so an unsigned `pangya-server` completes a TCP handshake and then sends nothing to a remote
+  peer while answering fine on loopback. `python3` is allow-listed, which makes this look like
+  a code bug. `scripts/tailnet-forward.py` works around it without changing host settings.
 
 ## Durable decisions in the proposed baseline
 

@@ -118,3 +118,52 @@ reuses the remaining validated source, window, codec, authentication deadline,
 idle deadline, and shutdown bounds. `data.load_timeout` is nonzero and capped at
 60 seconds.
 Configuration `Debug` redacts the resolved database URL and secret-file path.
+
+## Course par with a real client catalog
+
+`game.solo_practice.course_par` and `game.stroke_two.course_par` default to `0`, meaning
+"take par from the catalog". Only the generated catalogs can satisfy that: a real U.S. client
+`Course.iff` record is a presentation row — identifier, display and Korean names, map
+directory, short name, a length-prefixed property XML filename, one float — and carries no
+par at all. Per-hole par lives in the course's own data inside the PAK series.
+
+So with `manifest_version = 3` an enabled mode requires an explicit `course_par` in `1..=10`,
+and startup fails naming that requirement rather than inventing a number. The catalog is
+still what makes the declared value meaningful: a par declared for a course the client does
+not have is rejected. A declared par also overrides a generated catalog's own, so the two
+schemas share one code path.
+
+## Client patch web service
+
+`[client_web]` serves the static HTTP contract a retail client needs *before* it will open
+any socket: a string catalog, the XTEA-encrypted patch `updatelist`, and the theme documents
+plus the images they name. It is disabled by default. See
+[`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md) for the client-side setup and ADR-0015 for
+why it exists.
+
+- It is a **separate listener** from `[http]`, deliberately. The patch surface must be
+  reachable by the machine running the client; health, readiness, and metrics must not be.
+  Both keep the loopback default, and any non-loopback bind still needs
+  `--acknowledge-public-bind`. `client_web.bind` participates in the duplicate-bind and
+  nonzero-port checks with every other listener.
+- `advertise` is separate from `bind` for the same reason as `login.advertise`: the client
+  resolves it on its own machine and passes it to the OS HTTP client verbatim, so a
+  container-internal or wildcard address is unusable there. It becomes the absolute base URL
+  in `extracontents.xml`.
+- `client_directory` is required when enabled and is validated at startup. `entries = "paks"`
+  lists only the PAK series, which is what the client needs to mount its data; `"all"` mirrors
+  a retail patch server and also lists executables and DLLs, which means a locally replaced
+  client file is listed with the server's checksum rather than the one on disk.
+- `region` selects the `updatelist` XTEA key (`us`, `jp`, `th`, `eu`, `id`, `kr`).
+- `translation_catalog` points at the **plaintext** catalog XML; the service base64-encodes it
+  as the client expects. Omitting it serves an empty body, which the client accepts before
+  falling back to its own `.dat` strings. The catalog is client content and is
+  operator-supplied.
+- `theme_directory` is optional. Notice, lobby, and loading entries are derived from the retail
+  file-naming convention, and a file the generated theme document does not name is refused
+  rather than served, so no path built from request text reaches the filesystem. Theme images
+  are capped at 4 MiB each and the catalog at 4 MiB.
+- Content is built once at startup, on a blocking worker, before the listener binds. Building
+  the update list checksums the whole client directory — about eight seconds for the U.S.
+  series — so a misconfigured directory is a startup error rather than a client-visible 404.
+  Startup logs `client patch web service ready` with the generated list's size.
