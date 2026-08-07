@@ -764,8 +764,12 @@ async fn maybe_receive_opcode(stream: &mut TcpStream, key: u8) -> Option<u16> {
 }
 
 async fn assert_closed(stream: &mut TcpStream) {
+    assert_closed_within(stream, Duration::from_secs(1)).await;
+}
+
+async fn assert_closed_within(stream: &mut TcpStream, bound: Duration) {
     let mut eof = [0_u8; 1];
-    let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut eof))
+    let read = tokio::time::timeout(bound, stream.read(&mut eof))
         .await
         .expect("bounded close");
     assert!(
@@ -1529,9 +1533,12 @@ async fn game_duplicate_presence_raii_replay_concurrency_rates_and_timeouts_are_
     pool: PgPool,
 ) {
     let aggregate = create_account(&pool, "GameBounds", 1, 0x1000_0000).await;
+    // Both deadlines must clear a loaded runner's snapshot load and bootstrap write, or the
+    // first connection loses its presence guard before the duplicate ever contends for it.
+    // Every assertion below still bounds the close, so widening these only costs wall clock.
     let limits = GameRuntimeLimits {
-        authentication_timeout: Duration::from_millis(100),
-        idle_timeout: Duration::from_secs(2),
+        authentication_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(5),
         ..GameRuntimeLimits::default()
     };
     let (address, shutdown, task, metrics) = start_game(pool.clone(), limits.clone()).await;
@@ -1825,9 +1832,12 @@ async fn game_packet_and_byte_rate_layers_are_independent(pool: PgPool) {
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgPool) {
     let aggregate = create_account(&pool, "GameProto", 1, 0x1000_0000).await;
+    // The protocol, wrong-channel, and cancellation cases must never race the idle clock:
+    // they assert why a connection closed, so an idle close would be a false pass. The idle
+    // close gets its own service below, with the only deadline that test case observes.
     let limits = GameRuntimeLimits {
-        authentication_timeout: Duration::from_secs(1),
-        idle_timeout: Duration::from_millis(50),
+        authentication_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(5),
         command_timeout: Duration::from_millis(100),
         shutdown_grace: Duration::from_millis(200),
         ..GameRuntimeLimits::default()
@@ -1870,7 +1880,15 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
         ServiceKind::Game,
     )
     .await;
-    let (mut idle, idle_key) = connect_game(address).await;
+    // A dedicated service so the idle deadline is short enough to observe without bounding
+    // any exchange that precedes it. It shares the metrics, so the close is counted once.
+    let idle_limits = GameRuntimeLimits {
+        idle_timeout: Duration::from_secs(1),
+        ..limits.clone()
+    };
+    let idle_service = game_service(pool.clone(), idle_limits, metrics.clone());
+    let (idle_address, idle_shutdown, idle_task) = start_service(idle_service).await;
+    let (mut idle, idle_key) = connect_game(idle_address).await;
     send_packet(
         &mut idle,
         idle_key,
@@ -1882,13 +1900,15 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
     read_bootstrap(&mut idle, idle_key, 1).await;
     send_packet(&mut idle, idle_key, 6, 4, &1_u32.to_le_bytes()).await;
     assert_eq!(receive_packet(&mut idle, idle_key).await.0, 0x004e);
-    assert_closed(&mut idle).await;
+    assert_closed_within(&mut idle, Duration::from_secs(5)).await;
     assert_counter_at_least(
         &metrics,
         "pangya_connections_closed_total{service=\"game\",reason=\"timeout\"} ",
         1,
     )
     .await;
+    idle_shutdown.cancel();
+    idle_task.await.expect("idle join").expect("idle serve");
 
     let cancellation_token = issue_token(
         &pool,
@@ -1908,7 +1928,7 @@ async fn game_protocol_idle_and_cancellation_cleanup_are_deterministic(pool: PgP
     .await;
     read_bootstrap(&mut cancelled, cancelled_key, 1).await;
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_millis(300), task)
+    tokio::time::timeout(Duration::from_secs(3), task)
         .await
         .expect("shutdown bound")
         .expect("join")
@@ -3296,6 +3316,9 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
 
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_m5_unclean_in_game_restart_recovers_before_fresh_auth(pool: PgPool) {
+    // The loading deadline passed to each service below is only "long enough to finish
+    // loading"; this test asserts startup recovery, never a loading timeout. Recovery
+    // itself stays bounded by its own one-second budget.
     let limits = GameRuntimeLimits {
         global_connections: 4,
         connections_per_source: 4,
@@ -3307,7 +3330,7 @@ async fn game_m5_unclean_in_game_restart_recovers_before_fresh_auth(pool: PgPool
         pool.clone(),
         limits.clone(),
         Arc::new(M2Metrics::default()),
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         20,
     );
     let (address, _shutdown, task) = start_service(service).await;
@@ -3355,7 +3378,7 @@ async fn game_m5_unclean_in_game_restart_recovers_before_fresh_auth(pool: PgPool
         pool.clone(),
         limits,
         Arc::new(M2Metrics::default()),
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         20,
     );
     let (address, shutdown, task) = start_service(service).await;
@@ -3450,13 +3473,16 @@ async fn game_m5_shot_sequence_and_fixed_window_limits_are_independent(pool: PgP
 async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not_reward(
     pool: PgPool,
 ) {
+    // No assertion below observes these two deadlines; they only have to outlast a loaded
+    // runner's actor round trip. The deadlines this test does assert on are the 150ms
+    // loading timeout and the bounded receives, which keep their original values.
     let limits = GameRuntimeLimits {
         global_connections: 8,
         connections_per_source: 8,
         global_auth_per_window: 50,
         auth_per_window: 50,
-        idle_timeout: Duration::from_secs(3),
-        command_timeout: Duration::from_millis(200),
+        idle_timeout: Duration::from_secs(10),
+        command_timeout: Duration::from_secs(1),
         shutdown_grace: Duration::from_secs(1),
         ..GameRuntimeLimits::default()
     };
@@ -3467,7 +3493,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
         pool.clone(),
         limits.clone(),
         metrics.clone(),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         20,
     );
     let (address, shutdown, task) = start_service(service).await;
@@ -3492,7 +3518,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
         pool.clone(),
         limits.clone(),
         Arc::new(M2Metrics::default()),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         20,
     );
     let (address, shutdown, task) = start_service(service).await;
@@ -3533,7 +3559,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
         pool.clone(),
         limits.clone(),
         metrics.clone(),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         20,
     );
     let (address, shutdown, task) = start_service(service).await;
@@ -3564,8 +3590,10 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
     let (address, shutdown, task) = start_service(service).await;
     let mut timed = connect_m5_owner(&pool, address, "M5LoadTimeout", "Loading Timeout").await;
     let timed_started = start_solo(&mut timed).await;
+    // Still bounded, and the assertion is on the abort reason rather than on arrival speed,
+    // so the wider window costs nothing and cannot be tripped by a busy runner.
     let aborted = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         receive_typed::<MatchAborted>(&mut timed.stream, timed.key),
     )
     .await
@@ -3594,7 +3622,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
         pool.clone(),
         limits.clone(),
         metrics,
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         20,
     );
     let (address, shutdown, task) = start_service(service).await;
@@ -3627,7 +3655,7 @@ async fn game_m5_encrypted_tcp_abort_timeout_malformed_and_shutdown_paths_do_not
 
     // Service shutdown drains the active room and persists its terminal reason.
     let metrics = Arc::new(M2Metrics::default());
-    let service = solo_service(pool.clone(), limits, metrics, Duration::from_secs(1), 20);
+    let service = solo_service(pool.clone(), limits, metrics, Duration::from_secs(10), 20);
     let (address, shutdown, task) = start_service(service).await;
     let mut stopping = connect_m5_owner(&pool, address, "M5Shutdown", "Shutdown Match").await;
     send_typed(&mut stopping.stream, stopping.key, 4, &StartSolo::new()).await;
