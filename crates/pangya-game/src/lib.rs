@@ -40,12 +40,15 @@ use pangya_data::Catalog;
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
     BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome,
-    CatalogFingerprint, ConsumeHandover, HandoverRepository, MarkSoloInGame, MarkSoloInGameOutcome,
-    MarkStrokeInGame, MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository,
-    MatchResultKey, MatchSeed, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository,
-    PlayerSnapshot, RepositoryError, RoomError, RoomId, ServiceKind as DomainServiceKind,
-    SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
-    StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
+    CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, EconomyCommit, EconomyError,
+    EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
+    HandoverRepository, InventoryItemId, ItemDurability, ItemKind, ItemStacking, ItemTypeId,
+    MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
+    MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
+    RepositoryError, RoomError, RoomId, ServiceKind as DomainServiceKind, SoloMatchResult,
+    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
+    StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -53,20 +56,25 @@ use pangya_login::{
 };
 use pangya_protocol::{
     BalanceUpdate, ChannelJoined, CharacterBootstrap, CharacterInfo, CodecLimits,
-    CompatibilityProfile, DecodePacket, EncodePacket, EquipmentInfo, FinishHole, FrameCodec,
-    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HoleResult, InventoryBootstrap, InventorySegment,
-    LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
-    MatchStarted, OutboundFrame, PacketEncodeError, PlayerInfo, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
-    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand, EconomyCommandResult,
+    EconomyItemKind, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo,
+    FinishHole, FrameCodec, GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HoleResult, InventoryBootstrap,
+    InventoryChanged, InventorySegment, LoadingComplete,
+    MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
+    OutboundFrame, PacketEncodeError, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
+    RepairCommitted, RepairRequest, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
+    RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
     SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
     SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
     SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
     SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
     SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
     SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SelectChannel, ServiceKind, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServiceKind, ShopOffer,
+    ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
     SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo,
     StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
     StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
@@ -502,6 +510,19 @@ pub struct StrokeRuntimeConfig {
     pub shot_packets_per_window: u32,
 }
 
+/// Checked optional synthetic economy composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EconomyRuntimeConfig {
+    /// Repository command deadline.
+    pub command_timeout: Duration,
+    /// Per-connection commands per shared rate window.
+    pub commands_per_window: u32,
+    /// Offers emitted per page.
+    pub page_size: usize,
+    /// Maximum purchase quantity accepted from the wire.
+    pub max_purchase_quantity: u32,
+}
+
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
@@ -515,6 +536,8 @@ pub struct GameRuntimeConfig {
     pub solo_practice: Option<SoloRuntimeConfig>,
     /// Optional local-only synthetic exactly-two stroke mode.
     pub stroke_two: Option<StrokeRuntimeConfig>,
+    /// Optional local-only synthetic economy.
+    pub economy: Option<EconomyRuntimeConfig>,
 }
 
 impl Default for GameRuntimeConfig {
@@ -525,6 +548,7 @@ impl Default for GameRuntimeConfig {
             limits: GameRuntimeLimits::default(),
             solo_practice: None,
             stroke_two: None,
+            economy: None,
         }
     }
 }
@@ -562,6 +586,9 @@ pub enum GameRuntimeError {
     /// Match persistence failed with details redacted.
     #[error("GameService match persistence failed")]
     MatchPersistence,
+    /// Economy persistence failed with details redacted.
+    #[error("GameService economy persistence failed")]
+    EconomyPersistence,
     /// Connection or lobby drain exceeded grace.
     #[error("GameService graceful shutdown timed out")]
     ShutdownTimeout,
@@ -624,7 +651,7 @@ impl CaptureSink {
 /// Generic bounded GameService over domain repositories and an immutable catalog.
 pub struct GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     repository: Arc<R>,
     catalog: Catalog,
@@ -648,7 +675,7 @@ where
 
 impl<R> std::fmt::Debug for GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -660,7 +687,7 @@ where
 
 impl<R> GameService<R>
 where
-    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     /// Creates a GameService after validating every direct and actor bound.
     pub fn new(
@@ -736,6 +763,17 @@ where
                     || solo.shot_packets_per_window == 0
                     || solo.shot_packets_per_window > 1_000_000
             })
+            || config.economy.is_some_and(|economy| {
+                economy.command_timeout.is_zero()
+                    || economy.command_timeout > limits.shutdown_grace
+                    || economy.command_timeout > Duration::from_secs(60)
+                    || economy.commands_per_window == 0
+                    || economy.commands_per_window > 1_000_000
+                    || economy.page_size == 0
+                    || economy.page_size > pangya_protocol::MAX_SHOP_PAGE_ENTRIES
+                    || economy.max_purchase_quantity == 0
+                    || economy.max_purchase_quantity > pangya_protocol::MAX_PURCHASE_QUANTITY
+            })
             || config.stroke_two.is_some_and(|stroke| {
                 let wire_duration = |duration: Duration| {
                     duration.is_zero()
@@ -758,6 +796,15 @@ where
             });
         if invalid {
             return Err(GameRuntimeError::InvalidConfig);
+        }
+        if config.economy.is_some()
+            && (catalog.shop_offers().is_empty()
+                || !catalog
+                    .shop_offers()
+                    .iter()
+                    .any(|offer| offer.kind == ItemKind::Consumable))
+        {
+            return Err(GameRuntimeError::Catalog);
         }
         for (course, fingerprint) in config
             .solo_practice
@@ -1030,6 +1077,7 @@ where
         let mut commands = LocalRateWindow::new(self.config.limits.rate_window);
         let mut chats = LocalRateWindow::new(self.config.limits.rate_window);
         let mut shots = LocalRateWindow::new(self.config.limits.rate_window);
+        let mut economy_commands = LocalRateWindow::new(self.config.limits.rate_window);
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
@@ -1148,6 +1196,29 @@ where
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
+                            } else if is_known_economy_opcode(frame.opcode) {
+                                if state != GameState::InChannel {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if let Some(economy) = self.config.economy
+                                    && !economy_commands.admit_count(economy.commands_per_window)
+                                {
+                                    break Err(GameRuntimeError::Limited);
+                                }
+                                let handled = self
+                                    .handle_economy_command(
+                                        &mut framed,
+                                        established.account_id,
+                                        frame.opcode,
+                                        &frame.payload,
+                                    )
+                                    .await;
+                                if let Err(error) = handled {
+                                    break Err(error);
+                                }
                             } else if is_known_room_opcode(frame.opcode) {
                                 let Some(established) = identity.as_ref() else {
                                     break Err(GameRuntimeError::Protocol);
@@ -1276,6 +1347,425 @@ where
             Err(error) => Err(error),
             Ok(()) => result,
         }
+    }
+
+    async fn handle_economy_command(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        let Some(economy) = self.config.economy else {
+            let command = economy_command_for_opcode(opcode).ok_or(GameRuntimeError::Protocol)?;
+            decode_economy_request_shape(opcode, payload)?;
+            return self
+                .send(
+                    framed,
+                    &EconomyCommandResult::new(command, EconomyOutcome::Disabled),
+                )
+                .await;
+        };
+        match opcode {
+            SYNTHETIC_M7_C2S_SHOP_PAGE => {
+                let request =
+                    decode_packet_payload::<ShopPageRequest>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let offers = self.catalog.shop_offers();
+                let page_size = economy.page_size;
+                let total_pages_usize = offers.len().div_ceil(page_size).max(1);
+                let total_pages = u16::try_from(total_pages_usize)
+                    .map_err(|_| GameRuntimeError::InvalidConfig)?;
+                let page_index = usize::from(request.page());
+                if page_index >= total_pages_usize {
+                    return self
+                        .send_economy_result(
+                            framed,
+                            EconomyCommand::ShopPage,
+                            EconomyOutcome::Invalid,
+                        )
+                        .await;
+                }
+                let start = page_index
+                    .checked_mul(page_size)
+                    .ok_or(GameRuntimeError::InvalidConfig)?;
+                let end = start.saturating_add(page_size).min(offers.len());
+                let entries = offers[start..end]
+                    .iter()
+                    .copied()
+                    .map(protocol_shop_offer)
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.send(
+                    framed,
+                    &ShopPage::new(request.page(), total_pages, entries)
+                        .map_err(|_| GameRuntimeError::Catalog)?,
+                )
+                .await
+            }
+            SYNTHETIC_M7_C2S_PURCHASE => {
+                let request = decode_packet_payload::<PurchaseRequestPacket>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                if request.quantity() > economy.max_purchase_quantity {
+                    return self
+                        .send_economy_result(
+                            framed,
+                            EconomyCommand::Purchase,
+                            EconomyOutcome::Invalid,
+                        )
+                        .await;
+                }
+                let type_id = ItemTypeId::new(request.type_id());
+                let Some(definition) = self.catalog.shop_offer(type_id).copied() else {
+                    return self
+                        .send_economy_result(
+                            framed,
+                            EconomyCommand::Purchase,
+                            EconomyOutcome::Invalid,
+                        )
+                        .await;
+                };
+                let input = PurchaseRequest {
+                    account_id,
+                    operation_id: EconomyOperationId::new(request.operation_id()),
+                    catalog: self.catalog.fingerprint(),
+                    definition,
+                    quantity: request.quantity(),
+                };
+                let result =
+                    timeout(economy.command_timeout, self.repository.purchase(input)).await;
+                let committed = match result {
+                    Err(_) => {
+                        return self
+                            .send_economy_result(
+                                framed,
+                                EconomyCommand::Purchase,
+                                EconomyOutcome::Timeout,
+                            )
+                            .await;
+                    }
+                    Ok(Err(error)) => {
+                        return self
+                            .send_economy_error(framed, EconomyCommand::Purchase, error)
+                            .await;
+                    }
+                    Ok(Ok(EconomyCommit::Committed(value) | EconomyCommit::Replayed(value))) => {
+                        value
+                    }
+                };
+                self.send_economy_result(framed, EconomyCommand::Purchase, EconomyOutcome::Success)
+                    .await?;
+                self.send(
+                    framed,
+                    &PurchaseCommitted::new(
+                        committed.operation_id.get(),
+                        committed
+                            .inventory_id
+                            .get()
+                            .try_into()
+                            .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                        committed.item_type_id.get(),
+                        committed.quantity_after,
+                        committed.durability,
+                        committed.pang_balance,
+                    )
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                )
+                .await
+            }
+            SYNTHETIC_M7_C2S_EQUIP => {
+                let request =
+                    decode_packet_payload::<EquipRequest>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let snapshot = timeout(
+                    economy.command_timeout,
+                    self.repository.load_player_snapshot(account_id),
+                )
+                .await
+                .map_err(|_| GameRuntimeError::Timeout)?
+                .map_err(|_| GameRuntimeError::Snapshot)?;
+                let character_id = i64::try_from(request.character_id())
+                    .ok()
+                    .and_then(|v| CharacterId::new(v).ok());
+                let Some(character_id) = character_id else {
+                    return self
+                        .send_economy_result(framed, EconomyCommand::Equip, EconomyOutcome::Invalid)
+                        .await;
+                };
+                let Some(character) = snapshot
+                    .characters
+                    .iter()
+                    .find(|value| value.id == character_id)
+                else {
+                    return self
+                        .send_economy_result(
+                            framed,
+                            EconomyCommand::Equip,
+                            EconomyOutcome::NotOwned,
+                        )
+                        .await;
+                };
+                let selector =
+                    |raw: Option<u64>,
+                     expected: ItemKind|
+                     -> Result<Option<EconomyItemSelector>, EconomyOutcome> {
+                        let Some(raw) = raw else {
+                            return Ok(None);
+                        };
+                        let id = i64::try_from(raw)
+                            .ok()
+                            .and_then(|value| InventoryItemId::new(value).ok())
+                            .ok_or(EconomyOutcome::Invalid)?;
+                        let item = snapshot
+                            .inventory
+                            .iter()
+                            .find(|value| value.id == id)
+                            .ok_or(EconomyOutcome::NotOwned)?;
+                        let definition = self
+                            .catalog
+                            .item_definition(item.item_type_id)
+                            .copied()
+                            .ok_or(EconomyOutcome::Incompatible)?;
+                        if definition.kind != expected {
+                            return Err(EconomyOutcome::Incompatible);
+                        }
+                        Ok(Some(EconomyItemSelector {
+                            inventory_id: id,
+                            definition,
+                        }))
+                    };
+                let club = match selector(request.club_id(), ItemKind::ClubSet) {
+                    Ok(v) => v,
+                    Err(o) => {
+                        return self
+                            .send_economy_result(framed, EconomyCommand::Equip, o)
+                            .await;
+                    }
+                };
+                let ball = match selector(request.ball_id(), ItemKind::Ball) {
+                    Ok(v) => v,
+                    Err(o) => {
+                        return self
+                            .send_economy_result(framed, EconomyCommand::Equip, o)
+                            .await;
+                    }
+                };
+                let input = EquipmentChange {
+                    account_id,
+                    operation_id: EconomyOperationId::new(request.operation_id()),
+                    catalog: self.catalog.fingerprint(),
+                    expected_version: request.expected_version(),
+                    character_id,
+                    character_type_id: character.item_type_id,
+                    club,
+                    ball,
+                };
+                let result = timeout(economy.command_timeout, self.repository.equip(input)).await;
+                let committed = match result {
+                    Err(_) => {
+                        return self
+                            .send_economy_result(
+                                framed,
+                                EconomyCommand::Equip,
+                                EconomyOutcome::Timeout,
+                            )
+                            .await;
+                    }
+                    Ok(Err(e)) => {
+                        return self
+                            .send_economy_error(framed, EconomyCommand::Equip, e)
+                            .await;
+                    }
+                    Ok(Ok(EconomyCommit::Committed(v) | EconomyCommit::Replayed(v))) => v,
+                };
+                self.send_economy_result(framed, EconomyCommand::Equip, EconomyOutcome::Success)
+                    .await?;
+                self.send(
+                    framed,
+                    &EquipmentChanged::new(
+                        committed.operation_id.get(),
+                        u64::try_from(committed.character_id.get())
+                            .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                        committed
+                            .club_item_id
+                            .map(|v| {
+                                u64::try_from(v.get())
+                                    .map_err(|_| GameRuntimeError::EconomyPersistence)
+                            })
+                            .transpose()?,
+                        committed
+                            .ball_item_id
+                            .map(|v| {
+                                u64::try_from(v.get())
+                                    .map_err(|_| GameRuntimeError::EconomyPersistence)
+                            })
+                            .transpose()?,
+                        committed.version,
+                    )
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                )
+                .await
+            }
+            SYNTHETIC_M7_C2S_CONSUME | SYNTHETIC_M7_C2S_REPAIR => {
+                let (command, operation_id, raw_id) = if opcode == SYNTHETIC_M7_C2S_CONSUME {
+                    let request = decode_packet_payload::<ConsumeOneRequest>(
+                        payload,
+                        profile,
+                        ServiceKind::Game,
+                    )
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                    (
+                        EconomyCommand::Consume,
+                        request.operation_id(),
+                        request.inventory_id(),
+                    )
+                } else {
+                    let request =
+                        decode_packet_payload::<RepairRequest>(payload, profile, ServiceKind::Game)
+                            .map_err(|_| GameRuntimeError::Protocol)?;
+                    (
+                        EconomyCommand::Repair,
+                        request.operation_id(),
+                        request.inventory_id(),
+                    )
+                };
+                let id = i64::try_from(raw_id)
+                    .ok()
+                    .and_then(|v| InventoryItemId::new(v).ok());
+                let Some(id) = id else {
+                    return self
+                        .send_economy_result(framed, command, EconomyOutcome::Invalid)
+                        .await;
+                };
+                let snapshot = timeout(
+                    economy.command_timeout,
+                    self.repository.load_player_snapshot(account_id),
+                )
+                .await
+                .map_err(|_| GameRuntimeError::Timeout)?
+                .map_err(|_| GameRuntimeError::Snapshot)?;
+                let Some(item) = snapshot.inventory.iter().find(|value| value.id == id) else {
+                    return self
+                        .send_economy_result(framed, command, EconomyOutcome::NotOwned)
+                        .await;
+                };
+                let Some(definition) = self.catalog.item_definition(item.item_type_id).copied()
+                else {
+                    return self
+                        .send_economy_result(framed, command, EconomyOutcome::Incompatible)
+                        .await;
+                };
+                let selector = EconomyItemSelector {
+                    inventory_id: id,
+                    definition,
+                };
+                if command == EconomyCommand::Consume {
+                    let input = ConsumeItem {
+                        account_id,
+                        operation_id: EconomyOperationId::new(operation_id),
+                        catalog: self.catalog.fingerprint(),
+                        item: selector,
+                    };
+                    let result =
+                        timeout(economy.command_timeout, self.repository.consume_one(input)).await;
+                    let committed = match result {
+                        Err(_) => {
+                            return self
+                                .send_economy_result(framed, command, EconomyOutcome::Timeout)
+                                .await;
+                        }
+                        Ok(Err(e)) => return self.send_economy_error(framed, command, e).await,
+                        Ok(Ok(EconomyCommit::Committed(v) | EconomyCommit::Replayed(v))) => v,
+                    };
+                    self.send_economy_result(framed, command, EconomyOutcome::Success)
+                        .await?;
+                    self.send(
+                        framed,
+                        &InventoryChanged::new(
+                            committed.operation_id.get(),
+                            u64::try_from(committed.inventory_id.get())
+                                .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                            committed.item_type_id.get(),
+                            committed.quantity_after,
+                            None,
+                        )
+                        .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                    )
+                    .await
+                } else {
+                    let input = RepairItem {
+                        account_id,
+                        operation_id: EconomyOperationId::new(operation_id),
+                        catalog: self.catalog.fingerprint(),
+                        item: selector,
+                    };
+                    let result =
+                        timeout(economy.command_timeout, self.repository.repair(input)).await;
+                    let committed = match result {
+                        Err(_) => {
+                            return self
+                                .send_economy_result(framed, command, EconomyOutcome::Timeout)
+                                .await;
+                        }
+                        Ok(Err(e)) => return self.send_economy_error(framed, command, e).await,
+                        Ok(Ok(EconomyCommit::Committed(v) | EconomyCommit::Replayed(v))) => v,
+                    };
+                    self.send_economy_result(framed, command, EconomyOutcome::Success)
+                        .await?;
+                    self.send(
+                        framed,
+                        &RepairCommitted::new(
+                            committed.operation_id.get(),
+                            u64::try_from(committed.inventory_id.get())
+                                .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                            committed.durability,
+                            committed.pang_balance,
+                        )
+                        .map_err(|_| GameRuntimeError::EconomyPersistence)?,
+                    )
+                    .await
+                }
+            }
+            _ => Err(GameRuntimeError::Protocol),
+        }
+    }
+
+    async fn send_economy_result(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        command: EconomyCommand,
+        outcome: EconomyOutcome,
+    ) -> Result<(), GameRuntimeError> {
+        self.send(framed, &EconomyCommandResult::new(command, outcome))
+            .await
+    }
+
+    async fn send_economy_error(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        command: EconomyCommand,
+        error: EconomyError,
+    ) -> Result<(), GameRuntimeError> {
+        let outcome = match error {
+            EconomyError::Invalid => EconomyOutcome::Invalid,
+            EconomyError::InsufficientPang => EconomyOutcome::InsufficientPang,
+            EconomyError::NotOwned => EconomyOutcome::NotOwned,
+            EconomyError::Incompatible | EconomyError::Expired | EconomyError::Depleted => {
+                EconomyOutcome::Incompatible
+            }
+            EconomyError::StackFull => EconomyOutcome::StackFull,
+            EconomyError::VersionConflict => EconomyOutcome::VersionConflict,
+            EconomyError::IdempotencyDrift => EconomyOutcome::IdempotencyDrift,
+            EconomyError::AccountInactive => EconomyOutcome::NotOwned,
+            EconomyError::ArithmeticOverflow
+            | EconomyError::CorruptData
+            | EconomyError::Storage => return Err(GameRuntimeError::EconomyPersistence),
+        };
+        self.send_economy_result(framed, command, outcome).await
     }
 
     async fn authenticate(
@@ -3313,6 +3803,86 @@ fn unknown_decision(
     }
 }
 
+fn is_known_economy_opcode(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        SYNTHETIC_M7_C2S_SHOP_PAGE
+            | SYNTHETIC_M7_C2S_PURCHASE
+            | SYNTHETIC_M7_C2S_EQUIP
+            | SYNTHETIC_M7_C2S_CONSUME
+            | SYNTHETIC_M7_C2S_REPAIR
+    )
+}
+
+fn economy_command_for_opcode(opcode: u16) -> Option<EconomyCommand> {
+    match opcode {
+        SYNTHETIC_M7_C2S_SHOP_PAGE => Some(EconomyCommand::ShopPage),
+        SYNTHETIC_M7_C2S_PURCHASE => Some(EconomyCommand::Purchase),
+        SYNTHETIC_M7_C2S_EQUIP => Some(EconomyCommand::Equip),
+        SYNTHETIC_M7_C2S_CONSUME => Some(EconomyCommand::Consume),
+        SYNTHETIC_M7_C2S_REPAIR => Some(EconomyCommand::Repair),
+        _ => None,
+    }
+}
+
+fn decode_economy_request_shape(opcode: u16, payload: &[u8]) -> Result<(), GameRuntimeError> {
+    let profile = &CompatibilityProfile::US_852;
+    match opcode {
+        SYNTHETIC_M7_C2S_SHOP_PAGE => {
+            decode_packet_payload::<ShopPageRequest>(payload, profile, ServiceKind::Game).map(drop)
+        }
+        SYNTHETIC_M7_C2S_PURCHASE => {
+            decode_packet_payload::<PurchaseRequestPacket>(payload, profile, ServiceKind::Game)
+                .map(drop)
+        }
+        SYNTHETIC_M7_C2S_EQUIP => {
+            decode_packet_payload::<EquipRequest>(payload, profile, ServiceKind::Game).map(drop)
+        }
+        SYNTHETIC_M7_C2S_CONSUME => {
+            decode_packet_payload::<ConsumeOneRequest>(payload, profile, ServiceKind::Game)
+                .map(drop)
+        }
+        SYNTHETIC_M7_C2S_REPAIR => {
+            decode_packet_payload::<RepairRequest>(payload, profile, ServiceKind::Game).map(drop)
+        }
+        _ => return Err(GameRuntimeError::Protocol),
+    }
+    .map_err(|_| GameRuntimeError::Protocol)
+}
+
+fn protocol_shop_offer(
+    definition: pangya_domain::ItemDefinition,
+) -> Result<ShopOffer, GameRuntimeError> {
+    let kind = match definition.kind {
+        ItemKind::ClubSet => EconomyItemKind::ClubSet,
+        ItemKind::Ball => EconomyItemKind::Ball,
+        ItemKind::Consumable => EconomyItemKind::Consumable,
+        ItemKind::CharacterPart => EconomyItemKind::CharacterPart,
+        ItemKind::Character => return Err(GameRuntimeError::Catalog),
+    };
+    let price = definition.pang_price().ok_or(GameRuntimeError::Catalog)?;
+    let max_stack = match definition.stacking {
+        ItemStacking::Unique => 1,
+        ItemStacking::Stackable { max_stack } => max_stack,
+    };
+    let (max_durability, repair_rate) = match definition.durability {
+        ItemDurability::Nondurable => (0, 0),
+        ItemDurability::Durable {
+            max,
+            repair_pang_per_point,
+        } => (max, repair_pang_per_point),
+    };
+    ShopOffer::new(
+        definition.type_id.get(),
+        kind,
+        price,
+        max_stack,
+        max_durability,
+        repair_rate,
+    )
+    .map_err(|_| GameRuntimeError::Catalog)
+}
+
 fn is_known_solo_opcode(opcode: u16) -> bool {
     matches!(
         opcode,
@@ -3900,6 +4470,43 @@ mod tests {
             _limit: IncompleteMatchAbortLimit,
         ) -> RepositoryFuture<'_, Result<u32, MatchRepositoryError>> {
             Box::pin(async { Ok(0) })
+        }
+    }
+
+    impl EconomyRepository for FakeRepository {
+        fn purchase(
+            &self,
+            _request: PurchaseRequest,
+        ) -> RepositoryFuture<'_, Result<EconomyCommit<pangya_domain::PurchaseResult>, EconomyError>>
+        {
+            Box::pin(async { Err(EconomyError::Storage) })
+        }
+        fn equip(
+            &self,
+            _request: EquipmentChange,
+        ) -> RepositoryFuture<
+            '_,
+            Result<EconomyCommit<pangya_domain::EquipmentChangeResult>, EconomyError>,
+        > {
+            Box::pin(async { Err(EconomyError::Storage) })
+        }
+        fn consume_one(
+            &self,
+            _request: ConsumeItem,
+        ) -> RepositoryFuture<
+            '_,
+            Result<EconomyCommit<pangya_domain::ConsumeItemResult>, EconomyError>,
+        > {
+            Box::pin(async { Err(EconomyError::Storage) })
+        }
+        fn repair(
+            &self,
+            _request: RepairItem,
+        ) -> RepositoryFuture<
+            '_,
+            Result<EconomyCommit<pangya_domain::RepairItemResult>, EconomyError>,
+        > {
+            Box::pin(async { Err(EconomyError::Storage) })
         }
     }
 

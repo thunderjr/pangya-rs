@@ -21,12 +21,12 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::Catalog;
 use pangya_domain::{
-    HandoverRepository, MatchRepository, NewAccount, Nickname, PlayerRepository, RepositoryError,
-    Username,
+    EconomyRepository, HandoverRepository, MatchRepository, NewAccount, Nickname, PlayerRepository,
+    RepositoryError, Username,
 };
 use pangya_game::{
-    GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService, LobbyLimits, RoomActorLimits,
-    SoloRuntimeConfig, StrokeRuntimeConfig,
+    EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
+    LobbyLimits, RoomActorLimits, SoloRuntimeConfig, StrokeRuntimeConfig,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
@@ -286,7 +286,7 @@ fn compose_game_service<R>(
     observer: Arc<dyn GameObserver>,
 ) -> Result<Arc<GameService<R>>, ServerError>
 where
-    R: HandoverRepository + PlayerRepository + MatchRepository + 'static,
+    R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     GameService::new(repository, catalog, config, observer)
         .map(Arc::new)
@@ -322,6 +322,12 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         .map(|catalog| resolve_stroke_runtime_config(catalog, config.stroke_two))
         .transpose()?
         .flatten();
+    let economy = config.economy.map(|value| EconomyRuntimeConfig {
+        command_timeout: value.command_timeout,
+        commands_per_window: value.commands_per_window,
+        page_size: value.page_size,
+        max_purchase_quantity: value.max_purchase_quantity,
+    });
     let metrics = Arc::new(M2Metrics::default());
     let game = match catalog {
         Some(catalog) => Some(compose_game_service(
@@ -333,6 +339,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 limits: game_runtime_limits(&config)?,
                 solo_practice,
                 stroke_two,
+                economy,
             },
             metrics.clone(),
         )?),
@@ -1039,6 +1046,57 @@ mod tests {
                 self.release.notified().await;
                 Ok(0)
             })
+        }
+    }
+
+    impl EconomyRepository for RecoveryGate {
+        fn purchase(
+            &self,
+            _request: pangya_domain::PurchaseRequest,
+        ) -> RepositoryFuture<
+            '_,
+            Result<
+                pangya_domain::EconomyCommit<pangya_domain::PurchaseResult>,
+                pangya_domain::EconomyError,
+            >,
+        > {
+            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+        }
+        fn equip(
+            &self,
+            _request: pangya_domain::EquipmentChange,
+        ) -> RepositoryFuture<
+            '_,
+            Result<
+                pangya_domain::EconomyCommit<pangya_domain::EquipmentChangeResult>,
+                pangya_domain::EconomyError,
+            >,
+        > {
+            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+        }
+        fn consume_one(
+            &self,
+            _request: pangya_domain::ConsumeItem,
+        ) -> RepositoryFuture<
+            '_,
+            Result<
+                pangya_domain::EconomyCommit<pangya_domain::ConsumeItemResult>,
+                pangya_domain::EconomyError,
+            >,
+        > {
+            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
+        }
+        fn repair(
+            &self,
+            _request: pangya_domain::RepairItem,
+        ) -> RepositoryFuture<
+            '_,
+            Result<
+                pangya_domain::EconomyCommit<pangya_domain::RepairItemResult>,
+                pangya_domain::EconomyError,
+            >,
+        > {
+            Box::pin(async { Err(pangya_domain::EconomyError::Storage) })
         }
     }
 

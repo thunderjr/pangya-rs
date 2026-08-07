@@ -18,8 +18,8 @@ use pangya_domain::{
     StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
-    GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig, StrokeRuntimeConfig,
-    UnknownOpcodePolicy, deterministic_conditions,
+    EconomyRuntimeConfig, GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig,
+    StrokeRuntimeConfig, UnknownOpcodePolicy, deterministic_conditions,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
@@ -27,19 +27,21 @@ use pangya_login::{
 };
 use pangya_observability::M2Metrics;
 use pangya_protocol::{
-    BalanceUpdate, CompatibilityProfile, DecodePacket, EncodePacket, FinishHole, HoleResult, Lie,
-    LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase, MatchStarted, PacketWriter,
-    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
-    RoomCreateRequest, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest,
-    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, ServiceKind as ProtocolServiceKind,
-    ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
-    SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay,
-    StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome, StrokeCommandResult,
-    StrokeCompletion, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted,
-    StrokePhase, StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult,
-    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, decode_packet_payload,
-    encode_packet_payload,
+    BalanceUpdate, CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand,
+    EconomyCommandResult, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, FinishHole,
+    HoleResult, InventoryChanged, Lie, LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase,
+    MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket, RepairCommitted,
+    RepairRequest, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
+    RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    ServiceKind as ProtocolServiceKind, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay,
+    ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase,
+    StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate,
+    StrokeCommand, StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandings, StrokeTurnStarted,
+    Weather as ProtocolWeather, decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -199,6 +201,57 @@ impl pangya_domain::MatchRepository for BlockingStrokeCommitRepository {
     }
 }
 
+impl pangya_domain::EconomyRepository for BlockingStrokeCommitRepository {
+    fn purchase(
+        &self,
+        request: pangya_domain::PurchaseRequest,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<
+            pangya_domain::EconomyCommit<pangya_domain::PurchaseResult>,
+            pangya_domain::EconomyError,
+        >,
+    > {
+        pangya_domain::EconomyRepository::purchase(&self.inner, request)
+    }
+    fn equip(
+        &self,
+        request: pangya_domain::EquipmentChange,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<
+            pangya_domain::EconomyCommit<pangya_domain::EquipmentChangeResult>,
+            pangya_domain::EconomyError,
+        >,
+    > {
+        pangya_domain::EconomyRepository::equip(&self.inner, request)
+    }
+    fn consume_one(
+        &self,
+        request: pangya_domain::ConsumeItem,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<
+            pangya_domain::EconomyCommit<pangya_domain::ConsumeItemResult>,
+            pangya_domain::EconomyError,
+        >,
+    > {
+        pangya_domain::EconomyRepository::consume_one(&self.inner, request)
+    }
+    fn repair(
+        &self,
+        request: pangya_domain::RepairItem,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<
+            pangya_domain::EconomyCommit<pangya_domain::RepairItemResult>,
+            pangya_domain::EconomyError,
+        >,
+    > {
+        pangya_domain::EconomyRepository::repair(&self.inner, request)
+    }
+}
+
 #[derive(Clone)]
 struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 struct CaptureGuard(Arc<Mutex<Vec<u8>>>);
@@ -278,6 +331,39 @@ fn catalog() -> Catalog {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../pangya-data/tests/fixtures/synthetic-catalog");
     Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("catalog")
+}
+
+fn economy_catalog() -> Catalog {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../pangya-data/tests/fixtures/synthetic-catalog-v2");
+    Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("M7 catalog")
+}
+
+fn economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
+    Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool)),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: Some(EconomyRuntimeConfig {
+                    command_timeout: Duration::from_secs(2),
+                    commands_per_window: 50,
+                    page_size: 50,
+                    max_purchase_quantity: 99,
+                }),
+            },
+            metrics,
+        )
+        .expect("economy service"),
+    )
 }
 
 /// Builds a test-only generated catalog whose local Course record is course 1, hole 1, par 3.
@@ -371,6 +457,7 @@ fn solo_service(
                     shot_packets_per_window,
                 }),
                 stroke_two: None,
+                economy: None,
             },
             metrics,
         )
@@ -426,6 +513,7 @@ fn stroke_service_with_deadlines(
                         .expect("recovery limit"),
                     shot_packets_per_window: 120,
                 }),
+                economy: None,
             },
             metrics,
         )
@@ -449,6 +537,7 @@ fn game_service_with_policy(
                 limits,
                 solo_practice: None,
                 stroke_two: None,
+                economy: None,
             },
             metrics,
         )
@@ -475,6 +564,7 @@ where
     R: pangya_domain::HandoverRepository
         + pangya_domain::PlayerRepository
         + pangya_domain::MatchRepository
+        + pangya_domain::EconomyRepository
         + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1168,6 +1258,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 limits: GameRuntimeLimits::default(),
                 solo_practice: None,
                 stroke_two: None,
+                economy: None,
             },
             metrics.clone(),
         )
@@ -4010,6 +4101,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
                         .expect("recovery limit"),
                     shot_packets_per_window: 120,
                 }),
+                economy: None,
             },
             metrics.clone(),
         )
@@ -4950,4 +5042,202 @@ async fn game_connection_task_bound_and_shutdown_grace_are_enforced(pool: PgPool
         ),
         Some(0.0)
     );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_m7_encrypted_economy_is_catalog_priced_idempotent_and_restart_safe(pool: PgPool) {
+    let account = create_account(&pool, "EconomyFlow", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 5000 WHERE account_id = $1")
+        .bind(account.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund profile");
+    let metrics = Arc::new(M2Metrics::default());
+    let (address, shutdown, task) = start_service(economy_service(pool.clone(), metrics)).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        2,
+        &auth_payload(account.account.id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut stream, key, 1).await;
+    send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+
+    send_typed(&mut stream, key, 3, &ShopPageRequest::new(0)).await;
+    let page = receive_typed::<ShopPage>(&mut stream, key).await;
+    assert!(
+        page.entries()
+            .iter()
+            .any(|offer| offer.type_id() == 0x1a00_0001 && offer.pang_price() == 25)
+    );
+    assert!(
+        page.entries()
+            .iter()
+            .any(|offer| offer.type_id() == 0x1000_0001 && offer.pang_price() == 500)
+    );
+
+    let purchase_op = uuid::Uuid::new_v4();
+    let purchase = PurchaseRequestPacket::new(purchase_op, 0x1a00_0001, 2).expect("purchase");
+    send_typed(&mut stream, key, 4, &purchase).await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key).await,
+        EconomyCommandResult::new(EconomyCommand::Purchase, EconomyOutcome::Success)
+    );
+    let bought = receive_typed::<PurchaseCommitted>(&mut stream, key).await;
+    assert_eq!((bought.quantity_after(), bought.pang_balance()), (2, 4950));
+    send_typed(&mut stream, key, 5, &purchase).await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    assert_eq!(
+        receive_typed::<PurchaseCommitted>(&mut stream, key).await,
+        bought
+    );
+
+    for (salt, expected) in [(6, 1), (7, 0)] {
+        let consume =
+            ConsumeOneRequest::new(uuid::Uuid::new_v4(), bought.inventory_id()).expect("consume");
+        send_typed(&mut stream, key, salt, &consume).await;
+        assert_eq!(
+            receive_typed::<EconomyCommandResult>(&mut stream, key)
+                .await
+                .outcome(),
+            EconomyOutcome::Success
+        );
+        assert_eq!(
+            receive_typed::<InventoryChanged>(&mut stream, key)
+                .await
+                .quantity_after(),
+            expected
+        );
+    }
+
+    let club_op = uuid::Uuid::new_v4();
+    send_typed(
+        &mut stream,
+        key,
+        8,
+        &PurchaseRequestPacket::new(club_op, 0x1000_0001, 1).expect("club"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let club = receive_typed::<PurchaseCommitted>(&mut stream, key).await;
+    assert_eq!((club.durability(), club.pang_balance()), (Some(100), 4450));
+    sqlx::query("UPDATE inventory_items SET durability = 90 WHERE id = $1")
+        .bind(i64::try_from(club.inventory_id()).expect("id"))
+        .execute(&pool)
+        .await
+        .expect("synthetic wear");
+    send_typed(
+        &mut stream,
+        key,
+        9,
+        &RepairRequest::new(uuid::Uuid::new_v4(), club.inventory_id()).expect("repair"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let repaired = receive_typed::<RepairCommitted>(&mut stream, key).await;
+    assert_eq!(
+        (repaired.durability(), repaired.pang_balance()),
+        (100, 4420)
+    );
+
+    let character_id: i64 = sqlx::query_scalar("SELECT id FROM characters WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("character");
+    send_typed(
+        &mut stream,
+        key,
+        10,
+        &EquipRequest::new(
+            uuid::Uuid::new_v4(),
+            0,
+            u64::try_from(character_id).expect("character"),
+            Some(club.inventory_id()),
+            None,
+        )
+        .expect("equip"),
+    )
+    .await;
+    assert_eq!(
+        receive_typed::<EconomyCommandResult>(&mut stream, key)
+            .await
+            .outcome(),
+        EconomyOutcome::Success
+    );
+    let equipped = receive_typed::<EquipmentChanged>(&mut stream, key).await;
+    assert_eq!(
+        (equipped.club_id(), equipped.version()),
+        (Some(club.inventory_id()), 1)
+    );
+
+    let counts:(i64,i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM economy_operations),(SELECT count(*) FROM shop_currency_ledger),(SELECT count(*) FROM item_ledger),(SELECT count(*) FROM equipment_ledger)").fetch_one(&pool).await.expect("counts");
+    assert_eq!(counts, (6, 3, 5, 1));
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id=$1")
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("pang");
+    assert_eq!(pang, 4420);
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+
+    let (address, shutdown, task) = start_service(economy_service(
+        pool.clone(),
+        Arc::new(M2Metrics::default()),
+    ))
+    .await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut restarted, key) = connect_game(address).await;
+    send_packet(
+        &mut restarted,
+        key,
+        1,
+        2,
+        &auth_payload(account.account.id.get(), &token),
+    )
+    .await;
+    let (_, _, projected, _, _) = read_player_info(&mut restarted, key).await;
+    assert_eq!(projected, 4420);
+    assert_eq!(receive_packet(&mut restarted, key).await.0, 0x0072);
+    for _ in 0..1 {
+        assert_eq!(receive_packet(&mut restarted, key).await.0, 0x0073);
+    }
+    assert_eq!(receive_packet(&mut restarted, key).await.0, 0x004d);
+    drop(restarted);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
 }

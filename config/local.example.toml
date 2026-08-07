@@ -53,6 +53,14 @@ max_strokes = 30
 startup_recovery_limit = 1000
 shot_packets_per_window = 120
 
+[game.economy]
+# Local synthetic v2 catalog/shop only; disabled and not retail-compatible.
+enabled = false
+command_timeout = "3s"
+commands_per_window = 30
+page_size = 50
+max_purchase_quantity = 99
+
 [http]
 bind = "127.0.0.1:8080"
 metrics = true

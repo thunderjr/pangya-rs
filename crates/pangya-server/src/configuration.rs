@@ -118,6 +118,13 @@ section_default!(StrokeTwoSection {
     startup_recovery_limit: u32 = 1_000,
     shot_packets_per_window: u32 = 120
 });
+section_default!(EconomySection {
+    enabled: bool = false,
+    command_timeout: String = "3s".to_owned(),
+    commands_per_window: u32 = 30,
+    page_size: usize = 50,
+    max_purchase_quantity: u32 = 99
+});
 section_default!(GameSection {
     enabled: bool = false,
     bind: String = "127.0.0.1:20201".to_owned(),
@@ -138,7 +145,8 @@ section_default!(GameSection {
     unknown_capture_capacity: usize = 256,
     command_timeout: String = "3s".to_owned(),
     solo_practice: SoloPracticeSection = SoloPracticeSection::default(),
-    stroke_two: StrokeTwoSection = StrokeTwoSection::default()
+    stroke_two: StrokeTwoSection = StrokeTwoSection::default(),
+    economy: EconomySection = EconomySection::default()
 });
 section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
@@ -309,6 +317,8 @@ pub struct AppConfig {
     pub solo_practice: Option<ValidatedSoloPractice>,
     /// Optional validated local-only exactly-two stroke policy.
     pub stroke_two: Option<ValidatedStrokeTwo>,
+    /// Optional validated local-only synthetic economy policy.
+    pub economy: Option<ValidatedEconomy>,
     /// Admin HTTP listener.
     pub http_bind: SocketAddr,
     /// Enables read-only metrics exposition.
@@ -380,6 +390,19 @@ pub struct ValidatedSoloPractice {
     pub startup_recovery_limit: IncompleteMatchAbortLimit,
     /// Per-connection shot packet budget.
     pub shot_packets_per_window: u32,
+}
+
+/// Validated local-only synthetic economy policy.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedEconomy {
+    /// Repository command deadline.
+    pub command_timeout: Duration,
+    /// Per-connection command budget.
+    pub commands_per_window: u32,
+    /// Offers per page.
+    pub page_size: usize,
+    /// Maximum purchase quantity.
+    pub max_purchase_quantity: u32,
 }
 
 /// Validated local-only synthetic exactly-two stroke policy.
@@ -714,6 +737,11 @@ fn validate(
     let stroke_commit_timeout = duration(
         &raw.game.stroke_two.commit_timeout,
         "game.stroke_two.commit_timeout",
+        &mut issues,
+    );
+    let economy_command_timeout = duration(
+        &raw.game.economy.command_timeout,
+        "game.economy.command_timeout",
         &mut issues,
     );
 
@@ -1319,6 +1347,53 @@ fn validate(
         );
     }
 
+    if raw.game.economy.enabled && !raw.game.enabled {
+        issue(&mut issues, "game.economy.enabled", "requires game.enabled");
+    }
+    if raw.game.economy.commands_per_window == 0 || raw.game.economy.commands_per_window > 1_000_000
+    {
+        issue(
+            &mut issues,
+            "game.economy.commands_per_window",
+            "must be within 1..=1000000",
+        );
+    }
+    if raw.game.economy.page_size == 0 || raw.game.economy.page_size > 50 {
+        issue(
+            &mut issues,
+            "game.economy.page_size",
+            "must be within 1..=50",
+        );
+    }
+    if raw.game.economy.max_purchase_quantity == 0 || raw.game.economy.max_purchase_quantity > 99 {
+        issue(
+            &mut issues,
+            "game.economy.max_purchase_quantity",
+            "must be within 1..=99",
+        );
+    }
+    if shutdown_grace
+        .zip(economy_command_timeout)
+        .is_some_and(|(grace, command)| command > grace)
+        || economy_command_timeout.is_some_and(|command| command > Duration::from_secs(60))
+    {
+        issue(
+            &mut issues,
+            "game.economy.command_timeout",
+            "must not exceed shutdown grace or 60 seconds",
+        );
+    }
+    let economy = if raw.game.economy.enabled {
+        economy_command_timeout.map(|command_timeout| ValidatedEconomy {
+            command_timeout,
+            commands_per_window: raw.game.economy.commands_per_window,
+            page_size: raw.game.economy.page_size,
+            max_purchase_quantity: raw.game.economy.max_purchase_quantity,
+        })
+    } else {
+        None
+    };
+
     let solo_course_id = match CourseId::new(raw.game.solo_practice.course_id) {
         Ok(value) => Some(value),
         Err(_) => {
@@ -1448,6 +1523,7 @@ fn validate(
         unknown_opcode_policy: required(unknown_opcode_policy)?,
         solo_practice,
         stroke_two,
+        economy,
         http_bind: required(http_bind)?,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
