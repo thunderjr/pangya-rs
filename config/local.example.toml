@@ -30,6 +30,9 @@ unknown_opcode_strikes = 3
 # Capture retains bounded opcode/state/length metadata plus a SHA-256 digest, never raw payloads.
 unknown_capture_capacity = 256
 command_timeout = "3s"
+# Emits the reference-derived US 852 retail bootstrap instead of the synthetic one.
+# Required by a real client; unverified against one, so it stays opt-in.
+retail_bootstrap = false
 
 [game.solo_practice]
 # Local synthetic protocol only; disabled by default and not retail-compatible.

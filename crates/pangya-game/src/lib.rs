@@ -55,33 +55,36 @@ use pangya_login::{
     RegistryError, RegistryGuard, parse_handover,
 };
 use pangya_protocol::{
-    BalanceUpdate, ChannelJoined, CharacterBootstrap, CharacterInfo, CodecLimits,
-    CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand, EconomyCommandResult,
-    EconomyItemKind, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo,
-    FinishHole, FrameCodec, GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HoleResult, InventoryBootstrap,
-    InventoryChanged, InventorySegment, LoadingComplete,
-    MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
-    OutboundFrame, PacketEncodeError, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
-    RepairCommitted, RepairRequest, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
-    RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
-    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
-    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
-    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
-    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
-    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServiceKind, ShopOffer,
-    ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay,
-    SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo,
-    StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
-    encode_packet_payload, synthetic_game_hello,
+    BalanceUpdate, CHARACTER_PARTS, CHARACTER_STATS, ChannelJoined, CharacterBootstrap,
+    CharacterInfo, CodecLimits, CompatibilityProfile, ConsumeOneRequest, DecodePacket,
+    EQUIPPED_ITEM_SLOTS, EconomyCommand, EconomyCommandResult, EconomyItemKind, EconomyOutcome,
+    EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo, FinishHole, FrameCodec,
+    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HandoverControl, HandoverReply, HoleResult,
+    IffContainerChunk, IffContainerKind, InventoryBootstrap, InventoryChanged, InventorySegment,
+    LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
+    MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
+    PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
+    RetailCharacter, RetailEquipment, RetailPlayerIdentity, RetailPlayerStatistics, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest,
+    RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE,
+    SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST,
+    SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE,
+    SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION,
+    SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP,
+    SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT,
+    SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP,
+    SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel,
+    ServerChannelList, ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction,
+    ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
+    SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay,
+    StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome, StrokeCommandResult,
+    StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp, StrokeLoadingComplete,
+    StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind, StrokeResultRelay,
+    StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings, StrokeTurnStarted,
+    Weather as ProtocolWeather, Wind, decode_packet_payload, encode_packet_payload,
+    synthetic_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -580,6 +583,11 @@ pub struct GameRuntimeConfig {
     pub stroke_two: Option<StrokeRuntimeConfig>,
     /// Optional local-only synthetic economy.
     pub economy: Option<EconomyRuntimeConfig>,
+    /// Emits the reference-derived retail bootstrap instead of the synthetic one.
+    ///
+    /// Required by a real U.S. client, which never sends or understands the synthetic
+    /// family. Reference-derived and unverified against a client, so it stays opt-in.
+    pub retail_bootstrap: bool,
 }
 
 impl Default for GameRuntimeConfig {
@@ -591,6 +599,7 @@ impl Default for GameRuntimeConfig {
             solo_practice: None,
             stroke_two: None,
             economy: None,
+            retail_bootstrap: false,
         }
     }
 }
@@ -3708,6 +3717,9 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         snapshot: &PlayerSnapshot,
     ) -> Result<(), GameRuntimeError> {
+        if self.config.retail_bootstrap {
+            return self.send_retail_bootstrap(framed, snapshot).await;
+        }
         let account_id =
             u64::try_from(snapshot.account.id.get()).map_err(|_| GameRuntimeError::Snapshot)?;
         self.send(
@@ -3794,6 +3806,171 @@ where
             },
         )
         .await
+    }
+
+    /// Emits the reference-derived retail bootstrap sequence.
+    ///
+    /// Order is load-bearing: the client stays on its loading screen until the full
+    /// handover reply arrives, and renders the lobby from the roster/equipment/inventory
+    /// containers that follow. See `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
+    async fn send_retail_bootstrap(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        snapshot: &PlayerSnapshot,
+    ) -> Result<(), GameRuntimeError> {
+        let narrow = |value: i64| u32::try_from(value).map_err(|_| GameRuntimeError::Snapshot);
+
+        // Progress ticks release the client's loading bar before the large reply.
+        for step in 0..=2 {
+            self.send(framed, &HandoverControl::Progress(step)).await?;
+        }
+
+        let character = snapshot
+            .characters
+            .iter()
+            .find(|value| value.id == snapshot.equipment.character_id)
+            .ok_or(GameRuntimeError::Snapshot)?;
+        let equipment = RetailEquipment {
+            caddie_uid: 0,
+            character_uid: narrow(snapshot.equipment.character_id.get())?,
+            club_set_uid: snapshot
+                .equipment
+                .club_item_id
+                .map(|id| narrow(id.get()))
+                .transpose()?
+                .unwrap_or(0),
+            comet_iff_id: snapshot
+                .equipment
+                .ball_item_id
+                .and_then(|id| {
+                    snapshot
+                        .inventory
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map(|item| item.item_type_id.get())
+                })
+                .unwrap_or(0),
+            item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+        };
+        let reply = HandoverReply {
+            server_name: b"pangya-rs".to_vec(),
+            identity: RetailPlayerIdentity {
+                username: snapshot.account.username_display.as_bytes().to_vec(),
+                nickname: snapshot
+                    .profile
+                    .nickname
+                    .as_deref()
+                    .ok_or(GameRuntimeError::Snapshot)?
+                    .as_bytes()
+                    .to_vec(),
+                connection_id: 0,
+                user_id: narrow(snapshot.account.id.get())?,
+            },
+            statistics: RetailPlayerStatistics {
+                experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
+                ..RetailPlayerStatistics::default()
+            },
+            equipment,
+            character: RetailCharacter {
+                iff_id: character.item_type_id.get(),
+                uid: narrow(character.id.get())?,
+                hair_color: 0,
+                part_iff_ids: [0; CHARACTER_PARTS],
+                part_uids: [0; CHARACTER_PARTS],
+                stats: [0; CHARACTER_STATS],
+                mastery: 0,
+            },
+            caddie: RetailCaddie::default(),
+            server_time: [0; 16],
+            disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
+        };
+        self.send(framed, &reply).await?;
+
+        let mut roster = Vec::with_capacity(snapshot.characters.len());
+        for value in &snapshot.characters {
+            let mut writer = PacketWriter::default();
+            writer.u32_le(value.item_type_id.get());
+            writer.u32_le(narrow(value.id.get())?);
+            roster.push(writer.into_inner());
+        }
+        self.send_container(framed, IffContainerKind::CharacterRoster, roster)
+            .await?;
+        // No caddie support yet; the client still expects the container to arrive.
+        self.send_container(framed, IffContainerKind::CaddieRoster, Vec::new())
+            .await?;
+        self.send(framed, &equipment).await?;
+
+        let mut inventory = Vec::with_capacity(snapshot.inventory.len());
+        for item in &snapshot.inventory {
+            let mut writer = PacketWriter::default();
+            writer.u32_le(narrow(item.id.get())?);
+            writer.u32_le(item.item_type_id.get());
+            writer.u32_le(item.quantity);
+            inventory.push(writer.into_inner());
+        }
+        self.send_container(framed, IffContainerKind::Inventory, inventory)
+            .await?;
+
+        self.send(
+            framed,
+            &ServerChannelList {
+                channels: vec![RetailChannel {
+                    name: b"pangya-rs".to_vec(),
+                    capacity: 200,
+                    player_count: 0,
+                    id: u16::try_from(self.config.channel_id)
+                        .map_err(|_| GameRuntimeError::InvalidConfig)?,
+                    restrictions: 0,
+                }],
+            },
+        )
+        .await
+    }
+
+    /// Sends one rostered container as its chunk sequence.
+    async fn send_container(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        kind: IffContainerKind,
+        entries: Vec<Vec<u8>>,
+    ) -> Result<(), GameRuntimeError> {
+        let chunks =
+            IffContainerChunk::split(kind, entries).map_err(|_| GameRuntimeError::Protocol)?;
+        for chunk in chunks {
+            let mut writer = PacketWriter::default();
+            chunk
+                .encode_body(&mut writer, &CompatibilityProfile::US_852)
+                .map_err(|_| GameRuntimeError::Protocol)?;
+            self.send_raw(framed, chunk.opcode(), writer.into_inner())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sends a pre-encoded body under a runtime-selected opcode.
+    async fn send_raw(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        opcode: u16,
+        payload: Vec<u8>,
+    ) -> Result<(), GameRuntimeError> {
+        let bytes = payload.len().saturating_add(2);
+        timeout(
+            self.config.limits.command_timeout,
+            framed.send(OutboundFrame {
+                opcode,
+                payload: zeroize::Zeroizing::new(payload),
+                salt: OsRng.next_u32() as u8,
+            }),
+        )
+        .await
+        .map_err(|_| GameRuntimeError::Timeout)?
+        .map_err(|error| match error {
+            PacketEncodeError::Io(_) => GameRuntimeError::Io,
+            _ => GameRuntimeError::Protocol,
+        })?;
+        self.observer.frame("out", opcode, bytes);
+        Ok(())
     }
 
     async fn send<T: EncodePacket>(

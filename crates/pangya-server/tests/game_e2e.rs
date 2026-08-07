@@ -387,6 +387,7 @@ fn economy_service_with(
                 solo_practice: None,
                 stroke_two: None,
                 economy,
+                retail_bootstrap: false,
             },
             metrics,
         )
@@ -508,6 +509,7 @@ fn solo_service(
                 }),
                 stroke_two: None,
                 economy: None,
+                retail_bootstrap: false,
             },
             metrics,
         )
@@ -564,6 +566,7 @@ fn stroke_service_with_deadlines(
                     shot_packets_per_window: 120,
                 }),
                 economy: None,
+                retail_bootstrap: false,
             },
             metrics,
         )
@@ -588,6 +591,7 @@ fn game_service_with_policy(
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                retail_bootstrap: false,
             },
             metrics,
         )
@@ -1309,6 +1313,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                retail_bootstrap: false,
             },
             metrics.clone(),
         )
@@ -4152,6 +4157,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
                     shot_packets_per_window: 120,
                 }),
                 economy: None,
+                retail_bootstrap: false,
             },
             metrics.clone(),
         )
@@ -5728,6 +5734,7 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
                     command_timeout: Duration::from_millis(100),
                     ..default_economy()
                 }),
+                retail_bootstrap: false,
             },
             Arc::new(M2Metrics::default()),
         )
@@ -5758,6 +5765,96 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
         .await
         .expect("pang");
     assert_eq!(pang, 5000);
+
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool) {
+    let account = create_account(&pool, "RetailBoot", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        2,
+        &auth_payload(account.account.id.get(), &token),
+    )
+    .await;
+
+    // Three progress ticks, the full reply, then roster/caddie/equipment/inventory and
+    // the channel list. Order is what keeps the client off its loading screen.
+    let mut seen = Vec::new();
+    for _ in 0..9 {
+        let (opcode, body) = receive_packet(&mut stream, key).await;
+        seen.push((opcode, body));
+    }
+    let opcodes: Vec<u16> = seen.iter().map(|(opcode, _)| *opcode).collect();
+    assert_eq!(
+        opcodes,
+        vec![
+            0x0044, 0x0044, 0x0044, 0x0044, 0x0070, 0x0071, 0x0072, 0x0073, 0x004d
+        ]
+    );
+
+    // The three control frames are progress ticks 0..2.
+    for (index, expected) in [0_u8, 1, 2].into_iter().enumerate() {
+        assert_eq!(seen[index].1, vec![0xd2, expected]);
+    }
+
+    // The full reply must announce 852.00 or the client raises a version mismatch.
+    let reply = &seen[3].1;
+    assert_eq!(reply[0], 0x00);
+    assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), 6);
+    assert_eq!(&reply[3..9], b"852.00");
+
+    // Character roster carries the account's real starter character type id.
+    let roster = &seen[4].1;
+    assert_eq!(u16::from_le_bytes([roster[0], roster[1]]), 1);
+    assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
+    assert_eq!(
+        u32::from_le_bytes([roster[4], roster[5], roster[6], roster[7]]),
+        0x0400_0000
+    );
+
+    // The caddie container is empty but must still arrive.
+    assert_eq!(seen[5].1, vec![0, 0, 0, 0]);
+
+    // The channel list advertises exactly one channel with a zero-padded name.
+    let channels = &seen[8].1;
+    assert_eq!(channels[0], 1);
+    assert_eq!(&channels[1..10], b"pangya-rs");
+    assert_eq!(channels[10], 0);
 
     drop(stream);
     shutdown.cancel();

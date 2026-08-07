@@ -340,6 +340,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 solo_practice,
                 stroke_two,
                 economy,
+                retail_bootstrap: config.retail_bootstrap,
             },
             metrics.clone(),
         )?),

@@ -127,6 +127,7 @@ section_default!(EconomySection {
 });
 section_default!(GameSection {
     enabled: bool = false,
+    retail_bootstrap: bool = false,
     bind: String = "127.0.0.1:20201".to_owned(),
     advertise: String = "127.0.0.1:20201".to_owned(),
     id: u16 = 1,
@@ -319,6 +320,8 @@ pub struct AppConfig {
     pub stroke_two: Option<ValidatedStrokeTwo>,
     /// Optional validated local-only synthetic economy policy.
     pub economy: Option<ValidatedEconomy>,
+    /// Emits the reference-derived retail bootstrap instead of the synthetic one.
+    pub retail_bootstrap: bool,
     /// Admin HTTP listener.
     pub http_bind: SocketAddr,
     /// Enables read-only metrics exposition.
@@ -1347,6 +1350,13 @@ fn validate(
         );
     }
 
+    if raw.game.retail_bootstrap && !raw.game.enabled {
+        issue(
+            &mut issues,
+            "game.retail_bootstrap",
+            "requires game.enabled",
+        );
+    }
     if raw.game.economy.enabled && !raw.game.enabled {
         issue(&mut issues, "game.economy.enabled", "requires game.enabled");
     }
@@ -1524,6 +1534,7 @@ fn validate(
         solo_practice,
         stroke_two,
         economy,
+        retail_bootstrap: raw.game.retail_bootstrap,
         http_bind: required(http_bind)?,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
