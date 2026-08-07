@@ -66,8 +66,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz build
-      - run: cargo fuzz run client-codec -- -seed=1 -max_total_time=5
-      - run: cargo fuzz run server-decompression -- -seed=1 -max_total_time=5
-      - run: cargo fuzz run packet-reader -- -seed=1 -max_total_time=5
-      - run: cargo fuzz run iff-parser -- -seed=1 -max_total_time=5
+      # The installed cargo-fuzz is a musl prebuilt and defaults to its own build triple,
+      # but AddressSanitizer cannot link against a static libc. Fuzz the host target.
+      - run: echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+      - run: cargo fuzz build --target "$FUZZ_TRIPLE"
+      - run: cargo fuzz run --target "$FUZZ_TRIPLE" client-codec -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run --target "$FUZZ_TRIPLE" server-decompression -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run --target "$FUZZ_TRIPLE" packet-reader -- -seed=1 -max_total_time=5
+      - run: cargo fuzz run --target "$FUZZ_TRIPLE" iff-parser -- -seed=1 -max_total_time=5
