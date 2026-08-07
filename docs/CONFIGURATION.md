@@ -58,6 +58,13 @@ standings/own-balance/finished terminal burst. If either synthetic mode is enabl
 startup performs generic incomplete-match recovery exactly once using the larger enabled
 recovery cap and timeout before any listener binds.
 
+`game.retail_bootstrap` selects the reference-derived U.S. 852 bootstrap sequence instead
+of the synthetic one. It requires `game.enabled` and defaults to false. A real client cannot
+use the synthetic bootstrap, and the retail sequence is derived from vendored references
+rather than verified against a client, so neither is a retail-compatibility claim. See
+[`protocol/US852_RETAIL_BOOTSTRAP.md`](protocol/US852_RETAIL_BOOTSTRAP.md) and
+[`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
+
 `[game.economy]` is the independent disabled-by-default synthetic M7 inventory/shop
 boundary and claims no retail compatibility. Enabling it requires `game.enabled=true` and
 a catalog that carries at least one shop offer, of which at least one is a consumable;

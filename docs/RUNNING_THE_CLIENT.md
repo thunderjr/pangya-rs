@@ -13,11 +13,12 @@ builds and runs anywhere Rust and PostgreSQL do.
 | Stage | State |
 |---|---|
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** against a client. |
-| GameService bootstrap | Retail packets are implemented in `pangya-protocol` but **not yet wired into the runtime**, which still emits the synthetic family. A real client will fail here. |
+| GameService bootstrap | Implemented and emitted when `game.retail_bootstrap = true`: progress ticks, the full `0x0044` reply announcing `852.00`, character roster, caddie container, equipment, inventory, and the channel list. Proven over encrypted TCP in CI, **unverified** against a client. |
 | Lobby, rooms, match | Synthetic `0x7f**` families only. A real client cannot use them. |
 
-So today this gets you as far as testing login and server selection. Bootstrap wiring is
-the next step; see `PROGRESS.md`.
+So today this should get you through login, server selection, and the loading screen into
+the lobby. Anything past that — creating or joining a room, playing a hole — still speaks
+the synthetic protocol and will not work. See `PROGRESS.md`.
 
 ## 1. Obtain and extract the client
 
@@ -105,6 +106,8 @@ Start from `config/local.example.toml`. The parts that matter here:
 ```toml
 [game]
 enabled = true
+# Required for a real client; the synthetic bootstrap it replaces is not retail-compatible.
+retail_bootstrap = true
 
 [data]
 catalog_required_m3 = true
@@ -143,8 +146,10 @@ Because none of this is client-verified yet, the useful signal is exactly where 
 - If it errors during handover, the code matters. `11` is a server version mismatch, `1`
   and `9` send it back to LoginService, `3` means it could not reach LoginService at all.
   These are enumerated in `protocol/US852_RETAIL_BOOTSTRAP.md`.
-- If it hangs on the loading screen, the bootstrap sequence is incomplete rather than
-  malformed — that is the expected failure today.
+- Does it reach the lobby? That is the bootstrap sequence working end to end.
+- If it hangs on the loading screen, the sequence is incomplete rather than malformed —
+  the reply's sub-structures are reference-derived and some fields are still zeroed.
+- Reaching the lobby and then failing on room creation is the expected boundary today.
 
 Packet-body logging stays off; `logging.packet_bodies = true` is rejected. Report opcodes
 and observed behavior rather than captures, and never commit a capture.

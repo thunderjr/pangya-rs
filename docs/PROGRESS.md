@@ -279,7 +279,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. Wire the retail bootstrap into the `pangya-game` runtime: accept `RetailGameAuth`, build the roster/equipment/inventory containers from the catalog and player snapshot, and emit the documented sequence in place of the synthetic bootstrap.
+1. Accept `RetailGameAuth` on the inbound side; the bootstrap reply sequence is emitted under `game.retail_bootstrap`, but the auth packet the client actually sends is still decoded as the synthetic `GameAuth`.
 2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
 3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
 4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
@@ -295,7 +295,8 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 - Added `pangya-data` schema 3, which loads the real client catalog across all six declared families, covered in CI by a generated fixture containing no client bytes.
 - Added reference-derived retail bootstrap packets: `0x0002` auth, `0x0044` in all four forms including the full handover reply, `0x0072` equipment, `0x004d` channel list, and the `0x0070`/`0x0071`/`0x0073` chunked containers.
 - Recorded that three M3 bootstrap opcodes carry the wrong meaning today (`0x0070`, `0x0072`, `0x004d`), confirmed independently by PacketDoc and a working reference server.
-- The retail packets are not yet wired into the runtime, so no real client can complete bootstrap; no layout is client-verified.
+- Wired the retail bootstrap into the runtime behind `game.retail_bootstrap`, proven over encrypted TCP: progress ticks, the full reply announcing `852.00`, roster, caddie container, equipment, inventory, and channel list, in that order.
+- Added an operator guide for pointing a real client at a local instance. Inbound `0x0002` auth still decodes as the synthetic packet, so no real client can complete bootstrap yet; no layout is client-verified.
 
 ### 2026-08-07 — local synthetic M7 inventory, shop, and equipment checkpoint
 
