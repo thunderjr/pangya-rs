@@ -13,7 +13,7 @@ builds and runs anywhere Rust and PostgreSQL do.
 | Stage | State |
 |---|---|
 | Client startup: string catalog, patch `updatelist`, theme content | **Verified against the real client.** It performs 33 HTTP requests against this server, accepts all of them, and mounts its full 84-file PAK series. |
-| Client reaches its login screen | **Blocked.** The client exits about 20 seconds in, throwing a C++ exception from its own window/render factory, without ever opening a socket. See [Where it stops](#7-where-it-stops-today). |
+| Client reaches its login screen | **Blocked.** The client exits about 20 seconds in, throwing a C++ exception, without ever opening a socket. See [Where it stops](#7-where-it-stops-today). |
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** — no client has reached it. |
 | GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`, proven end to end over encrypted TCP in CI, **unverified** against a client. |
 | Rooms, one scored hole | Routed and proven over TCP in CI, **unverified** against a client. |
