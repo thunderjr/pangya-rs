@@ -64,27 +64,27 @@ use pangya_protocol::{
     LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailCharacter, RetailEquipment, RetailPlayerIdentity, RetailPlayerStatistics, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest,
-    RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE,
-    SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST,
-    SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE,
-    SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION,
-    SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP,
-    SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT,
-    SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP,
-    SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel,
-    ServerChannelList, ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction,
-    ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome,
-    SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay,
-    StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome, StrokeCommandResult,
-    StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp, StrokeLoadingComplete,
-    StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind, StrokeResultRelay,
-    StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings, StrokeTurnStarted,
-    Weather as ProtocolWeather, Wind, decode_packet_payload, encode_packet_payload,
-    synthetic_game_hello,
+    RetailCharacter, RetailEquipment, RetailGameAuth, RetailPlayerIdentity, RetailPlayerStatistics,
+    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
+    RoomCreateRequest, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest,
+    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
+    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
+    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
+    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    encode_packet_payload, synthetic_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -1861,20 +1861,34 @@ where
             self.observer.rate_limited(GameRateClass::AuthSource);
             return Err(GameRuntimeError::Limited);
         }
-        let auth = decode_packet_payload::<GameAuth>(
-            payload,
-            &CompatibilityProfile::US_852,
-            ServiceKind::Game,
-        )
-        .map_err(|_| GameRuntimeError::Protocol)?;
-        let claimed = i64::try_from(auth.claimed_account_id)
+        // A real client sends the retail `0x0002`, whose user id is a u32 and whose
+        // handover bearer is the login key. The synthetic packet carries the same two
+        // facts in a different shape, so both normalize to (claimed id, bearer).
+        let (claimed_account_id, handover) = if self.config.retail_bootstrap {
+            let auth = decode_packet_payload::<RetailGameAuth>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            (u64::from(auth.user_id), auth.login_key)
+        } else {
+            let auth = decode_packet_payload::<GameAuth>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            (auth.claimed_account_id, auth.handover)
+        };
+        let claimed = i64::try_from(claimed_account_id)
             .ok()
             .and_then(|value| AccountId::new(value).ok())
             .ok_or_else(|| {
                 self.observer.authentication("rejected");
                 GameRuntimeError::Authentication
             })?;
-        let bearer = std::str::from_utf8(&auth.handover).map_err(|_| {
+        let bearer = std::str::from_utf8(&handover).map_err(|_| {
             self.observer.authentication("rejected");
             GameRuntimeError::Authentication
         })?;

@@ -5803,12 +5803,18 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     )
     .await;
     let (mut stream, key) = connect_game(address).await;
-    send_packet(
+    // The retail auth packet a real client sends, not the synthetic one.
+    send_typed(
         &mut stream,
         key,
         1,
-        2,
-        &auth_payload(account.account.id.get(), &token),
+        &pangya_protocol::RetailGameAuth {
+            username: b"RetailBoot".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.clone().into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
     )
     .await;
 
