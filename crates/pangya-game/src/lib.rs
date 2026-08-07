@@ -1419,6 +1419,11 @@ where
                         }
                         _ => break Err(GameRuntimeError::Protocol),
                     }
+                    // Only client inactivity may consume the idle budget. Server-side work
+                    // for this frame — snapshot loads, bootstrap writes, actor round trips —
+                    // is charged by its own deadline, so a slow database must never shorten
+                    // the window the client has to send its next packet.
+                    idle_deadline = Instant::now() + self.config.limits.idle_timeout;
                 }
                 () = &mut sleeper => break Err(GameRuntimeError::Timeout),
             }
