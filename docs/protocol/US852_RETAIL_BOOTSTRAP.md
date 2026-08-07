@@ -171,3 +171,70 @@ Player statistics, trophies, course statistics, active character, active caddie,
 inventory sub-structures are referenced above but not yet transcribed field by field. The
 `12 × 21` course-statistics block dominates the reply's size and must be measured before
 the reply can be emitted. These are the next things to pin down.
+
+
+---
+
+# Retail lobby and room contract
+
+Same provenance and same caveat as the bootstrap above: reference-derived, not
+client-verified. Implemented in `pangya-protocol::us852_room`.
+
+## Client opcodes
+
+| Opcode | Meaning |
+|---|---|
+| `0x0004` | Select channel |
+| `0x0008` | Room create |
+| `0x0009` | Room join |
+| `0x000a` | Room settings update |
+| `0x000b` | Equipment update in lobby |
+| `0x000c` | Equipment update in room |
+| `0x000e` | Start match |
+| `0x000f` | Room leave |
+| `0x0081` | Join lobby |
+| `0x0082` | Leave lobby |
+
+## Server opcodes
+
+| Opcode | Meaning |
+|---|---|
+| `0x0047` | Room list |
+| `0x0048` | Room player census |
+| `0x0049` | Join result |
+| `0x004a` | Room settings |
+| `0x004c` | Leave acknowledgement |
+
+Note `0x0048` is the *room* census. PacketDoc's `0x0046` "User Census" is a different,
+lobby-level packet; do not conflate them.
+
+## Room record — 210 bytes
+
+Fixed 64-byte name, public flag, in-lobby flag, in-game-joinable flag, capacity,
+occupancy, 17 zero bytes, the constant 30, hole count, room type, `u16` room number, hole
+progression, course, `u32` shot timer, `u32` game timer, `u32` trophy catalog id, `u16`
+zero, 66 zero bytes of guild info, two `u32` hundreds, `u32` owner id, room type again,
+`u32` artifact catalog id, `u32` natural-wind flag, and four `u32` event fields.
+
+The two state flags are mutually exclusive and both zero means in-game-and-closed.
+PacketDoc subdivides the fixed middle differently but reaches the same total; where they
+disagree the reference server is followed, because it is the one a client demonstrably
+accepts.
+
+## Asymmetric join result
+
+`0x0049` success writes a `u16` status followed by the room record; rejection writes a
+single status byte. The widths genuinely differ — this is not an oversight to "fix".
+Rejection codes: 8 already started, 18 cannot create.
+
+`0x004c` carries the room the client now occupies, with `0xffff` meaning the lobby.
+
+## What remains to make rooms work
+
+The packets exist and are unit-tested. They are **not routed in the runtime**: room
+opcodes still dispatch to `handle_room_command`, which speaks the synthetic `0x7f00`
+family and drives the lobby/room actor. Wiring requires translating retail commands onto
+the existing actor commands and emitting the retail replies, gated the same way the
+bootstrap is. The actor model itself is protocol-agnostic and should not need changes —
+this is a wire-layer translation, deliberately left as a separate step rather than rushed
+alongside the packet definitions.

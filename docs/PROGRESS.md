@@ -279,7 +279,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. Port retail lobby/room layouts — client `0x0008` create, `0x0009` join, `0x000a` settings, `0x000f` leave, `0x0081`/`0x0082` lobby join/leave, and server `0x0046` census, `0x0047` room list — replacing the synthetic `0x7f00` family.
+1. Route the retail room packets in the runtime: translate `0x0008`/`0x0009`/`0x000a`/`0x000f` onto the existing lobby/room actor commands and emit `0x0047`/`0x0048`/`0x0049`/`0x004a`/`0x004c`, gated like the bootstrap. The packets and their widths are already implemented and unit-tested in `pangya-protocol::us852_room`; the actor model is protocol-agnostic and should not need changes.
 2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
 3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
 4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
