@@ -62,13 +62,15 @@ use pangya_protocol::{
     EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo, FinishHole, FrameCodec,
     GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HandoverControl, HandoverReply, HoleResult,
     IffContainerChunk, IffContainerKind, InventoryBootstrap, InventoryChanged, InventorySegment,
-    LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
+    Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailCharacter, RetailEquipment, RetailGameAuth, RetailHoleProgression, RetailPlayerIdentity,
-    RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailCharacter, RetailEquipment, RetailFinishHole, RetailGameAuth, RetailHole,
+    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailMatchInfo, RetailMatchStart,
+    RetailPlayerIdentity, RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom,
+    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
+    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailTurnEnd,
+    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -1133,6 +1135,8 @@ where
         let mut chats = LocalRateWindow::new(self.config.limits.rate_window);
         let mut shots = LocalRateWindow::new(self.config.limits.rate_window);
         let mut economy_commands = LocalRateWindow::new(self.config.limits.rate_window);
+        // Retail shots are opaque client payloads, so the server counts strokes itself.
+        let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
@@ -1273,6 +1277,28 @@ where
                                     .await;
                                 if let Err(error) = handled {
                                     break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && is_retail_match_opcode(frame.opcode)
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                let handled = self
+                                    .handle_retail_match_command(
+                                        &mut framed,
+                                        state,
+                                        established,
+                                        &shutdown,
+                                        idle_deadline,
+                                        &mut shots,
+                                        &mut retail_strokes,
+                                        frame.opcode,
+                                    )
+                                    .await;
+                                match handled {
+                                    Ok(next) => state = next,
+                                    Err(error) => break Err(error),
                                 }
                             } else if self.config.retail_bootstrap
                                 && is_retail_room_opcode(frame.opcode)
@@ -3224,11 +3250,92 @@ where
                 RoomEvent::Snapshot(_) | RoomEvent::Chat { .. } => {
                     return Ok(RoomEventEffect::Remain);
                 }
+                RoomEvent::SoloStarted(plan) => {
+                    let begin = plan.begin();
+                    let weather = match begin.weather() {
+                        pangya_domain::Weather::Clear => RetailWeather::Clear,
+                        pangya_domain::Weather::Cloudy => RetailWeather::Cloudy,
+                        pangya_domain::Weather::Rain => RetailWeather::Raining,
+                    };
+                    let course = u8::try_from(begin.config().course_id().get()).unwrap_or(0);
+                    self.send(
+                        framed,
+                        &RetailMatchStart {
+                            room_ui_type: 0,
+                            start_time: [0; 16],
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        framed,
+                        &RetailMatchInfo {
+                            course,
+                            room_ui_type: 0,
+                            hole_mode: 0,
+                            hole_count: 1,
+                            shot_timer_ms: 30_000,
+                            game_timer_ms: 600_000,
+                            holes: vec![RetailHole {
+                                random_id: 1,
+                                pin: 0,
+                                course,
+                                number: 1,
+                            }],
+                            random_seed: 1,
+                        },
+                    )
+                    .await?;
+                    self.send(framed, &RetailHoleWeather { weather }).await?;
+                    self.send(
+                        framed,
+                        &RetailHoleWind {
+                            strength: u8::try_from(begin.wind().speed_tenths() / 10)
+                                .unwrap_or(u8::MAX),
+                            direction: begin.wind().angle_degrees(),
+                        },
+                    )
+                    .await?;
+                    return Ok(RoomEventEffect::EnterLoading);
+                }
+                RoomEvent::SoloPhase { phase, .. } => {
+                    // The actor republishes this phase after every stroke, so the intro is
+                    // emitted only on the first transition out of loading. Later turns are
+                    // handed back explicitly by the shot handler.
+                    if matches!(phase, SoloMatchPhase::AwaitAction { .. })
+                        && state == GameState::InMatchLoading
+                    {
+                        let connection = u32::try_from(connection_id.get()).unwrap_or(0);
+                        self.send(
+                            framed,
+                            &RetailPlayerStartHole {
+                                connection_id: connection,
+                            },
+                        )
+                        .await?;
+                        self.send(
+                            framed,
+                            &RetailTurnStart {
+                                connection_id: connection,
+                            },
+                        )
+                        .await?;
+                        return Ok(RoomEventEffect::EnterMatch);
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
                 RoomEvent::Kicked { .. } => {
                     self.observer.room(GameRoomObservation::Kicked);
                     return Ok(RoomEventEffect::EnterChannel);
                 }
                 RoomEvent::Closed => return Ok(RoomEventEffect::EnterChannel),
+                // Shot relays are self-echo in a solo hole and are already covered by the
+                // explicit retail turn frames, so they carry no information here.
+                RoomEvent::SoloActionRelay { .. } | RoomEvent::SoloResultRelay { .. } => {
+                    return Ok(RoomEventEffect::Remain);
+                }
+                // Settlement is acknowledged by the retail hole-finished frame the command
+                // handler sends, so the synthetic result/balance pair is redundant.
+                RoomEvent::SoloCommitted(_) => return Ok(RoomEventEffect::EnterRoom),
                 _ => {}
             }
         }
@@ -3872,6 +3979,174 @@ where
             },
         )
         .await
+    }
+
+    /// Handles one retail match command by driving the durable solo match lifecycle.
+    ///
+    /// The retail wire differs from the synthetic one, but the underlying lifecycle —
+    /// reserve, load, play, settle exactly once — is the same and is already durable, so
+    /// this maps retail signals onto it rather than duplicating the state machine.
+    /// Shot payloads are the client's own and carry no server-authoritative value in a
+    /// solo hole, so they are counted rather than interpreted.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_retail_match_command(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+        identity: &RoomIdentity,
+        shutdown: &CancellationToken,
+        idle_deadline: Instant,
+        shots: &mut LocalRateWindow,
+        strokes: &mut u32,
+        opcode: u16,
+    ) -> Result<GameState, GameRuntimeError> {
+        let solo = self
+            .config
+            .solo_practice
+            .ok_or(GameRuntimeError::Protocol)?;
+        match (state, opcode) {
+            (GameState::InRoom, RETAIL_C2S_START_MATCH) => {
+                *strokes = 0;
+                let match_id = MatchId::new(uuid::Uuid::new_v4());
+                let result_key = MatchResultKey::new(uuid::Uuid::new_v4());
+                let mut seed_bytes = [0_u8; 32];
+                OsRng.fill_bytes(&mut seed_bytes);
+                let seed = MatchSeed::new(seed_bytes);
+                let (weather, wind) =
+                    deterministic_conditions(seed).map_err(|_| GameRuntimeError::InvalidConfig)?;
+                let begin = BeginSoloMatch::new(
+                    match_id,
+                    result_key,
+                    identity.account_id,
+                    solo.course,
+                    solo.catalog_fingerprint,
+                    seed,
+                    weather,
+                    wind,
+                );
+                let plan = SoloStartPlan::new(begin, solo.loading_timeout, solo.max_strokes)
+                    .map_err(|_| GameRuntimeError::InvalidConfig)?;
+                let prepared = self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::PrepareStart(plan))
+                    .await;
+                let begin = match prepared {
+                    Ok(LobbySoloRouteResult::Begin(begin)) => begin,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    // A refused start leaves the client in the room rather than closing it.
+                    Err(_) => return Ok(GameState::InRoom),
+                };
+                self.persist_and_confirm_begin(
+                    identity.connection_id,
+                    begin,
+                    shutdown,
+                    idle_deadline,
+                )
+                .await?;
+                Ok(GameState::InRoom)
+            }
+            (GameState::InMatchLoading, RETAIL_C2S_HOLE_LOAD_FINISHED) => {
+                let mark = match self
+                    .lobby
+                    .route_solo(
+                        identity.connection_id,
+                        LobbySoloCommand::LoadingComplete(
+                            LoadingComplete::new(100)
+                                .map_err(|_| GameRuntimeError::InvalidConfig)?,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(LobbySoloRouteResult::InGame(mark)) => mark,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(_) => return Ok(state),
+                };
+                self.persist_in_game(identity.connection_id, mark, shutdown, idle_deadline)
+                    .await?;
+                self.observer
+                    .match_event(GameMatchObservation::LoadingComplete);
+                Ok(state)
+            }
+            (GameState::InMatch, RETAIL_C2S_SHOT_COMMIT | RETAIL_C2S_SHOT_END) => {
+                if !shots.admit_count(solo.shot_packets_per_window) {
+                    self.observer
+                        .rate_limited(GameRateClass::ShotPacketsConnection);
+                    self.observer.shot(GameShotObservation::RateLimited);
+                    return Ok(state);
+                }
+                // The retail shot payload is the client's own and carries nothing the
+                // server can trust, so a shot is recorded as one stroke rather than
+                // interpreted. Scoring stays server-authoritative through the stroke count.
+                self.record_retail_stroke(identity.connection_id, strokes, false)
+                    .await?;
+                self.send(
+                    framed,
+                    &RetailTurnEnd {
+                        connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    },
+                )
+                .await?;
+                self.send(
+                    framed,
+                    &RetailTurnStart {
+                        connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            (GameState::InMatch, RETAIL_C2S_HOLE_FINISH) => {
+                // The finishing stroke is the one that holes out.
+                self.record_retail_stroke(identity.connection_id, strokes, true)
+                    .await?;
+                let commit = match self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::PrepareFinish)
+                    .await
+                {
+                    Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(_) => return Ok(state),
+                };
+                self.persist_and_apply_commit(
+                    identity.connection_id,
+                    commit,
+                    shutdown,
+                    idle_deadline,
+                )
+                .await?;
+                self.send(framed, &RetailFinishHole).await?;
+                Ok(GameState::InRoom)
+            }
+            _ => Err(GameRuntimeError::Protocol),
+        }
+    }
+
+    /// Records one retail stroke against the durable solo match state.
+    ///
+    /// The client owns trajectory, so the coordinates are not meaningful here; what the
+    /// match actor needs is the stroke sequence and whether the ball was holed.
+    async fn record_retail_stroke(
+        &self,
+        connection_id: PlayerConnectionId,
+        strokes: &mut u32,
+        holed: bool,
+    ) -> Result<(), GameRuntimeError> {
+        *strokes = strokes.saturating_add(1);
+        let sequence = *strokes;
+        let action = ShotAction::new(sequence, 0, 1.0, 0.0, 0.0, 0.0)
+            .map_err(|_| GameRuntimeError::Protocol)?;
+        let _ = self
+            .lobby
+            .route_solo(connection_id, LobbySoloCommand::ShotAction(action))
+            .await;
+        let result = ShotResult::new(sequence, 0.0, 0.0, 0.0, Lie::Fairway, holed)
+            .map_err(|_| GameRuntimeError::Protocol)?;
+        let _ = self
+            .lobby
+            .route_solo(connection_id, LobbySoloCommand::ShotResult(result))
+            .await;
+        Ok(())
     }
 
     /// Handles one retail lobby/room command.
@@ -4657,6 +4932,24 @@ fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
         owner_uid: 0,
         natural_wind: false,
     }
+}
+
+/// Retail match client opcodes.
+const RETAIL_C2S_START_MATCH: u16 = 0x000e;
+const RETAIL_C2S_HOLE_LOAD_FINISHED: u16 = 0x0011;
+const RETAIL_C2S_SHOT_COMMIT: u16 = 0x0012;
+const RETAIL_C2S_SHOT_END: u16 = 0x001c;
+const RETAIL_C2S_HOLE_FINISH: u16 = 0x0031;
+
+fn is_retail_match_opcode(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        RETAIL_C2S_START_MATCH
+            | RETAIL_C2S_HOLE_LOAD_FINISHED
+            | RETAIL_C2S_SHOT_COMMIT
+            | RETAIL_C2S_SHOT_END
+            | RETAIL_C2S_HOLE_FINISH
+    )
 }
 
 /// Retail lobby/room client opcodes.

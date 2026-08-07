@@ -6005,3 +6005,152 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
+    let catalog = economy_catalog();
+    let course = catalog
+        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .expect("one-hole course");
+    let account = create_account(&pool, "RetailGolfer", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            catalog.clone(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: Some(SoloRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout: Duration::from_secs(30),
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window: 80,
+                }),
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail match service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"RetailGolfer".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    for _ in 0..9 {
+        let _ = receive_packet(&mut stream, key).await;
+    }
+    send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+
+    // Create a room, then start a match from inside it.
+    let mut writer = pangya_protocol::PacketWriter::default();
+    writer.u8(0);
+    writer.u32_le(30_000);
+    writer.u32_le(600_000);
+    writer.u8(4);
+    writer.u8(0);
+    writer.u8(1);
+    writer.u8(1);
+    writer.bytes(&[0; 5]);
+    writer.pstring(b"Hole One", 64).expect("name");
+    writer.pstring(b"", 64).expect("password");
+    send_packet(&mut stream, key, 3, 0x0008, &writer.into_inner()).await;
+    eprintln!(
+        "PROBE create -> {:#06x}",
+        receive_packet(&mut stream, key).await.0
+    );
+    eprintln!(
+        "PROBE census -> {:#06x}",
+        receive_packet(&mut stream, key).await.0
+    );
+
+    // Start match: the client receives the plan, weather, and wind.
+    send_packet(&mut stream, key, 4, 0x000e, &[]).await;
+    eprintln!(
+        "PROBE start -> {:#06x}",
+        receive_packet(&mut stream, key).await.0
+    );
+    let (opcode, info) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0052, "match plan");
+    // Four header bytes, three u32 fields, one hole, the seed, then eighteen collectible
+    // counts the client reads regardless of how many holes the match has.
+    assert_eq!(info.len(), 4 + 12 + 7 + 4 + 18);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x009e, "weather");
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x005b, "wind");
+
+    // Loading finished moves the hole into play and hands the player the turn.
+    send_packet(&mut stream, key, 5, 0x0011, &[]).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0053,
+        "hole intro"
+    );
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0063,
+        "turn start"
+    );
+
+    // A shot is one stroke; the turn is handed back so the next can be played.
+    send_packet(&mut stream, key, 6, 0x0012, &[0xaa; 8]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00cc, "turn end");
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0063,
+        "turn start"
+    );
+
+    // Finishing holes out and settles durably.
+    send_packet(&mut stream, key, 7, 0x0031, &[]).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0065,
+        "hole finished"
+    );
+
+    let (pang, currency_rows, progression_rows): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT pang FROM profiles WHERE account_id=$1), \
+         (SELECT count(*) FROM currency_ledger), \
+         (SELECT count(*) FROM progression_ledger)",
+    )
+    .bind(account.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("settlement");
+    // Two strokes against a par-3 hole: the server scored it, not the client.
+    assert!(pang > 0, "the hole paid a Pang reward");
+    assert_eq!(currency_rows, 1, "exactly one immutable Pang ledger row");
+    assert_eq!(progression_rows, 1, "exactly one immutable EXP ledger row");
+
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
