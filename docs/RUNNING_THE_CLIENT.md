@@ -14,7 +14,7 @@ builds and runs anywhere Rust and PostgreSQL do.
 |---|---|
 | LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** against a client. |
 | GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`. The retail `0x0002` auth packet is accepted inbound, and the reply sequence is progress ticks, the full `0x0044` reply announcing `852.00`, character roster, caddie container, equipment, inventory, and the channel list. Proven end to end over encrypted TCP in CI, **unverified** against a client. |
-| Rooms | Create (`0x0008`), join (`0x0009`), leave (`0x000f`), and room list (`0x0047`) are routed and proven over TCP. **Room member census (`0x0048`) is not implemented**, so the client will not see who else is in a room. |
+| Rooms | Create (`0x0008`), join (`0x0009`), leave (`0x000f`), room list (`0x0047`), and member census (`0x0048`) are routed and proven over TCP, including capacity accounting and the room-master flag. |
 | Match / gameplay | Synthetic `0x7f20`/`0x7f30` families only. A real client cannot start or play a hole. |
 
 So today this should get you through login, server selection, the loading screen, the
@@ -23,7 +23,9 @@ lobby, and into a room. Starting a match will not work. See `PROGRESS.md`.
 One deliberate behaviour worth knowing: in retail mode the server **drops** lobby/room
 broadcast events rather than sending them, because they are still encoded in the synthetic
 family and emitting one into a retail stream would desynchronize the client far worse than
-the missing information does. That is why the member list stays empty.
+the missing information does. The census is sent on create and join, so a room shows its
+occupants at those points, but it does not yet update live when someone else joins or
+leaves while you are already in the room.
 
 ## 1. Obtain and extract the client
 

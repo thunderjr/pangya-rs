@@ -279,7 +279,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. Implement the retail room member census (`0x0048`) and re-enable room broadcasts, which are currently dropped in retail mode because they would otherwise emit synthetic packets into a retail stream. This is what makes a room show its occupants.
+1. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 2. Port the retail match set — start match (`0x000e`), hole load/start, shot commit/sync/end, turn and hole finish — replacing the synthetic `0x7f20`/`0x7f30` families. This is the last gate before a hole can actually be played.
 2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
 3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
@@ -298,7 +298,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 - Recorded that three M3 bootstrap opcodes carry the wrong meaning today (`0x0070`, `0x0072`, `0x004d`), confirmed independently by PacketDoc and a working reference server.
 - Wired the retail bootstrap into the runtime behind `game.retail_bootstrap`, proven over encrypted TCP: progress ticks, the full reply announcing `852.00`, roster, caddie container, equipment, inventory, and channel list, in that order.
 - Accepted the retail `0x0002` auth packet inbound, completing the login-to-lobby path: a real client's own auth now drives the retail bootstrap end to end.
-- Added and routed the retail room packets: create, join, leave, and list, proven over encrypted TCP including capacity accounting and a refused join. Room broadcasts are dropped in retail mode rather than emitted as synthetic packets, so the member census is the next gap.
+- Added and routed the retail room packets: create, join, leave, list, and the 341-byte member census, proven over encrypted TCP including capacity accounting, the room-master flag, and a refused join. Room broadcasts are dropped in retail mode rather than emitted as synthetic packets, so the census does not yet update live.
 - Added an operator guide for pointing a real client at a local instance. Everything past the lobby still speaks the synthetic protocol, and no layout is client-verified.
 
 ### 2026-08-07 — local synthetic M7 inventory, shop, and equipment checkpoint
