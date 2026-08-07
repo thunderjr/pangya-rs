@@ -280,7 +280,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 ## Immediate next actions
 
 1. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
-2. Port the retail match set — start match (`0x000e`), hole load/start, shot commit/sync/end, turn and hole finish — replacing the synthetic `0x7f20`/`0x7f30` families. This is the last gate before a hole can actually be played.
+2. Route the retail match packets, which are implemented and unit-tested but not wired. Unlike rooms this is not a pure wire translation: the existing match actors encode the synthetic protocol's own semantics (one hole, exactly two ready players, a fixed reward formula) while the retail flow is multi-hole and variable-party. Decide first whether to generalize the existing actor or add a retail one beside it sharing the protocol-agnostic settlement layer.
 2. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy, and find a source for course par, which `Course.iff` does not carry.
 3. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
 4. Preserve the validated synthetic M2-M7 evidence and complete local matrix.

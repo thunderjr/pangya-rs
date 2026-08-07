@@ -238,3 +238,65 @@ the existing actor commands and emitting the retail replies, gated the same way 
 bootstrap is. The actor model itself is protocol-agnostic and should not need changes —
 this is a wire-layer translation, deliberately left as a separate step rather than rushed
 alongside the packet definitions.
+
+
+---
+
+# Retail match contract
+
+Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
+
+## Client opcodes
+
+| Opcode | Meaning |
+|---|---|
+| `0x000e` | Start match |
+| `0x0011` | Hole load finished |
+| `0x001a` | Hole start |
+| `0x0012` | Shot commit |
+| `0x0013` | Rotate aim |
+| `0x0014` | Shot start |
+| `0x001b` | Shot sync |
+| `0x001c` | Shot end / turn end |
+| `0x0031` | Player hole finish |
+| `0x0034` | Finish player preview |
+| `0x0130` | Player quit |
+
+## Server opcodes
+
+| Opcode | Meaning | Body |
+|---|---|---|
+| `0x0076` | Match start | room UI type, `u32` 1, packed server time |
+| `0x0052` | Match plan | course, UI type, hole mode, hole count, `u32` trophy, `u32` shot timer, `u32` game timer, the hole plan, `u32` seed, then **18** collectible counts |
+| `0x009e` | Hole weather | `u16` weather ordinal, one zero byte |
+| `0x005b` | Hole wind | `u8` strength, `u8` silent flag, `u16` bearing, `u8` 1 to set rather than accumulate |
+| `0x0053` | Play a player's hole intro | `u32` connection id |
+| `0x0063` | Turn start | `u32` connection id |
+| `0x00cc` | Turn end | `u32` connection id, `u32` zero |
+| `0x0056` | Aim rotation relay | `u32` connection id, `f32` bearing |
+| `0x0055` | Shot commit relay | `u32` connection id, then the client's shot payload verbatim |
+| `0x0065` | Hole finished | empty |
+| `0x0090` | Finish-preview acknowledgement | empty |
+
+One hole record is `u32` random id, `u8` pin, `u8` course, `u8` number.
+
+Two details that are easy to get wrong and were pinned by tests:
+
+- `0x0052` must always write **eighteen** collectible count bytes regardless of how many
+  holes the match actually has. The client reads all eighteen.
+- Shots are relayed, not recomputed. The client owns trajectory; the server owns turn
+  order, scoring, and persistence. The relay body is deliberately opaque.
+
+## What remains to make a hole playable
+
+The packets are implemented and unit-tested. They are **not routed**, and routing them is
+not merely a wire translation the way rooms were: the existing match actors
+(`stroke_state.rs`, the solo path) encode the synthetic protocol's own semantics — exactly
+one hole, exactly two ready players, a fixed reward formula. The retail flow is
+multi-hole, variable-party, and drives loading and turn order from different client
+signals.
+
+So this step needs a design decision rather than a translation: either generalize the
+existing match actor to the retail lifecycle, or introduce a retail match actor beside it
+and share the settlement layer, which is already protocol-agnostic. That decision should be
+made deliberately, not folded into a packet-porting commit.
