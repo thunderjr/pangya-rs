@@ -104,7 +104,7 @@ use pangya_protocol::{
     StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
     StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
-    synthetic_game_hello, us852_game_hello,
+    packed_system_time, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -5608,7 +5608,7 @@ where
                 },
                 caddie: RetailCaddie::default(),
             },
-            server_time: [0; 16],
+            server_time: retail_now(),
             disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
         };
         self.send(framed, &reply).await?;
@@ -6116,8 +6116,24 @@ fn member_card(snapshot: &PlayerSnapshot) -> MemberCard {
 ///
 /// The client reads the same record here as in the handover reply that admitted it, so a
 /// roster that describes players any less completely is one it cannot build models from.
+/// The current wall clock, packed the way the client reads it.
+///
+/// Anything the clock cannot supply packs as the Unix epoch rather than as zeros: a zeroed
+/// block names no date — month zero and day zero exist on no calendar — and the client cannot
+/// convert one back into a time.
+fn retail_now() -> [u8; 16] {
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    packed_system_time(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(0),
+        u16::try_from(since_epoch.subsec_millis()).unwrap_or(0),
+    )
+}
+
 fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlayer {
     let card = member.card();
+    let start_time = retail_now();
     RetailMatchPlayer {
         number: u16::try_from(seat.saturating_add(1)).unwrap_or(u16::MAX),
         player: RetailPlayerData {
@@ -6150,7 +6166,7 @@ fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlaye
             },
             caddie: RetailCaddie::default(),
         },
-        start_time: [0; 16],
+        start_time,
     }
 }
 

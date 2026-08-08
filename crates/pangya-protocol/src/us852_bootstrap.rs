@@ -649,6 +649,23 @@ mod tests {
         assert_eq!(writer.as_slice(), &[1, 0, 1, 0, 1, 2, 3, 4]);
         assert_eq!(chunks[0].opcode(), 0x0070);
     }
+
+    /// A zeroed block is what this replaces, and month zero is the tell: no date has one.
+    #[test]
+    fn a_packed_system_time_names_a_real_date() {
+        // 2026-08-10 00:07:04.250 UTC, a Monday.
+        let packed = packed_system_time(1_786_320_424, 250);
+        let field = |index: usize| u16::from_le_bytes([packed[index * 2], packed[index * 2 + 1]]);
+        assert_eq!(field(0), 2026);
+        assert_eq!(field(1), 8);
+        assert_eq!(field(2), 1);
+        assert_eq!(field(3), 10);
+        assert_eq!(field(4), 0);
+        assert_eq!(field(5), 7);
+        assert_eq!(field(6), 4);
+        assert_eq!(field(7), 250);
+        assert_eq!(packed_system_time(0, 0)[0..2], 1970_u16.to_le_bytes());
+    }
 }
 
 /// Exact wire width of the retail player-statistics block.
@@ -1042,4 +1059,63 @@ impl EncodePacket for HandoverReply {
         writer.bytes(&[0; GUILD_INFO_BYTES]);
         Ok(())
     }
+}
+
+/// Packs a wall-clock instant into the sixteen-byte `SYSTEMTIME` the client reads.
+///
+/// Eight little-endian `u16` fields: year, month, day of week, day, hour, minute, second,
+/// millisecond. A zeroed block is not a valid time — month zero and day zero name no date —
+/// so anything the client converts back into a date from one gets nothing.
+///
+/// # Provenance
+///
+/// From `pangbox/server` (`pangya/systemtime.go`), ISC licensed.
+#[must_use]
+pub fn packed_system_time(unix_seconds: i64, millisecond: u16) -> [u8; 16] {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds_of_day = unix_seconds.rem_euclid(86_400);
+    // 1970-01-01 was a Thursday, and day zero of the week is Sunday.
+    let day_of_week = u16::try_from((days + 4).rem_euclid(7)).unwrap_or(0);
+    let (year, month, day) = civil_from_days(days);
+    let mut packed = [0_u8; 16];
+    let fields = [
+        year,
+        month,
+        day_of_week,
+        day,
+        u16::try_from(seconds_of_day / 3_600).unwrap_or(0),
+        u16::try_from((seconds_of_day / 60) % 60).unwrap_or(0),
+        u16::try_from(seconds_of_day % 60).unwrap_or(0),
+        millisecond,
+    ];
+    for (slot, field) in packed.chunks_exact_mut(2).zip(fields) {
+        slot.copy_from_slice(&field.to_le_bytes());
+    }
+    packed
+}
+
+/// Converts a count of days since the Unix epoch into a civil year, month and day.
+///
+/// Howard Hinnant's `civil_from_days`, shifted to an era beginning on 0000-03-01 so that the
+/// leap day falls at the end of a year and needs no special case.
+fn civil_from_days(days: i64) -> (u16, u16, u16) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (
+        u16::try_from(year).unwrap_or(0),
+        u16::try_from(month).unwrap_or(0),
+        u16::try_from(day).unwrap_or(0),
+    )
 }

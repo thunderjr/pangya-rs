@@ -97,7 +97,7 @@ pub use us852_bootstrap::{
     PLAYER_STATISTICS_BYTES, PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter,
     RetailCourseStatistics, RetailEquipment, RetailGameAuth, RetailPangBalance, RetailPlayerData,
     RetailPlayerIdentity, RetailPlayerStatistics, RetailPointBalance, ServerChannelList,
-    US852_SERVER_VERSION,
+    US852_SERVER_VERSION, packed_system_time,
 };
 pub use us852_match::{
     MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RETAIL_STANDING_BYTES, RetailAimRotate, RetailFinishHole,
