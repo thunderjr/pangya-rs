@@ -204,6 +204,8 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x001d` | `RetailPurchaseRequest` | `lib.rs:1365` → `handle_retail_purchase` `:4934` | client-verified (blocker 20) | `us852_room.rs:281`; `pangbox/server` `game/packet/client.go` `ClientBuyItem` |
 | `0x0020` | `RetailEquipmentUpdate` | `lib.rs:1349` → `handle_retail_equipment_update` `:4872` | client-verified (blocker 17) | `us852_room.rs:454`; tagged union over eight equipment kinds |
 | `0x0031` | `RETAIL_C2S_HOLE_FINISH` | `lib.rs:4653` / `:4479` | reference-derived | a completion, not a shot — counting it as a stroke scored every hole one over |
+| `0x0034` | `RETAIL_C2S_FIRST_SHOT_READY` | `handle_retail_stroke_command`, answered with `0x0090` | reference-derived | `pangbox/server` `game/server/conn.go` `ClientFirstShotReady`; the client waits for the reply before the first shot |
+| 13 cosmetic in-match opcodes | `RETAIL_ACCEPTED_MATCH_OPCODES` (`game.rs`) | accepted without a reply | reference-derived | aim, meter, power, club, item, relief, hole info, active-player ack, pause, arrow, load progress, game end, last-player-leave. Upstream relays each to the other participants; this server does not yet, so an opponent's aim does not animate |
 | `0x0081` | `RETAIL_C2S_MULTIPLAYER_JOIN` | `lib.rs:5100` | client-verified | opens the room directory; answered with the list then the acknowledgement |
 | `0x0082` | `RETAIL_C2S_MULTIPLAYER_LEAVE` | `lib.rs:5116` | client-verified | |
 | `0x009c` | `RetailPlayerHistoryRequest` | `lib.rs:1321` | client-verified (blocker 16) | `game.rs:307`; `pangbox/server` `game/packet/client.go` `ClientRequestPlayerHistory` |
@@ -261,7 +263,7 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x00f5` | `RetailMultiplayerJoined` | `us852_room.rs:841` | `lib.rs:5113` | empty body; `ServerMultiplayerJoined`, PacketDoc `00f5.ksy` |
 | `0x00f6` | `RetailMultiplayerLeft` | `us852_room.rs:862` | `lib.rs:5120` | empty body |
 | `0x0047` | `RetailRoomList` | `us852_room.rs:883` | `lib.rs:5105`, `:5297` | 210-byte room records |
-| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:1110` | `lib.rs:5211`, `:5230`, `:5279` | 341-byte player records. **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent |
+| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:1110` | `lib.rs:5211`, `:5279`, and every room snapshot while in the room | 341-byte player records. **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent. A snapshot re-sends the whole roster rather than a delta |
 | `0x0049` | `RetailRoomJoinResult` | `us852_room.rs:926` | `lib.rs:5163`, `:5206`, `:5259` | success writes a `u16` status then the room record; rejection writes one byte. The widths genuinely differ |
 | `0x004c` | `RetailRoomLeave` | `us852_room.rs:967` | `lib.rs:5241` | `0xffff` means the lobby |
 | `0x0076` | `RetailMatchStart` | `us852_match.rs:60` | `lib.rs:3948` | |
@@ -274,6 +276,7 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x0055` | `RetailShotCommitRelay` | `us852_match.rs:285` | `lib.rs:3565` | the client's own shot payload, relayed unchanged |
 | `0x0064` | `RetailShotSync` | `us852_match.rs:316` | `lib.rs:3573` | `ServerRoomShotSync`, `game/room/room.go` `handleRoomGameShotSync` |
 | `0x0065` | `RetailFinishHole` | `us852_match.rs:419` | `lib.rs:4015`, `:4499` | empty body |
+| `0x0090` | `RetailFirstShotReady` | `game.rs` | `handle_retail_stroke_command` | empty body; `ServerPlayerFirstShotReady`. Its arrival is the whole message |
 | `0x0066` | `RetailMatchFinish` | `us852_match.rs:386` | `lib.rs:4016` | the durable server-side settlement, never anything the client claimed. `ServerRoomFinishGame` |
 
 ### 2.6 Retail types defined but not routed
@@ -353,7 +356,7 @@ Covered by `game_retail_bootstrap_emits_the_reference_derived_sequence`.
 | `SYNTHETIC_M4_C2S_KICK` | `0x7f07` | none | keep until a retail kick path exists |
 | `SYNTHETIC_M4_C2S_STATE` | `0x7f08` | none | keep until the census can be requested, not only pushed |
 | `SYNTHETIC_M4_S2C_COMMAND_RESULT` | `0x7f82` | `0x0049` rejection, create/join only | keep until every retail room command can report a typed refusal |
-| `SYNTHETIC_M4_S2C_MEMBERSHIP_EVENT` | `0x7f83` | `0x0048` `Add`/`Remove`/`Update` — modelled, never emitted | keep until live census updates are emitted (`lib.rs:3425`) |
+| `SYNTHETIC_M4_S2C_MEMBERSHIP_EVENT` | `0x7f83` | `0x0048` `List`, re-sent on every membership or ready change | remove now |
 | `synthetic_m4_registry` | — | — | keep until the family is gone |
 
 7 remove now, 8 keep until.
@@ -612,7 +615,8 @@ family does, unless the named retail work lands first.
    (`lib.rs:3585`); the client simply finds itself back in the room.
 3. **Live room state.** Membership add/remove, chat, settings change, kick, and an explicit
    state query. In retail mode **all** lobby broadcasts are dropped (`lib.rs:3425`), so the
-   census is only correct at create, join, and ready.
+   census is re-sent in full on every room snapshot, so it is correct while a client sits in
+   the room; it is not sent during a hole, where it would contradict the match.
 4. **Post-settlement balances.** `0x7fa5`/`0x7fb8` push the new Pang and EXP the moment a
    match settles. Retail pushes `0x0095`/`0x0096` only during bootstrap and after a purchase,
    so a grant or a match reward is visible on the next login rather than immediately.
