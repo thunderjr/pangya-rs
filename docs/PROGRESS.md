@@ -374,11 +374,18 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     A related mismatch went with it. The room record echoed the creator's course and hole count while the match plan was built from the configuration, so a room could promise three holes on one course and the match contradict it a moment later; and the course the client is told to load is a one-byte ordinal the configured id may not fit into at all. The record now reports what will actually run. The timers and the room type stay the creator's, because those this server does honour.
 
+26. **Two real clients cannot be driven on one desktop, so the second seat is headless now** — **resolved 2026-08-08.** The game reads its mouse through DirectInput as accumulated relative deltas clamped to its own window, so parking the other instance elsewhere does not stop it seeing the cursor: both instances believe the pointer is over the same client-area pixel, and the one holding input focus is the one that acts. Focus could not be moved back to a client that had lost it. `SetForegroundWindow`, the foreground-lock-timeout trick, a synthetic title-bar click, the same click from the automation host, minimising the other window, and clicking the taskbar button all failed silently; `AttachThreadInput` hangs the automation host outright and `GetForegroundWindow` read from it names windows that are not foreground. All of it is recorded in the harness header so it is not rediscovered.
+
+    `pangya-test-client` removes the requirement instead of solving it: a person drives one real client and a headless one takes the other seat over the same retail wire, so what the real client experiences is a genuine two-player match. It can host or join, because the seat the real client is not in is the one that has to be filled. `pangya-server account handover` mints its bearer.
+
+    Two of them against the release binary played and settled a versus hole end to end — one durable match, both accounts scored, one Pang and one EXP ledger row each — which is the first time the retail versus path has run outside the test suite, against the shipped binary and the shipped config. It also immediately found two client-side ordering bugs of its own: a host that starts the moment the room fills races the other seat's ready packet, and a client that drains after readying swallows the match plan.
+
 ---
 
 ## Immediate next actions
 
-1. **Play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
+1. **Play a versus hole from one real client and one headless seat.** `pangya-test-client` fills the second seat; see [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md) §7.1. What is left is the real client's acceptance of the frames, which is the §19.6 steps 7-12 gate.
+2. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.

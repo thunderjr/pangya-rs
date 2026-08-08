@@ -299,8 +299,26 @@ Start button unlocks, but no real client has yet loaded the hole. That is the op
 
 ### 7.1 Driving a versus hole
 
-Two clients are needed; see "Playing a hole needs two clients" below for why, and "Running two
-clients on one host" for how. Then:
+A versus hole needs two players and only one of them has to be a real client. Two real ones
+cannot be driven on one desktop — only the instance holding input focus acts on a click, and
+focus cannot be taken back from a client that has it; the failed attempts are listed in the
+harness header. `pangya-test-client` takes the other seat over the same retail wire instead:
+
+```bash
+# One bearer per seat. Single use, so mint a fresh one for every attempt.
+export PANGYA_HANDOVER=$(cargo run -q -p pangya-server -- \
+  --config config/local.toml account handover --account-id <ID>)
+
+# Join the room the real client made. Its number is in the room's own header.
+cargo run -q -p pangya-test-client -- --game <ADDRESS>:20201 \
+  --account-id <ID> --username <NAME> --room <NUMBER>
+```
+
+It can also host, with `--host` instead of `--room`, and it prints the room number for the real
+client to join. `RUST_LOG=debug` prints every frame in order, which is the fastest way to see
+what the real client did and did not answer.
+
+Then:
 
 1. Enable `[game.stroke_two]`. `config/retail-local.example.toml` ships it enabled, with the
    course and par matching `[game.solo_practice]`. Both describe the one hole this server
