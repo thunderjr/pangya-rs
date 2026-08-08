@@ -362,6 +362,12 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     The existing `game_retail_match_plays_and_settles_one_hole` remains valid for what it covers — one client, one hole — and is not coverage of a versus match.
 
+24. **A room went stale while you sat in it, and a hole could not survive the client's own chatter** — **resolved 2026-08-08.** Two gaps found by reading what a real client sends around a versus hole rather than by driving one into it.
+
+    A client in a room learns that anyone else arrived, left, or readied only from a census, and the census was sent on create and join alone. A host watching `3 hole (1/2)` therefore never saw it become 2/2, and the client will not offer Start until it does — so the two-player match was unreachable from the real client whatever the server did with it. Room snapshots now translate into a census, but only while the connection is in the room: one mid-hole would contradict the match. The join handler stopped sending its own, because joining mutates the room and the actor already broadcasts to everyone in it, the joiner included.
+
+    Separately, thirteen in-match opcodes — aim rotation, the power meter, club changes, item use, relief drops, the client's own hole info, the active-player acknowledgement, pause, the aiming arrow, load progress, game end, last-player-leave — arrive during a hole and none of them changes a stroke, a turn, or a score. Under the shipped `unknown_opcode_policy = "disconnect"` each would have ended the session, so a hole could not have survived the first real shot. They are an explicit allowlist now, `RETAIL_ACCEPTED_MATCH_OPCODES`, listed with what upstream does with each: it relays them to the other participants and this server does not yet, so an opponent's aim does not animate. That is a stated gap rather than a silent one. `0x0034` is the exception that needs an answer — the client waits to be told it may take the first shot, and `0x0090` carries nothing but its arrival.
+
 ---
 
 ## Immediate next actions
