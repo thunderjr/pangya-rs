@@ -484,6 +484,14 @@ Invoke-PangyaLogin -Id 'rsp4' -Password 'pangya123'
 Set-PangyaTarget -ProcessId 8480          # switch back to the first
 ```
 
+### Configuration
+
+`config/retail-local.example.toml` is the configuration an unmodified U.S. 852 client needs — the
+plain local example plus the retail deltas, with the settings that fail silently called out at the
+top of the file. Copy it to an ignored local file rather than editing it in place.
+
+`DATABASE_URL` stays in the environment; no secret belongs in that file.
+
 ### Where the harness lives
 
 `scripts/windows/pangya-client.ps1` is the tracked copy. The VM runs it from

@@ -1,0 +1,202 @@
+# Retail local example: the configuration that drives an unmodified U.S. 852 client.
+#
+# This is config/local.example.toml with the deltas a real client needs. Copy it to an ignored
+# local file and point the server at it. docs/RUNNING_THE_CLIENT.md is the procedure around it.
+#
+# The settings that are easy to get wrong, and what happens when you do:
+#
+#   client_web.patch_number   A number above the client's own patch level makes it withhold the
+#                             login dialog entirely, with no error.
+#   game.retail_bootstrap     Off, the client reads the following frame at the wrong offset and
+#                             drops the connection, which it reports as "Server is full".
+#   game.economy.enabled      Off, every purchase is refused and nothing says why.
+#   data.iff_directory        Must be the PAK-extracted tables. An older copy validates fine and
+#                             silently lacks items, which reads as a pricing bug.
+#   security.login_timeout    The shipped 15s closes the connection mid-way through the client's
+#                             own first-time setup screens.
+#
+# Secrets stay out of this file. DATABASE_URL comes from the environment.
+
+# Local M2 plus opt-in synthetic GameService M5/M6 example. Copy to an ignored local file.
+[server]
+profile = "local"
+shutdown_grace = "10s"
+
+[login]
+bind = "127.0.0.1:10103"
+advertise = "100.74.132.53:10103"
+client_profile = "us_852"
+auto_create_accounts = true
+
+[game]
+# False preserves the M2-only process. Enabling requires the [data] gates below.
+enabled = true
+bind = "127.0.0.1:20201"
+advertise = "100.74.132.53:20201"
+id = 1
+name = "PangYa-RS Local"
+capacity = 200
+channel_id = 1
+max_rooms = 1024
+lobby_command_capacity = 256
+lobby_event_capacity = 256
+room_normal_capacity = 64
+room_control_capacity = 16
+outbound_room_event_capacity = 64
+room_commands_per_window = 30
+chat_messages_per_window = 10
+unknown_opcode_strikes = 3
+# Capture retains bounded opcode/state/length metadata plus a SHA-256 digest, never raw payloads.
+unknown_capture_capacity = 256
+command_timeout = "3s"
+# Emits the reference-derived US 852 retail bootstrap instead of the synthetic one.
+# Required by a real client; unverified against one, so it stays opt-in.
+retail_bootstrap = true
+
+[game.solo_practice]
+# Local synthetic protocol only; disabled by default and not retail-compatible.
+enabled = true
+course_id = 671088640
+# Par for the single hole. Zero means "take it from the catalog", which only the generated
+# catalogs can satisfy: a real client's Course.iff is a presentation row with no par field, so
+# a real-client catalog requires an explicit value here. Startup fails with an actionable
+# message rather than guessing.
+course_par = 4
+loading_timeout = "30s"
+commit_timeout = "3s"
+max_strokes = 30
+startup_recovery_limit = 1000
+shot_packets_per_window = 120
+
+[game.stroke_two]
+# Local synthetic exactly-two/one-hole protocol only; disabled and not retail-compatible.
+enabled = false
+course_id = 7
+course_par = 0
+loading_timeout = "30s"
+turn_timeout = "30s"
+game_timeout = "10m"
+commit_timeout = "3s"
+max_strokes = 30
+startup_recovery_limit = 1000
+shot_packets_per_window = 120
+
+[game.economy]
+# Local synthetic v2 catalog/shop only; disabled and not retail-compatible.
+enabled = true
+command_timeout = "3s"
+commands_per_window = 30
+page_size = 50
+max_purchase_quantity = 99
+
+[http]
+bind = "127.0.0.1:8080"
+metrics = true
+heartbeat_stale_after = "5s"
+
+# The static HTTP contract a retail client needs before it will speak the game protocol at all:
+# a string catalog, the XTEA-encrypted patch updatelist, and the theme documents plus their
+# images. Without these the client aborts during startup; see docs/RUNNING_THE_CLIENT.md.
+#
+# Deliberately a separate listener from [http]: this one has to be reachable by the machine
+# running the client, and health/metrics should not be.
+[client_web]
+enabled = true
+bind = "127.0.0.1:18090"
+# What the client is told to fetch theme images from. The client resolves this on its own
+# machine and passes it to WinINet verbatim, so it must be an address reachable from there.
+advertise = "100.74.132.53:18090"
+# Selects the updatelist XTEA key: us, jp, th, eu, id, kr.
+region = "us"
+# The directory holding the client's .pak series. Required when enabled.
+# client_directory = "./local-data/us851"
+# "paks" lists only the PAK series, which is what the client needs to mount its data.
+# "all" mirrors a retail patch server and also lists executables and DLLs.
+entries = "paks"
+patch_version = "PangYa-RS"
+patch_number = 851
+# Plaintext catalog XML; the service base64-encodes it the way the client expects. Operator
+# supplied, because the content is the client's own localized strings.
+# translation_catalog = "./local-data/us851-data/translation_us.xml"
+# Theme images. Point this at the client's own extrares directory; notice, lobby, and loading
+# entries are derived from the retail file-naming convention.
+# theme_directory = "./local-data/us851/extrares"
+
+# Flattened client tree. The client resolves every resource by bare file name.
+client_directory = "./local-data/us851"
+# Without this the client stops at "string load failed."
+translation_catalog = "./local-data/us851-data/translation_us.xml"
+theme_directory = "./local-data/us851/extrares"
+[database]
+# The URL value itself must only exist in this named environment variable or secret_file.
+url_env = "DATABASE_URL"
+# secret_file = "/run/secrets/pangya_database_url"
+max_connections = 10
+min_connections = 1
+acquire_timeout = "5s"
+connect_attempts = 5
+retry_initial = "100ms"
+retry_max = "2s"
+readiness_probe_interval = "1s"
+readiness_probe_timeout = "2s"
+
+[protocol]
+max_client_frame_bytes = 65535
+max_plaintext_bytes = 8388608
+max_expansion_ratio = 128
+unknown_opcode_policy = "disconnect"
+
+[logging]
+filter = "info,pangya_login=debug,pangya_game=debug,pangya_observability=debug"
+format = "pretty"
+packet_bodies = false
+
+[security]
+credential_concurrency = 2
+credential_queue_timeout = "250ms"
+credential_operation_timeout = "5s"
+global_connections = 256
+connections_per_source = 8
+source_capacity = 1024
+global_accepts_per_window = 1000
+accepts_per_window = 30
+global_logins_per_window = 1000
+logins_per_window = 10
+username_logins_per_window = 10
+rate_window = "60s"
+global_packets_per_window = 10000
+global_bytes_per_window = 16777216
+source_packets_per_window = 600
+source_bytes_per_window = 2097152
+packets_per_window = 60
+bytes_per_window = 262144
+malformed_strike_cap = 1
+max_retries = 3
+login_timeout = "300s"
+idle_timeout = "600s"
+
+[starter]
+# Provisional until M3 validates these IDs against an operator-supplied IFF catalog.
+character_key = "starter_character"
+character_type_id = 67108864
+allowed_character_type_ids = [67108864]
+equipped_club_key = "starter_club"
+
+[[starter.items]]
+key = "starter_club"
+item_type_id = 268435456
+quantity = 1
+
+[data]
+# For synthetic M3, iff_directory is the mounted root and manifest is relative to it.
+# iff_directory = "./local-data/us852"
+# manifest = "manifest.toml"
+catalog_required_m3 = true
+load_timeout = "5s"
+# The PAK-extracted tables, NOT us851-data/iff. See scripts/extract-client-iff.py: a catalog
+# built from a superseded copy loads cleanly and silently lacks every item added since.
+iff_directory = "./local-data/us851-data/pak-iff/iff"
+manifest = "manifest.toml"
+# Operator aid: reprices every item the client sells so the whole shop is reachable without
+# grinding a balance. Warns at startup. Remove for real pricing.
+price_override_pang = 1

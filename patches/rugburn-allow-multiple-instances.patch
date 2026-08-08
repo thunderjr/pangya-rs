@@ -1,0 +1,128 @@
+diff --git a/src/config.c b/src/config.c
+index 842795c..a2279f6 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -95,6 +95,18 @@ static void ReadJsonBypassSelfSignedCertificate(LPSTR *json, LPCSTR key) {
+         Config.bBypassSelfSignedCertificate = TRUE;
+ }
+ 
++static void ReadJsonAllowMultipleInstances(LPSTR *json, LPCSTR key) {
++    LPCSTR value = JsonReadString(json);
++
++    Config.bAllowMultipleInstances = FALSE;
++
++    if (value == NULL || value == "")
++        return;
++
++    if (_stricmp(value, "TRUE") == 0)
++        Config.bAllowMultipleInstances = TRUE;
++}
++
+ static void ReadJsonConfigMap(LPSTR *json, LPCSTR key) {
+     if (!strcmp(key, "UrlRewrites")) {
+         JsonReadMap(json, ReadJsonUrlRewriteRuleMap);
+@@ -104,6 +116,8 @@ static void ReadJsonConfigMap(LPSTR *json, LPCSTR key) {
+         JsonReadMap(json, ReadJsonPatchAddressMap);
+     } else if (!strcmp(key, "BypassSelfSignedCertificate")) {
+         ReadJsonBypassSelfSignedCertificate(json, key);
++    } else if (!strcmp(key, "AllowMultipleInstances")) {
++        ReadJsonAllowMultipleInstances(json, key);
+     } else {
+         FatalError("Unexpected JSON config key '%s'", key);
+     }
+diff --git a/src/config.h b/src/config.h
+index 8664e14..a983b40 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -51,6 +51,13 @@ typedef struct _RUGBURNCONFIG {
+     int NumPatchAddress;
+ 
+     BOOL bBypassSelfSignedCertificate;
++
++    /**
++     * Lets the client run more than once on a host by giving every named mutex a per-process
++     * suffix, defeating its single-instance check. Only useful against a local server, where a
++     * second player cannot otherwise be arranged.
++     */
++    BOOL bAllowMultipleInstances;
+ } RUGBURNCONFIG, *LPRUGBURNCONFIG;
+ 
+ extern RUGBURNCONFIG Config;
+diff --git a/src/hooks/kernel32/inject.c b/src/hooks/kernel32/inject.c
+index fb4763e..34796c8 100644
+--- a/src/hooks/kernel32/inject.c
++++ b/src/hooks/kernel32/inject.c
+@@ -25,6 +25,10 @@ static PFNCREATEMUTEXAPROC pCreateMutexA;
+ static PFNCREATEPROCESSAPROC pCreateProcessA = NULL;
+ static PFNGETEXITCODEPROCESSPROC pGetExitCodeProcess = NULL;
+ 
++static PFNCREATEMUTEXAPROC pCreateMutexAOrig = NULL;
++static PFNOPENMUTEXAPROC pOpenMutexA = NULL;
++static CHAR szMutexSuffix[32] = {0};
++
+ static BOOL StrContains(LPCSTR lpHaystack, LPCSTR lpNeedle) {
+     LPCSTR lpCheckHaystack, lpCheckNeedle;
+ 
+@@ -71,6 +75,41 @@ static BOOL STDCALL CreateProcessAHook(LPCSTR lpApplicationName, LPSTR lpCommand
+                            lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+ }
+ 
++/**
++ * Gives every named mutex a per-process suffix.
++ *
++ * The client refuses to run twice by creating a named mutex and checking whether it already
++ * existed. Making the name unique per process defeats that check without touching the packed
++ * executable, which cannot be patched statically in any case. Two instances on one host are only
++ * useful against a local server, where a second player is otherwise impossible to arrange.
++ *
++ * Unnamed mutexes are already per-process and pass straight through.
++ */
++static HANDLE STDCALL CreateMutexAHook(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner,
++                                       LPCSTR lpName) {
++    CHAR szUniqueName[512];
++
++    if (lpName == NULL) {
++        return pCreateMutexAOrig(lpMutexAttributes, bInitialOwner, NULL);
++    }
++    SPrintfZ(szUniqueName, "%s%s", lpName, szMutexSuffix);
++    Log("CreateMutexA(%s) -> %s\r\n", lpName, szUniqueName);
++    return pCreateMutexAOrig(lpMutexAttributes, bInitialOwner, szUniqueName);
++}
++
++/**
++ * Opens the same renamed mutex, so a lookup inside one instance still finds its own.
++ */
++static HANDLE STDCALL OpenMutexAHook(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName) {
++    CHAR szUniqueName[512];
++
++    if (lpName == NULL) {
++        return pOpenMutexA(dwDesiredAccess, bInheritHandle, NULL);
++    }
++    SPrintfZ(szUniqueName, "%s%s", lpName, szMutexSuffix);
++    return pOpenMutexA(dwDesiredAccess, bInheritHandle, szUniqueName);
++}
++
+ static BOOL STDCALL GetExitCodeProcessHook(HANDLE hProcess, LPDWORD lpExitCode) {
+     Log("GetExitCodeProcess(%08x, %08x);\r\n", hProcess, lpExitCode);
+     if (hProcess == hGameguardFakeHandle) {
+@@ -82,9 +121,20 @@ static BOOL STDCALL GetExitCodeProcessHook(HANDLE hProcess, LPDWORD lpExitCode)
+ }
+ 
+ VOID InitInjectHook() {
++    PFNGETCURRENTPROCESSIDPROC pGetCurrentProcessId;
++
+     hKernel32Module = LoadLib("kernel32");
+     pCreateMutexA = (PFNCREATEMUTEXAPROC)GetProc(hKernel32Module, "CreateMutexA");
+     hGameguardFakeHandle = pCreateMutexA(NULL, FALSE, NULL);
++    if (Config.bAllowMultipleInstances) {
++        pGetCurrentProcessId =
++            (PFNGETCURRENTPROCESSIDPROC)GetProc(hKernel32Module, "GetCurrentProcessId");
++        SPrintfZ(szMutexSuffix, "-rugburn-%d", pGetCurrentProcessId());
++        pCreateMutexAOrig =
++            (PFNCREATEMUTEXAPROC)HookProc(hKernel32Module, "CreateMutexA", (PVOID)CreateMutexAHook);
++        pOpenMutexA =
++            (PFNOPENMUTEXAPROC)HookProc(hKernel32Module, "OpenMutexA", (PVOID)OpenMutexAHook);
++    }
+     pCreateProcessA = (PFNCREATEPROCESSAPROC)HookProc(hKernel32Module, "CreateProcessA",
+                                                       (PVOID)CreateProcessAHook);
+     pGetExitCodeProcess = (PFNGETEXITCODEPROCESSPROC)HookProc(hKernel32Module, "GetExitCodeProcess",
