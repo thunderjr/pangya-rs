@@ -4588,6 +4588,19 @@ where
                     return Ok(Some(GameState::InRoom));
                 }
                 *strokes = 0;
+                // The client's own button reads Start for the room master and Ready for
+                // everyone else, so a master never sends `0x000d`: pressing Start *is* the
+                // master declaring itself ready. Without this the aggregate refuses every real
+                // start with `NotReady`, because the one player who cannot say so is the only
+                // one who can begin the match.
+                if !matches!(
+                    self.lobby
+                        .route(identity.connection_id, LobbyRoomCommand::SetReady(true))
+                        .await,
+                    Ok(LobbyRouteResult::Snapshot(_))
+                ) {
+                    return Ok(Some(GameState::InRoom));
+                }
                 self.begin_retail_stroke_match(
                     &snapshot,
                     room_id,

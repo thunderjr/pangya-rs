@@ -6413,9 +6413,8 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         "the host is told the room filled: {host_frames:04x?}"
     );
 
-    // Both mark ready, which is what unlocks Start on a real client.
-    send_packet(&mut host, host_key, 4, 0x000d, &[0]).await;
-    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+    // Only the visitor marks ready. The client's button says Start for the room master and
+    // Ready for everyone else, so a master never sends this — pressing Start is what says it.
     send_packet(&mut visitor, visitor_key, 4, 0x000d, &[0]).await;
     let _ = drain_available(&mut visitor, visitor_key, Duration::from_millis(600)).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
