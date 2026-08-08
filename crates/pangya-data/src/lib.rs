@@ -671,8 +671,10 @@ const fn client_family_tags(kind: CatalogKind) -> &'static [u8] {
         CatalogKind::CharacterPart => &[0x08],
         CatalogKind::ClubSet => &[0x10],
         CatalogKind::Ball => &[0x14],
-        // The client's Item table carries both tags.
-        CatalogKind::Consumable => &[0x18, 0x1a],
+        // The client's Item table spans several tags. Measured against the tables the client
+        // actually loads (extracted from the newest PAK): 0x18, 0x1a and 0x1b all appear, the
+        // last only on rows added after the revision this was first measured from.
+        CatalogKind::Consumable => &[0x18, 0x1a, 0x1b],
         CatalogKind::Course => &[0x28],
     }
 }

@@ -398,3 +398,18 @@ table. `pangbox/pangfiles` (`pak`) implements the overlay.
 
 Note also that the shop's names, prices and listing are rendered from the client's own tables.
 `data.price_override_pang` changes what the server *charges*, never what the client *displays*.
+
+### Extracting the client's item tables
+
+```bash
+scripts/extract-client-iff.py --client-dir local-data/us851 --region us --list
+scripts/extract-client-iff.py --client-dir local-data/us851 --out local-data/us851-data/pak-iff
+```
+
+The script reads each PAK's trailer and file table (XTEA-deciphering entry metadata and paths
+where flagged), decompresses the entry with the client's LZ77 variant, and keeps the copy from
+the newest PAK. Point `data.iff_directory` at a directory holding the unzipped tables plus a
+manifest built from their real counts, versions and record sizes.
+
+Do not skip this and use a loose `pangya_gb.iff`: an older copy loads and validates cleanly while
+silently lacking every item added since.

@@ -4,7 +4,9 @@
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
-> Next gate: **the catalog is built from a stale copy of the client's tables.** It now derives 2,664 priced offers from the real client files, but the client resolves its tables through its PAK chain, where a later PAK overrides the loose copy this catalog was built from. A real client's purchase names an item id that copy does not contain, so it is refused.
+> Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
+>
+> Next gate: **equipment update `0x0020`**, then playing a hole.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -312,17 +314,29 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     An operator override, `data.price_override_pang`, reprices every item the client sells. It exists so the whole shop is reachable for local testing without grinding a balance, it warns loudly at startup, and it deliberately cannot make an unavailable item purchasable — it rewrites the amount on rows the client already sells and leaves the rest alone.
 
-19. **The catalog is built from a superseded copy of the client's tables** — open. With pricing working, a real client's purchase is still refused: it asked for `0x10000061`, a club set that exists in **no** table inside the `pangya_gb.iff` this catalog is built from, although it sits inside that family's id range.
+19. **The catalog was built from a superseded copy of the client's tables** — **resolved 2026-08-08.** With pricing working, a real client's purchase was still refused: it asked for `0x10000061`, which sits inside the club-set id range but existed in **no** table in the archive the catalog was built from.
 
-    The cause is where the client gets its tables. It resolves `pangya_gb.iff` through its PAK chain rather than from a loose file, and the installed client carries a long series of them — `projectg700gb+.pak` through `projectg820gb.pak` — where a later PAK supersedes the same-named entry in an earlier one. The copy this catalog was built from is an earlier revision, so it is missing everything added since. `pangbox/pangfiles` (`pak`) is the reference implementation of that overlay, and extracting the winning `pangya_gb.iff` through it is what makes the server's catalog agree with the shop the client renders.
+    The client does not read its tables from a loose file. It resolves `pangya_gb.iff` through its **PAK chain**, where a later PAK supersedes a same-named entry in an earlier one, and this install carries `projectg700gb+.pak` through `projectg851gb.pak`. The copy in use was an early revision. `scripts/extract-client-iff.py` walks that chain, applies the overlay and writes the winning archive; the difference is not subtle:
 
-    Worth noting for the shop specifically: the client draws item names, prices and the listing itself from its own local tables. The server cannot change what the shop *displays* — `price_override_pang` changes only what it *charges*.
+    | Table | Superseded copy | Winning copy |
+    |---|---:|---:|
+    | `ClubSet.iff` | 60 | **83** |
+    | `Ball.iff` | 85 | **87** |
+    | `Item.iff` | 316 | **388** |
+    | `Part.iff` | 6087 | **7325** |
+    | `Character.iff` | 10 | **14** |
+
+    Offers went from 2,664 to **3,109**, and `0x10000061` resolves to `ClubSet, Pang(20000)` — the name and price the client's own Buy dialog shows, "Papel Training Club Set". One parser change was needed: the current `Item.iff` spans family tag `0x1b` as well as `0x18` and `0x1a`, on seven rows that did not exist in the older revision.
+
+    A catalog built from a superseded copy loads and validates cleanly and is still wrong, which is what made this expensive to find. The tell is a purchase refused with `stage: "not_in_catalog"` for an id inside a family's range.
+
+20. **A real client completes a purchase** — verified 2026-08-08. `0x001D` in, then `0x00C8`, `0x0096` and `0x0068` out; the balance moved 5,000,000 to 4,999,999 under `price_override_pang = 1`, `0x10000061` landed in the inventory, and the client rendered the bought clubs on the character.
 
 ---
 
 ## Immediate next actions
 
-1. **Extract the client's tables through its PAK chain** (blocker 19) so the catalog contains every item the client offers. Pricing works; the data is simply an older revision than the client's.
+1. **Implement equipment update `0x0020`** (blocker 17), the last thing that drops a real client out of an otherwise working session.
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
