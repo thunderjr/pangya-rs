@@ -19,8 +19,8 @@ use pangya_domain::{
 use pangya_protocol::{
     ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket,
     EmptyMessageServerList, EncodePacket, ErrorClass, FrameCodec, GameServerEntry, GameServerList,
-    InboundFrame, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginResult,
-    LoginSuccess, NicknameCheckResult, OutboundFrame, PacketEncodeError, PacketReader,
+    InboundFrame, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey,
+    LoginResult, LoginSuccess, NicknameCheckResult, OutboundFrame, PacketEncodeError, PacketReader,
     SelectCharacter, SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes,
     encode_packet_payload, us852_login_hello,
 };
@@ -850,12 +850,21 @@ where
                             needs_character: false,
                         })
                         .map_err(|_| LoginRuntimeError::Protocol)?;
+                    // A successful set is answered with the login result, not another nickname
+                    // check response: upstream breaks out of its nickname loop straight into the
+                    // common success tail. Answering with `0x000e` leaves a real client sitting on
+                    // an inert server list until the login deadline closes the connection.
+                    let record = account.as_ref().ok_or(LoginRuntimeError::Protocol)?;
                     self.send(
                         &mut framed,
-                        &NicknameCheckResult {
-                            unknown_result: 0,
-                            nickname: packet.nickname,
-                        },
+                        &LoginResult::Success(LoginSuccess {
+                            username: record.account.username_display.as_bytes().to_vec(),
+                            user_id: u32::try_from(record.account.id.get())
+                                .map_err(|_| LoginRuntimeError::Protocol)?,
+                            unknown: UnknownBytes([0; 14]),
+                            // Upstream echoes the nickname it just persisted.
+                            nickname: packet.nickname.clone(),
+                        }),
                     )
                     .await?;
                     let token = self
@@ -863,12 +872,7 @@ where
                         .await?;
                     handover_token = Some(token);
                 }
-                // Accepted in both setup states: the real U.S. 852 client shows character
-                // creation before it asks for a nickname, so a first-time account sends this
-                // while the nickname is still outstanding.
-                LoginState::AwaitCharacterSelect | LoginState::AwaitNicknameCheckOrSet
-                    if frame.opcode == 0x0008 =>
-                {
+                LoginState::AwaitCharacterSelect if frame.opcode == 0x0008 => {
                     let packet = self.decode_packet::<SelectCharacter>(&frame)?;
                     if !self
                         .config
@@ -1137,6 +1141,18 @@ where
         machine
             .apply(LoginEvent::HandoverIssued)
             .map_err(|_| LoginRuntimeError::Protocol)?;
+        let bearer = Zeroizing::new(generated.token.expose_secret().as_bytes().to_vec());
+        // `0x0010` is what the client remembers and later echoes back to GameService as its
+        // login key; `0x0003` after server selection carries the same value again. Sending only
+        // `0x0003` leaves the client with nothing to echo, and its GameService auth then arrives
+        // with an empty key. Upstream sends both, this one first.
+        self.send(
+            framed,
+            &LoginKey {
+                login_key: bearer.to_vec(),
+            },
+        )
+        .await?;
         self.send(
             framed,
             &ChatMacros {
@@ -1146,9 +1162,7 @@ where
         .await?;
         self.send(framed, &EmptyMessageServerList).await?;
         self.send(framed, &self.server_list()).await?;
-        Ok(Zeroizing::new(
-            generated.token.expose_secret().as_bytes().to_vec(),
-        ))
+        Ok(bearer)
     }
 
     fn server_list(&self) -> GameServerList {
@@ -1166,6 +1180,9 @@ where
                 boosts: 0,
                 unknown4: UnknownBytes([0; 6]),
                 char_icon: 0,
+                // Upstream LoginService advertises no channels here and lets GameService send its
+                // own channel list after the client connects; only the count byte is on the wire.
+                channels: Vec::new(),
             }],
         }
     }

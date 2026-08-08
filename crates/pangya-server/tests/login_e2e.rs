@@ -303,7 +303,8 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     .await;
     let (opcode, body) = receive_packet(&mut stream, transport_key).await;
     assert_eq!(opcode, 1);
-    assert_eq!(body, [0xd9, 0xff, 0xff, 0xff, 0xff]);
+    // U.S. 852 numbers both setup statuses one lower than the TH captures do.
+    assert_eq!(body, [0xd8, 0xff, 0xff, 0xff, 0xff]);
 
     send_packet(
         &mut stream,
@@ -325,9 +326,11 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
         &pstring(b"Synthetic-Nick"),
     )
     .await;
+    // A successful set is answered with the login result, not another `0x000e` check response.
     let (opcode, body) = receive_packet(&mut stream, transport_key).await;
-    assert_eq!(opcode, 0x000e);
-    assert_eq!(&body[..4], &[0, 0, 0, 0]);
+    assert_eq!(opcode, 1);
+    assert_eq!(body[0], 0, "status byte is success");
+    assert_eq!(receive_packet(&mut stream, transport_key).await.0, 0x10);
     assert_eq!(receive_packet(&mut stream, transport_key).await.0, 6);
     assert_eq!(receive_packet(&mut stream, transport_key).await.0, 9);
     let (opcode, server_list) = receive_packet(&mut stream, transport_key).await;
@@ -406,6 +409,7 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     )
     .await;
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 1);
+    assert_eq!(receive_packet(&mut first_active, first_key).await.0, 0x10);
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 6);
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 9);
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 2);
@@ -453,7 +457,7 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
         &login_payload("Synthetic_One", SECRET),
     )
     .await;
-    for expected in [1, 6, 9, 2] {
+    for expected in [1, 0x10, 6, 9, 2] {
         assert_eq!(receive_packet(&mut errored, errored_key).await.0, expected);
     }
     send_packet(&mut errored, errored_key, 11, 7, &pstring(b"WrongState")).await;
@@ -469,7 +473,7 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     )
     .await;
     assert_eq!(receive_packet(&mut after_error, after_error_key).await.0, 1);
-    for expected in [6, 9, 2] {
+    for expected in [0x10, 6, 9, 2] {
         assert_eq!(
             receive_packet(&mut after_error, after_error_key).await.0,
             expected
@@ -596,18 +600,37 @@ async fn needs_starter_selects_only_allowlisted_character_and_persists(pool: PgP
     .await;
     let (opcode, body) = receive_packet(&mut stream, key).await;
     assert_eq!(opcode, 1);
-    assert_eq!(body, [0xda]);
+    assert_eq!(body, [0xd9]);
     let mut character = Vec::new();
     character.extend_from_slice(&0x0400_0000_u32.to_le_bytes());
     character.extend_from_slice(&0_u16.to_le_bytes());
     send_packet(&mut stream, key, 2, 8, &character).await;
     // Upstream documents the login packet being resent with `success` once the character is
     // selected; a real client blocks until it arrives.
-    for expected in [1, 6, 9, 2] {
-        assert_eq!(receive_packet(&mut stream, key).await.0, expected);
+    let mut login_key_body = None;
+    for expected in [1, 0x10, 6, 9, 2] {
+        let (opcode, body) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, expected);
+        if opcode == 0x10 {
+            login_key_body = Some(body);
+        }
     }
     send_packet(&mut stream, key, 3, 3, &[7, 0, 0, 0]).await;
-    assert_eq!(receive_packet(&mut stream, key).await.0, 3);
+    let (opcode, game_key_body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 3);
+    // A real client stores the `0x0010` key and echoes it to GameService; `0x0003` repeats the
+    // same value after server selection. Both must carry the identical non-empty bearer, or the
+    // client authenticates with an empty login key. Only the opcodes were asserted before, which
+    // is why omitting `0x0010` entirely went unnoticed here.
+    let login_key_body = login_key_body.expect("login key packet");
+    let bearer_length = usize::from(u16::from_le_bytes([login_key_body[0], login_key_body[1]]));
+    assert!(bearer_length > 0, "login key must not be empty");
+    assert_eq!(login_key_body.len(), bearer_length + 2);
+    assert_eq!(
+        game_key_body[4..],
+        login_key_body[..],
+        "0x0003 repeats the 0x0010 bearer after four unknown bytes"
+    );
     let state: String =
         sqlx::query_scalar("SELECT setup_state FROM profiles WHERE account_id = $1")
             .bind(account_id)
@@ -1024,7 +1047,7 @@ async fn runtime_encode_failure_records_nonzero_protocol_metric(pool: PgPool) {
     .await;
     let (mut stream, key) = connect(address).await;
     send_packet(&mut stream, key, 1, 1, &login_payload("EncodeUser", SECRET)).await;
-    for expected in [1, 6, 9] {
+    for expected in [1, 0x10, 6, 9] {
         assert_eq!(receive_packet(&mut stream, key).await.0, expected);
     }
     let mut byte = [0_u8; 1];

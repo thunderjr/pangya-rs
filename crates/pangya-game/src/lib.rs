@@ -65,31 +65,31 @@ use pangya_protocol::{
     Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailCharacter, RetailEquipment, RetailFinishHole, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailMatchInfo, RetailMatchStart,
-    RetailPlayerIdentity, RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom,
-    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
-    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailTurnEnd,
-    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
-    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
-    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
-    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
-    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
-    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
-    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
-    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
-    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
-    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
-    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailChannelJoined, RetailCharacter, RetailEquipment, RetailFinishHole, RetailGameAuth,
+    RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailMatchInfo,
+    RetailMatchStart, RetailPlayerIdentity, RetailPlayerStartHole, RetailPlayerStatistics,
+    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
+    RetailSelectChannel, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
+    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
+    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
+    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
+    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
+    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
+    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
+    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
+    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
+    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
+    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
@@ -1135,7 +1135,13 @@ where
             Err(GameRuntimeError::Timeout) => GameTermination::Timeout,
             Err(GameRuntimeError::Limited) => GameTermination::Limited,
             Err(GameRuntimeError::Protocol) => GameTermination::Protocol,
-            Err(_) => GameTermination::Error,
+            Err(error) => {
+                // The metric class is deliberately coarse, but discarding the error entirely left
+                // a real-client failure here indistinguishable from any other, with nothing in the
+                // log to work from. The variant name carries no player data.
+                tracing::debug!(error = %error, "game connection failed");
+                GameTermination::Error
+            }
         };
         self.observer.closed(outcome);
         result.map(drop)
@@ -1248,27 +1254,43 @@ where
                             }
                         }
                         GameState::AwaitChannel if frame.opcode == SelectChannel::OPCODE => {
-                            let selected = match decode_packet_payload::<SelectChannel>(
-                                &frame.payload,
-                                &CompatibilityProfile::US_852,
-                                ServiceKind::Game,
-                            ) {
-                                Ok(selected) => selected,
-                                Err(_) => break Err(GameRuntimeError::Protocol),
+                            // A real client sends the one-byte sub-server ID documented for this
+                            // opcode; the synthetic packet carries a `u32` channel ID.
+                            let channel_id = if self.config.retail_bootstrap {
+                                match decode_packet_payload::<RetailSelectChannel>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                ) {
+                                    Ok(selected) => u32::from(selected.sub_server_id),
+                                    Err(_) => break Err(GameRuntimeError::Protocol),
+                                }
+                            } else {
+                                match decode_packet_payload::<SelectChannel>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                ) {
+                                    Ok(selected) => selected.channel_id,
+                                    Err(_) => break Err(GameRuntimeError::Protocol),
+                                }
                             };
-                            if selected.channel_id != self.config.channel_id
+                            if channel_id != self.config.channel_id
                                 || identity.is_none()
                                 || presence.is_none()
                             {
                                 break Err(GameRuntimeError::Protocol);
                             }
-                            let joined = ChannelJoined {
-                                channel_id: selected.channel_id,
-                            };
                             let sent = tokio::select! {
                                 biased;
                                 () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
-                                sent = self.send(&mut framed, &joined) => sent,
+                                sent = async {
+                                    if self.config.retail_bootstrap {
+                                        self.send(&mut framed, &RetailChannelJoined).await
+                                    } else {
+                                        self.send(&mut framed, &ChannelJoined { channel_id }).await
+                                    }
+                                } => sent,
                             };
                             if let Err(error) = sent {
                                 break Err(error);

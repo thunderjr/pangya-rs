@@ -132,6 +132,55 @@ impl DecodePacket for SelectChannel {
     }
 }
 
+/// U.S. 852 retail sub-server (channel) selection, client opcode `0x0004`.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/client/0004.ksy`: a single `u1` sub-server ID,
+/// where the synthetic [`SelectChannel`] carries a `u32`. A real client sends the one-byte form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailSelectChannel {
+    /// Sub-server identifier from the advertised channel list.
+    pub sub_server_id: u8,
+}
+
+impl DecodePacket for RetailSelectChannel {
+    const OPCODE: u16 = 0x0004;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let sub_server_id = reader.u8()?;
+        require_end(reader)?;
+        Ok(Self { sub_server_id })
+    }
+}
+
+/// U.S. 852 retail sub-server connect response, server opcode `0x004e`.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/server/004e.ksy`: a single `u1`, documented as
+/// only ever witnessed as `0x01`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailChannelJoined;
+
+impl EncodePacket for RetailChannelJoined {
+    const OPCODE: u16 = 0x004e;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(0x01);
+        Ok(())
+    }
+}
+
 /// Synthetic minimal player/profile bootstrap, server opcode `0x0070`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerInfo {

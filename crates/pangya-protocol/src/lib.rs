@@ -26,13 +26,15 @@ pub use error::{ErrorClass, PacketDecodeError, PacketEncodeError};
 pub use game::{
     ChannelJoined, CharacterBootstrap, CharacterInfo, EquipmentInfo, GAME_INVENTORY_SEGMENT_ITEMS,
     GameAuth, InventoryBootstrap, InventorySegment, MAX_GAME_HANDOVER_BYTES, PlayerInfo,
-    SelectChannel, synthetic_game_hello, us852_game_hello,
+    RetailChannelJoined, RetailSelectChannel, SelectChannel, synthetic_game_hello,
+    us852_game_hello,
 };
 pub use login::{
     ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList,
-    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey, LoginRequest,
-    LoginResult, LoginSuccess, NicknameCheckResult, SelectCharacter, SelectServer, SessionKey,
-    SetNickname, us852_login_hello,
+    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_STATUS_SET_CHARACTER,
+    LOGIN_STATUS_SET_NICKNAME, LoginKey, LoginRequest, LoginResult, LoginSuccess,
+    MAX_LOGIN_SERVER_CHANNELS, NicknameCheckResult, SelectCharacter, SelectServer,
+    ServerChannelEntry, SessionKey, SetNickname, us852_login_hello,
 };
 pub use m4_room::{
     MAX_ROOM_MEMBERS, MAX_ROOM_SUMMARIES, RoomChatEvent, RoomChatRequest, RoomCommand,

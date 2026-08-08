@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE characters SET item_type_id = $2 WHERE account_id = $1 AND id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9ccad69c92492a96f5ffafd713a1f1309c6fe13ed5b822864ecea31f94b0c767"
+}

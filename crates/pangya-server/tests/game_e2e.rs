@@ -1361,16 +1361,29 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
         &login_payload("VerticalGame"),
     )
     .await;
-    for opcode in [1, 6, 9, 2] {
-        assert_eq!(receive_packet(&mut login_stream, login_key).await.0, opcode);
+    // Take the bearer from `0x0010` the way a real client does, rather than from `0x0003`: the
+    // client stores the login key on this packet and echoes that stored value to GameService.
+    let mut login_key_body = None;
+    for opcode in [1, 0x10, 6, 9, 2] {
+        let (received, body) = receive_packet(&mut login_stream, login_key).await;
+        assert_eq!(received, opcode);
+        if received == 0x10 {
+            login_key_body = Some(body);
+        }
     }
+    let login_key_body = login_key_body.expect("login key packet");
+    let length = usize::from(u16::from_le_bytes([login_key_body[0], login_key_body[1]]));
+    let token = std::str::from_utf8(&login_key_body[2..2 + length])
+        .expect("token")
+        .to_owned();
     send_packet(&mut login_stream, login_key, 2, 3, &[7, 0, 0, 0]).await;
     let (opcode, body) = receive_packet(&mut login_stream, login_key).await;
     assert_eq!(opcode, 3);
-    let length = usize::from(u16::from_le_bytes([body[4], body[5]]));
-    let token = std::str::from_utf8(&body[6..6 + length])
-        .expect("token")
-        .to_owned();
+    assert_eq!(
+        &body[4..],
+        &login_key_body[..],
+        "server selection repeats the same bearer"
+    );
 
     let (mut game_stream, game_key) = connect_game(game_address).await;
     send_packet(
@@ -5968,9 +5981,12 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         for _ in 0..9 {
             let _ = receive_packet(&mut stream, key).await;
         }
-        // Enter the channel so room commands are in-state.
-        send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
-        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        // Enter the channel so room commands are in-state. Retail sends the one-byte sub-server
+        // ID, not the synthetic `u32` channel ID.
+        send_packet(&mut stream, key, 2, 4, &[1]).await;
+        let (opcode, body) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x004e);
+        assert_eq!(body, [0x01]);
         (stream, key)
     }
 
@@ -6117,7 +6133,8 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     for _ in 0..9 {
         let _ = receive_packet(&mut stream, key).await;
     }
-    send_packet(&mut stream, key, 2, 4, &1_u32.to_le_bytes()).await;
+    // Retail sends the one-byte sub-server ID for channel entry.
+    send_packet(&mut stream, key, 2, 4, &[1]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
 
     // Create a room, then start a match from inside it.

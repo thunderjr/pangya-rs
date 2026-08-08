@@ -5,6 +5,19 @@ use crate::{
     UnknownBytes,
 };
 
+/// U.S. 852 `0x0001` status asking the client to set a nickname.
+///
+/// The vendored PacketDoc examples are TH captures, where this status is `0xd9` and character
+/// selection is `0xda`. U.S. 852 is one lower in both cases: `pangbox/server`
+/// (`login/msgserver.go`) defines `LoginStatusSetNickname = 216` and
+/// `LoginStatusSetCharacter = 217`, and a real U.S. 852 client confirms it — sent `0xd9` it opens
+/// character creation, not the nickname dialog. Sending the TH codes here leaves the account
+/// without a nickname, which GameService then refuses during player bootstrap.
+pub const LOGIN_STATUS_SET_NICKNAME: u8 = 0xd8;
+/// U.S. 852 `0x0001` status asking the client to select a starter character.
+///
+/// See [`LOGIN_STATUS_SET_NICKNAME`] for why this differs from the TH capture fixtures.
+pub const LOGIN_STATUS_SET_CHARACTER: u8 = 0xd9;
 /// Legacy candidate invalid-credential result code; real-client acceptance remains external.
 pub const LOGIN_ERROR_INVALID_CREDENTIALS: u32 = 5_100_143;
 /// Legacy candidate duplicate-login result code; real-client acceptance remains external.
@@ -176,14 +189,9 @@ pub struct LoginSuccess {
 pub enum LoginResult {
     /// Status `0x00`.
     Success(LoginSuccess),
-    /// Status `0xd9` and its observed `0xffff_ffff` constant.
-    ///
-    /// Upstream documents the first-login order as nickname, then character, then success. A real
-    /// U.S. 852 client answers this status by opening a combined creation screen that carries both
-    /// a name field and the character roster, and replies with `0x0008` rather than a nickname
-    /// packet.
+    /// Status [`LOGIN_STATUS_SET_NICKNAME`] and its observed `0xffff_ffff` constant.
     NeedSetNickname,
-    /// Status `0xda` with no body.
+    /// Status [`LOGIN_STATUS_SET_CHARACTER`] with no body.
     NeedSelectCharacter,
     /// Status `0xe3` with an otherwise opaque numeric error code.
     Error(u32),
@@ -205,10 +213,10 @@ impl crate::EncodePacket for LoginResult {
                 writer.pstring(&value.nickname, 64)?;
             }
             Self::NeedSetNickname => {
-                writer.u8(0xd9);
+                writer.u8(LOGIN_STATUS_SET_NICKNAME);
                 writer.u32_le(u32::MAX);
             }
-            Self::NeedSelectCharacter => writer.u8(0xda),
+            Self::NeedSelectCharacter => writer.u8(LOGIN_STATUS_SET_CHARACTER),
             Self::Error(code) => {
                 writer.u8(0xe3);
                 writer.u32_le(*code);
@@ -243,6 +251,32 @@ impl crate::EncodePacket for NicknameCheckResult {
     }
 }
 
+/// Maximum channels advertised on one game-server entry.
+pub const MAX_LOGIN_SERVER_CHANNELS: usize = 255;
+
+/// One channel advertised inside a [`GameServerEntry`].
+///
+/// # Provenance
+///
+/// Adapted from `pangbox/server` (`pangya/server.go` `ChannelEntry`), ISC licensed. This trailer
+/// is absent from the vendored PacketDoc `loginservice/server/0002.ksy`, which documents the
+/// entry as ending at `char_icon`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerChannelEntry {
+    /// Fixed-width display name.
+    pub name: Vec<u8>,
+    /// Channel capacity.
+    pub max_users: u16,
+    /// Current channel occupancy.
+    pub num_users: u16,
+    /// Unclassified two bytes.
+    pub unknown1: u16,
+    /// Unclassified two bytes.
+    pub unknown2: u16,
+    /// Unclassified five bytes.
+    pub unknown3: UnknownBytes<5>,
+}
+
 /// Source-evidenced LoginService game-server entry for opcode `0x0002`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameServerEntry {
@@ -270,6 +304,10 @@ pub struct GameServerEntry {
     pub unknown4: UnknownBytes<6>,
     /// Character icon ID.
     pub char_icon: u16,
+    /// Advertised channels. Upstream LoginService sends none, but the count byte is still on the
+    /// wire; omitting it makes a real client read its channel count from the following bytes and
+    /// report the server as full instead of connecting.
+    pub channels: Vec<ServerChannelEntry>,
 }
 /// LoginService opcode `0x0002` game-server list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +342,21 @@ impl crate::EncodePacket for GameServerList {
             w.u16_le(s.boosts);
             w.bytes(&s.unknown4.0);
             w.u16_le(s.char_icon);
+            let channels =
+                u8::try_from(s.channels.len()).map_err(|_| PacketEncodeError::Limit {
+                    field: "server channels",
+                    actual: s.channels.len(),
+                    maximum: MAX_LOGIN_SERVER_CHANNELS,
+                })?;
+            w.u8(channels);
+            for channel in &s.channels {
+                w.fixed_nul(&channel.name, 64)?;
+                w.u16_le(channel.max_users);
+                w.u16_le(channel.num_users);
+                w.u16_le(channel.unknown1);
+                w.u16_le(channel.unknown2);
+                w.bytes(&channel.unknown3.0);
+            }
         }
         Ok(())
     }

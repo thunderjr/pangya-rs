@@ -315,3 +315,44 @@ so a faulting address can be disassembled offline. See
 
 Packet-body logging stays off; `logging.packet_bodies = true` is rejected. Report opcodes and
 observed behavior rather than captures, and never commit a capture.
+
+### Scripted client automation
+
+`C:\tools\pangya-client.ps1` on the Windows VM wraps the whole startup path — launch, login,
+nickname, character confirmation, server and channel selection — so none of it has to be
+rediscovered per session. Dot-source it and call the functions:
+
+```powershell
+. C:\tools\pangya-client.ps1
+Start-PangyaClient                       # kills any running client, launches, anchors the window
+Invoke-PangyaLogin -Id 'user' -Password 'secret'
+Set-PangyaNickname -Nickname 'Someone'   # first login only
+Confirm-PangyaCharacter                  # first login only, when the roster is shown
+Select-PangyaServer                      # double-clicks the first server row
+Invoke-PangyaDoubleClick 494 222         # enters the channel from the right-hand pane
+```
+
+Four things in that script are load-bearing, and each one cost a debugging session:
+
+- **The window is moved to the screen origin.** Because the engine cursor is driven by relative
+  deltas from a corner pin, the OS cursor ends up at the same coordinates as the engine cursor.
+  At the window's default placement that point is outside the client, so the click activates
+  another window and the client dismisses its modal login dialog. Anchoring keeps every click
+  inside the window. All coordinates in the script are client-area pixels, so they hold wherever
+  the window ends up.
+- **Keystrokes use SendInput scan codes, not `SendKeys`.** `SendKeys` targets the foreground
+  window and will silently type somewhere else.
+- **Double clicks must fit inside the OS double-click time.** A settle delay between the two taps
+  pushes the second press past 500 ms and the list row only ever selects, so the server or
+  channel never opens.
+- **Wait for the list to actually render before clicking a row.** Clicking row one before the
+  server list arrives selects a blank row, and the client reports that as `Server is full` — the
+  same message it shows for a genuinely full server, which makes this easy to misread as a
+  protocol defect.
+
+PowerShell also needs `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`; without it
+dot-sourcing fails and the calls afterwards look like they ran but did nothing.
+
+Because the login-to-game handover is single-use and short-lived, run the flow briskly: several
+minutes of manual poking between login and server selection expires it, and GameService then
+rejects the auth at `stage: "handover_consume"`.

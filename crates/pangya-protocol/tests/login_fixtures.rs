@@ -3,9 +3,10 @@
 use pangya_protocol::{
     ChatMacros, CheckNickname, CompatibilityProfile, DecodePacket, Direction,
     EmptyMessageServerList, EncodePacket, GameServerEntry, GameServerList,
-    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey, LoginRequest,
-    LoginResult, LoginSuccess, NicknameCheckResult, PacketReader, PacketWriter, SelectCharacter,
-    SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes,
+    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_STATUS_SET_CHARACTER,
+    LOGIN_STATUS_SET_NICKNAME, LoginKey, LoginRequest, LoginResult, LoginSuccess,
+    NicknameCheckResult, PacketReader, PacketWriter, SelectCharacter, SelectServer, ServiceKind,
+    SessionKey, SetNickname, UnknownBytes,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
@@ -91,14 +92,20 @@ fn outbound_login_result_variant_fixtures_encode_exactly() {
         nickname: Vec::new(),
     });
     assert_eq!(encoded(&success), success_fixture);
-    assert_eq!(
-        encoded(&LoginResult::NeedSetNickname),
-        include_bytes!("fixtures/login-out-0001-need-nickname/fixture.bin")
-    );
-    assert_eq!(
-        encoded(&LoginResult::NeedSelectCharacter),
-        include_bytes!("fixtures/login-out-0001-need-character/fixture.bin")
-    );
+    // These two fixtures are TH captures, and TH numbers both setup statuses one higher than
+    // U.S. 852 does. The captures are still the layout evidence — status byte, and for the
+    // nickname status a trailing `0xffff_ffff` — so assert the layout against them while encoding
+    // the U.S. status byte. See `LOGIN_STATUS_SET_NICKNAME` for the divergence and its evidence.
+    let th_nickname = include_bytes!("fixtures/login-out-0001-need-nickname/fixture.bin");
+    let th_character = include_bytes!("fixtures/login-out-0001-need-character/fixture.bin");
+    assert_eq!(th_nickname[2], LOGIN_STATUS_SET_NICKNAME + 1);
+    assert_eq!(th_character[2], LOGIN_STATUS_SET_CHARACTER + 1);
+    let mut us_nickname = th_nickname.to_vec();
+    us_nickname[2] = LOGIN_STATUS_SET_NICKNAME;
+    let mut us_character = th_character.to_vec();
+    us_character[2] = LOGIN_STATUS_SET_CHARACTER;
+    assert_eq!(encoded(&LoginResult::NeedSetNickname), us_nickname);
+    assert_eq!(encoded(&LoginResult::NeedSelectCharacter), us_character);
     assert_eq!(
         encoded(&LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS)),
         include_bytes!("fixtures/login-out-0001-error/fixture.bin")
@@ -128,12 +135,23 @@ fn outbound_server_list_captured_fixture_encodes_exactly() {
             boosts: u16::from_le_bytes(field[82..84].try_into().expect("boosts")),
             unknown4: UnknownBytes(field[84..90].try_into().expect("unknown4")),
             char_icon: u16::from_le_bytes(field[90..92].try_into().expect("icon")),
+            channels: Vec::new(),
         });
     }
     assert_eq!(servers.len(), count);
+    // The TH capture's entries are exactly 92 bytes and stop at `char_icon`. U.S. 852 appends a
+    // channel-count byte per entry, so an entry with no channels adds a single zero. Splicing
+    // those zeroes into the capture keeps it as the layout evidence for everything before them.
+    // See `GameServerEntry::channels` for why the U.S. client needs the trailer.
+    assert_eq!(fixture.len() - 3, count * 92);
     let encoded = encoded(&GameServerList { servers });
-    let mut normalized_fixture = fixture.to_vec();
-    for field in normalized_fixture[3..].chunks_exact_mut(92) {
+    let mut normalized_fixture = Vec::with_capacity(fixture.len() + count);
+    normalized_fixture.extend_from_slice(&fixture[..3]);
+    for field in fixture[3..].chunks_exact(92) {
+        normalized_fixture.extend_from_slice(field);
+        normalized_fixture.push(0);
+    }
+    for field in normalized_fixture[3..].chunks_exact_mut(93) {
         for range in [0..40, 52..70] {
             let nul = field[range.clone()]
                 .iter()
@@ -255,5 +273,6 @@ fn sample_server() -> GameServerEntry {
         boosts: 0,
         unknown4: UnknownBytes([0; 6]),
         char_icon: 0,
+        channels: Vec::new(),
     }
 }
