@@ -455,18 +455,29 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     Both test accounts were given one by hand to get past it. A starter comet belongs in the same
     grant as the club set.
 
-32. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
+32. **Nothing starts a single-player practice hole** — **open.** The client creates the room and
+    then waits: it sends no `0x000e`, and its Start Game stays disabled in a room of one, both
+    before and after the room learned its own settings. Two mode bytes in the room record were
+    tried against its header — the first names the mode it renders and has no string for
+    practice, the second changed nothing — and neither gates Start. Upstream references do not
+    cover practice, so the next step is capture rather than inference.
+
+33. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
 
 ---
 
 ## Immediate next actions
 
-1. **Give a room its own settings** (blocker 29), then re-verify §19.6 step 8 through practice.
-   Step 7 is now met on the real client — it creates a room *and* starts practice, and the header
-   reads `Single Player Practice Mode  Stroke  1 hole (1/1)`. A practice hole is a one-player
-   roster, so it isolates the hole-load crash from everything the second seat contributes; it is
-   the cheapest remaining probe of blocker 28. It is blocked only by the room describing itself as
-   Versus, which leaves the client's Start Game disabled.
+1. **Find what starts a practice hole** (blocker 33), then use it to probe blocker 28. Step 7 is
+   met — the client creates a room *and* starts practice, and its header reads
+   `[Private] Single Player Practice Mode  1 hole (1/1)  No Time Limit`, with the private flag,
+   hole count and "no time limit" all echoed from what it asked for. But it never sends `0x000e`
+   in a room of one and its Start Game stays disabled, before and after the room learned its own
+   settings. In the two-player room Start lit up only once the second seat readied, so the
+   client appears not to offer Start for a room of one at all: something else starts practice,
+   and it is not a client opcode we have seen. A practice hole is a one-player roster and would
+   isolate the hole-load crash from everything the second seat contributes, which is why it is
+   worth finding.
 2. **Stop the real client crashing during hole load** (blocker 28). It is the whole of the §19.6 steps 8-12 gate now: the room, the roster, the master's Start and the match plan are all accepted, and the hole itself is not. Settle the remaining `0x0052`/`0x0076`/`0x005b` fields and the hole-load handshake against `pangbox/server` and PacketDoc **before** changing anything — iterating against the client costs a full sign-in per attempt and its crash dump names nothing.
 3. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.

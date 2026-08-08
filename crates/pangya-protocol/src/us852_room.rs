@@ -179,6 +179,8 @@ pub struct RetailRoom {
     pub player_count: u8,
     /// Hole count.
     pub hole_count: u8,
+    /// A second mode byte whose meaning is not established; kept at zero.
+    pub play_mode: u8,
     /// Mode, as the client's own create request spelled it.
     ///
     /// Carried verbatim rather than mapped onto [`RetailRoomType`]: the client has modes this
@@ -225,7 +227,10 @@ impl RetailRoom {
         writer.u32_le(100);
         writer.u32_le(100);
         writer.u32_le(self.owner_uid);
-        writer.u8(self.mode);
+        // A second mode byte, held at zero. Echoing the room's own mode into it was tried and
+        // changed nothing on screen, so what it selects is still unestablished; zero is what
+        // every room this server described carried before the room profile existed.
+        writer.u8(self.play_mode);
         writer.u32_le(0); // artifact catalog id
         writer.u32_le(u32::from(self.natural_wind));
         for _ in 0..4 {
@@ -1300,6 +1305,7 @@ mod tests {
             player_count: 1,
             hole_count: 3,
             mode: RetailRoomType::Versus as u8,
+            play_mode: 0,
             id: 7,
             hole_progression: RetailHoleProgression::FrontStart,
             course: 0,
