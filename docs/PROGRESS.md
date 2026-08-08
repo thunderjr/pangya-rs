@@ -490,7 +490,13 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     running client does not work as-is: the break-in times out with the loader lock held and
     every `GetContextState` fails with `0x8007001F`, so no breakpoint can be set. The next thing
     to try is launching the client *under* the debugger rather than attaching to it
-    (`cdb -g -G -o ProjectG.exe`), which avoids the break-in entirely.
+    (`cdb -g -G -o ProjectG.exe`), which avoids the break-in entirely. **That was tried and the
+    client refuses it too**: launched under `cdb` it raises a stream of first-chance
+    `c0000096` (privileged instruction) exceptions — the packer's anti-debug — and exits before
+    reaching its login dialog. So both debugger routes are closed by the protection on the
+    binary, and reading the live process with `ReadProcessMemory`, which the packer does not
+    block, remains the only instrument. Defeating the anti-debug is a much larger undertaking
+    than this blocker warrants; the field-by-field method still works and needs no debugger.
 
     Note also that the anchor for "the key is at record offset 0" is not sound: the nickname and
     start time were measured from the array base `g + 0x656e`, not from a record base, so the
