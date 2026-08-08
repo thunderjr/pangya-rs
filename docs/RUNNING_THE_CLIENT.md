@@ -483,3 +483,18 @@ Set-PangyaTarget -ProcessId 10652         # park the others, anchor this one
 Invoke-PangyaLogin -Id 'rsp4' -Password 'pangya123'
 Set-PangyaTarget -ProcessId 8480          # switch back to the first
 ```
+
+### Where the harness lives
+
+The authoritative copy is on the VM at `C:\tools\pangya-client.ps1`. It is not mirrored into this
+repository: it is coordinate-bound to one client build and window size, so a copy here would drift
+silently from the one actually being run. Retrieve it through the host's shared folder when it
+needs review:
+
+```powershell
+Copy-Item 'C:\tools\pangya-client.ps1' '\\host.lan\Data\pangya-client.ps1' -Force
+```
+
+The mechanisms it depends on, and the reasons behind each, are the sections above; those are the
+part worth preserving, and they are recorded here rather than in comments on a file that lives
+outside version control.
