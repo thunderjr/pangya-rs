@@ -267,6 +267,7 @@ section_default!(DataSection {
     iff_directory: Option<PathBuf> = None,
     manifest: Option<PathBuf> = None,
     catalog_required_m3: bool = false,
+    price_override_pang: Option<u64> = None,
     load_timeout: String = "5s".to_owned()
 });
 
@@ -403,6 +404,8 @@ pub struct AppConfig {
     pub data_manifest: Option<PathBuf>,
     /// Bounded blocking catalog load duration.
     pub data_load_timeout: Duration,
+    /// Operator override repricing every item the client sells to this many Pang.
+    pub data_price_override_pang: Option<u64>,
 }
 
 /// Validated local-only synthetic solo-practice policy.
@@ -747,6 +750,14 @@ fn validate(
         &mut issues,
     );
     let data_load_timeout = duration(&raw.data.load_timeout, "data.load_timeout", &mut issues);
+    if raw.data.price_override_pang == Some(0) {
+        // Zero would hand out the entire shop for nothing, which is never what an operator
+        // means by an override; it is far more likely to be a typo.
+        issues.push(ConfigIssue {
+            field: "data.price_override_pang",
+            message: "price override must be at least one Pang",
+        });
+    }
     let credential_queue = duration(
         &raw.security.credential_queue_timeout,
         "security.credential_queue_timeout",
@@ -1659,6 +1670,7 @@ fn validate(
         allowed_character_type_ids: raw.starter.allowed_character_type_ids,
         iff_directory: raw.data.iff_directory,
         data_manifest: raw.data.manifest,
+        data_price_override_pang: raw.data.price_override_pang,
         data_load_timeout: required(data_load_timeout)?,
     })
 }

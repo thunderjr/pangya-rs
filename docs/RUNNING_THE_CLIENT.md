@@ -383,3 +383,18 @@ the server list is malformed — a missing channel-count byte per entry produced
 — and it is *also* what it shows when a list row is clicked before the list has rendered, which
 is an automation artifact rather than a server fault. `Enter-PangyaChannel` calls the check on its
 last attempt so a run that fails reports the client's own diagnosis instead of a generic timeout.
+
+### Where the client's item tables come from
+
+The client resolves `pangya_gb.iff` — a ZIP holding `ClubSet.iff`, `Ball.iff`, `Item.iff`,
+`Part.iff` and the rest — through its **PAK chain**, not from a loose file. The install carries a
+long series (`projectg700gb+.pak` through `projectg820gb.pak`), and a later PAK supersedes the
+same-named entry in an earlier one, so the winning copy is whichever the newest PAK provides.
+
+A catalog built from an older copy loads and validates cleanly, and is still wrong: it silently
+lacks every item added since. The symptom is a purchase refused with
+`stage: "not_in_catalog"` for an id that sits inside a family's range but is absent from the
+table. `pangbox/pangfiles` (`pak`) implements the overlay.
+
+Note also that the shop's names, prices and listing are rendered from the client's own tables.
+`data.price_override_pang` changes what the server *charges*, never what the client *displays*.

@@ -39,6 +39,28 @@ pub const M7_MANIFEST_VERSION: u32 = 2;
 pub const CLIENT_MANIFEST_VERSION: u32 = 3;
 /// Byte offset of the type ID inside a real client record.
 pub const CLIENT_TYPE_ID_OFFSET: usize = 4;
+/// Offset of the Pang price in a real client item record.
+///
+/// Every client table this server reads shares the item header `pangbox/server`
+/// (`pangya/iff/item.go`) documents: a four-byte active flag and id, a 40-byte name, a rank byte,
+/// a 40-byte icon, then price. Verified against the acquired client by reading known shop rows
+/// back out — "Air Knight Utility Set" at 10000 and "Candy Club Set" at 7500 match what the
+/// client's own shop displays.
+pub const CLIENT_PRICE_OFFSET: usize = 0x5c;
+/// Offset of the shop availability flag, immediately after price/discount/condition.
+pub const CLIENT_SHOP_FLAG_OFFSET: usize = 0x68;
+/// Smallest client record this server can price.
+pub const CLIENT_PRICED_RECORD_BYTES: usize = CLIENT_SHOP_FLAG_OFFSET + 2;
+/// Price the client tables use to mark a row that is not really for sale.
+///
+/// Rows carrying it always pair it with a zero shop flag, so it is a belt-and-braces check
+/// rather than the primary signal.
+pub const CLIENT_UNAVAILABLE_PRICE: u32 = 10_000_000;
+/// Stack ceiling applied to client consumables.
+///
+/// The per-item stack limit has not been located in the client records, so this is a stated
+/// server policy rather than data read from the table.
+pub const CLIENT_CONSUMABLE_MAX_STACK: u32 = 100;
 /// Hard catalog stack bound independent of operator input.
 pub const MAX_CATALOG_STACK: u32 = 10_000;
 /// Maximum manifest bytes read from an operator mount.
@@ -151,6 +173,18 @@ impl Catalog {
     /// Rejects path escapes, symlink escapes, non-regular files, size/arithmetic/header/hash
     /// mismatches, trailing bytes, missing required kinds, and duplicate kinds/type IDs.
     pub fn load(directory: &Path, manifest: &Path) -> Result<Self, CatalogError> {
+        Self::load_with_pricing(directory, manifest, CatalogPricing::Client)
+    }
+
+    /// Loads a catalog and applies an operator pricing policy to it.
+    ///
+    /// # Errors
+    /// Applies the same file and catalog validation as [`Self::load`].
+    pub fn load_with_pricing(
+        directory: &Path,
+        manifest: &Path,
+        pricing: CatalogPricing,
+    ) -> Result<Self, CatalogError> {
         validate_relative(manifest)?;
         let root = Dir::open_ambient_dir(directory, ambient_authority())
             .map_err(|_| CatalogError::Path)?;
@@ -159,7 +193,49 @@ impl Catalog {
             std::str::from_utf8(&manifest_bytes).map_err(|_| CatalogError::Manifest)?;
         let parsed: CatalogManifest =
             toml::from_str(manifest_text).map_err(|_| CatalogError::Manifest)?;
-        Self::load_manifest_from_dir(&root, parsed)
+        let catalog = Self::load_manifest_from_dir(&root, parsed)?;
+        Ok(catalog.repriced(pricing))
+    }
+
+    /// Returns this catalog with an operator pricing policy applied.
+    ///
+    /// Repricing deliberately cannot make an unsold item sellable: it rewrites the amount on
+    /// rows the client already sells and leaves everything else alone.
+    #[must_use]
+    pub fn repriced(self, pricing: CatalogPricing) -> Self {
+        let CatalogPricing::FlatPang(price) = pricing else {
+            return self;
+        };
+        let reprice = |definition: &ItemDefinition| {
+            let mut updated = *definition;
+            if matches!(definition.sale, ItemSale::Pang(_)) {
+                updated.sale = ItemSale::Pang(price);
+            }
+            updated
+        };
+        let inner = &*self.0;
+        let records = inner
+            .records
+            .iter()
+            .map(|(kind, table)| {
+                let table = table
+                    .iter()
+                    .map(|(id, record)| {
+                        let mut record = record.clone();
+                        record.definition = record.definition.as_ref().map(reprice);
+                        (*id, record)
+                    })
+                    .collect();
+                (*kind, table)
+            })
+            .collect();
+        let offers = inner.offers.iter().map(reprice).collect::<Vec<_>>();
+        Self(Arc::new(CatalogInner {
+            records,
+            offers: Arc::from(offers),
+            fingerprint: inner.fingerprint,
+            manifest_version: inner.manifest_version,
+        }))
     }
 
     /// Loads already parsed manifest metadata below one opened directory capability.
@@ -522,6 +598,69 @@ pub fn parse_iff_bytes(
     Ok(records)
 }
 
+/// Builds an economy definition from one real client record.
+///
+/// Only identity, sellability and price are taken from the table. Durability and part
+/// compatibility have not been located in these records, so they are stated conservatively
+/// rather than guessed: nothing is durable and every part is compatible with any character.
+/// Characters and courses are not sellable items and yield no definition.
+fn client_definition(
+    kind: CatalogKind,
+    type_id: ItemTypeId,
+    record: &[u8],
+) -> Result<Option<ItemDefinition>, CatalogError> {
+    let item_kind = match kind {
+        CatalogKind::Character | CatalogKind::Course => return Ok(None),
+        CatalogKind::ClubSet => ItemKind::ClubSet,
+        CatalogKind::Ball => ItemKind::Ball,
+        CatalogKind::Consumable => ItemKind::Consumable,
+        CatalogKind::CharacterPart => ItemKind::CharacterPart,
+    };
+    // A table narrower than the priced header carries no price to read. That is not a
+    // structural fault — identity still parses and the rest of the catalog stays usable — so
+    // such a record simply yields no economy definition.
+    if record.len() < CLIENT_PRICED_RECORD_BYTES {
+        return Ok(None);
+    }
+    let price = u64::from(le_u32(record, CLIENT_PRICE_OFFSET)?);
+    let shop_flag = record[CLIENT_SHOP_FLAG_OFFSET];
+    let sale = if shop_flag == 0 || price == u64::from(CLIENT_UNAVAILABLE_PRICE) || price == 0 {
+        ItemSale::NotSold
+    } else {
+        ItemSale::Pang(price)
+    };
+    let stacking = if matches!(item_kind, ItemKind::Consumable) {
+        ItemStacking::Stackable {
+            max_stack: CLIENT_CONSUMABLE_MAX_STACK,
+        }
+    } else {
+        ItemStacking::Unique
+    };
+    Ok(Some(ItemDefinition {
+        type_id,
+        kind: item_kind,
+        sale,
+        stacking,
+        durability: ItemDurability::Nondurable,
+        compatibility: ItemCompatibility::Any,
+    }))
+}
+
+/// How an operator wants the loaded catalog priced.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatalogPricing {
+    /// Prices are whatever the client's own tables say.
+    #[default]
+    Client,
+    /// Every item the client sells is repriced to this many Pang.
+    ///
+    /// An operator aid for local testing, so the whole shop is reachable without grinding a
+    /// balance. It only reprices rows the client already marks as for sale: it never makes an
+    /// unavailable item purchasable, so the shop the player sees stays the shop the client
+    /// renders.
+    FlatPang(u64),
+}
+
 /// Family tags accepted for a real client table, as the high byte of each type ID.
 ///
 /// A single client table may legitimately span more than one tag, so this is a set rather
@@ -597,7 +736,7 @@ pub fn parse_client_iff_bytes(
             type_id: ItemTypeId::new(type_id),
             opaque: Arc::from(&record[CLIENT_TYPE_ID_OFFSET + 4..]),
             local_one_hole_par: None,
-            definition: None,
+            definition: client_definition(entry.kind, ItemTypeId::new(type_id), record)?,
             character_part_slot: None,
         };
         if records.insert(type_id, value).is_some() {
@@ -951,6 +1090,57 @@ pub const fn crate_boundary() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// The client tables are the only source of item identity and price, so a regression here
+    /// silently empties the shop. This builds a record with the measured header layout and
+    /// checks both that a sellable row is priced and that the two "not really for sale" markers
+    /// are honoured.
+    #[test]
+    fn client_records_yield_priced_definitions() {
+        let mut record = vec![0_u8; CLIENT_PRICED_RECORD_BYTES + 2];
+        record[0] = 1;
+        record[CLIENT_TYPE_ID_OFFSET..CLIENT_TYPE_ID_OFFSET + 4]
+            .copy_from_slice(&0x1000_0001_u32.to_le_bytes());
+        record[CLIENT_PRICE_OFFSET..CLIENT_PRICE_OFFSET + 4]
+            .copy_from_slice(&6000_u32.to_le_bytes());
+        record[CLIENT_SHOP_FLAG_OFFSET] = 33;
+        let definition =
+            client_definition(CatalogKind::ClubSet, ItemTypeId::new(0x1000_0001), &record)
+                .expect("parses")
+                .expect("club sets are items");
+        assert_eq!(definition.sale, ItemSale::Pang(6000));
+        assert_eq!(definition.kind, ItemKind::ClubSet);
+
+        // A zero shop flag means the client does not offer it, whatever the price says.
+        let mut unsold = record.clone();
+        unsold[CLIENT_SHOP_FLAG_OFFSET] = 0;
+        assert_eq!(
+            client_definition(CatalogKind::ClubSet, ItemTypeId::new(1), &unsold)
+                .expect("parses")
+                .expect("definition")
+                .sale,
+            ItemSale::NotSold
+        );
+
+        // The sentinel price marks an unavailable row even if a flag survived.
+        let mut sentinel = record.clone();
+        sentinel[CLIENT_PRICE_OFFSET..CLIENT_PRICE_OFFSET + 4]
+            .copy_from_slice(&CLIENT_UNAVAILABLE_PRICE.to_le_bytes());
+        assert_eq!(
+            client_definition(CatalogKind::ClubSet, ItemTypeId::new(1), &sentinel)
+                .expect("parses")
+                .expect("definition")
+                .sale,
+            ItemSale::NotSold
+        );
+
+        // Characters and courses are not purchasable items in any table.
+        assert!(
+            client_definition(CatalogKind::Character, ItemTypeId::new(1), &record)
+                .expect("parses")
+                .is_none()
+        );
+    }
+
     use std::{env, fs, time::SystemTime};
 
     use proptest::prelude::*;

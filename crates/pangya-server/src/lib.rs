@@ -20,7 +20,7 @@ use std::{
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
-use pangya_data::{Catalog, CatalogKind};
+use pangya_data::{Catalog, CatalogKind, CatalogPricing};
 use pangya_domain::{
     AccountId, AccountRepository, BalanceGrant, CourseId, EconomyRepository, HandoverRepository,
     ItemTypeId, MatchRepository, NewAccount, Nickname, OneHoleConfig, PlayerRepository,
@@ -364,8 +364,18 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let catalog = if config.game_enabled {
         let directory = config.iff_directory.clone().ok_or(ServerError::Data)?;
         let manifest = config.data_manifest.clone().ok_or(ServerError::Data)?;
+        let pricing = config
+            .data_price_override_pang
+            .map_or(CatalogPricing::Client, CatalogPricing::FlatPang);
+        if let CatalogPricing::FlatPang(price) = pricing {
+            // Operators should never be surprised by this; it changes every price in the shop.
+            tracing::warn!(
+                price_pang = price,
+                "data.price_override_pang is set; every item the client sells is repriced"
+            );
+        }
         let loaded = run_detached_with_timeout(config.data_load_timeout, move || {
-            Catalog::load(&directory, &manifest)
+            Catalog::load_with_pricing(&directory, &manifest, pricing)
         })
         .await?
         .map_err(|_| ServerError::Data)?;

@@ -4,7 +4,7 @@
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
-> Next gate: **the item catalog parses to nothing.** Loading the real client's `iff` directory succeeds and cross-references validate, but it yields **zero** item definitions and therefore zero shop offers. Every purchase a real client makes is refused for want of a price, and equipment cannot be resolved either, so the whole economy is inert against real data.
+> Next gate: **the catalog is built from a stale copy of the client's tables.** It now derives 2,664 priced offers from the real client files, but the client resolves its tables through its PAK chain, where a later PAK overrides the loose copy this catalog was built from. A real client's purchase names an item id that copy does not contain, so it is refused.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -306,17 +306,23 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     It was deliberately not stubbed. `0x0020` is a tagged union over eight equipment kinds (character parts, caddie, consumables, ball, decoration, character, and two unclassified), and upstream persists the change before echoing the new state back. Acknowledging it without storing anything would tell the client an equipment change succeeded and then contradict itself on the next login. Implementing it means the equipment system, not a constant reply.
 
-18. **The catalog yields no item definitions for real client data** — open, and the blocker under the whole economy. `Catalog::load` against the extracted U.S. 851 `iff` directory succeeds, the manifest validates and cross-references pass, but `shop_offers()` is empty and `item_definition()` returns `None` for every probed type across club sets, balls, consumables and characters. The manifest reports `manifest_version = 3` with per-file `version = 13`, so the record parser is reading a layout these files do not use and every record ends up without a definition.
+18. **The catalog yields no item definitions for real client data** — **resolved 2026-08-08.** The client-schema path parsed identity only and always set `definition: None`, so `shop_offers()` was empty and every purchase was refused for want of a price. Real client records do carry the item header `pangbox/server` (`pangya/iff/item.go`) documents — a four-byte active flag and id, a 40-byte name, a rank byte, a 40-byte icon, then price — and reading it back against the acquired client reproduces the client's own shop exactly: "Air Knight Utility Set" at 10000 and "Candy Club Set" at 7500. Loading now yields **2,664** priced offers across club sets, balls, consumables and character parts.
 
-    The visible symptom is that a real client's purchases are always refused. That refusal is *correct* — the server prices from its own catalog and will not sell something it cannot price, so a modified client cannot name its own price — but it is refusing everything. The retail purchase path itself is verified end to end: the client's `0x001D` decodes, the refusal `0x0068` is sent, and the balance is left untouched.
+    Two things are stated rather than read, because they have not been located in these records: nothing is durable, and every part is compatible with any character. Characters and courses yield no definition at all, so the shop's character tab could not be served even so.
 
-    Note also that characters are not sellable by construction: `pangya-data` produces `ClubSet`, `Ball`, `Consumable` and `CharacterPart` definitions but never `Character`, so the shop's character tab could not be served even with a working parser.
+    An operator override, `data.price_override_pang`, reprices every item the client sells. It exists so the whole shop is reachable for local testing without grinding a balance, it warns loudly at startup, and it deliberately cannot make an unavailable item purchasable — it rewrites the amount on rows the client already sells and leaves the rest alone.
+
+19. **The catalog is built from a superseded copy of the client's tables** — open. With pricing working, a real client's purchase is still refused: it asked for `0x10000061`, a club set that exists in **no** table inside the `pangya_gb.iff` this catalog is built from, although it sits inside that family's id range.
+
+    The cause is where the client gets its tables. It resolves `pangya_gb.iff` through its PAK chain rather than from a loose file, and the installed client carries a long series of them — `projectg700gb+.pak` through `projectg820gb.pak` — where a later PAK supersedes the same-named entry in an earlier one. The copy this catalog was built from is an earlier revision, so it is missing everything added since. `pangbox/pangfiles` (`pak`) is the reference implementation of that overlay, and extracting the winning `pangya_gb.iff` through it is what makes the server's catalog agree with the shop the client renders.
+
+    Worth noting for the shop specifically: the client draws item names, prices and the listing itself from its own local tables. The server cannot change what the shop *displays* — `price_override_pang` changes only what it *charges*.
 
 ---
 
 ## Immediate next actions
 
-1. **Fix the catalog record parsing** (blocker 18) so real client data produces item definitions. Nothing in the economy — buying, equipping, pricing — can work until it does.
+1. **Extract the client's tables through its PAK chain** (blocker 19) so the catalog contains every item the client offers. Pricing works; the data is simply an older revision than the client's.
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.

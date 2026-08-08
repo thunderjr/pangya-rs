@@ -4388,9 +4388,11 @@ where
             decode_packet_payload::<RetailPurchaseRequest>(payload, profile, ServiceKind::Game)
                 .map_err(|_| GameRuntimeError::Protocol)?;
         let Some(economy) = self.config.economy else {
+            tracing::debug!(stage = "economy_disabled", "retail purchase refused");
             return self.refuse_retail_purchase(framed, account_id).await;
         };
         if request.items.is_empty() {
+            tracing::debug!(stage = "empty_request", "retail purchase refused");
             return self.refuse_retail_purchase(framed, account_id).await;
         }
 
@@ -4410,6 +4412,14 @@ where
                 .shop_offer(ItemTypeId::new(item.item_type_id))
                 .copied()
             else {
+                // The item id is catalog data, not player data, and without it a refusal is
+                // indistinguishable from a pricing bug.
+                tracing::debug!(
+                    stage = "not_in_catalog",
+                    item_type_id = item.item_type_id,
+                    shop_offers = self.catalog.shop_offers().len(),
+                    "retail purchase refused"
+                );
                 return self.refuse_retail_purchase(framed, account_id).await;
             };
             // The operation id makes a retried line replay its own commit instead of buying twice.
