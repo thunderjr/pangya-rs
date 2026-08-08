@@ -434,3 +434,52 @@ A second instance on the same host is not a workaround. The client holds a singl
 and the second launch produces no process; Rugburn hooks `CreateMutexA` only to satisfy
 GameGuard, so it offers no bypass. Driving a played hole therefore needs a second client on a
 second machine joining the same room over the Tailnet.
+
+### Running two clients on one host
+
+A versus room needs a second player, and the client refuses to start a second instance: it creates
+a named mutex and gives up if it already exists. The executable is WinLicense-packed, so it cannot
+be patched statically. The single-instance check is defeated at runtime instead, from Rugburn,
+which already hooks `kernel32`.
+
+`AllowMultipleInstances` in `rugburn.json` turns on a `CreateMutexA`/`OpenMutexA` hook that appends
+a per-process suffix to every *named* mutex, so each instance gets its own namespace and the check
+never sees an existing one. Unnamed mutexes are already per-process and pass through untouched.
+The option is off by default; it is only useful against a local server.
+
+```jsonc
+{
+  "UrlRewrites": { ... },
+  "AllowMultipleInstances": "TRUE",
+  "PortRewrites": [ ... ]
+}
+```
+
+Set-up used here: a second copy of the client in its own directory (`us851b`) with the rebuilt
+`ijl15.dll` and the option enabled, leaving the first install untouched. Both originals are kept
+as `ijl15.dll.orig`. Build the DLL with the repo's own toolchain:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w debian:bookworm-slim \
+  sh -c "apt-get update -qq && apt-get install -y -qq g++-mingw-w64-i686 make && make"
+```
+
+#### How the automation drives two windows
+
+This is the part that does not generalise for free. Clicks are relative `SendInput` deltas
+measured from a corner pin, so the OS cursor ends up at the same screen coordinates as the engine
+cursor, and every coordinate in the script is a client-area pixel of a window sitting at the
+screen origin. **Only one window can be at the origin at a time.**
+
+`Set-PangyaTarget -ProcessId N` therefore parks every other instance far to the right, moves the
+chosen one to the origin, and focuses it. Everything after that drives the target. Switching
+instances is an explicit `Set-PangyaTarget` call — the click helpers cannot infer it, and driving
+the wrong window is silent rather than an error.
+
+```powershell
+. C:\tools\pangya-client.ps1
+Get-PangyaInstances                       # ProcessId / Hwnd / Path
+Set-PangyaTarget -ProcessId 10652         # park the others, anchor this one
+Invoke-PangyaLogin -Id 'rsp4' -Password 'pangya123'
+Set-PangyaTarget -ProcessId 8480          # switch back to the first
+```
