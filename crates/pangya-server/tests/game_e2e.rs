@@ -6241,8 +6241,17 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         receive_packet(&mut stream, key).await.0
     );
 
-    // Start match: the client receives the plan, weather, and wind.
+    // Start match: the client receives the pre-match framing, then the roster and the plan.
+    // Weather and wind are not among them; upstream withholds both until every player has
+    // reported its hole loaded, and a retail client crashes mid-load when told early.
     send_packet(&mut stream, key, 4, 0x000e, &[]).await;
+    for expected in [0x0230_u16, 0x0231, 0x0077] {
+        assert_eq!(
+            receive_packet(&mut stream, key).await.0,
+            expected,
+            "match framing"
+        );
+    }
     assert_eq!(
         receive_packet(&mut stream, key).await.0,
         0x0076,
@@ -6254,11 +6263,20 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     // counts. Both eighteens are fixed-width: the client reads each array by its own size, not
     // by how many holes the match actually has.
     assert_eq!(info.len(), 4 + 12 + 18 * 7 + 4 + 18);
-    assert_eq!(receive_packet(&mut stream, key).await.0, 0x009e, "weather");
-    assert_eq!(receive_packet(&mut stream, key).await.0, 0x005b, "wind");
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x016a,
+        "mascot seed"
+    );
 
-    // Loading finished moves the hole into play and hands the player the turn.
+    // Loading finished releases the withheld weather and wind, moves the hole into play, and
+    // hands the player the turn.
     send_packet(&mut stream, key, 5, 0x0011, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x009e, "weather");
+    let (opcode, wind) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x005b, "wind");
+    // No reference server ever reports a still hole as zero wind.
+    assert!(wind.first().is_some_and(|&strength| strength >= 1));
     assert_eq!(
         receive_packet(&mut stream, key).await.0,
         0x0053,
@@ -6477,10 +6495,19 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     ] {
         let received = drain_frames(stream, key, Duration::from_millis(1200)).await;
         let frames: Vec<u16> = received.iter().map(|(opcode, _)| *opcode).collect();
-        for expected in [0x0076_u16, 0x0052, 0x009e, 0x005b] {
+        for expected in [0x0230_u16, 0x0231, 0x0077, 0x0076, 0x0052, 0x016a] {
             assert!(
                 frames.contains(&expected),
                 "{who} receives {expected:#06x} of the hole intro: {frames:04x?}"
+            );
+        }
+        // Weather and wind belong after the load, not during it. No reference server sends
+        // either before every player has reported its hole loaded, and a retail client
+        // crashes at the end of its load ramp when told early.
+        for withheld in [0x009e_u16, 0x005b] {
+            assert!(
+                !frames.contains(&withheld),
+                "{who} is not told {withheld:#06x} while still loading: {frames:04x?}"
             );
         }
         // The roster is what the client builds both players from, so it must be the full form
@@ -6516,6 +6543,10 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (&mut visitor, visitor_key, "visitor"),
     ] {
         let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        assert!(
+            frames.contains(&0x009e) && frames.contains(&0x005b),
+            "{who} is told the weather and wind once loaded: {frames:04x?}"
+        );
         assert!(
             frames.contains(&0x0053) && frames.contains(&0x0063),
             "{who} is told the hole started and whose turn it is: {frames:04x?}"

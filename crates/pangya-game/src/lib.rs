@@ -73,17 +73,18 @@ use pangya_protocol::{
     RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression,
     RetailHoleWeather, RetailHoleWind, RetailLoadProgress, RetailLockerCombinationAttempt,
     RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
-    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchFinish, RetailMatchInfo,
-    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
-    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
-    RetailPangBalance, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
-    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
+    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
+    RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
+    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
+    RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
+    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
+    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync,
+    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
     RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
     RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
     RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
@@ -670,7 +671,27 @@ enum AbortResolution {
     Committed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Everything a retail connection remembers about the hole it is in.
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectionMatchContext {
+    stroke: Option<ConnectionStrokeContext>,
+    /// Weather and wind for the hole being loaded, withheld until the room actor hands out
+    /// the first turn.
+    ///
+    /// No reference server sends either before every client has reported its hole loaded, and
+    /// the retail client crashes during the load ramp when it is told early. See
+    /// `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
+    atmosphere: Option<RetailHoleAtmosphere>,
+}
+
+/// The weather and wind frames a hole is introduced with, once its players are all loaded.
+#[derive(Clone, Copy, Debug)]
+struct RetailHoleAtmosphere {
+    weather: RetailWeather,
+    wind: pangya_domain::WindConditions,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ConnectionStrokeContext {
     match_id: MatchId,
     roster: [PlayerConnectionId; 2],
@@ -1187,7 +1208,7 @@ where
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
         let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
-        let mut stroke_context: Option<ConnectionStrokeContext> = None;
+        let mut match_context = ConnectionMatchContext::default();
 
         let result = loop {
             let deadline = if matches!(state, GameState::AwaitHandover | GameState::AwaitChannel) {
@@ -1215,7 +1236,7 @@ where
                             event,
                             room_id,
                             connection_id,
-                            &mut stroke_context,
+                            &mut match_context,
                         ) => handled,
                     };
                     match handled {
@@ -1226,7 +1247,7 @@ where
                         }
                         Ok(RoomEventEffect::EnterRoom) => {
                             state = GameState::InRoom;
-                            stroke_context = None;
+                            match_context = ConnectionMatchContext::default();
                         }
                         Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
                         Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
@@ -3404,7 +3425,7 @@ where
         event: RoomEvent,
         room_id: Option<RoomId>,
         connection_id: PlayerConnectionId,
-        stroke_context: &mut Option<ConnectionStrokeContext>,
+        match_context: &mut ConnectionMatchContext,
     ) -> Result<RoomEventEffect, GameRuntimeError> {
         let solo_event = matches!(
             &event,
@@ -3461,18 +3482,20 @@ where
                     // A solo hole has no turn arbitration, so the client's own timers are the
                     // only ones, and it is told the same defaults it shows for practice.
                     let roster = self.retail_match_roster(connection_id).await;
-                    self.send_retail_hole_intro(
-                        framed,
-                        &roster,
-                        RetailHoleIntro {
-                            course_id: begin.config().course_id().get(),
-                            weather: begin.weather(),
-                            wind: begin.wind(),
-                            shot_timer: RETAIL_SOLO_SHOT_TIMER,
-                            game_timer: RETAIL_SOLO_GAME_TIMER,
-                        },
-                    )
-                    .await?;
+                    match_context.atmosphere = Some(
+                        self.send_retail_hole_intro(
+                            framed,
+                            &roster,
+                            RetailHoleIntro {
+                                course_id: begin.config().course_id().get(),
+                                weather: begin.weather(),
+                                wind: begin.wind(),
+                                shot_timer: RETAIL_SOLO_SHOT_TIMER,
+                                game_timer: RETAIL_SOLO_GAME_TIMER,
+                            },
+                        )
+                        .await?,
+                    );
                     return Ok(RoomEventEffect::EnterLoading);
                 }
                 RoomEvent::SoloPhase { phase, .. } => {
@@ -3483,6 +3506,9 @@ where
                         && state == GameState::InMatchLoading
                     {
                         let connection = u32::try_from(connection_id.get()).unwrap_or(0);
+                        if let Some(atmosphere) = match_context.atmosphere.take() {
+                            self.send_retail_hole_atmosphere(framed, atmosphere).await?;
+                        }
                         self.send(
                             framed,
                             &RetailPlayerStartHole {
@@ -3520,19 +3546,21 @@ where
                     // actually enforce, so a shot that runs out on screen is the shot the
                     // server forfeits.
                     let roster = self.retail_match_roster(connection_id).await;
-                    self.send_retail_hole_intro(
-                        framed,
-                        &roster,
-                        RetailHoleIntro {
-                            course_id: begin.config().course_id().get(),
-                            weather: begin.weather(),
-                            wind: begin.wind(),
-                            shot_timer: plan.turn_timeout(),
-                            game_timer: plan.game_timeout(),
-                        },
-                    )
-                    .await?;
-                    *stroke_context = Some(ConnectionStrokeContext {
+                    let atmosphere = self
+                        .send_retail_hole_intro(
+                            framed,
+                            &roster,
+                            RetailHoleIntro {
+                                course_id: begin.config().course_id().get(),
+                                weather: begin.weather(),
+                                wind: begin.wind(),
+                                shot_timer: plan.turn_timeout(),
+                                game_timer: plan.game_timeout(),
+                            },
+                        )
+                        .await?;
+                    match_context.atmosphere = Some(atmosphere);
+                    match_context.stroke = Some(ConnectionStrokeContext {
                         match_id: begin.match_id(),
                         roster: *plan.roster(),
                         active: None,
@@ -3545,11 +3573,14 @@ where
                     let StrokeMatchPhase::AwaitAction { active, .. } = *phase else {
                         return Err(GameRuntimeError::Protocol);
                     };
-                    let context = stroke_context.as_mut().ok_or(GameRuntimeError::Protocol)?;
+                    let mut context = match_context.stroke.ok_or(GameRuntimeError::Protocol)?;
                     let connection = |id: PlayerConnectionId| u32::try_from(id.get()).unwrap_or(0);
                     match context.active {
                         // The first turn of the hole is introduced rather than handed over.
                         None => {
+                            if let Some(atmosphere) = match_context.atmosphere.take() {
+                                self.send_retail_hole_atmosphere(framed, atmosphere).await?;
+                            }
                             self.send(
                                 framed,
                                 &RetailPlayerStartHole {
@@ -3577,6 +3608,7 @@ where
                     )
                     .await?;
                     context.active = Some(active);
+                    match_context.stroke = Some(context);
                     return Ok(if state == GameState::InStrokeLoading {
                         RoomEventEffect::EnterStrokeMatch
                     } else {
@@ -3623,15 +3655,15 @@ where
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::StrokeCommitted(result) => {
-                    self.send_retail_stroke_committed(framed, *result, *stroke_context)
+                    self.send_retail_stroke_committed(framed, *result, match_context.stroke)
                         .await?;
-                    *stroke_context = None;
+                    match_context.stroke = None;
                     return Ok(RoomEventEffect::EnterRoom);
                 }
                 // An abort pays nothing, and there is no retail frame that says so. The room
                 // is what the client returns to either way.
                 RoomEvent::StrokeAborted(_) => {
-                    *stroke_context = None;
+                    match_context.stroke = None;
                     return Ok(RoomEventEffect::EnterRoom);
                 }
                 _ => {}
@@ -3793,7 +3825,7 @@ where
                     .map_err(|_| GameRuntimeError::Protocol)?,
                 )
                 .await?;
-                *stroke_context = Some(ConnectionStrokeContext {
+                match_context.stroke = Some(ConnectionStrokeContext {
                     match_id: begin.match_id(),
                     roster,
                     active: None,
@@ -3834,7 +3866,7 @@ where
                 else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                let context = stroke_context.ok_or(GameRuntimeError::Protocol)?;
+                let context = match_context.stroke.ok_or(GameRuntimeError::Protocol)?;
                 let timeout_ms = self
                     .config
                     .stroke_two
@@ -3895,7 +3927,7 @@ where
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::StrokeCommitted(result) => {
-                self.send_stroke_committed(framed, connection_id, result, *stroke_context)
+                self.send_stroke_committed(framed, connection_id, result, match_context.stroke)
                     .await?;
                 Ok(RoomEventEffect::EnterRoom)
             }
@@ -4002,15 +4034,20 @@ where
 
     /// Sends the frames a retail client needs before it will load a hole.
     ///
-    /// The roster comes first and carries every player whole, because the client builds each
-    /// of them from it; the plan follows and is one hole, because that is what this server
-    /// settles. The client reads the whole plan up front, so an incomplete one strands it.
+    /// The framing pair and the pang rate come first, then the roster carrying every player
+    /// whole, because the client builds each of them from it; the plan follows and is one
+    /// hole, because that is what this server settles. The client reads the whole plan up
+    /// front, so an incomplete one strands it, and the mascot seed closes the sequence.
+    ///
+    /// Weather and wind are deliberately not here. They are returned for the caller to hold
+    /// until every player has reported its hole loaded — no reference server sends either
+    /// before that point.
     async fn send_retail_hole_intro(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         roster: &[MemberSnapshot],
         hole: RetailHoleIntro,
-    ) -> Result<(), GameRuntimeError> {
+    ) -> Result<RetailHoleAtmosphere, GameRuntimeError> {
         let RetailHoleIntro {
             course_id,
             weather,
@@ -4027,6 +4064,9 @@ where
             pangya_domain::Weather::Rain => RetailWeather::Raining,
         };
         let course = u8::try_from(course_id).unwrap_or(0);
+        self.send(framed, &RetailMatchOpen).await?;
+        self.send(framed, &RetailMatchOpenAck).await?;
+        self.send(framed, &RetailPangRate::default()).await?;
         self.send(
             framed,
             &RetailMatchStart::Roster(
@@ -4057,11 +4097,27 @@ where
             },
         )
         .await?;
+        self.send(framed, &RetailMascotSeed::default()).await?;
+        Ok(RetailHoleAtmosphere { weather, wind })
+    }
+
+    /// Sends the weather and wind the hole is played under, once its players are all loaded.
+    ///
+    /// Upstream never sends a wind strength of zero, so a still hole is reported as the
+    /// weakest breeze rather than as no wind at all.
+    async fn send_retail_hole_atmosphere(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        atmosphere: RetailHoleAtmosphere,
+    ) -> Result<(), GameRuntimeError> {
+        let RetailHoleAtmosphere { weather, wind } = atmosphere;
         self.send(framed, &RetailHoleWeather { weather }).await?;
         self.send(
             framed,
             &RetailHoleWind {
-                strength: u8::try_from(wind.speed_tenths() / 10).unwrap_or(u8::MAX),
+                strength: u8::try_from(wind.speed_tenths() / 10)
+                    .unwrap_or(u8::MAX)
+                    .max(1),
                 direction: wind.angle_degrees(),
             },
         )
@@ -8152,7 +8208,7 @@ mod tests {
                     RoomEvent::AbortRequested(abort),
                     None,
                     test_identity().connection_id,
-                    &mut None,
+                    &mut ConnectionMatchContext::default(),
                 )
                 .await,
             Err(GameRuntimeError::Io)

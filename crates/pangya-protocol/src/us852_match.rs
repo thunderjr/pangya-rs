@@ -196,6 +196,120 @@ impl EncodePacket for RetailMatchInfo {
     }
 }
 
+/// Opens the pre-match framing a retail client expects, server opcodes `0x0230` and `0x0231`.
+///
+/// Both bodies are empty; the client reacts to the opcode alone. They are the first two frames
+/// upstream sends once a room starts, ahead of the roster.
+///
+/// # Provenance
+///
+/// From `pangbox/server` (`game/packet/server.go` `Server0230`/`Server0231`, sent by
+/// `game/room/room.go`), ISC licensed, and `Acrisio-Filho/SuperSS-Dev`
+/// (`Server/GameServer/room.cpp` `requestStartGame`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMatchOpen;
+
+impl EncodePacket for RetailMatchOpen {
+    const OPCODE: u16 = 0x0230;
+
+    fn encode(
+        &self,
+        _writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)
+    }
+}
+
+/// The second half of the pre-match framing pair, server opcode `0x0231`.
+///
+/// See [`RetailMatchOpen`] for provenance; this is the frame that follows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMatchOpenAck;
+
+impl EncodePacket for RetailMatchOpenAck {
+    const OPCODE: u16 = 0x0231;
+
+    fn encode(
+        &self,
+        _writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)
+    }
+}
+
+/// The pang multiplier for the match about to start, server opcode `0x0077`.
+///
+/// A percentage: 100 is the plain rate. Every reference server sends this before the roster.
+///
+/// # Provenance
+///
+/// From `pangbox/server` (`game/packet/server.go` `Server0077`, sent with `0x64` by
+/// `game/room/room.go`), ISC licensed; `Acrisio-Filho/SuperSS-Dev` sends the configured pang
+/// rate here and `hsreina/pangya-server` sends a literal `0x64`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPangRate {
+    /// Percentage applied to pang earned this match.
+    pub percent: u32,
+}
+
+impl Default for RetailPangRate {
+    fn default() -> Self {
+        Self { percent: 100 }
+    }
+}
+
+impl EncodePacket for RetailPangRate {
+    const OPCODE: u16 = 0x0077;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.percent);
+        Ok(())
+    }
+}
+
+/// Closes the pre-match framing, server opcode `0x016a`.
+///
+/// Seeds the client's mascot effects. All three reference servers send it immediately after the
+/// match plan; the value is opaque and they disagree on it, so any small one will do.
+///
+/// # Provenance
+///
+/// From `pangbox/server` (`game/packet/server.go` `Server016A`, sent by `game/room/room.go`
+/// after the plan), ISC licensed; `Acrisio-Filho/SuperSS-Dev` sends a bare random `u32` it
+/// calls the mascot effect seed, and `hsreina/pangya-server` a fixed one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMascotSeed {
+    /// Seed the client uses for mascot effects.
+    pub seed: u32,
+}
+
+impl Default for RetailMascotSeed {
+    fn default() -> Self {
+        Self { seed: 0x24bd }
+    }
+}
+
+impl EncodePacket for RetailMascotSeed {
+    const OPCODE: u16 = 0x016a;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.seed);
+        Ok(())
+    }
+}
+
 /// Hole weather, server opcode `0x009e`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetailHoleWeather {

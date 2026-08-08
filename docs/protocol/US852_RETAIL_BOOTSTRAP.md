@@ -266,7 +266,11 @@ Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
 
 | Opcode | Meaning | Body |
 |---|---|---|
-| `0x0076` | Match start | room UI type, `u32` 1, packed server time |
+| `0x0230` | Pre-match framing, first half | empty |
+| `0x0231` | Pre-match framing, second half | empty |
+| `0x0077` | Pang rate for the match | `u32` percentage, `100` for the plain rate |
+| `0x0076` | Match start | subtype `0x00` then `u8` count then one whole player record per seat, or subtype `0x04` then `u32` 1 then the packed server time |
+| `0x016a` | Mascot effect seed | `u32` |
 | `0x0052` | Match plan | course, UI type, hole mode, hole count, `u32` trophy, `u32` shot timer, `u32` game timer, the hole plan, `u32` seed, then **18** collectible counts |
 | `0x009e` | Hole weather | `u16` weather ordinal, one zero byte |
 | `0x005b` | Hole wind | `u8` strength, `u8` silent flag, `u16` bearing, `u8` 1 to set rather than accumulate |
@@ -280,10 +284,20 @@ Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
 
 One hole record is `u32` random id, `u8` pin, `u8` course, `u8` number.
 
-Two details that are easy to get wrong and were pinned by tests:
+Four details that are easy to get wrong and were pinned by tests:
 
 - `0x0052` must always write **eighteen** collectible count bytes regardless of how many
   holes the match actually has. The client reads all eighteen.
+- The order of the start is fixed: `0x0230`, `0x0231`, `0x0077`, `0x0076`, `0x0052`,
+  `0x016a`. Every reference server that sends a given frame sends it in that position.
+- **Weather and wind are not part of the start.** They are withheld until every player has
+  sent `0x0011`, and then sent immediately before `0x0053`. No reference server emits
+  either during the load, and the retail client dies at the end of its load ramp when told
+  early. See `pangbox/server` `game/room/room.go` `startHole`,
+  `Acrisio-Filho/SuperSS-Dev` `versus_base.cpp` `checkAllLoadHole`, and
+  `hsreina/pangya-server` `Game.pas` `HandlePlayerLoadOk`.
+- A wind strength of `0` is never sent; upstream picks `1..8`, so a still hole is reported
+  as the weakest breeze.
 - Shots are relayed, not recomputed. The client owns trajectory; the server owns turn
   order, scoring, and persistence. The relay body is deliberately opaque.
 
