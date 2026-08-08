@@ -6324,8 +6324,10 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         address: std::net::SocketAddr,
         account_id: pangya_domain::AccountId,
         username: &str,
+        tokens: &mut Vec<String>,
     ) -> (TcpStream, u8) {
         let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+        tokens.push(token.clone());
         let (mut stream, key) = connect_game_retail(address).await;
         send_typed(
             &mut stream,
@@ -6349,9 +6351,12 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (stream, key)
     }
 
-    let (mut host, host_key) = join_retail(&pool, address, owner.account.id, "PartyHost").await;
+    let traces = tracing_capture();
+    let mut tokens = Vec::new();
+    let (mut host, host_key) =
+        join_retail(&pool, address, owner.account.id, "PartyHost", &mut tokens).await;
     let (mut visitor, visitor_key) =
-        join_retail(&pool, address, guest.account.id, "PartyGuest").await;
+        join_retail(&pool, address, guest.account.id, "PartyGuest", &mut tokens).await;
 
     // The host opens a two-player room, exactly as the client's Make Room dialog does.
     let mut create = pangya_protocol::PacketWriter::default();
@@ -6575,6 +6580,15 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         progression_rows, 2,
         "one immutable EXP ledger row per player"
     );
+
+    // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
+    let logged = String::from_utf8_lossy(&traces.lock().expect("traces").clone()).into_owned();
+    for token in &tokens {
+        assert!(
+            !logged.contains(token.as_str()),
+            "a handover bearer reached the logs"
+        );
+    }
 
     drop(host);
     drop(visitor);
