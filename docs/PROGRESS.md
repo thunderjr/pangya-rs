@@ -6,7 +6,7 @@
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **a second client.** Everything a single real client can reach is verified. Starting a match is not blocked by anything server-side: the client refuses to start a two-player room holding one player, and only one instance of it will run on a host, so a played hole needs a second client on a second machine.
+> Next gate: **a two-player retail match, which the server does not implement.** Everything a single real client can reach is verified. The remaining §19.6 steps are blocked server-side, not by tooling: the retail start path begins a *solo* match for whoever pressed Start, so the second player a versus room requires is never a participant. See blocker 23.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -342,17 +342,25 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Worth recording as a process note: the edit adding `0x000D` to the retail room opcode set silently did not apply, because the surrounding text had been reformatted since it was written. The opcode arrived, matched no branch, and was answered with nothing — indistinguishable from a handler bug until the set was read back. Verify a set membership change by reading the function, not by assuming the edit landed.
 
-22. **Playing a hole needs a second client** — open, and not a server defect. Driving a real client as far as it goes: it creates a room, the ready handshake completes, and the room header then reads `3 hole (1/2)`. The client will not offer Start while a two-player room holds one player, and the Make Room dialog's smallest versus capacity is two.
+22. **Playing a hole needs a second client** — **the client-side half is resolved 2026-08-08.** A real client will not start a versus room holding fewer players than its capacity (the header reads `3 hole (1/2)`) and the smallest capacity its Make Room dialog offers is two, so a played hole needs two clients. It also refuses to run twice: the check is a named mutex, and `ProjectG.exe` is WinLicense-packed so it cannot be patched statically.
 
-    The obvious workaround does not work either. A second instance cannot be launched on the same host — the client holds a single-instance lock, and the second launch simply does not produce a process. Rugburn hooks `CreateMutexA` only to satisfy GameGuard, so it offers no bypass.
+    That is solved at runtime from Rugburn, which already hooks `kernel32`. `patches/rugburn-allow-multiple-instances.patch` adds an `AllowMultipleInstances` option that appends a per-process suffix to every named mutex. Two instances were confirmed running, the second signed in as its own account. The harness gained per-instance window targeting for it (`Set-PangyaTarget`), because clicks are relative deltas from a corner pin and only one window can occupy the screen origin at a time.
 
-    So the remaining §19.6 steps need a second client on a second machine joining the same room over the Tailnet, which is an infrastructure requirement rather than a protocol gap. The server side of the match is implemented and covered end to end by `game_retail_match_plays_and_settles_one_hole`, which exercises start, hole load, shot commit, hole finish and settlement over TCP against a real database.
+    What remains on this blocker is harness reliability, not capability — see the closing note below.
+
+23. **A two-player retail match is not implemented** — open, and the actual blocker for §19.6 steps 7-12. This supersedes the earlier claim in this file that the match was "implemented and covered end to end"; that was true only of the single-player case.
+
+    `RETAIL_C2S_START_MATCH` (`0x000E`) builds a `BeginSoloMatch` for `identity.account_id` and routes it through the solo lifecycle. A two-player match lifecycle does exist — `StrokeStartPlan` takes `participants` and both members' connection ids, with turn and game timeouts — but it is reachable only from the synthetic `0x7f4x` opcodes. Nothing connects the retail opcode to it.
+
+    So a real client, which can only ever start a two-player room, causes a solo match to begin for whoever pressed Start. `game_retail_start_with_two_players_begins_only_a_solo_match` pins this: with both players in the room and ready, the host gets a `match_players` row and **the guest gets none**, so nothing the second player does can be scored.
+
+    The implementation path is to route the retail start onto the stroke lifecycle rather than the solo one, which also brings the turn arbitration a versus hole needs. The existing `game_retail_match_plays_and_settles_one_hole` remains valid for what it covers — one client, one hole — and should not be mistaken for coverage of a versus match.
 
 ---
 
 ## Immediate next actions
 
-1. **Stand up a second client** on a second VM so a two-player room can start, then drive §19.6 steps 7-12 against it. Nothing server-side is known to be missing for this; the match path is already covered end to end.
+1. **Route the retail match start onto the two-player stroke lifecycle** (blocker 23). Until that exists, no amount of client-side work can produce a scored versus hole.
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.

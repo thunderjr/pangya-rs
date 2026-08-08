@@ -717,6 +717,34 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
     .expect("bounded packet receive")
 }
 
+/// Drains whatever a stream has to say within a short window, without asserting an order.
+/// Membership changes fan out to everyone in a room, so exact frame sequences are brittle in a
+/// multi-client test; the assertions that matter here are about persisted state.
+async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<u16> {
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining.min(Duration::from_millis(400)), async {
+            let mut header = [0_u8; 3];
+            stream.read_exact(&mut header).await.ok()?;
+            let total = usize::from(u16::from_le_bytes([header[1], header[2]])) + 3;
+            let mut frame = vec![0_u8; total];
+            frame[..3].copy_from_slice(&header);
+            stream.read_exact(&mut frame[3..]).await.ok()?;
+            let plain = pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).ok()?;
+            Some(u16::from_le_bytes([plain[0], plain[1]]))
+        })
+        .await
+        {
+            Ok(Some(opcode)) => seen.push(opcode),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
     let payload = encode_packet_payload(packet, &CompatibilityProfile::US_852).expect("encode");
     send_packet(stream, key, salt, T::OPCODE, &payload).await;
@@ -6231,4 +6259,153 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     drop(stream);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
+}
+
+/// A real client cannot start a versus room holding fewer players than its capacity, and the
+/// smallest capacity its Make Room dialog offers is two. So the only match a real client can ever
+/// begin is a two-player one — and this pins what the server actually does with that today.
+///
+/// The retail start handler builds a `BeginSoloMatch` for the connection that pressed Start, so
+/// the second player in the room is not a participant. This test exists to make that visible and
+/// to fail loudly if the behaviour changes, rather than leaving it to be rediscovered against a
+/// real client where it would look like a client bug.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPool) {
+    let catalog = economy_catalog();
+    let course = catalog
+        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .expect("one-hole course");
+    let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
+    let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            catalog.clone(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: Some(SoloRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout: Duration::from_secs(30),
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window: 80,
+                }),
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail party service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+
+    async fn join_retail(
+        pool: &PgPool,
+        address: std::net::SocketAddr,
+        account_id: pangya_domain::AccountId,
+        username: &str,
+    ) -> (TcpStream, u8) {
+        let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+        let (mut stream, key) = connect_game_retail(address).await;
+        send_typed(
+            &mut stream,
+            key,
+            1,
+            &pangya_protocol::RetailGameAuth {
+                username: username.as_bytes().to_vec(),
+                user_id: u32::try_from(account_id.get()).expect("user id"),
+                login_key: zeroize::Zeroizing::new(token.into_bytes()),
+                client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+                session_key: zeroize::Zeroizing::new(Vec::new()),
+            },
+        )
+        .await;
+        for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+            let _ = receive_packet(&mut stream, key).await;
+        }
+        send_packet(&mut stream, key, 2, 4, &[1]).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+        (stream, key)
+    }
+
+    let (mut host, host_key) = join_retail(&pool, address, owner.account.id, "PartyHost").await;
+    let (mut visitor, visitor_key) =
+        join_retail(&pool, address, guest.account.id, "PartyGuest").await;
+
+    // The host opens a two-player room, exactly as the client's Make Room dialog does.
+    let mut create = pangya_protocol::PacketWriter::default();
+    create.u8(0);
+    create.u32_le(30_000);
+    create.u32_le(600_000);
+    create.u8(2); // capacity: the smallest a versus room offers
+    create.u8(0);
+    create.u8(1);
+    create.u8(0);
+    create.bytes(&[0; 5]);
+    create.pstring(b"Party", 64).expect("room name");
+    create.pstring(b"", 64).expect("room password");
+    send_packet(&mut host, host_key, 3, 0x0008, &create.into_inner()).await;
+    let (opcode, joined) = receive_packet(&mut host, host_key).await;
+    assert_eq!(opcode, 0x0049, "room create is answered with a join result");
+    let room_number = u16::from_le_bytes([joined[65], joined[66]]);
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+
+    // The visitor joins, filling the room.
+    let mut join = pangya_protocol::PacketWriter::default();
+    join.u16_le(room_number);
+    join.pstring(b"", 64).expect("join password");
+    send_packet(&mut visitor, visitor_key, 3, 0x0009, &join.into_inner()).await;
+    let visitor_frames =
+        drain_available(&mut visitor, visitor_key, Duration::from_millis(900)).await;
+    assert!(
+        visitor_frames.contains(&0x0049),
+        "the visitor is admitted to the room: {visitor_frames:04x?}"
+    );
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+
+    // Both mark ready, which is what unlocks Start on a real client.
+    send_packet(&mut host, host_key, 4, 0x000d, &[0]).await;
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+    send_packet(&mut visitor, visitor_key, 4, 0x000d, &[0]).await;
+    let _ = drain_available(&mut visitor, visitor_key, Duration::from_millis(600)).await;
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+
+    // The host starts. The match that begins is a solo one belonging to the host alone: the
+    // guest's account has no match row, so nothing it does can be scored.
+    send_packet(&mut host, host_key, 5, 0x000e, &0_u32.to_le_bytes()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let host_matches: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM match_players WHERE account_id = $1")
+            .bind(owner.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("host match count");
+    let guest_matches: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM match_players WHERE account_id = $1")
+            .bind(guest.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("guest match count");
+
+    assert_eq!(host_matches, 1, "the host who pressed Start gets a match");
+    assert_eq!(
+        guest_matches, 0,
+        "the second player in the room is not a participant: the retail start path builds a \
+         BeginSoloMatch for one account, so a two-player versus room cannot be scored. This is \
+         the blocker for SPEC 19.6 steps 7-12, not a client defect."
+    );
+
+    shutdown.cancel();
+    task.await.expect("party join").expect("party serve");
 }
