@@ -22,8 +22,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::{Catalog, CatalogKind};
 use pangya_domain::{
-    CourseId, EconomyRepository, HandoverRepository, ItemTypeId, MatchRepository, NewAccount,
-    Nickname, OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver, Username,
+    AccountId, AccountRepository, BalanceGrant, CourseId, EconomyRepository, HandoverRepository,
+    ItemTypeId, MatchRepository, NewAccount, Nickname, OneHoleConfig, PlayerRepository,
+    RepositoryError, StorageObserver, Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -90,6 +91,25 @@ pub enum Command {
 pub enum AccountCommand {
     /// Atomically creates an account aggregate.
     Create(AccountCreateArgs),
+    /// Credits an account's pang and point balances.
+    Grant(AccountGrantArgs),
+}
+
+/// Operator balance-grant arguments.
+///
+/// This is the supported way to fund an account for shop testing. Editing `profiles` by hand
+/// bypasses the balance ceiling check and the audit line this emits.
+#[derive(Debug, Args)]
+pub struct AccountGrantArgs {
+    /// Numeric account identifier.
+    #[arg(long)]
+    pub account_id: i64,
+    /// Pang to add.
+    #[arg(long, default_value_t = 0)]
+    pub pang: u64,
+    /// Points ("cookies") to add.
+    #[arg(long, default_value_t = 0)]
+    pub points: u64,
 }
 
 /// Nonsecret account-create arguments and one secret source selector.
@@ -193,6 +213,9 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
         Command::Account {
             command: AccountCommand::Create(args),
         } => account_create(config, args).await,
+        Command::Account {
+            command: AccountCommand::Grant(args),
+        } => account_grant(config, args).await,
     }
 }
 
@@ -942,6 +965,42 @@ async fn connect_and_migrate(config: &AppConfig) -> Result<sqlx::PgPool, ServerE
         }
     }
     Err(ServerError::Database)
+}
+
+async fn account_grant(config: AppConfig, args: AccountGrantArgs) -> Result<(), ServerError> {
+    let grant = BalanceGrant {
+        pang: args.pang,
+        points: args.points,
+    };
+    if grant.is_empty() {
+        return Err(ServerError::AccountInput);
+    }
+    let account_id = AccountId::new(args.account_id).map_err(|_| ServerError::AccountInput)?;
+    let pool = connect_and_migrate(&config).await?;
+    let repository = PgRepository::new(pool.clone());
+    let balances = repository
+        .grant_balance(account_id, grant)
+        .await
+        .map_err(|_| ServerError::AccountInput)?;
+    tracing::info!(
+        action = "account_grant",
+        account_id = account_id.get(),
+        pang_granted = grant.pang,
+        points_granted = grant.points,
+        outcome = "success",
+        "operator audit"
+    );
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "balance granted: id={} pang={} points={}",
+        account_id.get(),
+        balances.pang,
+        balances.points
+    )
+    .map_err(|_| ServerError::Runtime)?;
+    pool.close().await;
+    Ok(())
 }
 
 async fn account_create(config: AppConfig, args: AccountCreateArgs) -> Result<(), ServerError> {

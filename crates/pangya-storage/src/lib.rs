@@ -16,23 +16,24 @@ use std::{
 use chrono::{DateTime, Utc};
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, Account,
-    AccountAggregate, AccountId, AccountRepository, AccountStatus, AuthenticatedSession,
-    AuthenticationRecord, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
-    BeginStrokeMatchOutcome, Character, CharacterId, CommitSoloHole, CommitStrokeMatch,
-    ConsumeHandover, ConsumeItem, ConsumeItemResult, CredentialHash, EconomyCommit, EconomyError,
-    EconomyOperationId, EconomyRepository, EquipmentChange, EquipmentChangeResult, EquipmentSet,
-    EquipmentSetId, HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
-    InventoryClass, InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind,
-    ItemSale, ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY,
-    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, NewAccount, NewHandover, Nickname, NoopStorageObserver, NormalizedNickname,
-    NormalizedUsername, PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult,
-    RepairItem, RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind,
-    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
-    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
-    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    AccountAggregate, AccountBalances, AccountId, AccountRepository, AccountStatus,
+    AuthenticatedSession, AuthenticationRecord, BalanceGrant, BeginSoloMatch,
+    BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome, Character, CharacterId,
+    CommitSoloHole, CommitStrokeMatch, ConsumeHandover, ConsumeItem, ConsumeItemResult,
+    CredentialHash, EconomyCommit, EconomyError, EconomyOperationId, EconomyRepository,
+    EquipmentChange, EquipmentChangeResult, EquipmentSet, EquipmentSetId, HandoverDigest,
+    HandoverError, HandoverRepository, IncompleteMatchAbortLimit, InventoryClass,
+    InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind, ItemSale,
+    ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS,
+    MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
+    MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
+    NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
+    PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem,
+    RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState,
+    SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted, StorageObserver,
+    StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace, StrokePlayerCommit,
+    StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather, WindConditions,
+    synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -512,6 +513,42 @@ impl PgRepository {
         )?;
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(snapshot)
+    }
+
+    /// Credits an operator balance grant under a row lock so a concurrent reward cannot be lost.
+    async fn grant_balance_inner(
+        &self,
+        account_id: AccountId,
+        grant: BalanceGrant,
+    ) -> Result<AccountBalances, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let current = sqlx::query!(
+            "SELECT pang, points FROM profiles WHERE account_id = $1 FOR UPDATE",
+            account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        let pang = operator_balance_add(current.pang, grant.pang)?;
+        let points = operator_balance_add(current.points, grant.points)?;
+        let updated = sqlx::query!(
+            "UPDATE profiles SET pang = $2, points = $3, updated_at = now() WHERE account_id = $1",
+            account_id.get(),
+            pang,
+            points
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::NotFound);
+        }
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(AccountBalances {
+            pang: u64::try_from(pang).map_err(|_| RepositoryError::CorruptData)?,
+            points: u64::try_from(points).map_err(|_| RepositoryError::CorruptData)?,
+        })
     }
 
     async fn set_status_inner(
@@ -1560,6 +1597,14 @@ impl AccountRepository for PgRepository {
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(self.observed(self.set_status_inner(account_id, status, now)))
     }
+
+    fn grant_balance(
+        &self,
+        account_id: AccountId,
+        grant: BalanceGrant,
+    ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>> {
+        Box::pin(self.observed(self.grant_balance_inner(account_id, grant)))
+    }
 }
 
 impl PlayerRepository for PgRepository {
@@ -2170,6 +2215,15 @@ fn validate_authority(
         return Err(MatchRepositoryError::WrongResultKey);
     }
     Ok(())
+}
+
+/// Adds an operator grant to a stored balance, refusing rather than wrapping.
+fn operator_balance_add(current: i64, grant: u64) -> Result<i64, RepositoryError> {
+    let current = u64::try_from(current).map_err(|_| RepositoryError::CorruptData)?;
+    let balance = current
+        .checked_add(grant)
+        .ok_or(RepositoryError::BalanceOverflow)?;
+    i64::try_from(balance).map_err(|_| RepositoryError::BalanceOverflow)
 }
 
 fn checked_balance_add(current: i64, reward: u64) -> Result<i64, MatchRepositoryError> {

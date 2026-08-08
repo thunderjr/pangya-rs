@@ -56,6 +56,9 @@ use tracing_subscriber::fmt::MakeWriter;
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 /// Generous packet deadline for ordinary E2E assertions. Timeout-path tests use their own short
 /// product deadlines, so a missing expected packet fails deterministically instead of hanging.
+/// Frames the retail bootstrap emits before the client is in the lobby.
+const RETAIL_BOOTSTRAP_FRAMES: usize = 11;
+
 const E2E_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BlockingStrokeCommitRepository {
@@ -5881,10 +5884,11 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     )
     .await;
 
-    // Three progress ticks, the full reply, then roster/caddie/equipment/inventory and
-    // the channel list. Order is what keeps the client off its loading screen.
+    // Three progress ticks, the full reply, then roster/caddie/equipment/inventory, the
+    // channel list, and finally the two balances the lobby header reads. Order is what keeps
+    // the client off its loading screen.
     let mut seen = Vec::new();
-    for _ in 0..9 {
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
         let (opcode, body) = receive_packet(&mut stream, key).await;
         seen.push((opcode, body));
     }
@@ -5892,7 +5896,7 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(
         opcodes,
         vec![
-            0x0044, 0x0044, 0x0044, 0x0044, 0x0070, 0x0071, 0x0072, 0x0073, 0x004d
+            0x0044, 0x0044, 0x0044, 0x0044, 0x0070, 0x0071, 0x0072, 0x0073, 0x004d, 0x0095, 0x0096
         ]
     );
 
@@ -5978,7 +5982,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         )
         .await;
         // Drain the nine bootstrap frames.
-        for _ in 0..9 {
+        for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
             let _ = receive_packet(&mut stream, key).await;
         }
         // Enter the channel so room commands are in-state. Retail sends the one-byte sub-server
@@ -6134,7 +6138,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         },
     )
     .await;
-    for _ in 0..9 {
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
         let _ = receive_packet(&mut stream, key).await;
     }
     // Retail sends the one-byte sub-server ID for channel entry, and gets two frames back.

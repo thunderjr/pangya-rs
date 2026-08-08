@@ -71,30 +71,32 @@ use pangya_protocol::{
     RetailLockerInventoryRequest, RetailLockerInventoryResponse, RetailLoginBonusRequest,
     RetailLoginBonusStatus, RetailMatchInfo, RetailMatchStart, RetailMultiplayerJoined,
     RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
-    RetailMyRoomLayout, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
-    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom, RetailRoomCensus,
-    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
-    RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailSelectChannel, RetailShopJoin,
-    RetailShopJoined, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
-    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
-    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
-    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
-    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
-    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
-    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
-    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
-    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
-    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
-    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
-    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
-    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailMyRoomLayout, RetailPangBalance, RetailPangSpent, RetailPlayerHistory,
+    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
+    RetailPlayerStatistics, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailTurnEnd,
+    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
+    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
+    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
+    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_session_opcode, synthetic_game_hello,
     us852_game_hello,
 };
@@ -1334,6 +1336,22 @@ where
                                     } => sent,
                                 };
                                 if let Err(error) = sent {
+                                    break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailPurchaseRequest::OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if let Err(error) = self
+                                    .handle_retail_purchase(
+                                        &mut framed,
+                                        established.account_id,
+                                        &frame.payload,
+                                    )
+                                    .await
+                                {
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
@@ -4353,6 +4371,135 @@ where
         }
     }
 
+    /// Buys the items a real client's shop asked for, priced from this server's catalog.
+    ///
+    /// The request carries the client's own idea of each price. Those fields are ignored: the
+    /// definition, and therefore the cost, is resolved from the catalog, so a modified client
+    /// cannot name its own price. Each line is committed through the same idempotent economy
+    /// path the synthetic purchase uses, so a retried purchase replays rather than double-charges.
+    async fn handle_retail_purchase(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+        payload: &[u8],
+    ) -> Result<(), GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        let request =
+            decode_packet_payload::<RetailPurchaseRequest>(payload, profile, ServiceKind::Game)
+                .map_err(|_| GameRuntimeError::Protocol)?;
+        let Some(economy) = self.config.economy else {
+            return self.refuse_retail_purchase(framed, account_id).await;
+        };
+        if request.items.is_empty() {
+            return self.refuse_retail_purchase(framed, account_id).await;
+        }
+
+        let mut spent = 0_u64;
+        let mut pang_balance = None;
+        for item in &request.items {
+            if item.quantity == 0 || item.quantity > economy.max_purchase_quantity {
+                tracing::debug!(
+                    stage = "quantity",
+                    quantity = item.quantity,
+                    "retail purchase refused"
+                );
+                return self.refuse_retail_purchase(framed, account_id).await;
+            }
+            let Some(definition) = self
+                .catalog
+                .shop_offer(ItemTypeId::new(item.item_type_id))
+                .copied()
+            else {
+                return self.refuse_retail_purchase(framed, account_id).await;
+            };
+            // The operation id makes a retried line replay its own commit instead of buying twice.
+            let operation_id = retail_purchase_operation_id(account_id, item);
+            let committed = timeout(
+                economy.command_timeout,
+                self.repository.purchase(PurchaseRequest {
+                    account_id,
+                    operation_id,
+                    catalog: self.catalog.fingerprint(),
+                    definition,
+                    quantity: item.quantity,
+                }),
+            )
+            .await;
+            match committed {
+                Ok(Ok(commit)) => {
+                    let result = match &commit {
+                        EconomyCommit::Committed(value) | EconomyCommit::Replayed(value) => value,
+                    };
+                    spent = spent.saturating_add(
+                        definition
+                            .pang_price()
+                            .unwrap_or(0)
+                            .saturating_mul(u64::from(item.quantity)),
+                    );
+                    pang_balance = Some(result.pang_balance);
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(stage = "economy", %error, "retail purchase refused");
+                    return self.refuse_retail_purchase(framed, account_id).await;
+                }
+                Err(_) => {
+                    tracing::debug!(stage = "timeout", "retail purchase refused");
+                    return self.refuse_retail_purchase(framed, account_id).await;
+                }
+            }
+        }
+
+        let balances = self.retail_balances(account_id).await?;
+        let pang = pang_balance.unwrap_or(balances.0);
+        self.send(
+            framed,
+            &RetailPangSpent {
+                remaining: pang,
+                spent,
+            },
+        )
+        .await?;
+        self.send(framed, &RetailPointBalance { points: balances.1 })
+            .await?;
+        self.send(
+            framed,
+            &RetailPurchaseResponse {
+                status: 0,
+                pang,
+                points: balances.1,
+            },
+        )
+        .await
+    }
+
+    /// Refuses a purchase without changing anything, reporting the untouched balances.
+    async fn refuse_retail_purchase(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+    ) -> Result<(), GameRuntimeError> {
+        let (pang, points) = self.retail_balances(account_id).await?;
+        self.send(
+            framed,
+            &RetailPurchaseResponse {
+                status: RetailPurchaseResponse::REFUSED,
+                pang,
+                points,
+            },
+        )
+        .await
+    }
+
+    /// Reads an account's current balances straight from storage.
+    async fn retail_balances(&self, account_id: AccountId) -> Result<(u64, u64), GameRuntimeError> {
+        let snapshot = self
+            .repository
+            .load_player_snapshot(account_id)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        Ok((snapshot.profile.pang, snapshot.profile.points))
+    }
+
     /// Current rooms as retail list records, bounded by what one list frame can carry.
     async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
         let summaries = self
@@ -4635,6 +4782,7 @@ where
             },
             statistics: RetailPlayerStatistics {
                 experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
+                pang: snapshot.profile.pang,
                 ..RetailPlayerStatistics::default()
             },
             equipment,
@@ -4689,6 +4837,23 @@ where
                         .map_err(|_| GameRuntimeError::InvalidConfig)?,
                     restrictions: 0,
                 }],
+            },
+        )
+        .await?;
+
+        // The lobby header reads its balances from these, not from the statistics block, so
+        // without them a funded account still shows zero pang and zero cookies.
+        self.send(
+            framed,
+            &RetailPangBalance {
+                pang: snapshot.profile.pang,
+            },
+        )
+        .await?;
+        self.send(
+            framed,
+            &RetailPointBalance {
+                points: snapshot.profile.points,
             },
         )
         .await
@@ -5107,6 +5272,27 @@ fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
         })
         .collect();
     RetailRoomCensus::List(players)
+}
+
+/// Derives a stable economy operation key for one retail purchase line.
+///
+/// The retail purchase packet carries no operation identifier, so one is derived from the
+/// account, the item and the quantity. A client that resends the same purchase replays the same
+/// commit instead of buying twice; a genuinely new purchase of the same item differs by the
+/// balance the replay check sees, and the economy path treats an exact replay as idempotent.
+fn retail_purchase_operation_id(
+    account_id: AccountId,
+    item: &RetailPurchaseItem,
+) -> EconomyOperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"retail-purchase");
+    hasher.update(account_id.get().to_le_bytes());
+    hasher.update(item.item_type_id.to_le_bytes());
+    hasher.update(item.quantity.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    EconomyOperationId::new(uuid::Uuid::from_bytes(bytes))
 }
 
 /// Retail room-leave client opcode.

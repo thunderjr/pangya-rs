@@ -4,7 +4,7 @@
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
-> Next gate: **equipment update `0x0020`.** The client opens the room directory, creates and enters a room, opens the shop, and opens My Room. My Room then sends `0x0020` and nothing answers it, which is the last thing between a real client and a stable lobby session.
+> Next gate: **the item catalog parses to nothing.** Loading the real client's `iff` directory succeeds and cross-references validate, but it yields **zero** item definitions and therefore zero shop offers. Every purchase a real client makes is refused for want of a price, and equipment cannot be resolved either, so the whole economy is inert against real data.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -306,11 +306,18 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     It was deliberately not stubbed. `0x0020` is a tagged union over eight equipment kinds (character parts, caddie, consumables, ball, decoration, character, and two unclassified), and upstream persists the change before echoing the new state back. Acknowledging it without storing anything would tell the client an equipment change succeeded and then contradict itself on the next login. Implementing it means the equipment system, not a constant reply.
 
+18. **The catalog yields no item definitions for real client data** — open, and the blocker under the whole economy. `Catalog::load` against the extracted U.S. 851 `iff` directory succeeds, the manifest validates and cross-references pass, but `shop_offers()` is empty and `item_definition()` returns `None` for every probed type across club sets, balls, consumables and characters. The manifest reports `manifest_version = 3` with per-file `version = 13`, so the record parser is reading a layout these files do not use and every record ends up without a definition.
+
+    The visible symptom is that a real client's purchases are always refused. That refusal is *correct* — the server prices from its own catalog and will not sell something it cannot price, so a modified client cannot name its own price — but it is refusing everything. The retail purchase path itself is verified end to end: the client's `0x001D` decodes, the refusal `0x0068` is sent, and the balance is left untouched.
+
+    Note also that characters are not sellable by construction: `pangya-data` produces `ClubSet`, `Ball`, `Consumable` and `CharacterPart` definitions but never `Character`, so the shop's character tab could not be served even with a working parser.
+
 ---
 
 ## Immediate next actions
 
-1. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
+1. **Fix the catalog record parsing** (blocker 18) so real client data produces item definitions. Nothing in the economy — buying, equipping, pricing — can work until it does.
+2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.

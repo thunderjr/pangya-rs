@@ -246,6 +246,138 @@ pub enum RoomListKind {
     Modifications = 3,
 }
 
+/// Maximum line items one retail purchase may carry.
+pub const MAX_RETAIL_PURCHASE_ITEMS: usize = 32;
+
+/// One line item in a retail purchase.
+///
+/// The two cost fields are what the *client* believes the item costs. They are decoded because
+/// they are on the wire, and then deliberately ignored: price comes from the server's catalog, so
+/// a modified client cannot name its own price.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPurchaseItem {
+    /// Catalog type being bought.
+    pub item_type_id: u32,
+    /// Requested quantity.
+    pub quantity: u32,
+    /// Client-asserted pang cost. Not authoritative.
+    pub claimed_cost_pang: u32,
+    /// Client-asserted point cost. Not authoritative.
+    pub claimed_cost_point: u32,
+}
+
+/// Shop purchase, client opcode `0x001d`.
+///
+/// # Provenance
+///
+/// Layout from `pangbox/server` (`game/packet/client.go` `ClientBuyItem`, `PurchaseItem`), ISC
+/// licensed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailPurchaseRequest {
+    /// Requested line items.
+    pub items: Vec<RetailPurchaseItem>,
+}
+
+impl DecodePacket for RetailPurchaseRequest {
+    const OPCODE: u16 = 0x001d;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let _unknown = reader.u8()?;
+        let count = usize::from(reader.u16_le()?);
+        if count > MAX_RETAIL_PURCHASE_ITEMS {
+            return Err(reader.invalid("purchase carries too many items"));
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let _unknown = reader.u32_le()?;
+            let item_type_id = reader.u32_le()?;
+            let _unknown2 = reader.u16_le()?;
+            let _unknown3 = reader.u16_le()?;
+            let quantity = reader.u32_le()?;
+            let claimed_cost_pang = reader.u32_le()?;
+            let claimed_cost_point = reader.u32_le()?;
+            items.push(RetailPurchaseItem {
+                item_type_id,
+                quantity,
+                claimed_cost_pang,
+                claimed_cost_point,
+            });
+        }
+        Ok(Self { items })
+    }
+}
+
+/// Pang balance after a purchase, server opcode `0x00c8`.
+///
+/// # Provenance
+///
+/// Two `u8`s, from `pangbox/server` (`game/packet/server.go` `ServerPangBalanceData`), ISC
+/// licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPangSpent {
+    /// Balance after the purchase.
+    pub remaining: u64,
+    /// Total spent by the purchase.
+    pub spent: u64,
+}
+
+impl EncodePacket for RetailPangSpent {
+    const OPCODE: u16 = 0x00c8;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u64_le(self.remaining);
+        writer.u64_le(self.spent);
+        Ok(())
+    }
+}
+
+/// Purchase outcome, server opcode `0x0068`.
+///
+/// # Provenance
+///
+/// A `u4` status then two `u8` balances, from `pangbox/server` (`game/packet/server.go`
+/// `ServerPurchaseItemResponse`), ISC licensed. Status `0` is success and `1` is the refusal
+/// upstream sends when the balance cannot cover the cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPurchaseResponse {
+    /// Zero on success.
+    pub status: u32,
+    /// Pang balance after the attempt.
+    pub pang: u64,
+    /// Point balance after the attempt.
+    pub points: u64,
+}
+
+impl RetailPurchaseResponse {
+    /// Status the client reads as "purchase refused".
+    pub const REFUSED: u32 = 1;
+}
+
+impl EncodePacket for RetailPurchaseResponse {
+    const OPCODE: u16 = 0x0068;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.status);
+        writer.u64_le(self.pang);
+        writer.u64_le(self.points);
+        Ok(())
+    }
+}
+
 /// Shop entry, client opcode `0x0140`.
 ///
 /// # Provenance

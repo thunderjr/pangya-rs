@@ -356,3 +356,30 @@ dot-sourcing fails and the calls afterwards look like they ran but did nothing.
 Because the login-to-game handover is single-use and short-lived, run the flow briskly: several
 minutes of manual poking between login and server selection expires it, and GameService then
 rejects the auth at `stage: "handover_consume"`.
+
+### Funding an account for shop testing
+
+`scripts/grant-balance.sh` credits pang and points through the server's own
+`account grant` command, which takes a row lock, refuses rather than wraps on overflow, and emits
+an operator audit line. Updating `profiles` with `psql` skips all three.
+
+```bash
+export DATABASE_URL=postgres://...
+scripts/grant-balance.sh --username rsp3 --pang 5000000 --points 10000
+scripts/grant-balance.sh --account-id 147 --pang 1000000
+```
+
+The lobby header reads its balances from the two frames that close the bootstrap (`0x0095` pang,
+`0x0096` points), so a grant applied while the client is connected shows up on the next login
+rather than immediately.
+
+### Detecting "Server is full."
+
+`Test-PangyaServerFull` in `C:\tools\pangya-client.ps1` watches the red label under the server
+list and returns whether it appeared. It samples for a few seconds because the label blinks.
+
+Worth knowing: that one message covers two unrelated causes. It is what a real client shows when
+the server list is malformed — a missing channel-count byte per entry produced it for a long time
+— and it is *also* what it shows when a list row is clicked before the list has rendered, which
+is an automation artifact rather than a server fault. `Enter-PangyaChannel` calls the check on its
+last attempt so a run that fails reports the client's own diagnosis instead of a generic timeout.

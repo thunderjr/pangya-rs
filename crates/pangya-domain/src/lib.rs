@@ -2883,6 +2883,11 @@ pub enum RepositoryError {
     /// Persisted data violated domain range/invariant checks.
     #[error("persisted data is invalid")]
     CorruptData,
+    /// A credit would take a balance past its representable ceiling.
+    ///
+    /// Refusing is the only safe outcome: wrapping would silently destroy a balance.
+    #[error("balance would overflow")]
+    BalanceOverflow,
     /// Storage is temporarily or permanently unavailable.
     #[error("storage operation failed: {0}")]
     Storage(StorageFault),
@@ -2971,6 +2976,44 @@ pub trait AccountRepository: Send + Sync {
         status: AccountStatus,
         now: SystemTime,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Credits an operator-authorised balance grant and returns the resulting balances.
+    ///
+    /// This is an operator action, not a gameplay one: nothing on the wire can reach it. It exists
+    /// so a local deployment can fund an account for shop testing without hand-editing rows, which
+    /// is how balances get corrupted. Both amounts are checked against the same balance ceiling the
+    /// reward path uses, so an operator cannot overflow an account into an inconsistent state.
+    fn grant_balance(
+        &self,
+        account_id: AccountId,
+        grant: BalanceGrant,
+    ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>>;
+}
+
+/// An operator-authorised credit to one account's balances.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BalanceGrant {
+    /// Pang to add.
+    pub pang: u64,
+    /// Points ("cookies") to add.
+    pub points: u64,
+}
+
+impl BalanceGrant {
+    /// Returns whether this grant would change anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.pang == 0 && self.points == 0
+    }
+}
+
+/// Balances after an operator grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountBalances {
+    /// Resulting pang balance.
+    pub pang: u64,
+    /// Resulting point balance.
+    pub points: u64,
 }
 
 /// Technology-neutral transactional economy repository contract.

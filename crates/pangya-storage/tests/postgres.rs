@@ -8,13 +8,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
-    AccountRepository, AccountStatus, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
-    BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole, CommitStrokeMatch,
-    ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit, EconomyError,
-    EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange, HandoverDigest,
-    HandoverError, HandoverRepository, IncompleteMatchAbortLimit, ItemCompatibility,
-    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId,
-    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    AccountRepository, AccountStatus, BalanceGrant, BeginSoloMatch, BeginSoloMatchOutcome,
+    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole,
+    CommitStrokeMatch, ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit,
+    EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
+    HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
+    ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
+    ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
     MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
     PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, ServiceKind,
@@ -4083,5 +4083,76 @@ async fn successful_operations_report_no_fault_and_a_missing_observer_changes_no
             .account
             .id,
         created.account.id
+    );
+}
+
+/// Operator balance grants are how an account gets funded for shop testing, so they must be
+/// additive, must refuse an unknown account rather than silently creating one, and must refuse
+/// rather than wrap when a credit would exceed the representable ceiling.
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn operator_balance_grants_accumulate_and_refuse_overflow(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let created = repository
+        .create_operator_account(account("BalanceUser", Some("BalanceNick")))
+        .await
+        .expect("account created");
+    let id = created.account.id;
+
+    let first = repository
+        .grant_balance(
+            id,
+            BalanceGrant {
+                pang: 10_000,
+                points: 25,
+            },
+        )
+        .await
+        .expect("first grant");
+    assert_eq!(first.pang, 10_000);
+    assert_eq!(first.points, 25);
+
+    // A second grant adds to the first rather than replacing it.
+    let second = repository
+        .grant_balance(
+            id,
+            BalanceGrant {
+                pang: 5_000,
+                points: 0,
+            },
+        )
+        .await
+        .expect("second grant");
+    assert_eq!(second.pang, 15_000);
+    assert_eq!(second.points, 25);
+
+    assert_eq!(
+        repository
+            .grant_balance(
+                id,
+                BalanceGrant {
+                    pang: u64::MAX,
+                    points: 0,
+                },
+            )
+            .await,
+        Err(RepositoryError::BalanceOverflow),
+        "a credit past the ceiling must refuse, never wrap"
+    );
+    // The refused grant left the balance untouched.
+    let after = repository
+        .grant_balance(id, BalanceGrant { pang: 0, points: 1 })
+        .await
+        .expect("grant after refusal");
+    assert_eq!(after.pang, 15_000);
+    assert_eq!(after.points, 26);
+
+    assert_eq!(
+        repository
+            .grant_balance(
+                AccountId::new(9_999_999).expect("id"),
+                BalanceGrant { pang: 1, points: 0 },
+            )
+            .await,
+        Err(RepositoryError::NotFound)
     );
 }

@@ -666,6 +666,8 @@ pub struct RetailPlayerStatistics {
     pub games_played: u32,
     /// Abandoned games, the other half of the quit rate.
     pub games_quit: u32,
+    /// Current pang balance.
+    pub pang: u64,
 }
 
 impl RetailPlayerStatistics {
@@ -692,7 +694,7 @@ impl RetailPlayerStatistics {
         writer.f32_le(0.0); // longest chip-in
         writer.u32_le(self.experience);
         writer.u8(self.level);
-        writer.u64_le(0); // lifetime Pang earned
+        writer.u64_le(self.pang);
         writer.u32_le(self.total_score as u32);
         writer.bytes(&[0; 5]);
         writer.u8(0);
@@ -717,6 +719,63 @@ impl RetailPlayerStatistics {
         writer.u32_le(0);
         writer.bytes(&[0; 8]);
         debug_assert_eq!(writer.as_slice().len() - start, PLAYER_STATISTICS_BYTES);
+    }
+}
+
+/// Pang balance update, server opcode `0x0095`.
+///
+/// The lobby header reads its pang from this, not from the bootstrap statistics block, so an
+/// account funded out of band shows zero until this is sent.
+///
+/// # Provenance
+///
+/// Type discriminant `273` selecting a `u4` status and a `u8` amount, from `pangbox/server`
+/// (`game/packet/server.go` `ServerMoneyUpdate`, `UpdatePangBalanceData`), ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPangBalance {
+    /// Current pang balance.
+    pub pang: u64,
+}
+
+impl EncodePacket for RetailPangBalance {
+    const OPCODE: u16 = 0x0095;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u16_le(273);
+        writer.u32_le(0);
+        writer.u64_le(self.pang);
+        Ok(())
+    }
+}
+
+/// Point ("cookie") balance, server opcode `0x0096`.
+///
+/// # Provenance
+///
+/// A single `u8`, from `pangbox/server` (`game/packet/server.go` `ServerPointsBalance`), ISC
+/// licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPointBalance {
+    /// Current point balance.
+    pub points: u64,
+}
+
+impl EncodePacket for RetailPointBalance {
+    const OPCODE: u16 = 0x0096;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u64_le(self.points);
+        Ok(())
     }
 }
 

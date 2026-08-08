@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pang, points FROM profiles WHERE account_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pang",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "points",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "2dbd0b3d8eea88e8f05d707bf8e471ab0f9f23c5b5bd944444db65df44b3b0bd"
+}
