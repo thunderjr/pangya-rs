@@ -27,10 +27,19 @@ use crate::{
         RelayDisposition, SoloMatchError, SoloMatchPhase, SoloMatchState, SoloStartPlan,
     },
     stroke_state::{
-        StrokeDeadline, StrokeDeadlineOutcome, StrokeLoadingOutcome, StrokeMatchError,
-        StrokeMatchPhase, StrokeMatchState, StrokeRelayOutcome, StrokeStartPlan,
+        StrokeDeadline, StrokeDeadlineOutcome, StrokeHoleOutOutcome, StrokeLoadingOutcome,
+        StrokeMatchError, StrokeMatchPhase, StrokeMatchState, StrokeRelayOutcome, StrokeStartPlan,
     },
 };
+
+/// The participant a stroke phase is waiting on, if any.
+const fn active_participant(phase: StrokeMatchPhase) -> Option<PlayerConnectionId> {
+    match phase {
+        StrokeMatchPhase::AwaitAction { active, .. }
+        | StrokeMatchPhase::AwaitResult { active, .. } => Some(active),
+        _ => None,
+    }
+}
 
 /// Identity established by the connection/authentication boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +52,37 @@ pub struct RoomIdentity {
     pub nickname: Nickname,
     /// The account's selected character, so a room roster can render it.
     pub character_id: Option<CharacterId>,
+}
+
+/// The largest client-authored in-match payload this server will relay.
+pub const MAX_RETAIL_RELAY_BYTES: usize = 256;
+
+/// A client-authored in-match frame relayed to the participants without interpretation.
+///
+/// The client computes trajectory and ball state, so these carry its own bytes. This server's
+/// authority is the stroke count and turn arbitration around them, never their content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailMatchRelay {
+    /// The committed shot, announced to the participants.
+    Shot(Vec<u8>),
+    /// Post-shot ball state, echoed to the participants.
+    Sync(Vec<u8>),
+}
+
+impl RetailMatchRelay {
+    /// The relayed bytes.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        match self {
+            Self::Shot(body) | Self::Sync(body) => body,
+        }
+    }
+
+    /// Whether the payload is within the relay bound.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.body().len() <= MAX_RETAIL_RELAY_BYTES
+    }
 }
 
 /// Bounded event delivered to a room member.
@@ -113,6 +153,13 @@ pub enum RoomEvent {
         from: PlayerConnectionId,
         /// Validated protocol value.
         result: StrokeShotResult,
+    },
+    /// A participant's own in-match frame, relayed unchanged to the captured roster.
+    RetailRelay {
+        /// Captured sender connection.
+        from: PlayerConnectionId,
+        /// The client's payload and what it is.
+        relay: RetailMatchRelay,
     },
     /// Exactly one connected coordinator must persist this aggregate settlement.
     StrokeSettlementRequested(CommitStrokeMatch),
@@ -944,6 +991,66 @@ impl RoomState {
         Ok(outcome)
     }
 
+    fn retail_relay(
+        &mut self,
+        caller: PlayerConnectionId,
+        relay: RetailMatchRelay,
+    ) -> Result<(), StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        if !relay.is_bounded() {
+            return Err(StrokeMatchError::Invariant);
+        }
+        if !matches!(
+            self.stroke.phase(),
+            StrokeMatchPhase::AwaitAction { .. } | StrokeMatchPhase::AwaitResult { .. }
+        ) {
+            return Err(StrokeMatchError::InvalidPhase);
+        }
+        self.broadcast_match(RoomEvent::RetailRelay {
+            from: caller,
+            relay,
+        });
+        Ok(())
+    }
+
+    fn stroke_hole_out(
+        &mut self,
+        caller: PlayerConnectionId,
+    ) -> Result<StrokeHoleOutOutcome, StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        let active_before = active_participant(self.stroke.phase());
+        let outcome = self.stroke.hole_out(caller)?;
+        match outcome {
+            StrokeHoleOutOutcome::Settlement(commit) => {
+                self.deadlines.clear_stroke();
+                self.broadcast_match(RoomEvent::StrokePhase {
+                    match_id: commit.match_id(),
+                    phase: self.stroke.phase(),
+                });
+                let _delivered = self.request_stroke_settlement(commit, None);
+            }
+            // Only a changed turn is announced. Finishing out of turn leaves the other
+            // participant mid-shot, and re-announcing their turn would restart it.
+            StrokeHoleOutOutcome::Waiting => {
+                if active_participant(self.stroke.phase()) != active_before {
+                    let plan = self
+                        .stroke
+                        .start_plan()
+                        .ok_or(StrokeMatchError::InvalidPhase)?;
+                    let generation = self
+                        .stroke
+                        .turn_generation()
+                        .ok_or(StrokeMatchError::Invariant)?;
+                    self.deadlines.stroke_turn =
+                        Some((Instant::now() + plan.turn_timeout(), generation));
+                    self.broadcast_match(RoomEvent::StrokeTurn(self.stroke.phase()));
+                }
+            }
+            StrokeHoleOutOutcome::Duplicate => {}
+        }
+        Ok(outcome)
+    }
+
     fn stroke_give_up(
         &mut self,
         caller: PlayerConnectionId,
@@ -1416,6 +1523,15 @@ enum RoomCommand {
         caller: PlayerConnectionId,
         result: StrokeShotResult,
         reply: oneshot::Sender<Result<StrokeRelayOutcome, StrokeMatchError>>,
+    },
+    StrokeHoleOut {
+        caller: PlayerConnectionId,
+        reply: oneshot::Sender<Result<StrokeHoleOutOutcome, StrokeMatchError>>,
+    },
+    RetailRelay {
+        caller: PlayerConnectionId,
+        relay: RetailMatchRelay,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
     },
     StrokeGiveUp {
         caller: PlayerConnectionId,
@@ -1911,6 +2027,40 @@ impl RoomHandle {
         receive.await.map_err(|_| StrokeMatchError::Closed)?
     }
 
+    /// Relays one participant's own in-match frame to the captured roster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the room is closed, the caller is not a participant, the payload
+    /// exceeds [`MAX_RETAIL_RELAY_BYTES`], or no hole is being played.
+    pub async fn retail_relay(
+        &self,
+        caller: PlayerConnectionId,
+        relay: RetailMatchRelay,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::RetailRelay {
+            caller,
+            relay,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
+    /// Records that a participant holed out, and returns automatic settlement once both have.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the room is closed or the aggregate rejects the completion.
+    pub async fn stroke_hole_out(
+        &self,
+        caller: PlayerConnectionId,
+    ) -> Result<StrokeHoleOutOutcome, StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::StrokeHoleOut { caller, reply })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
     /// Applies any participant's give-up and returns automatic settlement.
     pub async fn stroke_give_up(
         &self,
@@ -2377,6 +2527,18 @@ fn handle_normal(
             reply,
         } => {
             let _ignored = reply.send(state.stroke_result(caller, result));
+            true
+        }
+        RoomCommand::StrokeHoleOut { caller, reply } => {
+            let _ignored = reply.send(state.stroke_hole_out(caller));
+            true
+        }
+        RoomCommand::RetailRelay {
+            caller,
+            relay,
+            reply,
+        } => {
+            let _ignored = reply.send(state.retail_relay(caller, relay));
             true
         }
         RoomCommand::StrokeGiveUp { caller, reply } => {

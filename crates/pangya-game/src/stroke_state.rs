@@ -208,6 +208,17 @@ pub enum StrokeLoadingOutcome {
     Duplicate,
 }
 
+/// Result of a participant announcing that their ball is in the hole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrokeHoleOutOutcome {
+    /// The caller finished; the other participant is still playing.
+    Waiting,
+    /// The caller had already finished this hole.
+    Duplicate,
+    /// Both participants are terminal and settlement is prepared.
+    Settlement(CommitStrokeMatch),
+}
+
 /// Accepted relay and optional automatic terminal settlement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StrokeRelayOutcome {
@@ -655,6 +666,58 @@ impl StrokeMatchState {
         })
     }
 
+    /// Records that a participant's ball is in the hole, without charging a stroke.
+    ///
+    /// A retail client plays the holing shot through the ordinary action/result pair and only
+    /// *then* announces that the hole is over, so counting the announcement as a stroke would
+    /// score every hole one over. The announcement is therefore a completion, not a shot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller is not a participant, when a shot of theirs is still
+    /// outstanding, or when no hole is being played.
+    pub fn hole_out(
+        &mut self,
+        caller: PlayerConnectionId,
+    ) -> Result<StrokeHoleOutOutcome, StrokeMatchError> {
+        let active = self.active.as_mut().ok_or(StrokeMatchError::InvalidPhase)?;
+        let index = player_index(active, caller)?;
+        // In `AwaitResult` the caller's own shot has not landed yet, so nothing can have holed.
+        if active.phase != ActivePhase::AwaitAction {
+            return Err(StrokeMatchError::InvalidPhase);
+        }
+        if active.players[index].completion.is_some() {
+            return Ok(StrokeHoleOutOutcome::Duplicate);
+        }
+        if active.players[index].strokes == 0 {
+            return Err(StrokeMatchError::InvalidPhase);
+        }
+        active.players[index].completion = Some(StrokeCompletion::Holed);
+        if active
+            .players
+            .iter()
+            .all(|player| player.completion.is_some())
+        {
+            let commit = build_commit(active)?;
+            active.phase = ActivePhase::ResultsPending(commit);
+            return Ok(StrokeHoleOutOutcome::Settlement(commit));
+        }
+        if index == active.active {
+            let next_turn = active
+                .turn
+                .checked_add(1)
+                .ok_or(StrokeMatchError::Invariant)?;
+            let next_generation = active
+                .turn_generation
+                .checked_add(1)
+                .ok_or(StrokeMatchError::Invariant)?;
+            active.active = next_unfinished(active, index);
+            active.turn = next_turn;
+            active.turn_generation = next_generation;
+        }
+        Ok(StrokeHoleOutOutcome::Waiting)
+    }
+
     /// Voluntary participant forfeit; the other becomes winner-by-forfeit.
     pub fn give_up(
         &mut self,
@@ -1088,6 +1151,141 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(state.confirm_in_game(mark).is_ok());
+    }
+
+    /// A retail client plays the holing shot through the ordinary action/result pair and only
+    /// then announces the hole is over. Charging that announcement as a stroke would score every
+    /// hole one over, so it is a completion and nothing else.
+    #[test]
+    fn holing_out_completes_without_charging_a_stroke() {
+        let plan = plan(10);
+        let mut state = StrokeMatchState::new();
+        playing(&mut state, &plan, false);
+        let roster = *plan.roster();
+        assert_eq!(
+            state.accept_action(roster[0], action(1, 1.0)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .accept_result(roster[0], result(1, 1.0, false))
+                .map(|outcome| outcome.disposition()),
+            Ok(RelayDisposition::Accepted)
+        );
+        // The turn moved on, so the announcement arrives from the participant who is not active.
+        assert_eq!(
+            state.phase(),
+            StrokeMatchPhase::AwaitAction {
+                active: roster[1],
+                turn: 2,
+                sequence: 1,
+            }
+        );
+        assert_eq!(state.hole_out(roster[0]), Ok(StrokeHoleOutOutcome::Waiting));
+        assert_eq!(
+            state.hole_out(roster[0]),
+            Ok(StrokeHoleOutOutcome::Duplicate),
+            "a repeated announcement changes nothing"
+        );
+        // The other participant keeps playing, and keeps the turn once the first is finished.
+        assert_eq!(
+            state.accept_action(roster[1], action(1, 1.0)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .accept_result(roster[1], result(1, 1.0, false))
+                .map(|outcome| outcome.disposition()),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state.phase(),
+            StrokeMatchPhase::AwaitAction {
+                active: roster[1],
+                turn: 3,
+                sequence: 2,
+            }
+        );
+        let commit = match state.hole_out(roster[1]) {
+            Ok(StrokeHoleOutOutcome::Settlement(commit)) => commit,
+            other => unreachable!("both finished settles the hole: {other:?}"),
+        };
+        // One shot each: exactly one stroke each, and both holed.
+        for index in 0..2 {
+            assert_eq!(commit.players()[index].strokes(), 1);
+            assert_eq!(
+                commit.players()[index].completion(),
+                DomainCompletion::Holed
+            );
+        }
+    }
+
+    /// The hole cannot be over before it has been played, and it cannot be over while the
+    /// caller's own shot is still outstanding.
+    #[test]
+    fn holing_out_is_refused_before_a_stroke_and_mid_shot() {
+        let plan = plan(10);
+        let mut state = StrokeMatchState::new();
+        playing(&mut state, &plan, false);
+        let roster = *plan.roster();
+        assert_eq!(
+            state.hole_out(roster[0]),
+            Err(StrokeMatchError::InvalidPhase)
+        );
+        assert_eq!(
+            state.hole_out(connection(9)),
+            Err(StrokeMatchError::NotParticipant)
+        );
+        assert_eq!(
+            state.accept_action(roster[0], action(1, 1.0)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state.hole_out(roster[0]),
+            Err(StrokeMatchError::InvalidPhase),
+            "the shot has not landed yet"
+        );
+    }
+
+    /// Finishing while holding the turn must hand it to the participant still playing, or the
+    /// hole would wait on somebody who has nothing left to do.
+    #[test]
+    fn holing_out_in_turn_hands_the_turn_over() {
+        let plan = plan(10);
+        let mut state = StrokeMatchState::new();
+        playing(&mut state, &plan, false);
+        let roster = *plan.roster();
+        // Both play one shot, which returns the turn to the first participant.
+        for index in [0_usize, 1_usize] {
+            assert_eq!(
+                state.accept_action(roster[index], action(1, 1.0)),
+                Ok(RelayDisposition::Accepted)
+            );
+            assert_eq!(
+                state
+                    .accept_result(roster[index], result(1, 1.0, false))
+                    .map(|outcome| outcome.disposition()),
+                Ok(RelayDisposition::Accepted)
+            );
+        }
+        assert_eq!(
+            state.phase(),
+            StrokeMatchPhase::AwaitAction {
+                active: roster[0],
+                turn: 3,
+                sequence: 2,
+            }
+        );
+        assert_eq!(state.hole_out(roster[0]), Ok(StrokeHoleOutOutcome::Waiting));
+        assert_eq!(
+            state.phase(),
+            StrokeMatchPhase::AwaitAction {
+                active: roster[1],
+                turn: 4,
+                sequence: 2,
+            }
+        );
+        assert_eq!(state.turn_generation(), Some(4));
     }
 
     #[test]

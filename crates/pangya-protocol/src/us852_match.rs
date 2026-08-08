@@ -297,6 +297,121 @@ impl EncodePacket for RetailShotCommitRelay {
     }
 }
 
+/// Post-shot ball state echoed to every participant, server opcode `0x0064`.
+///
+/// The client owns ball physics, so the body is the shooting client's own sync payload
+/// relayed unchanged. Upstream echoes the first copy it receives to everyone, including the
+/// shooter, and this does the same.
+///
+/// # Provenance
+///
+/// Opcode and echo behaviour from `pangbox/server` (`game/packet/server.go`
+/// `ServerRoomShotSync`, `game/room/room.go` `handleRoomGameShotSync`), ISC licensed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailShotSync {
+    /// The client's own sync payload, relayed unchanged.
+    pub data: Vec<u8>,
+}
+
+impl EncodePacket for RetailShotSync {
+    const OPCODE: u16 = 0x0064;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&self.data);
+        Ok(())
+    }
+}
+
+/// Players a match result may carry.
+pub const MAX_MATCH_STANDINGS: usize = 8;
+/// Bytes in one standings record: `u32`, three bytes, `u16`, then three `u64`.
+pub const RETAIL_STANDING_BYTES: usize = 33;
+
+/// One player's line on the results screen.
+///
+/// # Provenance
+///
+/// Field order and widths from `pangbox/server` (`game/packet/server.go` `PlayerGameResult`),
+/// ISC licensed. Two fields are unclassified there and are written as zero here rather than
+/// given a guessed meaning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailStanding {
+    /// Whose line this is.
+    pub connection_id: u32,
+    /// One-based finishing place.
+    pub place: u8,
+    /// Score relative to par.
+    pub score: i8,
+    /// Experience awarded.
+    pub experience: u16,
+    /// Pang awarded for play.
+    pub pang: u64,
+    /// Pang awarded as a completion bonus.
+    pub bonus_pang: u64,
+}
+
+impl RetailStanding {
+    fn encode_body(self, writer: &mut PacketWriter) {
+        writer.u32_le(self.connection_id);
+        writer.u8(self.place);
+        writer.i8(self.score);
+        writer.u8(0); // unclassified upstream
+        writer.u16_le(self.experience);
+        writer.u64_le(self.pang);
+        writer.u64_le(self.bonus_pang);
+        writer.u64_le(0); // unclassified upstream
+    }
+}
+
+/// Match complete with final standings, server opcode `0x0066`.
+///
+/// This is what a real client puts on its results screen, so the values here are the durable
+/// server-side settlement — never anything the client claimed.
+///
+/// # Provenance
+///
+/// Opcode and layout from `pangbox/server` (`game/packet/server.go` `ServerRoomFinishGame`),
+/// ISC licensed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMatchFinish {
+    /// Final standings, best place first.
+    pub standings: Vec<RetailStanding>,
+}
+
+impl EncodePacket for RetailMatchFinish {
+    const OPCODE: u16 = 0x0066;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        if self.standings.len() > MAX_MATCH_STANDINGS {
+            return Err(PacketEncodeError::Limit {
+                field: "match standings",
+                actual: self.standings.len(),
+                maximum: MAX_MATCH_STANDINGS,
+            });
+        }
+        let count = u8::try_from(self.standings.len()).map_err(|_| PacketEncodeError::Limit {
+            field: "match standings",
+            actual: self.standings.len(),
+            maximum: MAX_MATCH_STANDINGS,
+        })?;
+        writer.u8(count);
+        for standing in &self.standings {
+            standing.encode_body(writer);
+        }
+        Ok(())
+    }
+}
+
 /// Hole complete, server opcode `0x0065`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetailFinishHole;
@@ -418,6 +533,44 @@ mod tests {
         )
         .expect("relay");
         assert_eq!(relay.as_slice(), &[5, 0, 0, 0, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn standings_are_counted_then_written_in_place_order() {
+        let payload = encode_packet_payload(
+            &RetailMatchFinish {
+                standings: vec![
+                    RetailStanding {
+                        connection_id: 1,
+                        place: 1,
+                        score: -1,
+                        experience: 40,
+                        pang: 300,
+                        bonus_pang: 100,
+                    },
+                    RetailStanding {
+                        connection_id: 2,
+                        place: 2,
+                        score: 3,
+                        experience: 20,
+                        pang: 150,
+                        bonus_pang: 0,
+                    },
+                ],
+            },
+            &profile(),
+        )
+        .expect("encode");
+        // One count byte, then one 33-byte record per player.
+        assert_eq!(payload.len(), 1 + 2 * RETAIL_STANDING_BYTES);
+        assert_eq!(payload[0], 2);
+        assert_eq!(payload[5], 1, "first place");
+        assert_eq!(payload[6] as i8, -1, "one under par");
+        assert_eq!(
+            payload[1 + RETAIL_STANDING_BYTES + 5] as i8,
+            3,
+            "three over par"
+        );
     }
 
     #[test]

@@ -6263,14 +6263,14 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 
 /// A real client cannot start a versus room holding fewer players than its capacity, and the
 /// smallest capacity its Make Room dialog offers is two. So the only match a real client can ever
-/// begin is a two-player one — and this pins what the server actually does with that today.
+/// begin is a two-player one, and this drives exactly that over TCP: two authenticated retail
+/// clients, a full versus room, both ready, then a whole hole played turn by turn and settled.
 ///
-/// The retail start handler builds a `BeginSoloMatch` for the connection that pressed Start, so
-/// the second player in the room is not a participant. This test exists to make that visible and
-/// to fail loudly if the behaviour changes, rather than leaving it to be rediscovered against a
-/// real client where it would look like a client bug.
+/// This supersedes the pin that the retail start built a `BeginSoloMatch` for whoever pressed
+/// Start. What it asserts instead is the property that pin existed to expose: **both** accounts
+/// are participants and both are paid, so a versus hole can be scored.
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPool) {
+async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
         .one_hole_course(CourseId::new(7).expect("course ID"))
@@ -6285,7 +6285,7 @@ async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPoo
                 channel_id: 1,
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
-                    packets_per_window: 200,
+                    packets_per_window: 400,
                     ..GameRuntimeLimits::default()
                 },
                 solo_practice: Some(SoloRuntimeConfig {
@@ -6298,7 +6298,18 @@ async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPoo
                         .expect("recovery limit"),
                     shot_packets_per_window: 80,
                 }),
-                stroke_two: None,
+                stroke_two: Some(StrokeRuntimeConfig {
+                    course,
+                    catalog_fingerprint: catalog.fingerprint(),
+                    loading_timeout: Duration::from_secs(30),
+                    turn_timeout: Duration::from_secs(60),
+                    game_timeout: Duration::from_secs(300),
+                    commit_timeout: Duration::from_secs(2),
+                    max_strokes: 10,
+                    startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
+                        .expect("recovery limit"),
+                    shot_packets_per_window: 120,
+                }),
                 economy: None,
                 retail_bootstrap: true,
             },
@@ -6357,7 +6368,15 @@ async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPoo
     send_packet(&mut host, host_key, 3, 0x0008, &create.into_inner()).await;
     let (opcode, joined) = receive_packet(&mut host, host_key).await;
     assert_eq!(opcode, 0x0049, "room create is answered with a join result");
-    let room_number = u16::from_le_bytes([joined[65], joined[66]]);
+    assert_eq!(
+        u16::from_le_bytes([joined[0], joined[1]]),
+        0,
+        "the room was created"
+    );
+    // The room number sits after the status, the name, the settings block and the identity
+    // fields; the same offset the room create/join test reads it from.
+    let room_number =
+        u16::from_le_bytes([joined[2 + 64 + 5 + 17 + 3], joined[2 + 64 + 5 + 17 + 4]]);
     let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
 
     // The visitor joins, filling the room.
@@ -6365,11 +6384,17 @@ async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPoo
     join.u16_le(room_number);
     join.pstring(b"", 64).expect("join password");
     send_packet(&mut visitor, visitor_key, 3, 0x0009, &join.into_inner()).await;
-    let visitor_frames =
-        drain_available(&mut visitor, visitor_key, Duration::from_millis(900)).await;
-    assert!(
-        visitor_frames.contains(&0x0049),
-        "the visitor is admitted to the room: {visitor_frames:04x?}"
+    let (opcode, admitted) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x0049, "the join is answered");
+    assert_eq!(
+        u16::from_le_bytes([admitted[0], admitted[1]]),
+        0,
+        "the visitor is admitted to the room, not refused"
+    );
+    assert_eq!(
+        receive_packet(&mut visitor, visitor_key).await.0,
+        0x0048,
+        "and sees the roster it joined"
     );
     let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
 
@@ -6380,32 +6405,140 @@ async fn game_retail_start_with_two_players_begins_only_a_solo_match(pool: PgPoo
     let _ = drain_available(&mut visitor, visitor_key, Duration::from_millis(600)).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
 
-    // The host starts. The match that begins is a solo one belonging to the host alone: the
-    // guest's account has no match row, so nothing it does can be scored.
+    // The host starts. Both clients receive the same hole intro, because both are playing it.
     send_packet(&mut host, host_key, 5, 0x000e, &0_u32.to_le_bytes()).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    for (stream, key, who) in [
+        (&mut host, host_key, "host"),
+        (&mut visitor, visitor_key, "visitor"),
+    ] {
+        let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        for expected in [0x0076_u16, 0x0052, 0x009e, 0x005b] {
+            assert!(
+                frames.contains(&expected),
+                "{who} receives {expected:#06x} of the hole intro: {frames:04x?}"
+            );
+        }
+    }
 
-    let host_matches: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM match_players WHERE account_id = $1")
-            .bind(owner.account.id.get())
-            .fetch_one(&pool)
-            .await
-            .expect("host match count");
-    let guest_matches: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM match_players WHERE account_id = $1")
-            .bind(guest.account.id.get())
-            .fetch_one(&pool)
-            .await
-            .expect("guest match count");
+    // Both load. The turn opens only once both have, and both are told whose it is.
+    send_packet(&mut host, host_key, 6, 0x0011, &[]).await;
+    let waiting = drain_available(&mut visitor, visitor_key, Duration::from_millis(500)).await;
+    assert!(
+        waiting.is_empty(),
+        "one loaded player does not open the turn: {waiting:04x?}"
+    );
+    send_packet(&mut visitor, visitor_key, 6, 0x0011, &[]).await;
+    for (stream, key, who) in [
+        (&mut host, host_key, "host"),
+        (&mut visitor, visitor_key, "visitor"),
+    ] {
+        let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        assert!(
+            frames.contains(&0x0053) && frames.contains(&0x0063),
+            "{who} is told the hole started and whose turn it is: {frames:04x?}"
+        );
+    }
 
-    assert_eq!(host_matches, 1, "the host who pressed Start gets a match");
+    // One shot each, alternating. The shot itself is relayed to the other client unchanged.
+    let mut salt = 7_u8;
+    for host_shoots in [true, false] {
+        {
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            send_packet(from, from_key, salt, 0x0012, &[0xab; 8]).await;
+        }
+        {
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            let relayed = drain_available(other, other_key, Duration::from_millis(900)).await;
+            assert!(
+                relayed.contains(&0x0055),
+                "the other client sees the committed shot: {relayed:04x?}"
+            );
+        }
+        salt = salt.wrapping_add(1);
+        {
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            let _ = drain_available(from, from_key, Duration::from_millis(400)).await;
+            send_packet(from, from_key, salt, 0x001c, &[]).await;
+            let handover = drain_available(from, from_key, Duration::from_millis(900)).await;
+            assert!(
+                handover.contains(&0x00cc) && handover.contains(&0x0063),
+                "the turn ends and the next one starts: {handover:04x?}"
+            );
+        }
+        {
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            let _ = drain_available(other, other_key, Duration::from_millis(600)).await;
+        }
+        salt = salt.wrapping_add(1);
+    }
+
+    // Both hole out. The second completion settles the match for both accounts at once.
+    send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
+    send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
+    for (stream, key, who) in [
+        (&mut host, host_key, "host"),
+        (&mut visitor, visitor_key, "visitor"),
+    ] {
+        let frames = drain_available(stream, key, Duration::from_millis(2000)).await;
+        assert!(
+            frames.contains(&0x0065),
+            "{who} is told the hole finished: {frames:04x?}"
+        );
+        assert!(
+            frames.contains(&0x0066),
+            "{who} receives the final standings: {frames:04x?}"
+        );
+    }
+
+    // Both accounts are participants of the same match, and both were paid exactly once.
+    let (matches, players): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM matches), (SELECT count(*) FROM match_players)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("match rows");
+    assert_eq!(matches, 1, "one durable match");
+    assert_eq!(players, 2, "both players are participants of it");
+    for (account, who) in [(owner.account.id, "host"), (guest.account.id, "guest")] {
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM match_players WHERE account_id = $1")
+                .bind(account.get())
+                .fetch_one(&pool)
+                .await
+                .expect("participant row");
+        assert_eq!(rows, 1, "{who} is scored");
+    }
+    let (currency_rows, progression_rows): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM currency_ledger), (SELECT count(*) FROM progression_ledger)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ledger rows");
+    assert_eq!(currency_rows, 2, "one immutable Pang ledger row per player");
     assert_eq!(
-        guest_matches, 0,
-        "the second player in the room is not a participant: the retail start path builds a \
-         BeginSoloMatch for one account, so a two-player versus room cannot be scored. This is \
-         the blocker for SPEC 19.6 steps 7-12, not a client defect."
+        progression_rows, 2,
+        "one immutable EXP ledger row per player"
     );
 
+    drop(host);
+    drop(visitor);
     shutdown.cancel();
     task.await.expect("party join").expect("party serve");
 }

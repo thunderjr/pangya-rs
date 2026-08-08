@@ -97,9 +97,10 @@ pub use us852_bootstrap::{
     RetailPlayerStatistics, RetailPointBalance, ServerChannelList, US852_SERVER_VERSION,
 };
 pub use us852_match::{
-    MAX_MATCH_HOLES, RetailAimRotate, RetailFinishHole, RetailHole, RetailHoleWeather,
-    RetailHoleWind, RetailMatchInfo, RetailMatchStart, RetailPlayerStartHole,
-    RetailShotCommitRelay, RetailTurnEnd, RetailTurnStart, RetailWeather,
+    MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RETAIL_STANDING_BYTES, RetailAimRotate, RetailFinishHole,
+    RetailHole, RetailHoleWeather, RetailHoleWind, RetailMatchFinish, RetailMatchInfo,
+    RetailMatchStart, RetailPlayerStartHole, RetailShotCommitRelay, RetailShotSync, RetailStanding,
+    RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,

@@ -69,13 +69,19 @@ startup_recovery_limit = 1000
 shot_packets_per_window = 120
 
 [game.stroke_two]
-# Local synthetic exactly-two/one-hole protocol only; disabled and not retail-compatible.
-enabled = false
-course_id = 7
-course_par = 0
-loading_timeout = "30s"
-turn_timeout = "30s"
-game_timeout = "10m"
+# Required by a real client. It will not start a versus room that is not full, and the smallest
+# capacity its Make Room dialog offers is two, so every match it can start is a two-player one
+# and runs on this lifecycle. Course and par must match `solo_practice`: both describe the one
+# hole this server settles, and the client loads the course named here.
+enabled = true
+course_id = 671088640
+course_par = 4
+loading_timeout = "60s"
+# These two are what the client counts down on screen, because the match plan carries them.
+# They are deliberately generous: a turn that expires forfeits the hole, and an operator
+# driving two clients by hand is slower than a player.
+turn_timeout = "3m"
+game_timeout = "30m"
 commit_timeout = "3s"
 max_strokes = 30
 startup_recovery_limit = 1000

@@ -30,10 +30,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     match_state::{RelayDisposition, SoloMatchError, SoloStartPlan},
     room::{
-        RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomEvent, RoomHandle, RoomIdentity,
-        spawn_room_with_events,
+        RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomEvent, RoomHandle,
+        RoomIdentity, spawn_room_with_events,
     },
-    stroke_state::{StrokeLoadingOutcome, StrokeMatchError, StrokeRelayOutcome, StrokeStartPlan},
+    stroke_state::{
+        StrokeHoleOutOutcome, StrokeLoadingOutcome, StrokeMatchError, StrokeRelayOutcome,
+        StrokeStartPlan,
+    },
 };
 
 /// Hard bounds for the lobby registry and each room it creates.
@@ -250,6 +253,10 @@ pub enum LobbyStrokeCommand {
     ShotAction(StrokeShotAction),
     /// Validated result.
     ShotResult(StrokeShotResult),
+    /// Participant announced their ball is in the hole.
+    HoleOut,
+    /// Participant's own in-match frame, relayed to the roster unchanged.
+    Relay(RetailMatchRelay),
     /// Participant give-up.
     GiveUp,
     /// Explicit no-reward abort.
@@ -267,6 +274,8 @@ pub enum LobbyStrokeRouteResult {
     Relay(RelayDisposition),
     /// Result relay plus optional terminal settlement.
     Result(StrokeRelayOutcome),
+    /// Hole-out completion, with settlement once both participants are terminal.
+    HoleOut(StrokeHoleOutOutcome),
     /// Automatic terminal settlement.
     Settlement(CommitStrokeMatch),
     /// Exact abort, if active state existed.
@@ -1357,6 +1366,14 @@ impl LobbyRegistry {
                 .stroke_result(connection_id, result)
                 .await
                 .map(LobbyStrokeRouteResult::Result),
+            LobbyStrokeCommand::Relay(relay) => handle
+                .retail_relay(connection_id, relay)
+                .await
+                .map(|()| LobbyStrokeRouteResult::Applied),
+            LobbyStrokeCommand::HoleOut => handle
+                .stroke_hole_out(connection_id)
+                .await
+                .map(LobbyStrokeRouteResult::HoleOut),
             LobbyStrokeCommand::GiveUp => handle
                 .stroke_give_up(connection_id)
                 .await
