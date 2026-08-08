@@ -467,6 +467,19 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     Two of the four candidates are now ruled out by experiment rather than by argument, leaving
     the equipped-item slots and the title and guild fields in the trailing equipment slots.
 
+    Three further things were checked and are **not** the cause:
+
+    - Every catalog id this server sends is a real entry in the client's own tables — character
+      `0x04000000` in `Character.iff`, club set `0x10000000` in `ClubSet.iff`, ball `0x14000000`
+      in `Ball.iff`. Checked offline against the extracted tables, no client run needed.
+    - The season-history block was widened from 21 courses per season to 22, which is what
+      `Acrisio-Filho/SuperSS-Dev` writes (`MS_NUM_MAPS`, `Server Lib/Game Server/TYPE/pangya_game_st.h`)
+      across its twelve blocks. The key stayed zero and the crash was unchanged, so the width was
+      reverted rather than left changed on a shared record — it alters the handover for every
+      client, and nothing observed distinguishes 21 from 22.
+    - Both the nickname and the match start time land at their right offsets in the client's
+      record, so the record is not shifted wholesale; only the key field is unset.
+
     The method is settled and cheap: sample the array, change one field, sample again. Each
     cycle needs the room number, which the server now logs.
 
