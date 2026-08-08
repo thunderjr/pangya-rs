@@ -120,8 +120,21 @@ impl EncodePacket for RetailMatchInfo {
         writer.u32_le(0); // trophy catalog id
         writer.u32_le(self.shot_timer_ms);
         writer.u32_le(self.game_timer_ms);
-        for hole in &self.holes {
-            hole.encode_body(writer);
+        // Eighteen hole records, always, however few are played. The client reads the array by
+        // its fixed width rather than by `hole_count`, so a short one leaves it parsing the
+        // seed and the collectible table as hole descriptors and dereferencing what it finds:
+        // the observed failure is an access violation on a null course during hole load.
+        for index in 0..MAX_MATCH_HOLES {
+            self.holes
+                .get(index)
+                .copied()
+                .unwrap_or(RetailHole {
+                    random_id: 0,
+                    pin: 0,
+                    course: self.course,
+                    number: 0,
+                })
+                .encode_body(writer);
         }
         writer.u32_le(self.random_seed);
         // Per-hole collectible tables. This server places none, but the client still reads
@@ -439,9 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn match_info_always_carries_eighteen_collectible_counts() {
+    fn match_info_always_carries_eighteen_holes_and_collectible_counts() {
         let info = RetailMatchInfo {
-            course: 0,
+            course: 7,
             room_ui_type: 0,
             hole_mode: 0,
             hole_count: 3,
@@ -459,12 +472,33 @@ mod tests {
             random_seed: 99,
         };
         let payload = encode_packet_payload(&info, &profile()).expect("encode");
-        // 4 header bytes, 3 u32 fields, 3 holes of 7 bytes, the seed, then 18 count bytes.
-        assert_eq!(payload.len(), 4 + 12 + 3 * 7 + 4 + MAX_MATCH_HOLES);
+        // 4 header bytes, 3 u32 fields, EIGHTEEN holes of 7 bytes whatever `hole_count` says,
+        // the seed, then 18 count bytes. The client reads the hole array by its fixed width.
+        assert_eq!(
+            payload.len(),
+            4 + 12 + MAX_MATCH_HOLES * 7 + 4 + MAX_MATCH_HOLES
+        );
         assert!(
             payload[payload.len() - MAX_MATCH_HOLES..]
                 .iter()
                 .all(|b| *b == 0)
+        );
+        // The padding holes still name the match's course, so nothing the client reads past
+        // the played holes points at a course that does not exist.
+        for index in 3..MAX_MATCH_HOLES {
+            let at = 4 + 12 + index * 7;
+            assert_eq!(payload[at + 5], 7, "hole {index} course");
+        }
+        // The seed follows all eighteen, not the third.
+        let seed_at = 4 + 12 + MAX_MATCH_HOLES * 7;
+        assert_eq!(
+            u32::from_le_bytes([
+                payload[seed_at],
+                payload[seed_at + 1],
+                payload[seed_at + 2],
+                payload[seed_at + 3],
+            ]),
+            99
         );
     }
 

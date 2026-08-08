@@ -3285,6 +3285,7 @@ pub struct MemberSnapshot {
     owner: bool,
     ready: bool,
     character_id: Option<CharacterId>,
+    character_iff_id: Option<u32>,
 }
 
 impl MemberSnapshot {
@@ -3297,6 +3298,7 @@ impl MemberSnapshot {
         owner: bool,
         ready: bool,
         character_id: Option<CharacterId>,
+        character_iff_id: Option<u32>,
     ) -> Self {
         Self {
             connection_id,
@@ -3305,7 +3307,17 @@ impl MemberSnapshot {
             owner,
             ready,
             character_id,
+            character_iff_id,
         }
+    }
+
+    /// The catalog id of the member's character, which the client resolves its model by.
+    ///
+    /// Distinct from [`Self::character_id`], which is the inventory id and means nothing to a
+    /// client: it has no inventory but its own.
+    #[must_use]
+    pub const fn character_iff_id(&self) -> Option<u32> {
+        self.character_iff_id
     }
 
     /// The member's selected character, when one is known.

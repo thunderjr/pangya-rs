@@ -52,6 +52,8 @@ pub struct RoomIdentity {
     pub nickname: Nickname,
     /// The account's selected character, so a room roster can render it.
     pub character_id: Option<CharacterId>,
+    /// That character's catalog id, which is what the client resolves the model by.
+    pub character_iff_id: Option<u32>,
 }
 
 /// The largest client-authored in-match payload this server will relay.
@@ -271,6 +273,7 @@ impl Member {
             self.owner,
             self.ready,
             self.identity.character_id,
+            self.identity.character_iff_id,
         )
     }
 }
@@ -2609,6 +2612,7 @@ mod tests {
                 .unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
             character_id: None,
+            character_iff_id: None,
         }
     }
 

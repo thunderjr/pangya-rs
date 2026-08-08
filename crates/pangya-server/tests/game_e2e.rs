@@ -1265,6 +1265,7 @@ fn member(client: &M4Client, connection_id: u64, owner: bool, ready: bool) -> Me
         owner,
         ready,
         None,
+        None,
     )
 }
 
@@ -2498,6 +2499,7 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
             true,
             false,
             admitted_member.character_id(),
+            admitted_member.character_iff_id(),
         )],
     );
     if owner_won {
@@ -5995,7 +5997,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         address: std::net::SocketAddr,
         account_id: pangya_domain::AccountId,
         username: &str,
-    ) -> (TcpStream, u8) {
+    ) -> (TcpStream, u8, u32) {
         let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
         let (mut stream, key) = connect_game_retail(address).await;
         send_typed(
@@ -6011,9 +6013,17 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
             },
         )
         .await;
-        // Drain the nine bootstrap frames.
-        for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
-            let _ = receive_packet(&mut stream, key).await;
+        // Drain the bootstrap frames, keeping the connection id out of the full reply: the
+        // client matches it against every census record to find itself, so it has to be the
+        // real one. Subtype, two pstrings, then the identity block's fixed head.
+        let mut connection_id = 0_u32;
+        for index in 0..RETAIL_BOOTSTRAP_FRAMES {
+            let (_, body) = receive_packet(&mut stream, key).await;
+            if index == 3 {
+                let at = 1 + 2 + 6 + 2 + 9 + 2 + 22 + 22 + 17 + 24;
+                connection_id =
+                    u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+            }
         }
         // Enter the channel so room commands are in-state. Retail sends the one-byte sub-server
         // ID, not the synthetic `u32` channel ID.
@@ -6025,10 +6035,10 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         let (opcode, body) = receive_packet(&mut stream, key).await;
         assert_eq!(opcode, 0x01f6);
         assert_eq!(body, [0; 4]);
-        (stream, key)
+        (stream, key, connection_id)
     }
 
-    let (mut host, host_key) =
+    let (mut host, host_key, host_connection) =
         connect_retail(&pool, address, owner.account.id, "RetailOwner").await;
 
     // Create a room with the retail packet the client actually sends.
@@ -6054,6 +6064,27 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     assert_eq!(census_opcode, 0x0048);
     assert_eq!(census[0], 0, "census kind = list");
     assert_eq!(census[3], 1, "one player in the room");
+    // The record names the same connection the bootstrap told this client it was. Without the
+    // match the client never finds its own row, so it never learns it is the master and its
+    // Start button stays an inert Ready.
+    assert_ne!(host_connection, 0, "bootstrap must name a real connection");
+    assert_eq!(
+        u32::from_le_bytes([census[4], census[5], census[6], census[7]]),
+        host_connection
+    );
+    // The character field is the client's own catalog id, never the inventory id: the client
+    // has no inventory but its own, and builds every player's model from this when the hole
+    // loads. Feeding it an inventory id leaves it dereferencing a null mid-load.
+    let character_at = 4 + 4 + 22 + 17 + 1 + 4 + 4;
+    assert_eq!(
+        u32::from_le_bytes([
+            census[character_at],
+            census[character_at + 1],
+            census[character_at + 2],
+            census[character_at + 3],
+        ]),
+        0x0400_0000
+    );
     // Owner flag is bit 3, written after the fixed identity block.
     let flags_at = 4 + 4 + 22 + 17 + 1 + 4 + 4 + 4 + 16 + 4 + 4;
     assert_eq!(
@@ -6068,7 +6099,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     assert_eq!(body[2 + 64 + 4], 1, "occupancy");
 
     // A second client joins the same room by number.
-    let (mut visitor, visitor_key) =
+    let (mut visitor, visitor_key, _) =
         connect_retail(&pool, address, guest.account.id, "RetailGuest").await;
     let mut join = pangya_protocol::PacketWriter::default();
     join.u16_le(room_id);
@@ -6200,15 +6231,17 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 
     // Start match: the client receives the plan, weather, and wind.
     send_packet(&mut stream, key, 4, 0x000e, &[]).await;
-    eprintln!(
-        "PROBE start -> {:#06x}",
-        receive_packet(&mut stream, key).await.0
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0076,
+        "match start"
     );
     let (opcode, info) = receive_packet(&mut stream, key).await;
     assert_eq!(opcode, 0x0052, "match plan");
-    // Four header bytes, three u32 fields, one hole, the seed, then eighteen collectible
-    // counts the client reads regardless of how many holes the match has.
-    assert_eq!(info.len(), 4 + 12 + 7 + 4 + 18);
+    // Four header bytes, three u32 fields, eighteen holes, the seed, then eighteen collectible
+    // counts. Both eighteens are fixed-width: the client reads each array by its own size, not
+    // by how many holes the match actually has.
+    assert_eq!(info.len(), 4 + 12 + 18 * 7 + 4 + 18);
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x009e, "weather");
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x005b, "wind");
 

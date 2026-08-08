@@ -36,6 +36,8 @@ const MAX_PLAINTEXT: usize = 8 * 1024 * 1024;
 const MAX_EXPANSION: usize = 128;
 /// How long to wait for any one frame before giving up on a step.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long this seat will sit in a room waiting for a person to drive the other one.
+const ROOM_WAIT: Duration = Duration::from_secs(600);
 
 /// Retail client opcodes this instrument sends.
 mod client_opcode {
@@ -309,12 +311,15 @@ impl Session {
         // A census reporting two occupants, both ready, is what unlocks Start on a real client:
         // the room filling up is not enough, and starting on the arrival alone races the other
         // seat's ready packet and is refused.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        // Paced by a person driving the other seat, so the whole wait is bounded rather than
+        // the gap between frames: an empty room is silent for as long as it takes.
+        let deadline = tokio::time::Instant::now() + ROOM_WAIT;
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(ClientError::NobodyJoined);
             }
-            let (opcode, census) = self.receive("the room to fill").await?;
+            let (opcode, census) = self.receive_within("the room to fill", remaining).await?;
             if opcode == server_opcode::ROOM_CENSUS && census_is_ready_pair(&census) {
                 break;
             }
@@ -335,7 +340,10 @@ impl Session {
     }
 
     async fn play_hole(&mut self, strokes: u8) -> Result<(), ClientError> {
-        self.wait_for(server_opcode::MATCH_INFO, "the match plan")
+        // The only wait here that is paced by a person: a real client in the other seat has to
+        // be driven to the room and its host has to press Ready and then Start. Everything
+        // after this is server-paced and keeps the ordinary frame timeout.
+        self.idle_until(server_opcode::MATCH_INFO, "the match plan", ROOM_WAIT)
             .await?;
         let _conditions = self.drain(Duration::from_secs(3)).await?;
         self.send(client_opcode::HOLE_LOAD_FINISHED, &[]).await?;
@@ -388,8 +396,16 @@ impl Session {
     }
 
     async fn receive(&mut self, what: &'static str) -> Result<(u16, Vec<u8>), ClientError> {
+        self.receive_within(what, FRAME_TIMEOUT).await
+    }
+
+    async fn receive_within(
+        &mut self,
+        what: &'static str,
+        first_byte: Duration,
+    ) -> Result<(u16, Vec<u8>), ClientError> {
         let mut header = [0_u8; 3];
-        timeout(FRAME_TIMEOUT, self.stream.read_exact(&mut header))
+        timeout(first_byte, self.stream.read_exact(&mut header))
             .await
             .map_err(|_| ClientError::Timeout(what))?
             .map_err(|_| ClientError::Closed(what))?;
@@ -457,6 +473,31 @@ impl Session {
     async fn wait_for(&mut self, opcode: u16, what: &'static str) -> Result<Vec<u8>, ClientError> {
         loop {
             let (seen, body) = self.receive(what).await?;
+            if seen == opcode {
+                return Ok(body);
+            }
+        }
+    }
+
+    /// Waits for one opcode across a whole budget rather than per frame.
+    ///
+    /// A room this seat is waiting in is silent between roster changes, so the ordinary
+    /// per-frame timeout ends the wait long before the budget does — which is the wrong bound
+    /// when what is being waited on is a person driving the other client. The budget covers the
+    /// silence; once a frame starts arriving the ordinary timeout governs the rest of it.
+    async fn idle_until(
+        &mut self,
+        opcode: u16,
+        what: &'static str,
+        budget: Duration,
+    ) -> Result<Vec<u8>, ClientError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Timeout(what));
+            }
+            let (seen, body) = self.receive_within(what, remaining).await?;
             if seen == opcode {
                 return Ok(body);
             }

@@ -1765,6 +1765,7 @@ mod tests {
                 .unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
             character_id: None,
+            character_iff_id: None,
         }
     }
 
@@ -2622,6 +2623,7 @@ mod tests {
                 true,
                 false,
                 None,
+                None,
             ),
             MemberSnapshot::new(
                 id(2),
@@ -2629,6 +2631,7 @@ mod tests {
                 "two".into(),
                 false,
                 true,
+                None,
                 None,
             ),
         ];

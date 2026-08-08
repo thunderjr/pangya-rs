@@ -305,6 +305,7 @@ pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {
 /// deliberately absent: those have real handlers.
 pub const RETAIL_ACCEPTED_MATCH_OPCODES: &[u16] = &[
     0x0006, // game end
+    0x000c, // the equipment this player is taking into the hole
     0x0013, // aim rotation
     0x0014, // power meter input
     0x0015, // power level
