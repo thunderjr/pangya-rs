@@ -435,6 +435,23 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     upstream numbers from one — and the crash did not move, so it was reverted rather than left
     in as a guess.
 
+    A wider sample, two full records taken at the moment of the crash, pins the layout:
+
+    ```
+    0050:  14 00 20 00 07 00 00 00 ... "RsPlayerFive"    <- record 0 holds a player
+    01a0 .. 2cf0: single small values every 0x2b0, reading 10 01 0a 05 10 0b 06 01 11 0c 07 02
+                  12 0d 08 03 13                          <- a shuffled table of eighteen
+    2fc0:  08 00 16 00 14 00 20 00 07 00 00 32 74 55 33 ...  <- record 1, same fields at +0x3c
+    ```
+
+    The 0x2f84 stride is confirmed by the two records, a nickname from the roster lands at
+    record + 0x50, and the record's **first dword — the very field the lookup keys on — is zero**
+    while the rest of the record parsed fine. So the client fills the record from our roster and
+    leaves that one field unset, which means it is a field we send as zero or do not send at all.
+
+    That is the next thing to establish: which roster field the client writes to record + 0. The
+    method is settled and cheap now — sample the array, change one field, sample again.
+
 29. **A room's own settings are not remembered, so `0x004a` describes every room as Versus** —
     **fixed.** `RoomProfile` now travels with the room's settings and its summary, so the room
     record and the room status report the mode, course, hole count and timers the creator asked
