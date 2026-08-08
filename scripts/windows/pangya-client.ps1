@@ -176,9 +176,40 @@ public class PangyaWindows {
 }
 "@ -ErrorAction SilentlyContinue
 
+# UNSOLVED: which instance a click reaches is decided by input focus, and focus cannot be taken
+# back from a client that already has it.
+#
+# The engine tracks the cursor through DirectInput as accumulated relative deltas clamped to its
+# own window, so parking a window elsewhere does NOT move its idea of where the pointer is: both
+# instances believe the cursor is over the same client-area pixel, and the one holding input
+# focus is the one that acts. Whichever client was activated last keeps acting, and every
+# attempt below to move focus to the other one failed, silently, while reporting success:
+#
+#   SetForegroundWindow                                   no effect
+#   SPI_SETFOREGROUNDLOCKTIMEOUT=0 then SetForegroundWindow, BringWindowToTop
+#                                                         no effect
+#   absolute SetCursorPos + SendInput click on the title bar
+#                                                         no effect
+#   the same click delivered by the automation host       no effect
+#   ShowWindow(other, SW_MINIMIZE)                        window minimises, target still deaf
+#   clicking the target's taskbar button                  no effect
+#
+# GetForegroundWindow, read from the automation host, is not a usable check either: it kept
+# naming a window that had been minimised. Verify a switch by observed pixels, never by that.
+#
+# Do NOT reach for AttachThreadInput. Borrowing the input state of a busy game thread hangs the
+# automation host and takes the whole PowerShell channel down with it for minutes.
+#
+# What does work is launching an instance: a new client takes focus and can then be driven. So a
+# two-client run today must interleave launch and use rather than switch between two live
+# clients, and driving a versus hole — which needs both alive at once — is still open.
+
 # Where non-target instances are parked. Far enough right that no click can reach them.
 $script:PangyaParkedX = 1000
 $script:PangyaParkedY = 40
+# The instance currently sitting at the origin, so a click does not re-anchor what is already
+# anchored. See Confirm-PangyaAnchor.
+$script:PangyaAnchoredPid = $null
 
 function Get-PangyaInstances {
   Get-Process ProjectG -ErrorAction SilentlyContinue | ForEach-Object {
@@ -201,26 +232,36 @@ function Set-PangyaTarget {
   [PangyaWindows]::Focus($target.Hwnd)
   Start-Sleep -Milliseconds 400
   $script:PangyaTargetPid = $ProcessId
+  $script:PangyaAnchoredPid = $ProcessId
   return $target
 }
 
 function Get-PangyaTarget { $script:PangyaTargetPid }
 
 # Re-asserts the target window's position before a click, instead of PangyaClient.Anchor().
+#
+# Moving or focusing a window costs the click that follows it: the engine needs a moment to take
+# input focus back, and a click inside that moment is swallowed. So this re-anchors only when the
+# instance being driven has changed since the last anchor, which is why a run of clicks on one
+# client — typing an id, then a password, then pressing Login — is not interrupted by window
+# churn. Pass -Force after anything that could have moved a window out from under us.
 function Confirm-PangyaAnchor {
-  if ($script:PangyaTargetPid) {
-    $all = @(Get-PangyaInstances)
-    $target = $all | Where-Object ProcessId -eq $script:PangyaTargetPid
-    if (-not $target) { throw "target client $($script:PangyaTargetPid) has no window" }
-    foreach ($other in $all | Where-Object ProcessId -ne $script:PangyaTargetPid) {
-      [PangyaWindows]::Move($other.Hwnd, $script:PangyaParkedX, $script:PangyaParkedY)
-    }
-    [PangyaWindows]::Move($target.Hwnd, 0, 0)
-    [PangyaWindows]::Focus($target.Hwnd)
-    Start-Sleep -Milliseconds 150
-  } else {
+  param([switch]$Force)
+  if (-not $script:PangyaTargetPid) {
     [PangyaClient]::Anchor() | Out-Null
+    return
   }
+  if (-not $Force -and $script:PangyaAnchoredPid -eq $script:PangyaTargetPid) { return }
+  $all = @(Get-PangyaInstances)
+  $target = $all | Where-Object ProcessId -eq $script:PangyaTargetPid
+  if (-not $target) { throw "target client $($script:PangyaTargetPid) has no window" }
+  foreach ($other in $all | Where-Object ProcessId -ne $script:PangyaTargetPid) {
+    [PangyaWindows]::Move($other.Hwnd, $script:PangyaParkedX, $script:PangyaParkedY)
+  }
+  [PangyaWindows]::Move($target.Hwnd, 0, 0)
+  [PangyaWindows]::Focus($target.Hwnd)
+  Start-Sleep -Milliseconds 500
+  $script:PangyaAnchoredPid = $script:PangyaTargetPid
 }
 
 # Client-area origin of the instance being driven. Falls back to the single-window lookup when
@@ -435,13 +476,53 @@ $script:NickConfirm    = @(528,217)
 $script:NickYes        = @(353,371)
 
 # ---- Flows --------------------------------------------------------------------------------
+# The password field is the one place a swallowed click is invisible: the field masks its
+# content, so "typed nothing" and "typed the password" look identical, and the Login button then
+# does nothing at all. Both fields are therefore filled and checked before Login is pressed.
 function Invoke-PangyaLogin {
-  param([Parameter(Mandatory=$true)][string]$Id,[Parameter(Mandatory=$true)][string]$Password)
-  Invoke-PangyaClick @script:LoginIdField
-  Send-PangyaText $Id
-  Invoke-PangyaClick @script:LoginPwField
-  Send-PangyaText $Password
-  Invoke-PangyaClick @script:LoginButton
+  param(
+    [Parameter(Mandatory=$true)][string]$Id,
+    [Parameter(Mandatory=$true)][string]$Password,
+    [int]$Attempts = 3
+  )
+  for ($i = 1; $i -le $Attempts; $i++) {
+    Invoke-PangyaClick @script:LoginIdField
+    Send-PangyaText $Id
+    Invoke-PangyaClick @script:LoginPwField
+    Send-PangyaText $Password
+    if (Test-PangyaLoginFilled) {
+      Invoke-PangyaClick @script:LoginButton
+      return $true
+    }
+    # Clear whatever did land, so a retry does not append to a half-typed field.
+    Invoke-PangyaClick @script:LoginIdField
+    Send-PangyaText ([string][char]8 * 24)
+    Invoke-PangyaClick @script:LoginPwField
+    Send-PangyaText ([string][char]8 * 24)
+  }
+  throw 'login fields never both filled'
+}
+
+# Both login fields draw dark glyphs on a white field, so "has something in it" is a dark-pixel
+# count in each field's own rectangle. Cheaper and more reliable than reading the text back.
+function Test-PangyaLoginFilled {
+  Add-Type -AssemblyName System.Drawing
+  $origin = Get-PangyaOrigin
+  foreach ($box in @(@{X=356;Y=202;W=90;H=13}, @{X=356;Y=229;W=90;H=13})) {
+    $bmp = New-Object System.Drawing.Bitmap $box.W, $box.H
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($origin.X + $box.X, $origin.Y + $box.Y, 0, 0, $bmp.Size)
+    $dark = 0
+    for ($px = 0; $px -lt $box.W; $px++) {
+      for ($py = 0; $py -lt $box.H; $py++) {
+        $c = $bmp.GetPixel($px, $py)
+        if ((($c.R + $c.G + $c.B) / 3) -lt 110) { $dark++ }
+      }
+    }
+    $g.Dispose(); $bmp.Dispose()
+    if ($dark -lt 8) { return $false }
+  }
+  return $true
 }
 
 function Set-PangyaNickname {
@@ -488,6 +569,7 @@ function Stop-AllPangyaClients {
     Start-Sleep -Milliseconds 300
   }
   $script:PangyaTargetPid = $null
+  $script:PangyaAnchoredPid = $null
 }
 
 # Launches one install without disturbing the others, identifying the new process by diffing the
