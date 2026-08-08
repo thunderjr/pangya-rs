@@ -386,19 +386,63 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Also settled here: the census character field is the **catalog** id from the client's own `Character.iff` (PacketDoc `0048.ksy` `item_id_character`), not the inventory id. A room member now carries both, because the client resolves models by catalog id and has no inventory but its own.
 
-28. **A real client crashes while loading a versus hole** — **open, but much further along.** Three causes found and fixed, from the references rather than from the wire:
+28. **A real client crashes while loading a versus hole** — **open, and now localized to a
+    specific instruction in the client.** Seven causes found and fixed so far, from the
+    references and from the client's own memory rather than by guessing at the wire:
 
     - `0x0052` carries a fixed `[18]HoleInfo` array the client reads by width, not by the `hole_count` beside it (`pangbox/server` `game/packet/server.go` `ServerRoomGameData`, filled in `game/room/room.go`). Entries past `hole_count` are zeroed, which is what upstream sends.
     - `0x0076` is `ServerGameInit`, and its subtype picks between two bodies that share no shape: `0x00` is a player count followed by every player whole, `0x04` is a bare timestamp (`pangbox/packetdoc` `gameservice/server/0076.ksy`). We stamped the full subtype onto the timestamp body, so the client read a four-byte field's low byte as "one player" and parsed a multi-kilobyte record out of the nineteen bytes after it. The roster is now 24 KB of real players, and the record is the same `RetailPlayerData` the handover reply carries — upstream reuses one structure for both.
     - Client `0x0048` is hole-loading progress and is broadcast back as `0x00a3` to the whole match (`handleRoomLoadingProgress`). The client draws a bar per player and waits on all of them.
 
-    What remains: the client now answers `0x000c`, `0x0048` and `0x001a`, receives its `0x00a3` echoes, runs its whole progress ramp — and dies at the end of it, before sending `0x0011`, with an access violation reading `[null + 0x150]`. The crash site moved once, when the roster was fixed, and has not moved since.
+    What remains: the client now answers `0x000c`, `0x0048` and `0x001a`, receives its `0x00a3`
+    echoes, runs its whole progress ramp — and dies at the end of it, before sending `0x0011`,
+    with an access violation reading `[null + 0x150]` at `0x00883983`. The crash site moved once,
+    when the roster was fixed, and has not moved since — through four further fixes, each of
+    which was a real defect and none of which was this one:
 
-    Two cited candidates are unimplemented. Upstream frames the start with `0x004a` (room closed, phase `WaitingLoad`), then `0x0230`, `0x0231`, `0x0077` with `0x64`, before the roster, and `0x016a` after the plan. And weather and wind belong *after* every player has sent `0x0011`, alongside `0x0053`, not immediately after the plan where we send them (`game/room/room.go` `startHole`). The room-status frame is the more likely of the two, being the client's signal that its room has entered a game at all.
+    - the pre-match framing (`0x0230`, `0x0231`, `0x0077`, `0x016a`) and holding weather and wind
+      until every player has loaded, both as all three reference servers do them;
+    - a real `SYSTEMTIME` on the roster and the handover, where both had sent sixteen zero bytes;
+    - the club set's catalog id in the player record, where a zero had been sent on the belief
+      that the client ignored the block;
+    - equipping a ball, which no account had: account creation grants a character and a club set
+      and no comet, so every player entered the hole with none. The client's gear row now shows
+      one. **This is a real gap in account creation and is not yet fixed in the server.**
+
+    The crash is now localized rather than guessed at, by reading the running client's own memory
+    (`OpenProcess`/`ReadProcessMemory` from the VM; the on-disk image is packed, so only a live
+    process disassembles). The faulting function is `0x00883950`, a `__thiscall` whose first stack
+    argument is null:
+
+    ```
+    00747a63  mov  eax, [0xe10fac]                  ; a global manager
+    00747a68  mov  ecx, [eax + 0x103f4]
+    00747a6e  movzx ecx, byte [ecx + 0x185]         ; an index, 0 in the lobby
+    00747a75  imul ecx, ecx, 0x2f84                 ; stride of a per-player record
+    00747a7b  mov  eax, [ecx + eax + 0x656e]        ; the record's first dword: a lookup key
+    00747a83  call 0x6aeda0                         ; singleton getter -> 0xe40300
+    00747a8a  call 0x6ad790                         ; list lookup by that key; 0 when not found
+    00747a8f  mov  edi, eax
+    00747a93  cmp  edi, ebx                         ; ebx = 0
+    00747a95  je   0x747aa7                         ; not found -> the argument stays 0
+    ...
+    00747aae  call 0x883950                         ; faults on [arg + 0x150]
+    ```
+
+    Sampling that array every 100 ms through a real match start showed the key **zero**, which is
+    exactly the not-found path. So the client is looking up a per-player record it never
+    registered. Numbering the roster seats from zero instead of one was tried on that evidence —
+    upstream numbers from one — and the crash did not move, so it was reverted rather than left
+    in as a guess.
 
 29. **The room directory never lists rooms** — **open.** A client that opens Multiplay sees an empty list even when rooms exist, so a real client can only ever be the host: it has no way to join one. The room list is served on request but never pushed, and nothing was found that the client sends to refresh it.
 
-30. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
+30. **Account creation grants no ball** — **open.** `account create` grants a starter character
+    and a club set; the equipped comet is left null, so every player enters a hole with no ball.
+    Both test accounts were given one by hand to get past it. A starter comet belongs in the same
+    grant as the club set.
+
+31. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
 
 ---
 
