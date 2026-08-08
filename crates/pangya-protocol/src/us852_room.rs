@@ -179,8 +179,12 @@ pub struct RetailRoom {
     pub player_count: u8,
     /// Hole count.
     pub hole_count: u8,
-    /// Mode.
-    pub room_type: RetailRoomType,
+    /// Mode, as the client's own create request spelled it.
+    ///
+    /// Carried verbatim rather than mapped onto [`RetailRoomType`]: the client has modes this
+    /// server does not model — its single-player practice room is one — and it renders its own
+    /// header and gates its Start button on getting the mode it asked for back.
+    pub mode: u8,
     /// Room number.
     pub id: u16,
     /// Hole progression.
@@ -209,7 +213,7 @@ impl RetailRoom {
         writer.bytes(&[0; 17]);
         writer.u8(MAX_ROOM_PLAYERS);
         writer.u8(self.hole_count);
-        writer.u8(self.room_type as u8);
+        writer.u8(self.mode);
         writer.u16_le(self.id);
         writer.u8(self.hole_progression as u8);
         writer.u8(self.course);
@@ -221,7 +225,7 @@ impl RetailRoom {
         writer.u32_le(100);
         writer.u32_le(100);
         writer.u32_le(self.owner_uid);
-        writer.u8(self.room_type as u8);
+        writer.u8(self.mode);
         writer.u32_le(0); // artifact catalog id
         writer.u32_le(u32::from(self.natural_wind));
         for _ in 0..4 {
@@ -265,7 +269,7 @@ impl EncodePacket for RetailRoomStatus {
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
         writer.u16_le(0xffff);
-        writer.u8(self.room.room_type as u8);
+        writer.u8(self.room.mode);
         writer.u8(self.room.course);
         writer.u8(self.room.hole_count);
         writer.u8(self.room.hole_progression as u8);
@@ -1295,7 +1299,7 @@ mod tests {
             max_players: 4,
             player_count: 1,
             hole_count: 3,
-            room_type: RetailRoomType::Versus,
+            mode: RetailRoomType::Versus as u8,
             id: 7,
             hole_progression: RetailHoleProgression::FrontStart,
             course: 0,
@@ -1498,7 +1502,7 @@ mod tests {
         let payload = encode_packet_payload(&RetailRoomStatus { room: room.clone() }, &profile())
             .expect("status");
         assert_eq!(&payload[0..2], &[0xff, 0xff]);
-        assert_eq!(payload[2], room.room_type as u8);
+        assert_eq!(payload[2], room.mode);
         assert_eq!(payload[3], room.course);
         assert_eq!(payload[4], room.hole_count);
         assert_eq!(payload[5], room.hole_progression as u8);

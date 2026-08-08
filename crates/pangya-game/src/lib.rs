@@ -50,9 +50,9 @@ use pangya_domain::{
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
     MemberSnapshot, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
     PurchaseRequest, RepairItem, RepositoryError, RoomError, RoomId, RoomName, RoomPassword,
-    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, SoloMatchResult,
-    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
-    StrokeParticipant, StrokeRosterOrder,
+    RoomProfile, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind,
+    SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
+    StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -82,9 +82,9 @@ use pangya_protocol::{
     RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
     RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
     RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus,
-    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
-    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync,
+    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
     RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
     RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
     RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
@@ -5340,6 +5340,19 @@ where
                 let Ok(settings) = RoomSettings::new(request.max_players) else {
                     return self.reject_retail_join(framed, state).await;
                 };
+                // The room keeps the shape the client asked for. It renders its own header
+                // from this and gates Start on it, so a practice room told it is a versus room
+                // of one leaves Start disabled and goes nowhere. The course is still the
+                // configured one: that is the hole this server actually settles.
+                let settings = settings.with_profile(RoomProfile {
+                    mode: request.room_type,
+                    course: self.retail_course(),
+                    hole_count: 1,
+                    hole_progression: 0,
+                    shot_timer_ms: request.shot_timer_ms,
+                    game_timer_ms: request.game_timer_ms,
+                    natural_wind: false,
+                });
                 let created = self
                     .lobby
                     .create(
@@ -6276,7 +6289,7 @@ fn retail_room_from_summary(
         max_players: summary.max_members(),
         player_count: summary.members(),
         hole_count: 1,
-        room_type: RetailRoomType::from_wire(request.room_type).unwrap_or(RetailRoomType::Versus),
+        mode: request.room_type,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
         course,
@@ -6289,42 +6302,39 @@ fn retail_room_from_summary(
 
 /// Builds a retail room record from a summary alone, for the lobby list.
 fn retail_room_from_summary_only(summary: &RoomSummary) -> RetailRoom {
-    RetailRoom {
-        name: summary.name().as_str().as_bytes().to_vec(),
-        public: !summary.password_protected(),
-        state: RetailRoomState::Lobby,
-        max_players: summary.max_members(),
-        player_count: summary.members(),
-        hole_count: 1,
-        room_type: RetailRoomType::Versus,
-        id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
-        hole_progression: RetailHoleProgression::FrontStart,
-        course: 0,
-        shot_timer_ms: 30_000,
-        game_timer_ms: 600_000,
-        owner_uid: 0,
-        natural_wind: false,
-    }
+    retail_room_from_parts(summary, summary.members())
 }
 
 /// Builds a retail room record from a joined room's authoritative snapshot.
 fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
-    let summary = snapshot.summary();
+    retail_room_from_parts(
+        snapshot.summary(),
+        u8::try_from(snapshot.members().len()).unwrap_or(u8::MAX),
+    )
+}
+
+/// Describes a room the way the room itself describes it.
+///
+/// Everything but the occupancy comes from the room's own profile, which is the shape its
+/// creator asked for. Rebuilding it as a default versus room instead is what left a client
+/// sitting in its own practice room told it was somewhere else, with Start disabled.
+fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom {
+    let profile = summary.profile();
     RetailRoom {
         name: summary.name().as_str().as_bytes().to_vec(),
         public: !summary.password_protected(),
         state: RetailRoomState::Lobby,
         max_players: summary.max_members(),
-        player_count: u8::try_from(snapshot.members().len()).unwrap_or(u8::MAX),
-        hole_count: 1,
-        room_type: RetailRoomType::Versus,
+        player_count,
+        hole_count: profile.hole_count,
+        mode: profile.mode,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
-        course: 0,
-        shot_timer_ms: 30_000,
-        game_timer_ms: 600_000,
+        course: profile.course,
+        shot_timer_ms: profile.shot_timer_ms,
+        game_timer_ms: profile.game_timer_ms,
         owner_uid: 0,
-        natural_wind: false,
+        natural_wind: profile.natural_wind,
     }
 }
 

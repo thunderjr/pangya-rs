@@ -477,6 +477,7 @@ impl RoomState {
             u8::try_from(self.members.len()).unwrap_or(u8::MAX),
             self.settings.max_members(),
             self.password.is_some(),
+            self.settings.profile(),
         )
     }
 

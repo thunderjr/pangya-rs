@@ -3250,10 +3250,37 @@ impl fmt::Debug for RoomPassword {
     }
 }
 
+/// The shape of the game a room was opened to play.
+///
+/// A room is not just a name and a capacity: the client that opened it chose a mode, a course,
+/// a number of holes and its timers, and it renders its own room header and gates its Start
+/// button on getting those back. Nothing here is enforced by the match — it is what the room
+/// says of itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoomProfile {
+    /// Wire value of the mode: versus, chat, tournament, battle, or a client-private mode
+    /// such as practice. Carried verbatim, because a mode this server does not model is still
+    /// one the client renders.
+    pub mode: u8,
+    /// Course ordinal.
+    pub course: u8,
+    /// Holes the room says it will play.
+    pub hole_count: u8,
+    /// Hole progression ordinal.
+    pub hole_progression: u8,
+    /// Per-shot timer in milliseconds.
+    pub shot_timer_ms: u32,
+    /// Whole-game timer in milliseconds.
+    pub game_timer_ms: u32,
+    /// Whether wind varies naturally.
+    pub natural_wind: bool,
+}
+
 /// Validated mutable room settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoomSettings {
     max_members: u8,
+    profile: RoomProfile,
 }
 
 impl RoomSettings {
@@ -3268,7 +3295,18 @@ impl RoomSettings {
     /// Returns [`RoomValueError::InvalidCapacity`] outside the range.
     pub const fn new(max_members: u8) -> Result<Self, RoomValueError> {
         if max_members >= 1 && max_members <= 30 {
-            Ok(Self { max_members })
+            Ok(Self {
+                max_members,
+                profile: RoomProfile {
+                    mode: 0,
+                    course: 0,
+                    hole_count: 1,
+                    hole_progression: 0,
+                    shot_timer_ms: 30_000,
+                    game_timer_ms: 600_000,
+                    natural_wind: false,
+                },
+            })
         } else {
             Err(RoomValueError::InvalidCapacity)
         }
@@ -3278,6 +3316,19 @@ impl RoomSettings {
     #[must_use]
     pub const fn max_members(self) -> u8 {
         self.max_members
+    }
+
+    /// Returns the same settings describing the game the room was opened to play.
+    #[must_use]
+    pub const fn with_profile(mut self, profile: RoomProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// What the room says of the game it will play.
+    #[must_use]
+    pub const fn profile(self) -> RoomProfile {
+        self.profile
     }
 }
 
@@ -3412,6 +3463,7 @@ pub struct RoomSummary {
     members: u8,
     max_members: u8,
     password_protected: bool,
+    profile: RoomProfile,
 }
 
 impl RoomSummary {
@@ -3424,6 +3476,7 @@ impl RoomSummary {
         members: u8,
         max_members: u8,
         password_protected: bool,
+        profile: RoomProfile,
     ) -> Self {
         Self {
             id,
@@ -3432,6 +3485,7 @@ impl RoomSummary {
             members,
             max_members,
             password_protected,
+            profile,
         }
     }
     /// Room identity.
@@ -3458,6 +3512,11 @@ impl RoomSummary {
     #[must_use]
     pub const fn max_members(&self) -> u8 {
         self.max_members
+    }
+    /// What the room says of the game it will play.
+    #[must_use]
+    pub const fn profile(&self) -> RoomProfile {
+        self.profile
     }
     /// Whether joining requires a password.
     #[must_use]

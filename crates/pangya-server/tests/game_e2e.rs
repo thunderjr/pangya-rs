@@ -1297,6 +1297,7 @@ fn snapshot(
             u8::try_from(members.len()).expect("member count"),
             capacity,
             protected,
+            RoomSettings::new(capacity).expect("capacity").profile(),
         ),
         members,
     )
@@ -6479,6 +6480,29 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     assert!(
         host_frames.contains(&0x0048),
         "the host is told the room filled: {host_frames:04x?}"
+    );
+
+    // The room describes itself the way its creator asked for, not as a default versus room.
+    // A client told its own room is something else renders the wrong header and gates Start on
+    // the wrong rules — a practice room of one reported as versus never starts at all.
+    send_packet(&mut host, host_key, 3, 0x000a, &[0xff, 0xff, 0]).await;
+    let described = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    let status = described
+        .iter()
+        .find(|(opcode, _)| *opcode == 0x004a)
+        .map(|(_, body)| body.clone())
+        .unwrap_or_default();
+    assert_eq!(status.get(2).copied(), Some(0), "the mode it was made with");
+    assert_eq!(status.get(4).copied(), Some(1), "one hole");
+    assert_eq!(
+        status.get(10).copied(),
+        Some(2),
+        "the capacity it was made with"
+    );
+    assert_eq!(
+        status.get(13..17).map(<[u8]>::to_vec),
+        Some(30_000_u32.to_le_bytes().to_vec()),
+        "the shot timer it was made with"
     );
 
     // A real client edits the room on its way into a match. Unanswered it sits on a modal;

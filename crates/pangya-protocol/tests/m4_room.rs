@@ -76,6 +76,10 @@ fn summary(
         members,
         maximum,
         protected,
+        // The synthetic family carries no room shape, so its summaries take the default one.
+        RoomSettings::new(maximum)
+            .expect("valid synthetic capacity")
+            .profile(),
     )
 }
 

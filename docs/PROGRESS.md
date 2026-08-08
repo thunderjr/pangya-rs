@@ -436,7 +436,12 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     in as a guess.
 
 29. **A room's own settings are not remembered, so `0x004a` describes every room as Versus** —
-    **open, found while verifying SPEC 19.6 step 7.** The room actor stores a name, a password and
+    **fixed.** `RoomProfile` now travels with the room's settings and its summary, so the room
+    record and the room status report the mode, course, hole count and timers the creator asked
+    for. The mode is carried as the client's own byte rather than mapped onto the four modelled
+    types: the client's single-player practice room is a mode this server does not model and
+    still has to render. Pinned by `game_retail_two_players_play_and_settle_one_versus_hole`.
+    Was, before the fix: The room actor stores a name, a password and
     a capacity; the mode, course, hole count and timers a client asked for are echoed once from
     the create request and then lost. `retail_room_from_snapshot` therefore rebuilds the record as
     a Versus room on course zero with default timers, and the new `0x004a` reply repeats that. A

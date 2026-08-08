@@ -176,6 +176,9 @@ fn decode_summary(reader: &mut PacketReader<'_>) -> Result<RoomSummary, PacketDe
         members,
         settings.max_members(),
         password_protected,
+        // The synthetic family carries a capacity and nothing else of the room's shape, so a
+        // summary decoded from it describes the default game rather than inventing one.
+        settings.profile(),
     ))
 }
 
