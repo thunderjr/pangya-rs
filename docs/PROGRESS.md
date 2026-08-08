@@ -462,9 +462,10 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     So the client is not copying our wire order — the start time precedes the name in its own
     struct — it is filling named fields one by one, and every one we can see lands correctly.
-    The key is a field the client has nothing to fill from. Remaining candidates, all of which
-    this server sends as zero or not at all: the mascot block, the equipped-item slots, and the
-    title and guild fields in the trailing equipment slots.
+    The key is a field the client has nothing to fill from. The **mascot** was eliminated the
+    same way — a real mascot catalog id in the block left the key zero and the crash unchanged.
+    Two of the four candidates are now ruled out by experiment rather than by argument, leaving
+    the equipped-item slots and the title and guild fields in the trailing equipment slots.
 
     The method is settled and cheap: sample the array, change one field, sample again. Each
     cycle needs the room number, which the server now logs.
