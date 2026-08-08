@@ -3934,6 +3934,21 @@ where
         .await
     }
 
+    /// The course ordinal the client will be told to load.
+    ///
+    /// The retail wire carries a one-byte course, so a configured id outside that range cannot
+    /// be named and falls back to the first course rather than truncating into another one.
+    /// Stroke and solo describe the same hole; stroke wins because a real client can only start
+    /// a two-player match.
+    fn retail_course(&self) -> u8 {
+        self.config
+            .stroke_two
+            .map(|stroke| stroke.course)
+            .or_else(|| self.config.solo_practice.map(|solo| solo.course))
+            .and_then(|course| u8::try_from(course.course_id().get()).ok())
+            .unwrap_or(0)
+    }
+
     /// Sends the four frames a retail client needs before it will load a hole.
     ///
     /// The plan is one hole because that is what this server settles; the client reads the
@@ -5187,7 +5202,8 @@ where
                     Ok(summary) => {
                         *room_id = Some(summary.id());
                         self.observer.room(GameRoomObservation::Created);
-                        let room = retail_room_from_summary(&summary, &request);
+                        let room =
+                            retail_room_from_summary(&summary, &request, self.retail_course());
                         self.send(framed, &RetailRoomJoinResult::Accepted(Box::new(room)))
                             .await?;
                         self.send_retail_census(framed, identity.connection_id)
@@ -5917,18 +5933,30 @@ const RETAIL_C2S_MULTIPLAYER_LEAVE: u16 = 0x0082;
 /// Builds a retail room record from a lobby summary plus the settings the creator asked
 /// for. The lobby model stores capacity and identity only, so course, timers, and hole
 /// count are echoed from the request rather than invented.
-fn retail_room_from_summary(summary: &RoomSummary, request: &RetailRoomCreate) -> RetailRoom {
+/// Builds a retail room record from a lobby summary plus the settings the creator asked for.
+///
+/// Course and hole count are **not** echoed. This server settles exactly one hole on the course
+/// its configuration names, and the match plan says so when the hole starts; echoing the request
+/// would have the room header promise three holes on another course and the match contradict it
+/// a moment later. Reporting what will actually run is the honest answer, and it is the value
+/// the client will be given to load. The timers and the room type are the creator's own, because
+/// those this server does honour.
+fn retail_room_from_summary(
+    summary: &RoomSummary,
+    request: &RetailRoomCreate,
+    course: u8,
+) -> RetailRoom {
     RetailRoom {
         name: summary.name().as_str().as_bytes().to_vec(),
         public: !summary.password_protected(),
         state: RetailRoomState::Lobby,
         max_players: summary.max_members(),
         player_count: summary.members(),
-        hole_count: request.hole_count,
+        hole_count: 1,
         room_type: RetailRoomType::from_wire(request.room_type).unwrap_or(RetailRoomType::Versus),
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
-        course: request.course,
+        course,
         shot_timer_ms: request.shot_timer_ms,
         game_timer_ms: request.game_timer_ms,
         owner_uid: 0,
