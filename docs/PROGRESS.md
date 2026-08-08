@@ -4,7 +4,7 @@
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
-> Next gate: **the lobby opcodes the client sends once it is standing there.** `0x016E` (login bonus status) and `0x009C` arrive immediately after channel entry and are currently only captured, not answered; `protocol.unknown_opcode_policy = "capture"` is what keeps the session alive past them.
+> Next gate: **the lobby actions.** The client sits in the lobby indefinitely under the shipped `unknown_opcode_policy = "disconnect"`; what has not been driven yet is Start Game, room creation, and playing a hole from the real client.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -298,13 +298,15 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Two smaller things fell out of this. The retail channel-select `0x0004` is a **one-byte** sub-server ID, not the synthetic `u32`, and its `0x004e` reply is a single `0x01`. And the catch-all arm that mapped every unclassified `GameRuntimeError` to `Error` discarded the error entirely, which is why the bootstrap failure was indistinguishable from any other; it now logs the variant.
 
-16. **Lobby opcodes are unanswered** — open. Standing in the lobby the client sends `0x016E` (login bonus status request, no payload, documented as always following `0x0004`) and `0x009C`. Neither is implemented, so the session only survives because `protocol.unknown_opcode_policy` is `capture`; under the shipped `disconnect` default the client is dropped the moment it finishes entering the channel. Answering `0x016E` with `0x0248` is the documented next step.
+16. **Lobby opcodes are unanswered** — **resolved 2026-08-08.** Standing in the lobby a real client sends `0x016E` (login bonus status) and `0x009C` (recent-player history), and channel entry itself expects more than the connect response. All three are answered now: `0x004E` is followed by upstream's unclassified four-byte `0x01F6` notice, `0x016E` gets a `0x0248` reporting nothing claimable, and `0x009C` gets a `0x010E` of five zeroed recent-player slots — an empty history rather than invented opponents, which is what upstream sends too.
+
+    Rather than keep finding these one client restart at a time, the remaining session-level chatter was enumerated from upstream's client opcode table and its handler bodies. Ten opcodes that upstream accepts and answers with nothing (online status, typing indicator, idle status, client exception reports, macro set, messenger list, and four unclassified ones) are now an explicit allowlist, `RETAIL_ACCEPTED_SESSION_OPCODES`. Room and match opcodes are deliberately excluded: those have real state handlers, and silently accepting one would hide a gap in them. The lobby is now stable under the shipped `unknown_opcode_policy = "disconnect"` rather than depending on a permissive policy.
 
 ---
 
 ## Immediate next actions
 
-1. **Answer the lobby opcodes** (blocker 16), starting with `0x016E` → `0x0248`. Until they are implemented the real-client path depends on `unknown_opcode_policy = "capture"`, which is not the shipped default.
+1. **Drive a room and a hole from the real client.** Lobby entry is done; §19.6 steps 5-12 need Start Game, room creation, and a played hole against the retail room and match packets.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

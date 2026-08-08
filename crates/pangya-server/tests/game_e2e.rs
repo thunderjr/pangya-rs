@@ -5987,6 +5987,10 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         let (opcode, body) = receive_packet(&mut stream, key).await;
         assert_eq!(opcode, 0x004e);
         assert_eq!(body, [0x01]);
+        // Upstream follows the connect response with an unclassified four-byte notice.
+        let (opcode, body) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x01f6);
+        assert_eq!(body, [0; 4]);
         (stream, key)
     }
 
@@ -6133,9 +6137,10 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     for _ in 0..9 {
         let _ = receive_packet(&mut stream, key).await;
     }
-    // Retail sends the one-byte sub-server ID for channel entry.
+    // Retail sends the one-byte sub-server ID for channel entry, and gets two frames back.
     send_packet(&mut stream, key, 2, 4, &[1]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
 
     // Create a room, then start a match from inside it.
     let mut writer = pangya_protocol::PacketWriter::default();

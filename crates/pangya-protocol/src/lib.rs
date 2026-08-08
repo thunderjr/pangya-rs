@@ -26,8 +26,10 @@ pub use error::{ErrorClass, PacketDecodeError, PacketEncodeError};
 pub use game::{
     ChannelJoined, CharacterBootstrap, CharacterInfo, EquipmentInfo, GAME_INVENTORY_SEGMENT_ITEMS,
     GameAuth, InventoryBootstrap, InventorySegment, MAX_GAME_HANDOVER_BYTES, PlayerInfo,
-    RetailChannelJoined, RetailSelectChannel, SelectChannel, synthetic_game_hello,
-    us852_game_hello,
+    RETAIL_ACCEPTED_SESSION_OPCODES, RETAIL_RECENT_PLAYER_BYTES, RETAIL_RECENT_PLAYERS,
+    RetailChannelJoinNotice, RetailChannelJoined, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailPlayerHistory, RetailPlayerHistoryRequest, RetailSelectChannel, SelectChannel,
+    is_retail_accepted_session_opcode, synthetic_game_hello, us852_game_hello,
 };
 pub use login::{
     ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList,

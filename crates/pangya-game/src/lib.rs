@@ -65,32 +65,35 @@ use pangya_protocol::{
     Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailChannelJoined, RetailCharacter, RetailEquipment, RetailFinishHole, RetailGameAuth,
-    RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailMatchInfo,
-    RetailMatchStart, RetailPlayerIdentity, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
-    RetailSelectChannel, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
-    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
-    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
-    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
-    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
-    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
-    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
-    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
-    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
-    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
-    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
-    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
-    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
-    encode_packet_payload, synthetic_game_hello, us852_game_hello,
+    RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailEquipment,
+    RetailFinishHole, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
+    RetailHoleWind, RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchInfo,
+    RetailMatchStart, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomType, RetailSelectChannel, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
+    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
+    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
+    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    encode_packet_payload, is_retail_accepted_session_opcode, synthetic_game_hello,
+    us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -1286,7 +1289,10 @@ where
                                 () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
                                 sent = async {
                                     if self.config.retail_bootstrap {
-                                        self.send(&mut framed, &RetailChannelJoined).await
+                                        // Upstream follows the connect response with this notice
+                                        // before the client asks for anything.
+                                        self.send(&mut framed, &RetailChannelJoined).await?;
+                                        self.send(&mut framed, &RetailChannelJoinNotice).await
                                     } else {
                                         self.send(&mut framed, &ChannelJoined { channel_id }).await
                                     }
@@ -1300,6 +1306,40 @@ where
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
+                            } else if self.config.retail_bootstrap
+                                && matches!(
+                                    frame.opcode,
+                                    RetailLoginBonusRequest::OPCODE
+                                        | RetailPlayerHistoryRequest::OPCODE
+                                )
+                            {
+                                // A real client sends both of these the moment it finishes entering
+                                // a channel. Leaving them unanswered means the lobby only survives
+                                // under a permissive unknown-opcode policy.
+                                if !frame.payload.is_empty() {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let sent = tokio::select! {
+                                    biased;
+                                    () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
+                                    sent = async {
+                                        if frame.opcode == RetailLoginBonusRequest::OPCODE {
+                                            self.send(&mut framed, &RetailLoginBonusStatus).await
+                                        } else {
+                                            self.send(&mut framed, &RetailPlayerHistory).await
+                                        }
+                                    } => sent,
+                                };
+                                if let Err(error) = sent {
+                                    break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && is_retail_accepted_session_opcode(frame.opcode)
+                            {
+                                // Documented session-level chatter the client does not wait on.
+                                // Accepting it explicitly keeps the unknown-opcode policy for
+                                // opcodes that really are unrecognized.
+                                self.observer.unknown(GameUnknownObservation::Ignored);
                             } else if is_known_economy_opcode(frame.opcode) {
                                 if state != GameState::InChannel {
                                     break Err(GameRuntimeError::Protocol);

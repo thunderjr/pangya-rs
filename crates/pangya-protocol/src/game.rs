@@ -181,6 +181,169 @@ impl EncodePacket for RetailChannelJoined {
     }
 }
 
+/// U.S. 852 retail login-bonus status request, client opcode `0x016e`.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/client/016e.ksy`: no payload. Documented as
+/// always following the sub-server connect, which is where a real client sends it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoginBonusRequest;
+
+impl DecodePacket for RetailLoginBonusRequest {
+    const OPCODE: u16 = 0x016e;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// U.S. 852 retail login-bonus status response, server opcode `0x0248`.
+///
+/// This server has no login-bonus schedule, so it answers with the "already collected" form and a
+/// zeroed preview: nothing is offered and nothing is claimable. Reporting the uncollected form
+/// would advertise a reward the client could then try to claim.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/server/0248.ksy`. The trailing block is a union
+/// selected by `bonus_collected`; the collected branch is three `u4` preview fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoginBonusStatus;
+
+impl EncodePacket for RetailLoginBonusStatus {
+    const OPCODE: u16 = 0x0248;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; 4]);
+        writer.u8(0x01);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        Ok(())
+    }
+}
+
+/// U.S. 852 retail post-channel-join notice, server opcode `0x01f6`.
+///
+/// # Provenance
+///
+/// Four zero bytes, from `pangbox/server` (`game/server/conn.go`, the `ClientJoinChannel` case),
+/// ISC licensed, which sends it immediately after the sub-server connect response. Its meaning is
+/// not established, so the bytes are carried verbatim rather than modelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailChannelJoinNotice;
+
+impl EncodePacket for RetailChannelJoinNotice {
+    const OPCODE: u16 = 0x01f6;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; 4]);
+        Ok(())
+    }
+}
+
+/// Session-level client opcodes a real U.S. 852 client sends that this server accepts and answers
+/// with nothing.
+///
+/// These are documented in `pangbox/server` (`game/packet/client.go`) and handled there with an
+/// empty case — the client neither expects nor waits for a reply. Accepting them explicitly keeps
+/// the shipped `unknown_opcode_policy` meaningful: genuinely unrecognized opcodes still hit it,
+/// rather than the whole lobby depending on a permissive policy.
+///
+/// Room and match opcodes are deliberately absent. Those have real state handlers, and silently
+/// accepting one would hide a gap in them instead of surfacing it.
+pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
+    0x0007, // online status of another user
+    0x0018, // typing indicator
+    0x0032, // idle status
+    0x0033, // client-side exception report
+    0x004f, // unclassified
+    0x0069, // chat macro set
+    0x0088, // unclassified
+    0x008b, // messenger list request
+    0x00c1, // unclassified
+    0x00fe, // unclassified
+];
+
+/// Returns whether `opcode` is a session-level opcode this server accepts without replying.
+#[must_use]
+pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {
+    RETAIL_ACCEPTED_SESSION_OPCODES.contains(&opcode)
+}
+
+/// Recent-player slots in a [`RetailPlayerHistory`].
+pub const RETAIL_RECENT_PLAYERS: usize = 5;
+/// Bytes in one recent-player record: `u32`, two 22-byte names, `u32`.
+pub const RETAIL_RECENT_PLAYER_BYTES: usize = 52;
+
+/// U.S. 852 retail recent-player history request, client opcode `0x009c`.
+///
+/// # Provenance
+///
+/// No payload. Opcode and empty body from `pangbox/server` (`game/packet/client.go`
+/// `ClientRequestPlayerHistory`), ISC licensed; the vendored PacketDoc `gameservice/client/009c.ksy`
+/// documents the same empty request. A real client sends it right after entering a channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPlayerHistoryRequest;
+
+impl DecodePacket for RetailPlayerHistoryRequest {
+    const OPCODE: u16 = 0x009c;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// U.S. 852 retail recent-player history, server opcode `0x010e`.
+///
+/// Five fixed slots, all zeroed: this server keeps no recent-opponent history, and an empty list is
+/// the honest answer rather than inventing players.
+///
+/// # Provenance
+///
+/// Record shape from `pangbox/server` (`game/packet/server.go` `ServerPlayerHistory`, `RecentPlayer`),
+/// ISC licensed, which sends the same zero-valued response. The vendored PacketDoc
+/// `gameservice/server/010e.ksy` describes the identical 260 bytes as one record plus padding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPlayerHistory;
+
+impl EncodePacket for RetailPlayerHistory {
+    const OPCODE: u16 = 0x010e;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; RETAIL_RECENT_PLAYERS * RETAIL_RECENT_PLAYER_BYTES]);
+        Ok(())
+    }
+}
+
 /// Synthetic minimal player/profile bootstrap, server opcode `0x0070`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerInfo {
@@ -379,6 +542,80 @@ mod tests {
             "the two hellos must stay distinguishable by length"
         );
         assert!(us852_game_hello(0x10).is_err());
+    }
+
+    /// The client sends the request the moment it enters a channel, so the answer is on the
+    /// critical path to the lobby. `bonus_collected = 1` selects the preview branch, which is
+    /// three `u4`s rather than the uncollected branch's eight padding bytes plus one `u4`.
+    #[test]
+    fn retail_login_bonus_status_reports_nothing_claimable() {
+        let mut writer = PacketWriter::new();
+        RetailLoginBonusStatus
+            .encode(&mut writer, &CompatibilityProfile::US_852)
+            .expect("encode");
+        let bytes = writer.into_inner();
+        assert_eq!(bytes.len(), 4 + 1 + 4 * 5);
+        assert_eq!(&bytes[..4], &[0; 4]);
+        assert_eq!(bytes[4], 0x01, "already collected, so nothing is claimable");
+        assert!(bytes[5..].iter().all(|byte| *byte == 0));
+    }
+
+    /// An empty history is five zeroed slots, not an empty packet: the client reads a fixed
+    /// number of fixed-width records.
+    /// The allowlist exists so the unknown-opcode policy still means something. If a room or
+    /// match opcode ever lands in it, a genuine gap in those handlers would be silently accepted.
+    #[test]
+    fn accepted_session_opcodes_exclude_room_and_match_opcodes() {
+        for opcode in RETAIL_ACCEPTED_SESSION_OPCODES {
+            assert!(is_retail_accepted_session_opcode(*opcode));
+        }
+        for room_or_match in [
+            0x0008_u16, 0x0009, 0x000a, 0x000d, 0x000f, 0x0011, 0x0012, 0x0031,
+        ] {
+            assert!(
+                !is_retail_accepted_session_opcode(room_or_match),
+                "{room_or_match:#06x} has a state handler and must not be silently accepted"
+            );
+        }
+        assert!(!is_retail_accepted_session_opcode(GameAuth::OPCODE));
+        assert!(!is_retail_accepted_session_opcode(SelectChannel::OPCODE));
+    }
+
+    #[test]
+    fn retail_player_history_is_five_empty_slots() {
+        let mut writer = PacketWriter::new();
+        RetailPlayerHistory
+            .encode(&mut writer, &CompatibilityProfile::US_852)
+            .expect("encode");
+        let bytes = writer.into_inner();
+        assert_eq!(bytes.len(), 260);
+        assert_eq!(
+            bytes.len(),
+            RETAIL_RECENT_PLAYERS * RETAIL_RECENT_PLAYER_BYTES
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn retail_login_bonus_request_has_no_payload() {
+        let mut reader = PacketReader::new(
+            &[],
+            crate::Direction::ClientToServer,
+            crate::ServiceKind::Game,
+            Some(RetailLoginBonusRequest::OPCODE),
+        );
+        assert!(
+            RetailLoginBonusRequest::decode(&mut reader, &CompatibilityProfile::US_852).is_ok()
+        );
+        let mut trailing = PacketReader::new(
+            &[0],
+            crate::Direction::ClientToServer,
+            crate::ServiceKind::Game,
+            Some(RetailLoginBonusRequest::OPCODE),
+        );
+        assert!(
+            RetailLoginBonusRequest::decode(&mut trailing, &CompatibilityProfile::US_852).is_err()
+        );
     }
 
     #[test]
