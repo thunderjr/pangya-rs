@@ -6,7 +6,7 @@
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **a two-player retail match, which the server does not implement.** Everything a single real client can reach is verified. The remaining §19.6 steps are blocked server-side, not by tooling: the retail start path begins a *solo* match for whoever pressed Start, so the second player a versus room requires is never a participant. See blocker 23.
+> Next gate: **a two-player retail match against the real client.** The server implements it now: a retail start in a room holding two players runs the stroke lifecycle, with turn arbitration, a relay of the client's own shot frames, and a settlement that pays both participants exactly once. It is proven over TCP against a real database by `game_retail_two_players_play_and_settle_one_versus_hole`. What remains for §19.6 steps 7-12 is the real client's acceptance of it. See blocker 23.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -44,7 +44,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
 | Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
-| Gameplay | 🟡 | Local synthetic M5 solo and M6 exactly-two-ready-player stroke/turn/standings/settlement checkpoints pass the complete local matrix; real U.S. 852 one-/two-client gates remain open |
+| Gameplay | 🟡 | Local synthetic M5 solo and M6 exactly-two-ready-player stroke/turn/standings/settlement checkpoints pass the complete local matrix, and the retail wire now drives the same two-player lifecycle end to end over TCP; real U.S. 852 one-/two-client gates remain open |
 | Economy | 🟡 | Local synthetic M7 checkpoint complete; not retail-validated |
 | Social/parity | ⬜ | M8+; no M8 implementation or checkpoint claim |
 
@@ -348,21 +348,26 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     What remains on this blocker is harness reliability, not capability — see the closing note below.
 
-23. **A two-player retail match is not implemented** — open, and the actual blocker for §19.6 steps 7-12. This supersedes the earlier claim in this file that the match was "implemented and covered end to end"; that was true only of the single-player case.
+23. **A two-player retail match is not implemented** — **resolved 2026-08-08.** This superseded the earlier claim in this file that the match was "implemented and covered end to end"; that was true only of the single-player case.
 
     `RETAIL_C2S_START_MATCH` (`0x000E`) builds a `BeginSoloMatch` for `identity.account_id` and routes it through the solo lifecycle. A two-player match lifecycle does exist — `StrokeStartPlan` takes `participants` and both members' connection ids, with turn and game timeouts — but it is reachable only from the synthetic `0x7f4x` opcodes. Nothing connects the retail opcode to it.
 
     So a real client, which can only ever start a two-player room, causes a solo match to begin for whoever pressed Start. `game_retail_start_with_two_players_begins_only_a_solo_match` pins this: with both players in the room and ready, the host gets a `match_players` row and **the guest gets none**, so nothing the second player does can be scored.
 
-    The implementation path is to route the retail start onto the stroke lifecycle rather than the solo one, which also brings the turn arbitration a versus hole needs. The existing `game_retail_match_plays_and_settles_one_hole` remains valid for what it covers — one client, one hole — and should not be mistaken for coverage of a versus match.
+    The retail start now reads the room before it starts anything: two members run the stroke aggregate, one member still runs the solo one. Three things the versus flow needed did not exist. `StrokeMatchState::hole_out` is a completion rather than a shot, because the client plays the holing stroke through the ordinary action/result pair and only *then* announces the hole is over — counting the announcement as a stroke scored every hole one over. A bounded relay carries the client's own in-match frames (`0x0055` shot announce, `0x0064` ball sync) to the other participant unchanged, since the client owns trajectory and this server's authority is the stroke count and whose turn it is. And `0x0066` carries the final standings, so the results screen shows the durable settlement.
+
+    `game_retail_two_players_play_and_settle_one_versus_hole` replaces the pin and drives two authenticated retail clients through a whole hole over TCP: both receive the hole intro, the turn alternates with `0x00cc`/`0x0063`, each shot reaches the other client as `0x0055`, and the second hole-out settles one durable match with **both** accounts as participants and one Pang and one EXP ledger row each.
+
+    A process note that matters more than the fix. The pinning test proved less than it claimed: it read the room number from the wrong offset of the join reply, so its guest was refused the room with `RoomNotFound` and could not have been scored whatever the server did. `0x0049` is both the acceptance and the rejection, so asserting the opcode alone asserted nothing. The replacement asserts the status word, and the guest's census frame, before it believes anyone is in a room.
+
+    The existing `game_retail_match_plays_and_settles_one_hole` remains valid for what it covers — one client, one hole — and is not coverage of a versus match.
 
 ---
 
 ## Immediate next actions
 
-1. **Route the retail match start onto the two-player stroke lifecycle** (blocker 23). Until that exists, no amount of client-side work can produce a scored versus hole.
+1. **Play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
-2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

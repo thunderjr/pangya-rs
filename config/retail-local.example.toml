@@ -179,7 +179,10 @@ bytes_per_window = 262144
 malformed_strike_cap = 1
 max_retries = 3
 login_timeout = "300s"
-idle_timeout = "600s"
+# The client sends nothing while it sits in the lobby, so this is how long a session survives
+# an operator who is reading a log or setting up a second client. Ten minutes is short enough to
+# lose a session mid-run; the client reports it as "Game Disconnected from the server."
+idle_timeout = "3600s"
 
 [starter]
 # Provisional until M3 validates these IDs against an operator-supplied IFF catalog.
