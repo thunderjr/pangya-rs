@@ -13,12 +13,14 @@ builds and runs anywhere Rust and PostgreSQL do.
 | Stage | State |
 |---|---|
 | Client startup: string catalog, patch `updatelist`, theme content | **Verified against the real client.** It performs 33 HTTP requests against this server, accepts all of them, and mounts its full 84-file PAK series. |
-| Client reaches its login screen | **Blocked.** The client dies about 20 seconds in on a deterministic null-pointer access violation, without ever opening a socket. See [Where it stops](#7-where-it-stops-today). |
-| LoginService handshake, login, server list | Real U.S. opcodes and layouts, MD5 client secret handled. Plausible but **unverified** — no client has reached it. |
+| Client reaches its login screen | **Verified.** Requires the resource flattening and `patch_number` settings below. |
+| LoginService login | **Verified.** The client authenticates: `account authenticated`, opcode `0x0001` in and out. |
+| First-character setup | **Partly verified.** Character Creation is shown and the chosen character is accepted and persisted, but the setup state does not advance, so a returning login repeats it. Blocker 14 in `PROGRESS.md`. |
+| Server list, GameService handover onward | **Unverified** — gated on blocker 14. |
 | GameService auth + bootstrap | Complete when `game.retail_bootstrap = true`, proven end to end over encrypted TCP in CI, **unverified** against a client. |
 | Rooms, one scored hole | Routed and proven over TCP in CI, **unverified** against a client. |
 
-Everything from the login screen onward is therefore still gated on the startup blocker.
+Everything past first-character setup is therefore still gated on blocker 14.
 
 ## 1. Obtain and extract the client
 
@@ -161,6 +163,14 @@ Keep every listener on loopback. Any non-loopback bind requires
 Startup logs `client patch web service ready` with the size of the generated update list.
 For the unmodified U.S. series with `entries = "paks"` that is 14,560 bytes.
 
+**`patch_number` must not exceed the client's own patch level.** With a higher number the client
+loads, renders its scene, re-checks the `updatelist`, and then never offers a login dialog at
+all — it believes an update is pending. For this build set `patch_number = 851`.
+
+**Raise `security.login_timeout` for first-time setup.** The shipped 15 seconds closes the
+connection while the client's own Character Creation screen is still open. Something like
+`300s` is appropriate while setting an account up.
+
 ### The translation catalog
 
 `translation_catalog` points at the **plaintext** catalog XML; the service base64-encodes it
@@ -212,9 +222,9 @@ The client dials **10803**; 10103 is included because other builds in the family
 Run `ProjectG.exe` directly, from the client directory. The launcher and updater are not
 involved; Rugburn sets `PANGYA_ARG` so the updater check is skipped.
 
-## 6. Two host prerequisites that are not the server's
+## 6. Client-side prerequisites that are not the server's
 
-These are properties of the machine running the client. Both were found the hard way.
+These are properties of the client install and the machine running it. All were found the hard way.
 
 ### An audio device must exist
 
@@ -227,21 +237,26 @@ backend does it:
 -audiodev none,id=snd0 -device intel-hda -device hda-output,audiodev=snd0
 ```
 
-### Three loose data files must sit in the client directory
+### Every resource must be a loose file in the client directory
 
-The client opens `chat.bin`, `nick.bin`, and `bbh.bin` as real files in its own directory. All
-three are inside the PAK series — `pangfiles` extracts them to `data/` — but the client's
-bare-name lookup does not find them there, and putting them under `data/` on disk does not
-help either. Copy them to the client root:
+This is the big one. The client asks for resources by **bare file name** — `chat.bin`,
+`[s_pointer1.png`, and so on — and does not find them inside its PAK series. Putting them under
+`data/` on disk does not help either; they have to be directly in the client directory.
 
-```powershell
-copy local-data\us851-data\data\chat.bin  C:\pangya\us851\
-copy local-data\us851-data\data\nick.bin  C:\pangya\us851\
-copy local-data\us851-data\data\bbh.bin   C:\pangya\us851\
+Fortunately the whole extracted tree flattens cleanly: 41,192 files with 41,192 distinct base
+names, no collisions. Flatten all of it into the client directory:
+
+```bash
+mkdir -p /tmp/flat
+cd local-data/us851-data/data
+find . -type f -exec sh -c 'ln "$1" "/tmp/flat/$(basename "$1")"' _ {} \;
+COPYFILE_DISABLE=1 tar -cf /tmp/flat.tar -C /tmp/flat .
+# then, in the client directory on Windows:
+#   tar.exe -xf flat.tar -C C:\pangya\us851
 ```
 
-Without them the client raises `WAppException("Cannot open file.")` and exits. The other
-top-level extracted files make no difference, so these three are the whole requirement.
+Without this the client throws `WAppException("Cannot open file.")` for the first `.bin` it
+wants, and after that a null-pointer access violation for the first cursor image.
 
 ### `IntegratedPak` must exist in the registry
 
@@ -272,42 +287,31 @@ publish it with `scripts/tailnet-forward.py`, which forwards through the interpr
 
 ## 7. Where it stops today
 
-With everything above in place the client:
+With everything above in place the client renders its login screen, authenticates, and reaches
+Character Creation. Choosing a character is accepted and persisted. Immediately afterwards the
+connection closes with `reason: "protocol"`, and a fresh login shows Character Creation again
+rather than advancing — the account's setup state is never marked complete. That is a server-side
+defect, tracked as blocker 14 in `PROGRESS.md`.
 
-- fetches the string catalog, the `updatelist`, `extracontents.xml`, the theme document, and
-  all 30 theme images from this server — 33 requests, all answered;
-- mounts its complete PAK series (about 130,000 file operations);
-- then, roughly 20 seconds in, dies on a deterministic access violation at `ProjectG.exe`
-  `+0x488d08`, reading `[ecx+0x30]` with `ecx` zero: a method called on a null `this`.
+### Automating the client's UI
 
-It writes its own crash report next to the executable — `exception.log`, `stack.log`, and
-`exception.dmp`. No socket is ever opened to LoginService, so nothing about the game protocol
-has been exercised yet.
+The client reads its mouse through DirectInput, so it ignores `SetCursorPos` completely and its
+in-engine cursor will not follow it. Synthetic clicks therefore do nothing to its own widgets,
+even though keyboard input works. Drive it with **relative** `SendInput` deltas instead: push the
+cursor into a corner with a large negative delta to pin it, then move by the target offset. After
+pinning, engine coordinates equal client-area pixels, so a widget at screen `(x, y)` is reached by
+moving `(x - client_left, y - client_top)`.
 
-Two things to know before spending time on it:
+### If you need to know what the client is failing on
 
-- **The client is protected with WinLicense** (Oreans). Attaching a debugger prints its banner
-  and then the process is terminated, so a debugger is not usable.
-- **The symbol names in the crash report are meaningless.** The image is packed with randomized
-  section names, so every frame resolves to the nearest preceding export plus an offset in the
-  hundreds of kilobytes.
-
-What does work is a first-chance vectored exception handler inside Rugburn — it is already
-injected as `ijl15.dll`, so `AddVectoredExceptionHandler(1, …)` in its `DllMain` sees every
-exception before the client's own handler, returns `EXCEPTION_CONTINUE_SEARCH` so nothing
-changes, and the protector never notices. For an MSVC throw it can walk the exception record's
-`ThrowInfo` for the RTTI type name and print readable strings the thrown object points at,
-guarding each dereference with `VirtualQuery`. That is how the three missing files above were
-found; see `evidence/REAL_CLIENT_STARTUP_2026-08-07.md` for the handler's shape and output.
-
-Ruled out as causes: the audio device, all three HTTP prerequisites, `IntegratedPak`,
-GameGuard (disabled, and confirmed not loaded), Rugburn's cosmetic US 852 patches (a build
-with only the GameGuard patches crashes identically), DNS (no lookups are made), Direct3D
-availability (`dxdiag` reports D3D enabled with feature levels through 12_1), the client's
-own graphics quality settings, missing theme images, and client file integrity (every game
-file was verified byte-for-byte against the source install).
-
-The most useful thing to report if you get further is the crash log plus what changed.
+The client is protected with WinLicense, so a debugger is terminated on attach and the packed
+image's symbol names are meaningless. Diagnose from inside the process: Rugburn is already
+injected as `ijl15.dll`, so a first-chance `AddVectoredExceptionHandler` in its `DllMain` can read
+the RTTI type name out of an MSVC throw's `ThrowInfo` and print any strings the thrown object
+points at, guarding each dereference with `VirtualQuery` and returning
+`EXCEPTION_CONTINUE_SEARCH` so nothing changes. It can also dump the unpacked image out of memory
+so a faulting address can be disassembled offline. See
+`evidence/REAL_CLIENT_STARTUP_2026-08-07.md`.
 
 Packet-body logging stays off; `logging.packet_bodies = true` is rejected. Report opcodes and
 observed behavior rather than captures, and never commit a capture.

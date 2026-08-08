@@ -94,99 +94,114 @@ Both were real and are fixed.
   failure collapsed into "required runtime task exited". The typed cause is now logged first;
   that is how the catalog defect above was identified at all.
 
-## 5. Where it stops, and how it was narrowed
+## 5. Getting the client to its login screen
 
-### The client is WinLicense-protected
+Three more requirements had to be found. Each was identified by satisfying the previous one and
+reading what failed next.
 
-Attaching `cdb` prints the protector's own banner and then the process is terminated:
+### The client is WinLicense-protected, so diagnose from inside the process
+
+Attaching `cdb` prints the protector's banner and then the process is terminated:
 
 ```
 ---        WinLicense Professional           ---
 ---      (c)2012 Oreans Technologies         ---
 ```
 
-followed by `ntdll!NtTerminateProcess`. That explains every earlier debugging dead end, and two
-things follow from it:
+Two consequences. First, the crash report's symbol names are meaningless: the image is packed
+with randomized section names, so every frame resolves to the nearest preceding export plus an
+offset in the hundreds of kilobytes. Second, a debugger is unusable.
 
-- **The crash report's symbol names mean nothing.** Every frame resolves to
-  `RFSingleton<RFWindowFactoryManager>::_singleton+0x…` or `RFMatrixTransform2DPoint+0x…` with
-  offsets in the hundreds of kilobytes, because the image is packed with randomized section
-  names and those are simply the nearest preceding exports. An earlier reading of them as
-  "the fault is in the window/render subsystem" was wrong.
-- **A debugger cannot be used**, so first-chance information has to come from inside the
-  process.
-
-### The technique that worked: a vectored handler inside Rugburn
-
-Rugburn is already injected as `ijl15.dll`, so a `AddVectoredExceptionHandler(1, …)` in its
-`DllMain` sees every exception first-chance, returns `EXCEPTION_CONTINUE_SEARCH` so behaviour is
-unchanged, and the protector never notices. For an MSVC throw
-(`0xE06D7363`) the record carries `magic`, the thrown object, and its `ThrowInfo`, so the handler
-can walk `ThrowInfo → CatchableTypeArray → CatchableType → TypeDescriptor+8` for the RTTI name
-and print any readable ASCII the object's fields point at. Every dereference is guarded by
-`VirtualQuery` first, so a bad pointer cannot fault the handler.
-
-That produced the answer immediately:
+What works instead is a first-chance vectored exception handler inside Rugburn, which is already
+injected as `ijl15.dll`. `AddVectoredExceptionHandler(1, …)` in its `DllMain` sees every
+exception before the client's own handler and returns `EXCEPTION_CONTINUE_SEARCH`, so behaviour
+is unchanged and the protector never notices. For an MSVC throw (`0xE06D7363`) the record carries
+the thrown object and its `ThrowInfo`, so the handler can walk
+`ThrowInfo → CatchableTypeArray → CatchableType → TypeDescriptor+8` for the RTTI name and print
+any readable ASCII the object's fields point at, guarding every dereference with `VirtualQuery`.
+It answered immediately:
 
 ```
-[veh] C++ throw #1 at 75ff3184 params=3
-[veh]   magic=19930520 obj=0019df70 throwinfo=00d7358c
 [veh]   rtti-type -> ".?AVWAppException@@"
 [veh]       points-at -> "Cannot open file."
 [veh]       points-at -> "chat.bin"
 ```
 
-### Three loose client files were missing
+The same handler, extended to dump the unpacked image out of memory, made the later
+access-violation site disassemblable offline.
 
-The client opens `chat.bin`, `nick.bin`, and `bbh.bin` **as real files in its own directory**,
-not through its PAK filesystem. All three exist inside the PAK series — `pangfiles` extracts
-them to `data/` — but a bare-name lookup does not find them there, and placing them under
-`data/` on disk does not satisfy it either. Copying the three into the client root does. Each
-one was found by fixing the previous and re-reading the handler's output, so the chain is
-`chat.bin → nick.bin → bbh.bin`. Adding the other eight top-level extracted files changes
-nothing, so three is the minimum and the maximum that matters.
+### Requirement: the client's resources must be loose files, not PAK entries
 
-With them in place the C++ exception is gone entirely and the client gets measurably further —
-its crash report now includes an `Inst Dir` line it never reached before.
+`chat.bin` is inside the PAK series, and the client still could not open it. Placing it under
+`data/` on disk did not help; placing it in the client root did, and the failure moved to
+`nick.bin`, then `bbh.bin`. Disassembling the next fault site showed the same shape: the client
+builds `"[s_pointer" + name + ".png"` for fifteen cursor images, calls a loader, and dereferences
+the result with no null check. Those files are also PAK-resident, and again only a loose copy
+satisfied it.
 
-### What remains
+Every resource this client asks for is a **bare file name**, and the whole extracted `data/`
+tree flattens without a single collision — 41,192 files, 41,192 distinct base names. Flattening
+all of them into the client directory removed the entire class of failure at once, and the client
+then rendered its 3D login scene.
 
-A deterministic access violation, at the same address on every run:
+That the namespace is flat and collision-free is what makes this safe rather than a hack; it is
+evidently the shape the client expects.
+
+### Requirement: the advertised patch number must not exceed the client's own
+
+With `patch_number = 9999` the client loads, renders its scene, re-requests the `updatelist`,
+and then sits there permanently with no login dialog. With `patch_number = 851`, matching the
+client's own patch level, the login dialog appears. The client treats a higher number as "an
+update is pending" and refuses to offer login.
+
+## 6. The real client authenticates
+
+With all of the above, the U.S. 852 client reached its login screen and logged in. Server side:
 
 ```
-[av] #1 at 00888d08 accessing 00000030
-[av]   eax=0d1f4790 ebx=00000000 ecx=00000000 edx=0d1f4790
-[av]   esi=0d5e0fd0 edi=00000000
+connection accepted, connection_id: 1, service: "login", client_profile: "us_852"
+account authenticated, service: "login", account_id: 1
+packet, service: "login", direction: "in",  opcode: 1
+packet, service: "login", direction: "out", opcode: 1
 ```
 
-`ecx` is zero and the instruction reads `[ecx+0x30]`: a method called on a null `this`. The
-object in `esi` has a vtable at `0x00d06c94`, and the object `eax`/`edx` both point at is
-entirely zero-filled — something that should have been constructed was not. No filename or
-other string appears anywhere on the stack, so unlike the previous failure this one is not a
-missing file.
+This is the first time any real U.S. 852 protocol has been exchanged with this server. It
+exercises, end to end and for real: the U.S. 852 hello, the client frame decode and decrypt path,
+the login packet layout, MD5 transport-secret canonicalization with Argon2id verification, and
+local auto-create.
 
-Additionally ruled out for **this** failure, each by direct observation:
+The client then displayed its **Character Creation** screen, meaning it understood the
+"needs character" outcome. Selecting Nuri (`0x04000000`, the identifier the shipped
+`[starter]` policy allows) and confirming persisted the character:
 
-| Hypothesis | How it was ruled out |
-|---|---|
-| Theme JPEG decoding | Serving an empty theme document, so the client downloads no images at all, produces the identical AV at the identical address |
-| Loose files shadowing PAK content | Reducing the root additions from 11 files to only the three the client demands produces the identical AV |
-| The translation catalog's content | An empty catalog body produces the identical AV |
-| Hypervisor detection | The guest now reports `HypervisorPresent: False` with real-looking SMBIOS strings; unchanged |
+```
+ id | account_id | item_type_id
+----+------------+--------------
+  1 |          1 |     67108864
+```
 
-Getting further needs static analysis of an unpacked image (the faulting address is
-`ProjectG.exe+0x488d08`), which is a different kind of work from anything above and is not
-attempted here.
+So `SPEC.md` §19.6 steps 1 and 2 now pass against the real client, and step 3 partially does:
+first-character setup is accepted and durable.
 
-Also still eliminated from the original 20-second exit, and unchanged by any of the above:
-audio, all three HTTP prerequisites, `IntegratedPak`, GameGuard, Rugburn's cosmetic US 852
-patches, DNS, Direct3D availability, the client's graphics settings, client file integrity, the
-launcher argument, and `.dat` string-table alignment.
+### Where it stops now
 
-**No socket is ever opened to LoginService**, so no part of the game protocol has been exercised
-by a real client yet.
+Immediately after the character is confirmed the connection closes with
+`reason: "protocol"`, and a fresh login still shows Character Creation rather than advancing.
+The character row is written but the account's setup state is not advanced, so the login result
+keeps reporting "needs character". That is a server-side defect in the retail setup flow, not a
+client problem, and it is the next thing to fix. It is recorded as blocker 14.
 
-## 6. Test-harness note
+Two operational findings from the same session:
+
+- `security.login_timeout` was 15 seconds, which closed the connection while the character
+  screen was still open. Interactive first-time setup needs a far longer allowance; the run
+  above used 300 seconds.
+- The client reads its mouse through DirectInput, so it ignores `SetCursorPos` entirely and its
+  in-engine cursor does not follow it. Automating its UI needs relative `SendInput` deltas;
+  pinning the cursor into a corner with a large negative delta first gives absolute positioning,
+  after which engine coordinates equal client-area pixels.
+
+## 7. Test-harness note
 
 macOS's Application Firewall gates incoming connections per application. The unsigned
 `pangya-server` is not on its allow list, so a remote peer completed the TCP handshake and

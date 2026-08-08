@@ -42,19 +42,31 @@ full PAK series, but still exits before opening any socket. Durable facts:
   rejects empty objects and arrays.
 - **The theme `url` attribute must be an absolute URL.** The client passes it to WinINet
   verbatim, so a leading-slash path produces a request with no host.
-- **The client needs three loose files in its own directory**: `chat.bin`, `nick.bin`, `bbh.bin`.
-  They exist in the PAK series but the client's bare-name lookup does not find them there, and
-  `data/` on disk does not satisfy it. Without them: `WAppException("Cannot open file.")`.
+- **The client resolves every resource by bare file name and does not read them from its PAKs.**
+  The whole extracted `data/` tree must be flattened into the client directory: 41,192 files with
+  41,192 distinct base names, so it flattens without collisions. Without this the client throws
+  `WAppException("Cannot open file.")` and then null-derefs on its cursor images.
+- **`client_web.patch_number` must not exceed the client's own patch level** (851 for this build).
+  Higher and the client renders its scene, re-checks the updatelist, and never offers a login
+  dialog at all.
+- **`security.login_timeout` of 15 s is too short for a real client's first-time setup**; it
+  closes the connection while Character Creation is open. Use several minutes for setup.
+- **The client reads its mouse through DirectInput**: it ignores `SetCursorPos` and its in-engine
+  cursor will not follow it, so synthetic clicks do nothing to its widgets while keyboard input
+  works. Automate with relative `SendInput` deltas, pinning into a corner first for absolute
+  positioning; after pinning, engine coordinates equal client-area pixels.
 - **The client is WinLicense-protected (Oreans).** A debugger is terminated on attach, and the
   crash report's symbol names are meaningless because the image is packed. Diagnose from inside
   the process instead: a vectored exception handler in Rugburn (already injected as `ijl15.dll`)
   sees throws first-chance, can read the RTTI type name from the record's `ThrowInfo` and any
   strings the thrown object points at, and the protector never notices. That technique is what
   found the three files; its shape is in `evidence/REAL_CLIENT_STARTUP_2026-08-07.md`.
-- **Open blocker 13**: a deterministic AV at `ProjectG.exe+0x488d08`, `[ecx+0x30]` with `ecx`
-  zero. Not a missing file. Theme JPEGs, loose-file shadowing, the translation catalog, and
-  hypervisor detection are all ruled out for it. Read the evidence file before re-testing any
-  hypothesis; a dozen are already eliminated.
+- **The real client authenticates.** `connection accepted → account authenticated`, opcode
+  `0x0001` in and out, then it shows Character Creation and the chosen character persists. This is
+  real U.S. 852 protocol, verified, not synthetic.
+- **Open blocker 14**: after the character is confirmed the connection closes with
+  `reason: "protocol"` and a fresh login repeats Character Creation, because the account's setup
+  state is never advanced. Server-side defect; it gates every remaining §19.6 step.
 - **macOS harness trap**: the Application Firewall gates incoming connections per application,
   so an unsigned `pangya-server` completes a TCP handshake and then sends nothing to a remote
   peer while answering fine on loopback. `python3` is allow-listed, which makes this look like
