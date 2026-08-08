@@ -637,6 +637,8 @@ pub const CHARACTER_AUX_PARTS: usize = 5;
 pub const CHARACTER_STATS: usize = 5;
 /// Character card slots.
 pub const CHARACTER_CARDS: usize = 12;
+/// Exact wire width of the retail equipped-character block.
+pub const CHARACTER_BLOCK_BYTES: usize = 513;
 /// Fixed guild-info tail width.
 const GUILD_INFO_BYTES: usize = 277;
 
@@ -820,7 +822,8 @@ pub struct RetailCharacter {
 }
 
 impl RetailCharacter {
-    fn encode_body(&self, writer: &mut PacketWriter) {
+    pub(crate) fn encode_body(&self, writer: &mut PacketWriter) {
+        let start = writer.as_slice().len();
         writer.u32_le(self.iff_id);
         writer.u32_le(self.uid);
         writer.u32_le(self.hair_color);
@@ -843,6 +846,7 @@ impl RetailCharacter {
         for _ in 0..CHARACTER_CARDS {
             writer.u32_le(0);
         }
+        debug_assert_eq!(writer.as_slice().len() - start, CHARACTER_BLOCK_BYTES);
     }
 }
 

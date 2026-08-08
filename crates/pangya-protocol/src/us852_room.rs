@@ -9,8 +9,8 @@
 //! a client. The totals agree either way.
 
 use crate::{
-    CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError, PacketEncodeError,
-    PacketReader, PacketWriter,
+    CHARACTER_BLOCK_BYTES, CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError,
+    PacketEncodeError, PacketReader, PacketWriter, RetailCharacter,
 };
 
 /// Fixed byte width of a room name on the wire.
@@ -993,7 +993,13 @@ pub enum RoomCensusKind {
 }
 
 /// Exact wire width of one room census player record.
-pub const ROOM_PLAYER_RECORD_BYTES: usize = 341;
+///
+/// The identity half is 341 bytes and the equipped-character block that closes it is another
+/// 513. Both halves are mandatory: a client reading a record short by the character block finds
+/// the next record 513 bytes early, which it renders as a roster of garbage names. That stays
+/// invisible with a single member — there is no second record to land wrong — so it only
+/// surfaces once a room holds two, which is every room that can start a versus hole.
+pub const ROOM_PLAYER_RECORD_BYTES: usize = 341 + CHARACTER_BLOCK_BYTES;
 
 /// Room status bits the client renders next to each player.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1036,14 +1042,19 @@ pub struct RetailRoomPlayer {
     pub nickname: Vec<u8>,
     /// Zero-based seat within the room.
     pub slot: u8,
-    /// Equipped character inventory id.
-    pub character_uid: u32,
+    /// Equipped character's **catalog** id, from the client's own `Character.iff`.
+    ///
+    /// Not the inventory id: this is what the client looks the character model up by, and an
+    /// id it cannot resolve leaves it holding a null it dereferences when the hole loads.
+    pub character_iff_id: u32,
     /// Room status bits.
     pub flags: RoomPlayerFlags,
     /// Player level.
     pub level: u8,
     /// Durable numeric account identifier.
     pub user_id: u32,
+    /// Equipped character, which closes the record and which the client renders in the slot.
+    pub character: RetailCharacter,
 }
 
 impl RetailRoomPlayer {
@@ -1055,7 +1066,7 @@ impl RetailRoomPlayer {
         writer.u8(self.slot);
         writer.u32_le(0);
         writer.u32_le(0); // title
-        writer.u32_le(self.character_uid);
+        writer.u32_le(self.character_iff_id);
         for _ in 0..4 {
             writer.u32_le(0); // skin background, frame, sticker, slot
         }
@@ -1086,6 +1097,7 @@ impl RetailRoomPlayer {
         writer.u8(0); // invited
         writer.f32_le(0.0); // average score
         writer.f32_le(0.0);
+        self.character.encode_body(writer);
         debug_assert_eq!(writer.as_slice().len() - start, ROOM_PLAYER_RECORD_BYTES);
         Ok(())
     }
@@ -1346,15 +1358,24 @@ mod tests {
             connection_id: 11,
             nickname: b"Nick".to_vec(),
             slot: 0,
-            character_uid: 5,
+            character_iff_id: 5,
             flags: RoomPlayerFlags::new(true, false),
             level: 3,
             user_id: 42,
+            character: RetailCharacter {
+                iff_id: 0x0100_0000,
+                uid: 5,
+                hair_color: 0,
+                part_iff_ids: [0; crate::CHARACTER_PARTS],
+                part_uids: [0; crate::CHARACTER_PARTS],
+                stats: [0; crate::CHARACTER_STATS],
+                mastery: 0,
+            },
         }
     }
 
     #[test]
-    fn census_player_record_is_exactly_three_hundred_forty_one_bytes() {
+    fn census_player_record_carries_its_character_block() {
         let payload = encode_packet_payload(
             &RetailRoomCensus::Add(Box::new(sample_player())),
             &profile(),
@@ -1362,8 +1383,21 @@ mod tests {
         .expect("encode");
         // kind, the 0xffff marker, the count, then one record.
         assert_eq!(payload.len(), 4 + ROOM_PLAYER_RECORD_BYTES);
+        assert_eq!(ROOM_PLAYER_RECORD_BYTES, 854);
         assert_eq!(payload[0], RoomCensusKind::Add as u8);
         assert_eq!(payload[3], 1);
+        // The character block closes the record, so its catalog id sits exactly 513 bytes from
+        // the end. A record that lost the block would put the next one 513 bytes early.
+        let character = payload.len() - CHARACTER_BLOCK_BYTES;
+        assert_eq!(
+            u32::from_le_bytes([
+                payload[character],
+                payload[character + 1],
+                payload[character + 2],
+                payload[character + 3],
+            ]),
+            0x0100_0000
+        );
     }
 
     #[test]

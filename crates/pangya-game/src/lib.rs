@@ -2177,10 +2177,13 @@ where
             .ok_or(GameRuntimeError::Snapshot)
             .and_then(|value| Nickname::parse(value).map_err(|_| GameRuntimeError::Snapshot))?;
         match self.authentication_remaining(started) {
-            Ok(remaining) => timeout(remaining, self.send_bootstrap(framed, &loaded))
-                .await
-                .map_err(|_| GameRuntimeError::Timeout)
-                .and_then(|result| result),
+            Ok(remaining) => timeout(
+                remaining,
+                self.send_bootstrap(framed, &loaded, connection_id),
+            )
+            .await
+            .map_err(|_| GameRuntimeError::Timeout)
+            .and_then(|result| result),
             Err(error) => Err(error),
         }?;
         let guard = self
@@ -2204,8 +2207,14 @@ where
                 account_id: session.account_id,
                 nickname,
                 // Carried from the authenticated snapshot so a room roster can render the
-                // player's character instead of an empty slot.
+                // player's character instead of an empty slot. Both halves travel: the client
+                // renders by catalog id and has no way to resolve an inventory one.
                 character_id: Some(loaded.equipment.character_id),
+                character_iff_id: loaded
+                    .characters
+                    .iter()
+                    .find(|value| value.id == loaded.equipment.character_id)
+                    .map(|value| value.item_type_id.get()),
             },
         ))
     }
@@ -4268,9 +4277,12 @@ where
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         snapshot: &PlayerSnapshot,
+        connection_id: PlayerConnectionId,
     ) -> Result<(), GameRuntimeError> {
         if self.config.retail_bootstrap {
-            return self.send_retail_bootstrap(framed, snapshot).await;
+            return self
+                .send_retail_bootstrap(framed, snapshot, connection_id)
+                .await;
         }
         let account_id =
             u64::try_from(snapshot.account.id.get()).map_err(|_| GameRuntimeError::Snapshot)?;
@@ -4905,10 +4917,19 @@ where
                             connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                             nickname: identity.nickname.display().as_bytes().to_vec(),
                             slot: 0,
-                            character_uid: 0,
+                            character_iff_id: 0,
                             flags: RoomPlayerFlags::new(false, false),
                             level: 1,
                             user_id: account_id,
+                            character: RetailCharacter {
+                                iff_id: 0,
+                                uid: 0,
+                                hair_color: 0,
+                                part_iff_ids: [0; CHARACTER_PARTS],
+                                part_uids: [0; CHARACTER_PARTS],
+                                stats: [0; CHARACTER_STATS],
+                                mastery: 0,
+                            },
                         },
                     },
                 )
@@ -5369,6 +5390,7 @@ where
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         snapshot: &PlayerSnapshot,
+        connection_id: PlayerConnectionId,
     ) -> Result<(), GameRuntimeError> {
         let narrow = |value: i64| u32::try_from(value).map_err(|_| GameRuntimeError::Snapshot);
 
@@ -5415,7 +5437,10 @@ where
                     .ok_or(GameRuntimeError::Snapshot)?
                     .as_bytes()
                     .to_vec(),
-                connection_id: 0,
+                // The client matches this against the connection id on every room census
+                // record to find its own. Told zero, it never recognises itself, so it never
+                // learns it is the room master and its Start button stays an inert Ready.
+                connection_id: u32::try_from(connection_id.get()).unwrap_or(0),
                 user_id: narrow(snapshot.account.id.get())?,
             },
             statistics: RetailPlayerStatistics {
@@ -5903,13 +5928,26 @@ fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
             connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
             nickname: member.nickname().as_bytes().to_vec(),
             slot: u8::try_from(slot).unwrap_or(u8::MAX),
-            character_uid: member
-                .character_id()
-                .and_then(|id| u32::try_from(id.get()).ok())
-                .unwrap_or(0),
+            character_iff_id: member.character_iff_id().unwrap_or(0),
             flags: RoomPlayerFlags::new(member.is_owner(), member.is_ready()),
             level: 1,
             user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
+            // The client builds every player's model from this block when the hole loads, so
+            // the catalog id has to be one its own Character.iff holds. Fitted parts are not
+            // carried by a room member and stay zero: they change how a character looks, not
+            // whether it can be instantiated.
+            character: RetailCharacter {
+                iff_id: member.character_iff_id().unwrap_or(0),
+                uid: member
+                    .character_id()
+                    .and_then(|id| u32::try_from(id.get()).ok())
+                    .unwrap_or(0),
+                hair_color: 0,
+                part_iff_ids: [0; CHARACTER_PARTS],
+                part_uids: [0; CHARACTER_PARTS],
+                stats: [0; CHARACTER_STATS],
+                mastery: 0,
+            },
         })
         .collect();
     RetailRoomCensus::List(players)
@@ -6541,6 +6579,7 @@ mod tests {
             account_id: AccountId::new(7).unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse("Tester").unwrap_or_else(|_| unreachable!()),
             character_id: None,
+            character_iff_id: None,
         }
     }
 
@@ -6550,6 +6589,7 @@ mod tests {
             account_id: AccountId::new(8).unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse("Second").unwrap_or_else(|_| unreachable!()),
             character_id: None,
+            character_iff_id: None,
         }
     }
 
