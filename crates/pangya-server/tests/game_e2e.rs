@@ -6507,6 +6507,12 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         );
     }
 
+    // SPEC 19.6 step 11: replaying the finish packet must not pay twice. Both clients resend
+    // theirs, which is what a client does when it is unsure the server heard it.
+    send_packet(&mut host, host_key, salt.wrapping_add(1), 0x0031, &[]).await;
+    send_packet(&mut visitor, visitor_key, salt.wrapping_add(1), 0x0031, &[]).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
     // Both accounts are participants of the same match, and both were paid exactly once.
     let (matches, players): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM matches), (SELECT count(*) FROM match_players)",
