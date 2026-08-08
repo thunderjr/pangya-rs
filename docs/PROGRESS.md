@@ -6,7 +6,7 @@
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **equipment update `0x0020`**, then playing a hole.
+> Next gate: **playing a hole.** Everything up to and including the room is verified against a real client; §19.6 steps 7-12 still need a started match, a played hole and the results screen.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -304,9 +304,11 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Rather than keep finding these one client restart at a time, the remaining session-level chatter was enumerated from upstream's client opcode table and its handler bodies. Ten opcodes that upstream accepts and answers with nothing (online status, typing indicator, idle status, client exception reports, macro set, messenger list, and four unclassified ones) are now an explicit allowlist, `RETAIL_ACCEPTED_SESSION_OPCODES`. Room and match opcodes are deliberately excluded: those have real state handlers, and silently accepting one would hide a gap in them. The lobby is now stable under the shipped `unknown_opcode_policy = "disconnect"` rather than depending on a permissive policy.
 
-17. **Equipment update `0x0020` is unanswered** — open. Opening My Room, the client sends enter (`0x00B5`), a furniture request (`0x00B7`), a locker inventory request (`0x00D3`), and then `0x0020` repeatedly. The first three are answered — the room renders with its locker, tabs, inventory grid and stat panel — but `0x0020` is not, and three of them exhaust the unknown-opcode strike budget and drop the connection, which the client reports as `Network error occured. (Error 10054)`.
+17. **Equipment update `0x0020` is unanswered** — **resolved 2026-08-08.** Opening My Room, the client sends this repeatedly, and three unanswered ones exhausted the unknown-opcode strike budget and dropped the connection, which the client reported as `Network error occured. (Error 10054)`.
 
-    It was deliberately not stubbed. `0x0020` is a tagged union over eight equipment kinds (character parts, caddie, consumables, ball, decoration, character, and two unclassified), and upstream persists the change before echoing the new state back. Acknowledging it without storing anything would tell the client an equipment change succeeded and then contradict itself on the next login. Implementing it means the equipment system, not a constant reply.
+    It is a tagged union over eight equipment kinds. What this server sends back is the equipment it *actually holds*, not an acknowledgement of the requested change: character parts, caddies, consumables and decoration have no durable representation here, so echoing the request would report a change that was never stored and contradict itself on the next login. Reporting stored state is accurate, and a client that asks for something this server cannot keep simply sees it revert. Character parts and the two unclassified kinds are accepted without a reply, because none could be formed honestly.
+
+    My Room now opens and stays open under the shipped `unknown_opcode_policy = "disconnect"`.
 
 18. **The catalog yields no item definitions for real client data** — **resolved 2026-08-08.** The client-schema path parsed identity only and always set `definition: None`, so `shop_offers()` was empty and every purchase was refused for want of a price. Real client records do carry the item header `pangbox/server` (`pangya/iff/item.go`) documents — a four-byte active flag and id, a 40-byte name, a rank byte, a 40-byte icon, then price — and reading it back against the acquired client reproduces the client's own shop exactly: "Air Knight Utility Set" at 10000 and "Candy Club Set" at 7500. Loading now yields **2,664** priced offers across club sets, balls, consumables and character parts.
 
@@ -336,7 +338,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. **Implement equipment update `0x0020`** (blocker 17), the last thing that drops a real client out of an otherwise working session.
+1. **Play a hole from the real client**, the remaining §19.6 steps: start the match, play and complete a hole, and show the results screen.
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.

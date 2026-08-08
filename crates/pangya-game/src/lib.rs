@@ -66,18 +66,19 @@ use pangya_protocol::{
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
     RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailEquipment,
-    RetailFinishHole, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
-    RetailHoleWind, RetailLockerCombinationAttempt, RetailLockerCombinationResponse,
-    RetailLockerInventoryRequest, RetailLockerInventoryResponse, RetailLoginBonusRequest,
-    RetailLoginBonusStatus, RetailMatchInfo, RetailMatchStart, RetailMultiplayerJoined,
-    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
-    RetailMyRoomLayout, RetailPangBalance, RetailPangSpent, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailTurnEnd,
-    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole,
+    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
+    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
+    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailMatchInfo, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
+    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
+    RetailPangBalance, RetailPangSpent, RetailPlayerHistory, RetailPlayerHistoryRequest,
+    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
+    RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
+    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
+    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -1336,6 +1337,22 @@ where
                                     } => sent,
                                 };
                                 if let Err(error) = sent {
+                                    break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailEquipmentUpdate::OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if let Err(error) = self
+                                    .handle_retail_equipment_update(
+                                        &mut framed,
+                                        established.account_id,
+                                        &frame.payload,
+                                    )
+                                    .await
+                                {
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
@@ -4369,6 +4386,70 @@ where
                 .await
             }
         }
+    }
+
+    /// Answers an equipment change with the equipment this server actually holds.
+    ///
+    /// A real client sends this repeatedly the moment My Room opens, and leaving it unanswered
+    /// drops the session. What it deliberately does *not* do is acknowledge the requested change:
+    /// character parts, caddies, consumables and decoration have no durable representation here,
+    /// so echoing the request back would report a change that was never stored and contradict
+    /// itself on the next login. Reporting the stored state instead is accurate, and a client
+    /// that asked for something this server cannot keep simply sees it revert.
+    async fn handle_retail_equipment_update(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+        payload: &[u8],
+    ) -> Result<(), GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        let request =
+            decode_packet_payload::<RetailEquipmentUpdate>(payload, profile, ServiceKind::Game)
+                .map_err(|_| GameRuntimeError::Protocol)?;
+        // Character parts and the two unclassified slots have no reply this server can form
+        // honestly, so they are accepted and left alone rather than answered with a guess.
+        let reply = match request.slot {
+            RetailEquipmentSlot::CharacterParts
+            | RetailEquipmentSlot::UnknownEight
+            | RetailEquipmentSlot::UnknownNine => {
+                self.observer.unknown(GameUnknownObservation::Ignored);
+                return Ok(());
+            }
+            RetailEquipmentSlot::Caddie => RetailEquipmentUpdated::Caddie { caddie_id: 0 },
+            RetailEquipmentSlot::Consumables => RetailEquipmentUpdated::Consumables {
+                item_type_ids: [0; pangya_protocol::RETAIL_CONSUMABLE_SLOTS],
+            },
+            RetailEquipmentSlot::Decoration => {
+                RetailEquipmentUpdated::Decoration { type_ids: [0; 6] }
+            }
+            RetailEquipmentSlot::Ball | RetailEquipmentSlot::Character => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                if request.slot == RetailEquipmentSlot::Character {
+                    RetailEquipmentUpdated::Character {
+                        character_id: u32::try_from(snapshot.equipment.character_id.get())
+                            .unwrap_or(0),
+                    }
+                } else {
+                    let ball = snapshot.equipment.ball_item_id.and_then(|id| {
+                        snapshot
+                            .inventory
+                            .iter()
+                            .find(|item| item.id == id)
+                            .map(|item| (id.get(), item.item_type_id.get()))
+                    });
+                    let (item_id, item_type_id) = ball.unwrap_or((0, 0));
+                    RetailEquipmentUpdated::Ball {
+                        item_id: u32::try_from(item_id).unwrap_or(0),
+                        item_type_id,
+                    }
+                }
+            }
+        };
+        self.send(framed, &reply).await
     }
 
     /// Buys the items a real client's shop asked for, priced from this server's catalog.

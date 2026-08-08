@@ -102,8 +102,9 @@ pub use us852_match::{
     RetailShotCommitRelay, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
-    MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, ROOM_NAME_BYTES,
-    ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES, RetailHoleProgression,
+    MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,
+    ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailHoleProgression,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailMultiplayerJoined, RetailMultiplayerLeft,
     RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,

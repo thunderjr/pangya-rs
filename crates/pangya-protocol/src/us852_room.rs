@@ -378,6 +378,184 @@ impl EncodePacket for RetailPurchaseResponse {
     }
 }
 
+/// Consumable slots carried by an equipment update.
+pub const RETAIL_CONSUMABLE_SLOTS: usize = 10;
+
+/// Which equipment an update concerns.
+///
+/// # Provenance
+///
+/// Discriminants and bodies from `pangbox/server` (`game/packet/client.go`
+/// `ClientEquipmentUpdate`), ISC licensed. Types `8` and `9` are unclassified there and here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentSlot {
+    /// Character parts. The body is the client's character block and is not modelled.
+    CharacterParts,
+    /// Selected caddie.
+    Caddie,
+    /// The ten consumable slots.
+    Consumables,
+    /// Selected ball, which the client calls a comet.
+    Ball,
+    /// Profile decoration: background, frame, sticker, slot, cut-in and title.
+    Decoration,
+    /// Selected character.
+    Character,
+    /// Unclassified update carrying one `u4`.
+    UnknownEight,
+    /// Unclassified update carrying a character id and four `u4`s.
+    UnknownNine,
+}
+
+impl RetailEquipmentSlot {
+    /// Returns the wire discriminant.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::CharacterParts => 0,
+            Self::Caddie => 1,
+            Self::Consumables => 2,
+            Self::Ball => 3,
+            Self::Decoration => 4,
+            Self::Character => 5,
+            Self::UnknownEight => 8,
+            Self::UnknownNine => 9,
+        }
+    }
+
+    /// Returns the slot for a wire discriminant.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::CharacterParts),
+            1 => Some(Self::Caddie),
+            2 => Some(Self::Consumables),
+            3 => Some(Self::Ball),
+            4 => Some(Self::Decoration),
+            5 => Some(Self::Character),
+            8 => Some(Self::UnknownEight),
+            9 => Some(Self::UnknownNine),
+            _ => None,
+        }
+    }
+}
+
+/// Equipment change, client opcode `0x0020`.
+///
+/// Only the slot is decoded. The bodies vary per slot and several are large; this server reports
+/// the equipment it actually holds rather than acting on a requested change it cannot persist, so
+/// the requested values are deliberately not read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailEquipmentUpdate {
+    /// Which equipment the client is changing.
+    pub slot: RetailEquipmentSlot,
+}
+
+impl DecodePacket for RetailEquipmentUpdate {
+    const OPCODE: u16 = 0x0020;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let tag = reader.u8()?;
+        let slot = RetailEquipmentSlot::from_tag(tag)
+            .ok_or_else(|| reader.invalid("unknown equipment slot"))?;
+        Ok(Self { slot })
+    }
+}
+
+/// The equipment this server holds for one slot, server opcode `0x006b`.
+///
+/// # Provenance
+///
+/// Layout from `pangbox/server` (`game/packet/server.go` `ServerPlayerEquipmentUpdated` and its
+/// per-slot bodies), ISC licensed, including the status value it sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentUpdated {
+    /// The caddie in use; zero when none is.
+    Caddie {
+        /// Caddie identifier.
+        caddie_id: u32,
+    },
+    /// The ten consumable slots.
+    Consumables {
+        /// Catalog type in each slot; zero when empty.
+        item_type_ids: [u32; RETAIL_CONSUMABLE_SLOTS],
+    },
+    /// The ball in use; zeroes when none is.
+    Ball {
+        /// Owned inventory row.
+        item_id: u32,
+        /// Catalog type.
+        item_type_id: u32,
+    },
+    /// Profile decoration; zeroes when none is set.
+    Decoration {
+        /// Background, frame, sticker, slot, cut-in and title types.
+        type_ids: [u32; 6],
+    },
+    /// The selected character.
+    Character {
+        /// Owned character row.
+        character_id: u32,
+    },
+}
+
+impl RetailEquipmentUpdated {
+    /// Status byte upstream sends alongside an applied update.
+    pub const STATUS_APPLIED: u8 = 0x04;
+
+    /// Returns the slot this reply describes.
+    #[must_use]
+    pub const fn slot(&self) -> RetailEquipmentSlot {
+        match self {
+            Self::Caddie { .. } => RetailEquipmentSlot::Caddie,
+            Self::Consumables { .. } => RetailEquipmentSlot::Consumables,
+            Self::Ball { .. } => RetailEquipmentSlot::Ball,
+            Self::Decoration { .. } => RetailEquipmentSlot::Decoration,
+            Self::Character { .. } => RetailEquipmentSlot::Character,
+        }
+    }
+}
+
+impl EncodePacket for RetailEquipmentUpdated {
+    const OPCODE: u16 = 0x006b;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(Self::STATUS_APPLIED);
+        writer.u8(self.slot().tag());
+        match self {
+            Self::Caddie { caddie_id } => writer.u32_le(*caddie_id),
+            Self::Consumables { item_type_ids } => {
+                for type_id in item_type_ids {
+                    writer.u32_le(*type_id);
+                }
+            }
+            Self::Ball {
+                item_id,
+                item_type_id,
+            } => {
+                writer.u32_le(*item_id);
+                writer.u32_le(*item_type_id);
+            }
+            Self::Decoration { type_ids } => {
+                for type_id in type_ids {
+                    writer.u32_le(*type_id);
+                }
+            }
+            Self::Character { character_id } => writer.u32_le(*character_id),
+        }
+        Ok(())
+    }
+}
+
 /// Shop entry, client opcode `0x0140`.
 ///
 /// # Provenance
@@ -979,6 +1157,66 @@ impl EncodePacket for RetailRoomCensus {
 
 #[cfg(test)]
 mod tests {
+    /// The reply is a tagged union, so the slot byte and the body must agree; a mismatch would
+    /// make the client read the next field at the wrong offset.
+    #[test]
+    fn equipment_reply_tags_match_their_bodies() {
+        let cases = [
+            (
+                RetailEquipmentUpdated::Caddie { caddie_id: 7 },
+                RetailEquipmentSlot::Caddie,
+                2 + 4,
+            ),
+            (
+                RetailEquipmentUpdated::Consumables {
+                    item_type_ids: [0; RETAIL_CONSUMABLE_SLOTS],
+                },
+                RetailEquipmentSlot::Consumables,
+                2 + 4 * RETAIL_CONSUMABLE_SLOTS,
+            ),
+            (
+                RetailEquipmentUpdated::Ball {
+                    item_id: 1,
+                    item_type_id: 2,
+                },
+                RetailEquipmentSlot::Ball,
+                2 + 8,
+            ),
+            (
+                RetailEquipmentUpdated::Decoration { type_ids: [0; 6] },
+                RetailEquipmentSlot::Decoration,
+                2 + 24,
+            ),
+            (
+                RetailEquipmentUpdated::Character { character_id: 3 },
+                RetailEquipmentSlot::Character,
+                2 + 4,
+            ),
+        ];
+        for (reply, slot, expected_len) in cases {
+            let mut writer = PacketWriter::new();
+            reply
+                .encode(&mut writer, &CompatibilityProfile::US_852)
+                .expect("encode");
+            let bytes = writer.into_inner();
+            assert_eq!(bytes.len(), expected_len, "{slot:?}");
+            assert_eq!(bytes[0], RetailEquipmentUpdated::STATUS_APPLIED);
+            assert_eq!(bytes[1], slot.tag(), "{slot:?}");
+        }
+    }
+
+    /// Every slot the client can send must decode, and nothing else may.
+    #[test]
+    fn equipment_update_accepts_only_known_slots() {
+        for tag in [0_u8, 1, 2, 3, 4, 5, 8, 9] {
+            let slot = RetailEquipmentSlot::from_tag(tag).expect("known slot");
+            assert_eq!(slot.tag(), tag);
+        }
+        for tag in [6_u8, 7, 10, 255] {
+            assert!(RetailEquipmentSlot::from_tag(tag).is_none(), "{tag}");
+        }
+    }
+
     use super::*;
     use crate::{ServiceKind, decode_packet_payload, encode_packet_payload};
 

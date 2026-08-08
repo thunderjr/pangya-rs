@@ -413,3 +413,13 @@ manifest built from their real counts, versions and record sizes.
 
 Do not skip this and use a loose `pangya_gb.iff`: an older copy loads and validates cleanly while
 silently lacking every item added since.
+
+### The notice dialog trap
+
+A stray click on the player-list pane opens a "You have left a message" notice. While it is up it
+swallows every later click, so a run fails somewhere unrelated and looks like a server fault.
+`Invoke-PangyaClick` and `Invoke-PangyaDoubleClick` therefore clear a pending notice before every
+click; `Dismiss-PangyaNotice` passes `-SkipNoticeCheck` on its own click so it cannot recurse.
+
+Wiring the check into one high-level step is not enough — that was the first attempt, and any
+other step still lost its clicks.
