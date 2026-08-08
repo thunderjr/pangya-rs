@@ -486,15 +486,28 @@ Set-PangyaTarget -ProcessId 8480          # switch back to the first
 
 ### Where the harness lives
 
-The authoritative copy is on the VM at `C:\tools\pangya-client.ps1`. It is not mirrored into this
-repository: it is coordinate-bound to one client build and window size, so a copy here would drift
-silently from the one actually being run. Retrieve it through the host's shared folder when it
-needs review:
+`scripts/windows/pangya-client.ps1` is the tracked copy. The VM runs it from
+`C:\tools\pangya-client.ps1`, so the two must be kept in step — copy it out after editing here,
+and copy it back after editing there:
 
 ```powershell
+# repo -> VM (via the host's shared folder)
+Copy-Item '\\host.lan\Data\pangya-client.ps1' 'C:\tools\pangya-client.ps1' -Force
+# VM -> repo
 Copy-Item 'C:\tools\pangya-client.ps1' '\\host.lan\Data\pangya-client.ps1' -Force
 ```
 
-The mechanisms it depends on, and the reasons behind each, are the sections above; those are the
-part worth preserving, and they are recorded here rather than in comments on a file that lives
-outside version control.
+The tracked copy is a tidied version of what grew on the VM: definitions now precede their use,
+the duplicated widget-position and wait helpers are merged, and the window-targeting plumbing sits
+above the input helpers that depend on it. It is functionally the same script, but it has not yet
+been run from the VM in that form, so **sync it and dot-source it once before trusting a long
+run**. PowerShell resolves functions at call time, so the previous ordering worked by accident
+rather than by design.
+
+The VM also needs `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Without it dot-sourcing
+fails and every later call looks like it ran but did nothing — which is indistinguishable from the
+client ignoring input.
+
+Every coordinate in the script is a client-area pixel and every screen probe is a hand-picked
+pixel region, so both are bound to this client build and window size. If a wait starts passing or
+failing wrongly, re-verify the region against a screenshot before suspecting the server.
