@@ -368,6 +368,12 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Separately, thirteen in-match opcodes — aim rotation, the power meter, club changes, item use, relief drops, the client's own hole info, the active-player acknowledgement, pause, the aiming arrow, load progress, game end, last-player-leave — arrive during a hole and none of them changes a stroke, a turn, or a score. Under the shipped `unknown_opcode_policy = "disconnect"` each would have ended the session, so a hole could not have survived the first real shot. They are an explicit allowlist now, `RETAIL_ACCEPTED_MATCH_OPCODES`, listed with what upstream does with each: it relays them to the other participants and this server does not yet, so an opponent's aim does not animate. That is a stated gap rather than a silent one. `0x0034` is the exception that needs an answer — the client waits to be told it may take the first shot, and `0x0090` carries nothing but its arrival.
 
+25. **A real client could never have started the match it is the only one able to start** — **resolved 2026-08-08.** The client's own button reads Start for the room master and Ready for everyone else, so a master never sends `0x000d`. The stroke aggregate requires every participant ready, so it refused every real start with `NotReady`: the one player who cannot say it is the only one who can begin the match. Pressing Start is the master saying it, and the retail start records that before it reserves the plan, which keeps the aggregate's invariant rather than weakening it. The versus test now has only the guest send a ready packet, because that is what two real clients do.
+
+    Found the same way as blocker 24 — by reading what the client sends rather than by driving one — and it would have looked exactly like a dead Start button.
+
+    A related mismatch went with it. The room record echoed the creator's course and hole count while the match plan was built from the configuration, so a room could promise three holes on one course and the match contradict it a moment later; and the course the client is told to load is a one-byte ordinal the configured id may not fit into at all. The record now reports what will actually run. The timers and the room type stay the creator's, because those this server does honour.
+
 ---
 
 ## Immediate next actions
