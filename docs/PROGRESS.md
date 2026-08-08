@@ -483,6 +483,20 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     The method is settled and cheap: sample the array, change one field, sample again. Each
     cycle needs the room number, which the server now logs.
 
+    A debugger would settle it in one run instead of one field per run, and WinDbg turns out to
+    be **already installed** on the VM — as an MSIX package, which is why an earlier filesystem
+    search missed it. `cdb.exe` is at
+    `C:\Program Files\WindowsApps\Microsoft.WinDbg_*\x86\cdb.exe`. An invasive attach to the
+    running client does not work as-is: the break-in times out with the loader lock held and
+    every `GetContextState` fails with `0x8007001F`, so no breakpoint can be set. The next thing
+    to try is launching the client *under* the debugger rather than attaching to it
+    (`cdb -g -G -o ProjectG.exe`), which avoids the break-in entirely.
+
+    Note also that the anchor for "the key is at record offset 0" is not sound: the nickname and
+    start time were measured from the array base `g + 0x656e`, not from a record base, so the
+    key may sit mid-record. The candidate list built on that assumption should be re-derived
+    once a breakpoint can read the addresses directly.
+
 29. **A room's own settings are not remembered, so `0x004a` describes every room as Versus** —
     **fixed.** `RoomProfile` now travels with the room's settings and its summary, so the room
     record and the room status report the mode, course, hole count and timers the creator asked
