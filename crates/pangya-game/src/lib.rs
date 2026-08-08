@@ -67,42 +67,43 @@ use pangya_protocol::{
     IffContainerChunk, IffContainerKind, InventoryBootstrap, InventoryChanged, InventorySegment,
     Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
-    PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailEquipment,
-    RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole,
-    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
-    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
-    RetailMatchFinish, RetailMatchInfo, RetailMatchStart, RetailMultiplayerJoined,
-    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
-    RetailMyRoomLayout, RetailPangBalance, RetailPangSpent, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
-    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
-    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
-    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
-    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
-    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
-    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
-    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
-    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
-    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
-    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
-    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
-    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
-    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
-    encode_packet_payload, is_retail_accepted_session_opcode, synthetic_game_hello,
-    us852_game_hello,
+    PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
+    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
+    RetailEquipment, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
+    RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression,
+    RetailHoleWeather, RetailHoleWind, RetailLockerCombinationAttempt,
+    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
+    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchFinish, RetailMatchInfo,
+    RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter,
+    RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance,
+    RetailPangSpent, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPointBalance,
+    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRoom,
+    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
+    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailSelectChannel,
+    RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
+    RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
+    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
+    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
+    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
+    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
+    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
+    synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -4535,6 +4536,21 @@ where
         opcode: u16,
         payload: &[u8],
     ) -> Result<Option<GameState>, GameRuntimeError> {
+        // The cosmetic half of a hole: where a player is aiming, how far the power meter has
+        // travelled, which club is in hand. None of it changes a stroke, a turn, or a score.
+        // What matters is that it is answered by an explicit allowlist rather than by the
+        // unknown-opcode policy, which under the shipped `disconnect` would end the session
+        // mid-hole.
+        if is_retail_accepted_match_opcode(opcode) {
+            self.observer.unknown(GameUnknownObservation::Ignored);
+            return Ok(Some(state));
+        }
+        if opcode == RETAIL_C2S_FIRST_SHOT_READY {
+            // The client announces it is ready for the first shot and waits to be told to go.
+            // The reply carries nothing; it is the fact of it that the client reads.
+            self.send(framed, &RetailFirstShotReady).await?;
+            return Ok(Some(state));
+        }
         match (state, opcode) {
             (GameState::InRoom, RETAIL_C2S_START_MATCH) => {
                 let Ok(LobbyRouteResult::Snapshot(snapshot)) = self
@@ -5987,7 +6003,8 @@ fn is_retail_match_opcode(opcode: u16) -> bool {
             | RETAIL_C2S_SHOT_SYNC
             | RETAIL_C2S_SHOT_END
             | RETAIL_C2S_HOLE_FINISH
-    )
+            | RETAIL_C2S_FIRST_SHOT_READY
+    ) || is_retail_accepted_match_opcode(opcode)
 }
 
 /// Retail lobby/room client opcodes.

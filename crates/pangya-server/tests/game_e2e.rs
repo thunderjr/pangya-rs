@@ -6494,6 +6494,25 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         salt = salt.wrapping_add(1);
     }
 
+    // The cosmetic in-match chatter a real client sends around a shot must not drop it. The
+    // shipped policy is `disconnect`, so an unlisted opcode here would end the session.
+    salt = salt.wrapping_add(1);
+    send_packet(&mut host, host_key, salt, 0x0034, &[]).await;
+    let ready = drain_available(&mut host, host_key, Duration::from_millis(900)).await;
+    assert!(
+        ready.contains(&0x0090),
+        "the client is told it may take its first shot: {ready:04x?}"
+    );
+    for opcode in [0x0013_u16, 0x0015, 0x0016, 0x001a, 0x0022, 0x0048] {
+        salt = salt.wrapping_add(1);
+        send_packet(&mut host, host_key, salt, opcode, &[0; 4]).await;
+        let noise = drain_available(&mut host, host_key, Duration::from_millis(300)).await;
+        assert!(
+            noise.is_empty(),
+            "{opcode:#06x} is accepted in silence, not answered: {noise:04x?}"
+        );
+    }
+
     // Both hole out. The second completion settles the match for both accounts at once.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;

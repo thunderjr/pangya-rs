@@ -289,6 +289,71 @@ pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {
     RETAIL_ACCEPTED_SESSION_OPCODES.contains(&opcode)
 }
 
+/// In-match client opcodes a real U.S. 852 client sends that this server accepts and answers
+/// with nothing.
+///
+/// These are the cosmetic half of a hole: where a player is aiming, how far the power meter has
+/// travelled, which club is in hand, where a relief drop went, and what the client believes the
+/// hole's par and pin are. Upstream relays each to the other participants
+/// (`pangbox/server`, `game/room/room.go` `handleRoomGameShotRotate` and its neighbours, ISC),
+/// and this server does not yet, so an opponent's aim does not animate. None of them changes a
+/// stroke, a turn, or a score, which is why not answering is safe — and why they are listed
+/// here rather than left to the unknown-opcode policy, which would drop the connection
+/// mid-hole.
+///
+/// The authoritative half — start, load, shot commit, shot sync, turn end, hole finish — is
+/// deliberately absent: those have real handlers.
+pub const RETAIL_ACCEPTED_MATCH_OPCODES: &[u16] = &[
+    0x0006, // game end
+    0x0013, // aim rotation
+    0x0014, // power meter input
+    0x0015, // power level
+    0x0016, // club change
+    0x0017, // item use
+    0x0019, // comet relief drop
+    0x001a, // the client's own hole info: par, tee and pin
+    0x0022, // acknowledgement of the active-player announcement
+    0x0030, // pause
+    0x0037, // last player leaving the room
+    0x0042, // aiming arrow
+    0x0048, // per-player load progress
+];
+
+/// Returns whether `opcode` is an in-match opcode this server accepts without replying.
+#[must_use]
+pub fn is_retail_accepted_match_opcode(opcode: u16) -> bool {
+    RETAIL_ACCEPTED_MATCH_OPCODES.contains(&opcode)
+}
+
+/// U.S. 852 retail first-shot acknowledgement, server opcode `0x0090`.
+///
+/// The client announces it is ready for the first shot of a hole and waits to be told to go.
+/// The reply carries nothing; it is the fact of it that the client reads.
+///
+/// # Provenance
+///
+/// Opcode, empty body, and its use as the direct answer to client `0x0034` from
+/// `pangbox/server` (`game/packet/server.go` `ServerPlayerFirstShotReady`,
+/// `game/server/conn.go` `ClientFirstShotReady`), ISC licensed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailFirstShotReady;
+
+impl EncodePacket for RetailFirstShotReady {
+    const OPCODE: u16 = 0x0090;
+
+    fn encode(
+        &self,
+        _writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile.require_us852()?;
+        Ok(())
+    }
+}
+
+/// The client opcode [`RetailFirstShotReady`] answers.
+pub const RETAIL_C2S_FIRST_SHOT_READY: u16 = 0x0034;
+
 /// Recent-player slots in a [`RetailPlayerHistory`].
 pub const RETAIL_RECENT_PLAYERS: usize = 5;
 /// Bytes in one recent-player record: `u32`, two 22-byte names, `u32`.
