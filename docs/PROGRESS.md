@@ -435,21 +435,35 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     upstream numbers from one — and the crash did not move, so it was reverted rather than left
     in as a guess.
 
-29. **The room directory never lists rooms** — **open.** A client that opens Multiplay sees an empty list even when rooms exist, so a real client can only ever be the host: it has no way to join one. The room list is served on request but never pushed, and nothing was found that the client sends to refresh it.
+29. **A room's own settings are not remembered, so `0x004a` describes every room as Versus** —
+    **open, found while verifying SPEC 19.6 step 7.** The room actor stores a name, a password and
+    a capacity; the mode, course, hole count and timers a client asked for are echoed once from
+    the create request and then lost. `retail_room_from_snapshot` therefore rebuilds the record as
+    a Versus room on course zero with default timers, and the new `0x004a` reply repeats that. A
+    real client sitting in its own Single Player Practice Mode room is told it is in a versus room
+    of one and leaves Start Game disabled. The settings belong on the room, beside its name.
 
-30. **Account creation grants no ball** — **open.** `account create` grants a starter character
+30. **The room directory never lists rooms** — **open.** A client that opens Multiplay sees an empty list even when rooms exist, so a real client can only ever be the host: it has no way to join one. The room list is served on request but never pushed, and nothing was found that the client sends to refresh it.
+
+31. **Account creation grants no ball** — **open.** `account create` grants a starter character
     and a club set; the equipped comet is left null, so every player enters a hole with no ball.
     Both test accounts were given one by hand to get past it. A starter comet belongs in the same
     grant as the club set.
 
-31. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
+32. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
 
 ---
 
 ## Immediate next actions
 
-1. **Stop the real client crashing during hole load** (blocker 28). It is the whole of the §19.6 steps 7-12 gate now: the room, the roster, the master's Start and the match plan are all accepted, and the hole itself is not. Settle the remaining `0x0052`/`0x0076`/`0x005b` fields and the hole-load handshake against `pangbox/server` and PacketDoc **before** changing anything — iterating against the client costs a full sign-in per attempt and its crash dump names nothing.
-2. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
+1. **Give a room its own settings** (blocker 29), then re-verify §19.6 step 8 through practice.
+   Step 7 is now met on the real client — it creates a room *and* starts practice, and the header
+   reads `Single Player Practice Mode  Stroke  1 hole (1/1)`. A practice hole is a one-player
+   roster, so it isolates the hole-load crash from everything the second seat contributes; it is
+   the cheapest remaining probe of blocker 28. It is blocked only by the room describing itself as
+   Versus, which leaves the client's Start Game disabled.
+2. **Stop the real client crashing during hole load** (blocker 28). It is the whole of the §19.6 steps 8-12 gate now: the room, the roster, the master's Start and the match plan are all accepted, and the hole itself is not. Settle the remaining `0x0052`/`0x0076`/`0x005b` fields and the hole-load handshake against `pangbox/server` and PacketDoc **before** changing anything — iterating against the client costs a full sign-in per attempt and its crash dump names nothing.
+3. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
