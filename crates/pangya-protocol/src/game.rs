@@ -317,7 +317,6 @@ pub const RETAIL_ACCEPTED_MATCH_OPCODES: &[u16] = &[
     0x0030, // pause
     0x0037, // last player leaving the room
     0x0042, // aiming arrow
-    0x0048, // per-player load progress
 ];
 
 /// Returns whether `opcode` is an in-match opcode this server accepts without replying.

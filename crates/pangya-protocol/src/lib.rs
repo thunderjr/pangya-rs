@@ -95,15 +95,16 @@ pub use us852_bootstrap::{
     HandoverControl, HandoverRejection, HandoverReply, IFF_CONTAINER_CHUNK_ENTRIES,
     IffContainerChunk, IffContainerKind, MAX_BOOTSTRAP_STRING_BYTES, MAX_SERVER_CHANNELS,
     PLAYER_STATISTICS_BYTES, PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter,
-    RetailCourseStatistics, RetailEquipment, RetailGameAuth, RetailPangBalance,
+    RetailCourseStatistics, RetailEquipment, RetailGameAuth, RetailPangBalance, RetailPlayerData,
     RetailPlayerIdentity, RetailPlayerStatistics, RetailPointBalance, ServerChannelList,
     US852_SERVER_VERSION,
 };
 pub use us852_match::{
     MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RETAIL_STANDING_BYTES, RetailAimRotate, RetailFinishHole,
-    RetailHole, RetailHoleWeather, RetailHoleWind, RetailMatchFinish, RetailMatchInfo,
-    RetailMatchStart, RetailPlayerStartHole, RetailShotCommitRelay, RetailShotSync, RetailStanding,
-    RetailTurnEnd, RetailTurnStart, RetailWeather,
+    RetailHole, RetailHoleWeather, RetailHoleWind, RetailLoadProgress, RetailMatchFinish,
+    RetailMatchInfo, RetailMatchPlayer, RetailMatchStart, RetailPlayerStartHole,
+    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailWeather,
 };
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,

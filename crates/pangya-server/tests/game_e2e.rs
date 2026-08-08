@@ -720,7 +720,8 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
 /// Drains whatever a stream has to say within a short window, without asserting an order.
 /// Membership changes fan out to everyone in a room, so exact frame sequences are brittle in a
 /// multi-client test; the assertions that matter here are about persisted state.
-async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<u16> {
+/// Reads whatever the server has already sent, as (opcode, body) pairs.
+async fn drain_frames(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<(u16, Vec<u8>)> {
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
@@ -733,16 +734,27 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
             frame[..3].copy_from_slice(&header);
             stream.read_exact(&mut frame[3..]).await.ok()?;
             let plain = pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).ok()?;
-            Some(u16::from_le_bytes([plain[0], plain[1]]))
+            Some((
+                u16::from_le_bytes([plain[0], plain[1]]),
+                plain.get(2..).unwrap_or_default().to_vec(),
+            ))
         })
         .await
         {
-            Ok(Some(opcode)) => seen.push(opcode),
+            Ok(Some(frame)) => seen.push(frame),
             Ok(None) => break,
             Err(_) => break,
         }
     }
     seen
+}
+
+async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<u16> {
+    drain_frames(stream, key, budget)
+        .await
+        .into_iter()
+        .map(|(opcode, _)| opcode)
+        .collect()
 }
 
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
@@ -6463,13 +6475,32 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (&mut host, host_key, "host"),
         (&mut visitor, visitor_key, "visitor"),
     ] {
-        let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        let received = drain_frames(stream, key, Duration::from_millis(1200)).await;
+        let frames: Vec<u16> = received.iter().map(|(opcode, _)| *opcode).collect();
         for expected in [0x0076_u16, 0x0052, 0x009e, 0x005b] {
             assert!(
                 frames.contains(&expected),
                 "{who} receives {expected:#06x} of the hole intro: {frames:04x?}"
             );
         }
+        // The roster is what the client builds both players from, so it must be the full form
+        // - subtype zero, then a count - and carry them whole. Stamping subtype zero on the
+        // short timestamp body instead leaves the client parsing a player out of 19 bytes.
+        let roster = received
+            .iter()
+            .find(|(opcode, _)| *opcode == 0x0076)
+            .map(|(_, body)| body.clone())
+            .unwrap_or_default();
+        assert_eq!(roster.first().copied(), Some(0x00), "{who} roster subtype");
+        assert_eq!(roster.get(1).copied(), Some(2), "{who} roster names both");
+        assert!(
+            roster.len() > 2 * 1024,
+            "{who} roster carries whole players, not a stub: {} bytes",
+            roster.len()
+        );
+        // Seat numbers are one-based, and the first entry is the host.
+        assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
+        assert_eq!(&roster[4..13], b"PartyHost");
     }
 
     // Both load. The turn opens only once both have, and both are told whose it is.
@@ -6549,7 +6580,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         ready.contains(&0x0090),
         "the client is told it may take its first shot: {ready:04x?}"
     );
-    for opcode in [0x0013_u16, 0x0015, 0x0016, 0x001a, 0x0022, 0x0048] {
+    for opcode in [0x0013_u16, 0x0015, 0x0016, 0x001a, 0x0022] {
         salt = salt.wrapping_add(1);
         send_packet(&mut host, host_key, salt, opcode, &[0; 4]).await;
         let noise = drain_available(&mut host, host_key, Duration::from_millis(300)).await;
@@ -6558,6 +6589,22 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             "{opcode:#06x} is accepted in silence, not answered: {noise:04x?}"
         );
     }
+    // Loading progress is the exception: the client draws a bar per player and waits on all of
+    // them, so its own progress is republished to the whole match rather than swallowed.
+    salt = salt.wrapping_add(1);
+    send_packet(&mut host, host_key, salt, 0x0048, &[7]).await;
+    let echoed = drain_frames(&mut host, host_key, Duration::from_millis(400)).await;
+    let (_, body) = echoed
+        .iter()
+        .find(|(opcode, _)| *opcode == 0x00a3)
+        .expect("progress reaches the room");
+    assert_eq!(body[4], 7, "the progress the client reported");
+    let seen = drain_frames(&mut visitor, visitor_key, Duration::from_millis(400)).await;
+    assert!(
+        seen.iter().any(|(opcode, _)| *opcode == 0x00a3),
+        "the other player's bar moves too: {:04x?}",
+        seen.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>()
+    );
 
     // Both hole out. The second completion settles the match for both accounts at once.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;

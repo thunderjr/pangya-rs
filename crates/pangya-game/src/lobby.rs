@@ -257,6 +257,8 @@ pub enum LobbyStrokeCommand {
     HoleOut,
     /// Participant's own in-match frame, relayed to the roster unchanged.
     Relay(RetailMatchRelay),
+    /// Publish this participant's hole-loading progress to the rest of the match.
+    LoadProgress(u8),
     /// Participant give-up.
     GiveUp,
     /// Explicit no-reward abort.
@@ -1370,6 +1372,10 @@ impl LobbyRegistry {
                 .retail_relay(connection_id, relay)
                 .await
                 .map(|()| LobbyStrokeRouteResult::Applied),
+            LobbyStrokeCommand::LoadProgress(progress) => handle
+                .retail_load_progress(connection_id, progress)
+                .await
+                .map(|()| LobbyStrokeRouteResult::Applied),
             LobbyStrokeCommand::HoleOut => handle
                 .stroke_hole_out(connection_id)
                 .await
@@ -1766,6 +1772,7 @@ mod tests {
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
+            card: pangya_domain::MemberCard::default(),
         }
     }
 

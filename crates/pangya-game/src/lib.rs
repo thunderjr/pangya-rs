@@ -47,12 +47,12 @@ use pangya_domain::{
     EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDurability, ItemKind, ItemStacking, ItemTypeId,
     MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, Nickname, OneHoleConfig,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
-    RepositoryError, RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot,
-    RoomSummary, ServiceKind as DomainServiceKind, SoloMatchResult, SourceAddressPrefix,
-    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
-    StrokeRosterOrder,
+    MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
+    MemberSnapshot, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
+    PurchaseRequest, RepairItem, RepositoryError, RoomError, RoomId, RoomName, RoomPassword,
+    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, SoloMatchResult,
+    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
+    StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -71,37 +71,37 @@ use pangya_protocol::{
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
     RetailEquipment, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
     RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression,
-    RetailHoleWeather, RetailHoleWind, RetailLockerCombinationAttempt,
+    RetailHoleWeather, RetailHoleWind, RetailLoadProgress, RetailLockerCombinationAttempt,
     RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
     RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchFinish, RetailMatchInfo,
-    RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter,
-    RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance,
-    RetailPangSpent, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
-    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPointBalance,
-    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRoom,
-    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
-    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailSelectChannel,
-    RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
-    RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
-    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
-    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
-    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
-    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
-    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
-    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
-    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
-    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
-    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
-    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
-    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
-    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
-    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
+    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
+    RetailPangBalance, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
+    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
+    RetailPlayerStatistics, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
+    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
+    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
+    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
+    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
+    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
+    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
+    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
+    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
+    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
+    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
+    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     synthetic_game_hello, us852_game_hello,
 };
@@ -2215,6 +2215,7 @@ where
                     .iter()
                     .find(|value| value.id == loaded.equipment.character_id)
                     .map(|value| value.item_type_id.get()),
+                card: member_card(&loaded),
             },
         ))
     }
@@ -3417,6 +3418,7 @@ where
         let stroke_event = matches!(
             &event,
             RoomEvent::RetailRelay { .. }
+                | RoomEvent::RetailLoadProgress { .. }
                 | RoomEvent::StrokeStarted(_)
                 | RoomEvent::StrokePhase { .. }
                 | RoomEvent::StrokeTurn(_)
@@ -3458,13 +3460,17 @@ where
                     let begin = plan.begin();
                     // A solo hole has no turn arbitration, so the client's own timers are the
                     // only ones, and it is told the same defaults it shows for practice.
+                    let roster = self.retail_match_roster(connection_id).await;
                     self.send_retail_hole_intro(
                         framed,
-                        begin.config().course_id().get(),
-                        begin.weather(),
-                        begin.wind(),
-                        RETAIL_SOLO_SHOT_TIMER,
-                        RETAIL_SOLO_GAME_TIMER,
+                        &roster,
+                        RetailHoleIntro {
+                            course_id: begin.config().course_id().get(),
+                            weather: begin.weather(),
+                            wind: begin.wind(),
+                            shot_timer: RETAIL_SOLO_SHOT_TIMER,
+                            game_timer: RETAIL_SOLO_GAME_TIMER,
+                        },
                     )
                     .await?;
                     return Ok(RoomEventEffect::EnterLoading);
@@ -3513,13 +3519,17 @@ where
                     // The timers the client counts down with are the ones the room actor will
                     // actually enforce, so a shot that runs out on screen is the shot the
                     // server forfeits.
+                    let roster = self.retail_match_roster(connection_id).await;
                     self.send_retail_hole_intro(
                         framed,
-                        begin.config().course_id().get(),
-                        begin.weather(),
-                        begin.wind(),
-                        plan.turn_timeout(),
-                        plan.game_timeout(),
+                        &roster,
+                        RetailHoleIntro {
+                            course_id: begin.config().course_id().get(),
+                            weather: begin.weather(),
+                            wind: begin.wind(),
+                            shot_timer: plan.turn_timeout(),
+                            game_timer: plan.game_timeout(),
+                        },
                     )
                     .await?;
                     *stroke_context = Some(ConnectionStrokeContext {
@@ -3576,6 +3586,20 @@ where
                 // The relays a retail client reads are the client's own frames, forwarded by
                 // the retail relay event. The synthetic pair carries nothing it understands.
                 RoomEvent::StrokeActionRelay { .. } | RoomEvent::StrokeResultRelay { .. } => {
+                    return Ok(RoomEventEffect::Remain);
+                }
+                // The loading screen draws a bar per player and waits on all of them, so each
+                // client has to hear about the others'. Upstream broadcasts one of these for
+                // every progress frame it receives, including back to the sender.
+                RoomEvent::RetailLoadProgress { from, progress } => {
+                    self.send(
+                        framed,
+                        &RetailLoadProgress {
+                            connection_id: u32::try_from(from.get()).unwrap_or(0),
+                            progress: *progress,
+                        },
+                    )
+                    .await?;
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::RetailRelay { from, relay } => {
@@ -3850,7 +3874,9 @@ where
             }
             // Only a retail connection produces one of these, and only a retail connection can
             // read one. Reaching a synthetic stream means the room mixed the two families.
-            RoomEvent::RetailRelay { .. } => Err(GameRuntimeError::Protocol),
+            RoomEvent::RetailRelay { .. } | RoomEvent::RetailLoadProgress { .. } => {
+                Err(GameRuntimeError::Protocol)
+            }
             RoomEvent::StrokeSettlementRequested(commit) => {
                 self.persist_stroke_commit_by_room(
                     room_id.ok_or(GameRuntimeError::Protocol)?,
@@ -3958,19 +3984,40 @@ where
             .unwrap_or(0)
     }
 
-    /// Sends the four frames a retail client needs before it will load a hole.
+    /// The room's members, in seat order, for a match roster.
     ///
-    /// The plan is one hole because that is what this server settles; the client reads the
-    /// whole plan up front, so an incomplete one strands it on the loading screen.
+    /// Read from the room rather than from the match plan: the plan names connections, and the
+    /// roster has to describe whole players. An empty answer sends an empty roster, which the
+    /// client renders as a match with nobody in it rather than misreading the frame.
+    async fn retail_match_roster(&self, connection_id: PlayerConnectionId) -> Vec<MemberSnapshot> {
+        match self
+            .lobby
+            .route(connection_id, LobbyRoomCommand::GetState)
+            .await
+        {
+            Ok(LobbyRouteResult::Snapshot(snapshot)) => snapshot.members().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Sends the frames a retail client needs before it will load a hole.
+    ///
+    /// The roster comes first and carries every player whole, because the client builds each
+    /// of them from it; the plan follows and is one hole, because that is what this server
+    /// settles. The client reads the whole plan up front, so an incomplete one strands it.
     async fn send_retail_hole_intro(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
-        course_id: u32,
-        weather: pangya_domain::Weather,
-        wind: pangya_domain::WindConditions,
-        shot_timer: Duration,
-        game_timer: Duration,
+        roster: &[MemberSnapshot],
+        hole: RetailHoleIntro,
     ) -> Result<(), GameRuntimeError> {
+        let RetailHoleIntro {
+            course_id,
+            weather,
+            wind,
+            shot_timer,
+            game_timer,
+        } = hole;
         let millis = |duration: Duration| {
             u32::try_from(duration.as_millis()).map_err(|_| GameRuntimeError::InvalidConfig)
         };
@@ -3982,10 +4029,13 @@ where
         let course = u8::try_from(course_id).unwrap_or(0);
         self.send(
             framed,
-            &RetailMatchStart {
-                room_ui_type: 0,
-                start_time: [0; 16],
-            },
+            &RetailMatchStart::Roster(
+                roster
+                    .iter()
+                    .enumerate()
+                    .map(|(seat, member)| retail_match_player(seat, member))
+                    .collect(),
+            ),
         )
         .await?;
         self.send(
@@ -4570,6 +4620,19 @@ where
         // mid-hole.
         if is_retail_accepted_match_opcode(opcode) {
             self.observer.unknown(GameUnknownObservation::Ignored);
+            return Ok(Some(state));
+        }
+        if opcode == RETAIL_C2S_LOAD_PROGRESS {
+            // The client draws a loading bar per player, so its own progress is republished to
+            // everyone in the match. Ignoring it leaves every other client's bar stuck.
+            let progress = payload.first().copied().unwrap_or(0);
+            let _ignored = self
+                .lobby
+                .route_stroke(
+                    identity.connection_id,
+                    LobbyStrokeCommand::LoadProgress(progress),
+                )
+                .await;
             return Ok(Some(state));
         }
         if opcode == RETAIL_C2S_FIRST_SHOT_READY {
@@ -5428,37 +5491,40 @@ where
         };
         let reply = HandoverReply {
             server_name: b"pangya-rs".to_vec(),
-            identity: RetailPlayerIdentity {
-                username: snapshot.account.username_display.as_bytes().to_vec(),
-                nickname: snapshot
-                    .profile
-                    .nickname
-                    .as_deref()
-                    .ok_or(GameRuntimeError::Snapshot)?
-                    .as_bytes()
-                    .to_vec(),
-                // The client matches this against the connection id on every room census
-                // record to find its own. Told zero, it never recognises itself, so it never
-                // learns it is the room master and its Start button stays an inert Ready.
-                connection_id: u32::try_from(connection_id.get()).unwrap_or(0),
-                user_id: narrow(snapshot.account.id.get())?,
+            player: RetailPlayerData {
+                identity: RetailPlayerIdentity {
+                    username: snapshot.account.username_display.as_bytes().to_vec(),
+                    nickname: snapshot
+                        .profile
+                        .nickname
+                        .as_deref()
+                        .ok_or(GameRuntimeError::Snapshot)?
+                        .as_bytes()
+                        .to_vec(),
+                    // The client matches this against the connection id on every room census
+                    // record to find its own. Told zero, it never recognises itself, so it
+                    // never learns it is the room master and its Start button stays an inert
+                    // Ready.
+                    connection_id: u32::try_from(connection_id.get()).unwrap_or(0),
+                    user_id: narrow(snapshot.account.id.get())?,
+                },
+                statistics: RetailPlayerStatistics {
+                    experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
+                    pang: snapshot.profile.pang,
+                    ..RetailPlayerStatistics::default()
+                },
+                equipment,
+                character: RetailCharacter {
+                    iff_id: character.item_type_id.get(),
+                    uid: narrow(character.id.get())?,
+                    hair_color: 0,
+                    part_iff_ids: [0; CHARACTER_PARTS],
+                    part_uids: [0; CHARACTER_PARTS],
+                    stats: [0; CHARACTER_STATS],
+                    mastery: 0,
+                },
+                caddie: RetailCaddie::default(),
             },
-            statistics: RetailPlayerStatistics {
-                experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
-                pang: snapshot.profile.pang,
-                ..RetailPlayerStatistics::default()
-            },
-            equipment,
-            character: RetailCharacter {
-                iff_id: character.item_type_id.get(),
-                uid: narrow(character.id.get())?,
-                hair_color: 0,
-                part_iff_ids: [0; CHARACTER_PARTS],
-                part_uids: [0; CHARACTER_PARTS],
-                stats: [0; CHARACTER_STATS],
-                mastery: 0,
-            },
-            caddie: RetailCaddie::default(),
             server_time: [0; 16],
             disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
         };
@@ -5918,6 +5984,93 @@ const fn protocol_abort_reason(reason: MatchAbortReason) -> ProtocolMatchAbortRe
     }
 }
 
+/// Everything about the hole a retail client is about to load, other than who is in it.
+#[derive(Clone, Copy, Debug)]
+struct RetailHoleIntro {
+    course_id: u32,
+    weather: pangya_domain::Weather,
+    wind: pangya_domain::WindConditions,
+    shot_timer: Duration,
+    game_timer: Duration,
+}
+
+/// Projects the part of an authenticated player that the rest of a room is allowed to see.
+fn member_card(snapshot: &PlayerSnapshot) -> MemberCard {
+    let character = snapshot
+        .characters
+        .iter()
+        .find(|value| value.id == snapshot.equipment.character_id);
+    MemberCard {
+        username: snapshot.account.username_display.clone(),
+        character_iff_id: character.map(|value| value.item_type_id.get()).unwrap_or(0),
+        character_uid: character
+            .and_then(|value| u32::try_from(value.id.get()).ok())
+            .unwrap_or(0),
+        // No caddie is equippable yet, so the roster reports none rather than inventing one.
+        caddie_uid: 0,
+        club_set_uid: snapshot
+            .equipment
+            .club_item_id
+            .and_then(|id| u32::try_from(id.get()).ok())
+            .unwrap_or(0),
+        comet_iff_id: snapshot
+            .equipment
+            .ball_item_id
+            .and_then(|id| {
+                snapshot
+                    .inventory
+                    .iter()
+                    .find(|item| item.id == id)
+                    .map(|item| item.item_type_id.get())
+            })
+            .unwrap_or(0),
+        experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
+        pang: snapshot.profile.pang,
+    }
+}
+
+/// Rebuilds one player's record for a match roster from what the room holds of them.
+///
+/// The client reads the same record here as in the handover reply that admitted it, so a
+/// roster that describes players any less completely is one it cannot build models from.
+fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlayer {
+    let card = member.card();
+    RetailMatchPlayer {
+        number: u16::try_from(seat.saturating_add(1)).unwrap_or(u16::MAX),
+        player: RetailPlayerData {
+            identity: RetailPlayerIdentity {
+                username: card.username.as_bytes().to_vec(),
+                nickname: member.nickname().as_bytes().to_vec(),
+                connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
+                user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
+            },
+            statistics: RetailPlayerStatistics {
+                experience: card.experience,
+                pang: card.pang,
+                ..RetailPlayerStatistics::default()
+            },
+            equipment: RetailEquipment {
+                caddie_uid: card.caddie_uid,
+                character_uid: card.character_uid,
+                club_set_uid: card.club_set_uid,
+                comet_iff_id: card.comet_iff_id,
+                item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+            },
+            character: RetailCharacter {
+                iff_id: card.character_iff_id,
+                uid: card.character_uid,
+                hair_color: 0,
+                part_iff_ids: [0; CHARACTER_PARTS],
+                part_uids: [0; CHARACTER_PARTS],
+                stats: [0; CHARACTER_STATS],
+                mastery: 0,
+            },
+            caddie: RetailCaddie::default(),
+        },
+        start_time: [0; 16],
+    }
+}
+
 /// Builds a retail census roster from a room's authoritative snapshot.
 fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
     let players = snapshot
@@ -6072,6 +6225,7 @@ const RETAIL_SOLO_GAME_TIMER: Duration = Duration::from_secs(600);
 const RETAIL_C2S_SHOT_SYNC: u16 = 0x001b;
 const RETAIL_C2S_SHOT_END: u16 = 0x001c;
 const RETAIL_C2S_HOLE_FINISH: u16 = 0x0031;
+const RETAIL_C2S_LOAD_PROGRESS: u16 = 0x0048;
 
 fn is_retail_match_opcode(opcode: u16) -> bool {
     matches!(
@@ -6083,6 +6237,7 @@ fn is_retail_match_opcode(opcode: u16) -> bool {
             | RETAIL_C2S_SHOT_END
             | RETAIL_C2S_HOLE_FINISH
             | RETAIL_C2S_FIRST_SHOT_READY
+            | RETAIL_C2S_LOAD_PROGRESS
     ) || is_retail_accepted_match_opcode(opcode)
 }
 
@@ -6580,6 +6735,7 @@ mod tests {
             nickname: Nickname::parse("Tester").unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
+            card: MemberCard::default(),
         }
     }
 
@@ -6590,6 +6746,7 @@ mod tests {
             nickname: Nickname::parse("Second").unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
+            card: MemberCard::default(),
         }
     }
 

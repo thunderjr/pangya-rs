@@ -3276,6 +3276,31 @@ impl RoomSettings {
     }
 }
 
+/// What the other players in a room see of a member.
+///
+/// A roster is not a list of names: a client builds every other player's model, portrait and
+/// scoreboard line from these, so they travel with the member rather than being looked up per
+/// frame. Nothing secret belongs here — it is published to everyone in the room.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemberCard {
+    /// Account name.
+    pub username: String,
+    /// Equipped character's catalog id.
+    pub character_iff_id: u32,
+    /// Equipped character's inventory id.
+    pub character_uid: u32,
+    /// Equipped caddie's inventory id.
+    pub caddie_uid: u32,
+    /// Equipped club set's inventory id.
+    pub club_set_uid: u32,
+    /// Equipped ball's catalog id.
+    pub comet_iff_id: u32,
+    /// Accumulated experience.
+    pub experience: u32,
+    /// Pang balance.
+    pub pang: u64,
+}
+
 /// Immutable public member projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberSnapshot {
@@ -3286,6 +3311,7 @@ pub struct MemberSnapshot {
     ready: bool,
     character_id: Option<CharacterId>,
     character_iff_id: Option<u32>,
+    card: MemberCard,
 }
 
 impl MemberSnapshot {
@@ -3308,7 +3334,21 @@ impl MemberSnapshot {
             ready,
             character_id,
             character_iff_id,
+            card: MemberCard::default(),
         }
+    }
+
+    /// Attaches what the rest of the room sees of this member.
+    #[must_use]
+    pub fn with_card(mut self, card: MemberCard) -> Self {
+        self.card = card;
+        self
+    }
+
+    /// What the rest of the room sees of this member.
+    #[must_use]
+    pub const fn card(&self) -> &MemberCard {
+        &self.card
     }
 
     /// The catalog id of the member's character, which the client resolves its model by.

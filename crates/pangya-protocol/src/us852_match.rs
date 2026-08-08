@@ -4,7 +4,9 @@
 //! GB.852-targeting reference server's observable protocol behavior. **None has been
 //! accepted by a real client.** These supersede the synthetic `0x7f20`/`0x7f30` families.
 
-use crate::{CompatibilityProfile, EncodePacket, PacketEncodeError, PacketWriter};
+use crate::{
+    CompatibilityProfile, EncodePacket, PacketEncodeError, PacketWriter, RetailPlayerData,
+};
 
 /// Holes a match may carry.
 pub const MAX_MATCH_HOLES: usize = 18;
@@ -48,13 +50,41 @@ impl RetailHole {
     }
 }
 
-/// Match start notification, server opcode `0x0076`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetailMatchStart {
-    /// Room mode as the client's UI labels it.
-    pub room_ui_type: u8,
-    /// Packed server time.
+/// One seat in the match roster.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMatchPlayer {
+    /// One-based seat within the room.
+    pub number: u16,
+    /// The whole player, as the lobby describes them.
+    pub player: RetailPlayerData,
+    /// Packed match start time.
     pub start_time: [u8; 16],
+}
+
+/// Match roster, server opcode `0x0076`.
+///
+/// This is what the client builds every player in the hole from, so it carries each of them
+/// whole. The subtype chooses between that and a bare timestamp, and the two bodies share no
+/// shape: a versus match must send [`Self::Roster`], because a client told "full" and handed a
+/// timestamp reads the first byte of it as a player count and then parses the rest of the
+/// frame as a player record several kilobytes long. It builds a player out of whatever it
+/// finds and dereferences it when the hole loads.
+///
+/// # Provenance
+///
+/// Subtypes and both bodies from `pangbox/packetdoc`
+/// (`gameservice/server/0076.ksy`, `full_payload` and `minimal_payload`) and `pangbox/server`
+/// (`game/packet/server.go` `ServerGameInit`, sent from `game/room/room.go` `handleRoomStartGame`
+/// with `GameInitTypeFull` and every player), ISC licensed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailMatchStart {
+    /// Every player in the match, whole. What a versus hole needs.
+    Roster(Vec<RetailMatchPlayer>),
+    /// A bare timestamp, for the modes that carry no roster.
+    TimeOnly {
+        /// Packed match start time.
+        start_time: [u8; 16],
+    },
 }
 
 impl EncodePacket for RetailMatchStart {
@@ -66,9 +96,28 @@ impl EncodePacket for RetailMatchStart {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
-        writer.u8(self.room_ui_type);
-        writer.u32_le(1);
-        writer.bytes(&self.start_time);
+        match self {
+            Self::Roster(players) => {
+                let count = u8::try_from(players.len()).map_err(|_| PacketEncodeError::Limit {
+                    field: "match players",
+                    actual: players.len(),
+                    maximum: usize::from(u8::MAX),
+                })?;
+                writer.u8(0x00);
+                writer.u8(count);
+                for seat in players {
+                    writer.u16_le(seat.number);
+                    seat.player.encode_body(writer)?;
+                    writer.bytes(&seat.start_time);
+                    writer.u8(0); // cards in hand
+                }
+            }
+            Self::TimeOnly { start_time } => {
+                writer.u8(0x04);
+                writer.u32_le(1);
+                writer.bytes(start_time);
+            }
+        }
         Ok(())
     }
 }
@@ -120,10 +169,11 @@ impl EncodePacket for RetailMatchInfo {
         writer.u32_le(0); // trophy catalog id
         writer.u32_le(self.shot_timer_ms);
         writer.u32_le(self.game_timer_ms);
-        // Eighteen hole records, always, however few are played. The client reads the array by
-        // its fixed width rather than by `hole_count`, so a short one leaves it parsing the
-        // seed and the collectible table as hole descriptors and dereferencing what it finds:
-        // the observed failure is an access violation on a null course during hole load.
+        // Eighteen hole records, always, however few are played: the client reads the array by
+        // its fixed width and not by the `hole_count` beside it, so a short one leaves it
+        // parsing the seed and the collectible table as hole descriptors. The entries past
+        // `hole_count` are zeroed rather than filled, which is what `pangbox/server` sends and
+        // what a real client has accepted.
         for index in 0..MAX_MATCH_HOLES {
             self.holes
                 .get(index)
@@ -131,7 +181,7 @@ impl EncodePacket for RetailMatchInfo {
                 .unwrap_or(RetailHole {
                     random_id: 0,
                     pin: 0,
-                    course: self.course,
+                    course: 0,
                     number: 0,
                 })
                 .encode_body(writer);
@@ -191,6 +241,38 @@ impl EncodePacket for RetailHoleWind {
         writer.u16_le(self.direction);
         // 1 sets the value outright; 0 would add to the current wind.
         writer.u8(1);
+        Ok(())
+    }
+}
+
+/// One player's hole-loading progress, server opcode `0x00a3`.
+///
+/// The client draws a loading bar per player and waits on all of them, so it has to be told
+/// about everyone else's. Upstream broadcasts one of these for every client `0x0048`.
+///
+/// # Provenance
+///
+/// From `pangbox/server` (`game/packet/server.go` `ServerPlayerLoadProgress`, broadcast by
+/// `game/room/room.go` `handleRoomLoadingProgress`), ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoadProgress {
+    /// Whose progress this is.
+    pub connection_id: u32,
+    /// How far along they are, as the client reports it.
+    pub progress: u8,
+}
+
+impl EncodePacket for RetailLoadProgress {
+    const OPCODE: u16 = 0x00a3;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.progress);
         Ok(())
     }
 }
@@ -483,11 +565,10 @@ mod tests {
                 .iter()
                 .all(|b| *b == 0)
         );
-        // The padding holes still name the match's course, so nothing the client reads past
-        // the played holes points at a course that does not exist.
+        // The entries past `hole_count` are zeroed, as `pangbox/server` sends them.
         for index in 3..MAX_MATCH_HOLES {
             let at = 4 + 12 + index * 7;
-            assert_eq!(payload[at + 5], 7, "hole {index} course");
+            assert_eq!(payload[at..at + 7], [0; 7], "hole {index}");
         }
         // The seed follows all eighteen, not the third.
         let seed_at = 4 + 12 + MAX_MATCH_HOLES * 7;

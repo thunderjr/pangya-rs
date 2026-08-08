@@ -5,9 +5,9 @@ use std::{num::NonZeroUsize, time::Duration};
 use pangya_domain::{
     AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, CharacterId,
     ChatText, CommitSoloHole, CommitStrokeMatch, MarkSoloInGame, MarkStrokeInGame,
-    MatchAbortReason, MatchId, MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId,
-    RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
-    SoloMatchResult, StrokeMatchResult,
+    MatchAbortReason, MatchId, MatchResultKey, MemberCard, MemberSnapshot, Nickname,
+    PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot,
+    RoomSummary, SoloMatchResult, StrokeMatchResult,
 };
 use pangya_protocol::{
     LoadingComplete, ShotAction, ShotResult, StrokeLoadingComplete, StrokeShotAction,
@@ -54,6 +54,8 @@ pub struct RoomIdentity {
     pub character_id: Option<CharacterId>,
     /// That character's catalog id, which is what the client resolves the model by.
     pub character_iff_id: Option<u32>,
+    /// What the rest of the room sees of this player, including in a match roster.
+    pub card: MemberCard,
 }
 
 /// The largest client-authored in-match payload this server will relay.
@@ -155,6 +157,13 @@ pub enum RoomEvent {
         from: PlayerConnectionId,
         /// Validated protocol value.
         result: StrokeShotResult,
+    },
+    /// One participant's hole-loading progress, for everyone else's loading bar.
+    RetailLoadProgress {
+        /// Captured sender connection.
+        from: PlayerConnectionId,
+        /// How far along the client says it is.
+        progress: u8,
     },
     /// A participant's own in-match frame, relayed unchanged to the captured roster.
     RetailRelay {
@@ -275,6 +284,7 @@ impl Member {
             self.identity.character_id,
             self.identity.character_iff_id,
         )
+        .with_card(self.identity.card.clone())
     }
 }
 
@@ -1016,6 +1026,23 @@ impl RoomState {
         Ok(())
     }
 
+    /// Publishes one participant's loading progress to the whole match.
+    ///
+    /// Unlike a shot relay this belongs to the loading phase, which is the only time the
+    /// client sends it and the only time anyone is waiting to see it.
+    fn retail_load_progress(
+        &mut self,
+        caller: PlayerConnectionId,
+        progress: u8,
+    ) -> Result<(), StrokeMatchError> {
+        self.stroke_participant(caller)?;
+        self.broadcast_match(RoomEvent::RetailLoadProgress {
+            from: caller,
+            progress,
+        });
+        Ok(())
+    }
+
     fn stroke_hole_out(
         &mut self,
         caller: PlayerConnectionId,
@@ -1536,6 +1563,11 @@ enum RoomCommand {
         relay: RetailMatchRelay,
         reply: oneshot::Sender<Result<(), StrokeMatchError>>,
     },
+    RetailLoadProgress {
+        caller: PlayerConnectionId,
+        progress: u8,
+        reply: oneshot::Sender<Result<(), StrokeMatchError>>,
+    },
     StrokeGiveUp {
         caller: PlayerConnectionId,
         reply: oneshot::Sender<Result<CommitStrokeMatch, StrokeMatchError>>,
@@ -2050,6 +2082,25 @@ impl RoomHandle {
         receive.await.map_err(|_| StrokeMatchError::Closed)?
     }
 
+    /// Publishes one participant's hole-loading progress to the whole match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the room is closed or the caller is not a participant.
+    pub async fn retail_load_progress(
+        &self,
+        caller: PlayerConnectionId,
+        progress: u8,
+    ) -> Result<(), StrokeMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_stroke(RoomCommand::RetailLoadProgress {
+            caller,
+            progress,
+            reply,
+        })?;
+        receive.await.map_err(|_| StrokeMatchError::Closed)?
+    }
+
     /// Records that a participant holed out, and returns automatic settlement once both have.
     ///
     /// # Errors
@@ -2544,6 +2595,14 @@ fn handle_normal(
             let _ignored = reply.send(state.retail_relay(caller, relay));
             true
         }
+        RoomCommand::RetailLoadProgress {
+            caller,
+            progress,
+            reply,
+        } => {
+            let _ignored = reply.send(state.retail_load_progress(caller, progress));
+            true
+        }
         RoomCommand::StrokeGiveUp { caller, reply } => {
             let _ignored = reply.send(state.stroke_give_up(caller));
             true
@@ -2613,6 +2672,7 @@ mod tests {
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
+            card: pangya_domain::MemberCard::default(),
         }
     }
 

@@ -530,6 +530,14 @@ mod tests {
     fn sample_reply() -> HandoverReply {
         HandoverReply {
             server_name: b"pangya-rs".to_vec(),
+            player: sample_player_data(),
+            server_time: [0; 16],
+            disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
+        }
+    }
+
+    fn sample_player_data() -> RetailPlayerData {
+        RetailPlayerData {
             identity: RetailPlayerIdentity {
                 username: b"player".to_vec(),
                 nickname: b"Nick".to_vec(),
@@ -554,9 +562,31 @@ mod tests {
                 mastery: 0,
             },
             caddie: RetailCaddie::default(),
-            server_time: [0; 16],
-            disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
         }
+    }
+
+    /// The record the client reads is identical in the lobby and in a match roster, so the
+    /// roster entry is exactly the reply's player block plus its seat, time and card count.
+    #[test]
+    fn a_match_roster_entry_carries_the_same_player_record_as_the_lobby() {
+        let reply = encode_packet_payload(&sample_reply(), &profile()).expect("reply");
+        let roster = encode_packet_payload(
+            &crate::RetailMatchStart::Roster(vec![crate::RetailMatchPlayer {
+                number: 1,
+                player: sample_player_data(),
+                start_time: [0; 16],
+            }]),
+            &profile(),
+        )
+        .expect("roster");
+        // Subtype and count, then the seat number, then the record.
+        assert_eq!(roster[0], 0x00);
+        assert_eq!(roster[1], 1);
+        assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
+        // In the reply the record follows the subtype, both pstrings and the room id.
+        let record = 1 + 2 + 6 + 2 + 9 + 2;
+        let width = roster.len() - 4 - 16 - 1;
+        assert_eq!(roster[4..4 + width], reply[record..record + width]);
     }
 
     #[test]
@@ -577,7 +607,7 @@ mod tests {
     #[test]
     fn character_block_is_five_hundred_thirteen_bytes() {
         let mut writer = PacketWriter::default();
-        sample_reply().character.encode_body(&mut writer);
+        sample_reply().player.character.encode_body(&mut writer);
         assert_eq!(writer.as_slice().len(), 513);
     }
 
@@ -889,7 +919,6 @@ pub struct RetailPlayerIdentity {
 
 impl RetailPlayerIdentity {
     fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
-        writer.u16_le(0xffff); // room id; 0xffff means "not in a room"
         writer.fixed_nul(&self.username, 22)?;
         writer.fixed_nul(&self.nickname, 22)?;
         writer.fixed_nul(&[], 17)?; // guild name
@@ -907,14 +936,17 @@ impl RetailPlayerIdentity {
     }
 }
 
-/// Full retail handover reply, server opcode `0x0044` subtype `0x00`.
+/// One player, whole.
 ///
-/// This is the packet that releases the client from its loading screen into the lobby.
+/// The client reads this same record in two places: the handover reply that admits it to the
+/// lobby, and the match roster that opens a versus hole. Upstream reuses one structure for
+/// both (`pangbox/server` `pangya/player.go` `PlayerData`, carried by `PlayerMainData` in
+/// `game/packet/server.go` and by `GamePlayer` in the same file), so this does too — a match
+/// roster that describes players any less completely than the lobby does is one the client
+/// cannot build its models from.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HandoverReply {
-    /// Server display name.
-    pub server_name: Vec<u8>,
-    /// Lobby identity fields.
+pub struct RetailPlayerData {
+    /// Identity fields.
     pub identity: RetailPlayerIdentity,
     /// Cumulative statistics.
     pub statistics: RetailPlayerStatistics,
@@ -924,29 +956,10 @@ pub struct HandoverReply {
     pub character: RetailCharacter,
     /// Equipped caddie.
     pub caddie: RetailCaddie,
-    /// Packed server time.
-    pub server_time: [u8; 16],
-    /// Feature-disable flags; `1 << 18` is the known-good baseline.
-    pub disabled_features: u64,
 }
 
-impl HandoverReply {
-    /// Feature-flag value the reference server uses.
-    pub const DEFAULT_DISABLED_FEATURES: u64 = 1 << 18;
-}
-
-impl EncodePacket for HandoverReply {
-    const OPCODE: u16 = 0x0044;
-
-    fn encode(
-        &self,
-        writer: &mut PacketWriter,
-        profile: &CompatibilityProfile,
-    ) -> Result<(), PacketEncodeError> {
-        check_encode_profile(profile)?;
-        writer.u8(0x00); // full-reply subtype
-        writer.pstring(US852_SERVER_VERSION, MAX_BOOTSTRAP_STRING_BYTES)?;
-        writer.pstring(&self.server_name, MAX_BOOTSTRAP_STRING_BYTES)?;
+impl RetailPlayerData {
+    pub(crate) fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
         self.identity.encode_body(writer)?;
         self.statistics.encode_body(writer);
         // Trophies: amateur 6..1 then pro 1..7, each gold/silver/bronze.
@@ -977,6 +990,46 @@ impl EncodePacket for HandoverReply {
         writer.u32_le(0);
         writer.fixed_nul(b"0", 16)?;
         writer.bytes(&[0; 33]);
+        Ok(())
+    }
+}
+
+/// Full retail handover reply, server opcode `0x0044` subtype `0x00`.
+///
+/// This is the packet that releases the client from its loading screen into the lobby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoverReply {
+    /// Server display name.
+    pub server_name: Vec<u8>,
+    /// The player being admitted.
+    pub player: RetailPlayerData,
+    /// Packed server time.
+    pub server_time: [u8; 16],
+    /// Feature-disable flags; `1 << 18` is the known-good baseline.
+    pub disabled_features: u64,
+}
+
+impl HandoverReply {
+    /// Feature-flag value the reference server uses.
+    pub const DEFAULT_DISABLED_FEATURES: u64 = 1 << 18;
+}
+
+impl EncodePacket for HandoverReply {
+    const OPCODE: u16 = 0x0044;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(0x00); // full-reply subtype
+        writer.pstring(US852_SERVER_VERSION, MAX_BOOTSTRAP_STRING_BYTES)?;
+        writer.pstring(&self.server_name, MAX_BOOTSTRAP_STRING_BYTES)?;
+        // The room this player is in, ahead of the record itself: 0xffff means "none". It is
+        // not part of the player record, which is why the match roster does not repeat it.
+        writer.u16_le(0xffff);
+        self.player.encode_body(writer)?;
         writer.bytes(&self.server_time);
         writer.u16_le(0);
         for _ in 0..3 {
