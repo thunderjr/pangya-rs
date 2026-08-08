@@ -5368,6 +5368,11 @@ where
                     Ok(summary) => {
                         *room_id = Some(summary.id());
                         self.observer.room(GameRoomObservation::Created);
+                        // The number is on the room's own header in the client, and an
+                        // operator driving a second seat into it has otherwise no way to learn
+                        // it: the room directory does not list rooms yet. It is a room number,
+                        // not an identity — nothing secret travels here.
+                        tracing::info!(room = summary.id().get(), "retail room created");
                         let room =
                             retail_room_from_summary(&summary, &request, self.retail_course());
                         self.send(framed, &RetailRoomJoinResult::Accepted(Box::new(room)))
