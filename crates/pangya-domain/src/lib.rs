@@ -3257,12 +3257,17 @@ pub struct RoomSettings {
 }
 
 impl RoomSettings {
-    /// Creates settings with a member capacity in `2..=30`.
+    /// Creates settings with a member capacity in `1..=30`.
+    ///
+    /// One is a real capacity, not a degenerate one: a practice room holds exactly the player
+    /// who opened it, and a client that asks for one and is refused drops back to the lobby
+    /// with no explanation. Modes that need two players enforce that where they start, not
+    /// here.
     ///
     /// # Errors
     /// Returns [`RoomValueError::InvalidCapacity`] outside the range.
     pub const fn new(max_members: u8) -> Result<Self, RoomValueError> {
-        if max_members >= 2 && max_members <= 30 {
+        if max_members >= 1 && max_members <= 30 {
             Ok(Self { max_members })
         } else {
             Err(RoomValueError::InvalidCapacity)
@@ -3848,7 +3853,12 @@ mod tests {
         assert_eq!(password.expose_bytes(), b"secret");
         assert_eq!(format!("{password:?}"), "RoomPassword([REDACTED])");
         assert_eq!(RoomPassword::parse(""), Err(RoomValueError::InvalidLength));
-        assert_eq!(RoomSettings::new(1), Err(RoomValueError::InvalidCapacity));
+        assert_eq!(
+            RoomSettings::new(1).map(RoomSettings::max_members),
+            Ok(1),
+            "a practice room holds one player"
+        );
+        assert_eq!(RoomSettings::new(0), Err(RoomValueError::InvalidCapacity));
         assert_eq!(RoomSettings::new(30).map(RoomSettings::max_members), Ok(30));
     }
 
