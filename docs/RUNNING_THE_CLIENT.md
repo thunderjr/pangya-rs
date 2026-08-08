@@ -305,18 +305,17 @@ focus cannot be taken back from a client that has it; the failed attempts are li
 harness header. `pangya-test-client` takes the other seat over the same retail wire instead:
 
 ```bash
-# One bearer per seat. Single use, so mint a fresh one for every attempt.
-export PANGYA_HANDOVER=$(cargo run -q -p pangya-server -- \
-  --config config/local.toml account handover --account-id <ID>)
+cargo build --release -p pangya-server -p pangya-test-client
 
 # Join the room the real client made. Its number is in the room's own header.
-cargo run -q -p pangya-test-client -- --game <ADDRESS>:20201 \
-  --account-id <ID> --username <NAME> --room <NUMBER>
+scripts/second-seat.sh --username rsp5 --room <NUMBER>
 ```
 
-It can also host, with `--host` instead of `--room`, and it prints the room number for the real
-client to join. `RUST_LOG=debug` prints every frame in order, which is the fastest way to see
-what the real client did and did not answer.
+The script resolves the account, mints a fresh bearer — a handover is single use, so every
+attempt needs one — and passes it through the environment rather than the command line. It can
+also host, with `--host` instead of `--room`, printing the room number for the real client to
+join. `RUST_LOG=debug` prints every frame in order, which is the fastest way to see what the
+real client did and did not answer.
 
 Then:
 
