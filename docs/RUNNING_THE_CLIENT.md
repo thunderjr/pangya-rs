@@ -300,9 +300,9 @@ Start button unlocks, but no real client has yet loaded the hole. That is the op
 ### 7.1 Driving a versus hole
 
 A versus hole needs two players and only one of them has to be a real client. Two real ones
-cannot be driven on one desktop — only the instance holding input focus acts on a click, and
-focus cannot be taken back from a client that has it; the failed attempts are listed in the
-harness header. `pangya-test-client` takes the other seat over the same retail wire instead:
+*can* now be driven on one desktop — `Set-PangyaTarget` switches the acting instance and proves
+each switch by pixels; see "How the automation drives two windows" — but `pangya-test-client`
+can still take the other seat over the same retail wire when one real client is enough:
 
 ```bash
 cargo build --release -p pangya-server -p pangya-test-client
@@ -519,16 +519,26 @@ measured from a corner pin, so the OS cursor ends up at the same screen coordina
 cursor, and every coordinate in the script is a client-area pixel of a window sitting at the
 screen origin. **Only one window can be at the origin at a time.**
 
-`Set-PangyaTarget -ProcessId N` therefore parks every other instance far to the right, moves the
-chosen one to the origin, and focuses it. Everything after that drives the target. Switching
-instances is an explicit `Set-PangyaTarget` call — the click helpers cannot infer it, and driving
-the wrong window is silent rather than an error.
+Worse, input focus decides which instance acts on the synthetic input, and the focused client
+holds its DirectInput devices *exclusively*: Alt+Tab and friends are suppressed, clicks on other
+windows are eaten, and `SetForegroundWindow` is refused. Focus can only be given up, not taken —
+minimising a DirectInput game forces it to unacquire, and minimising the foreground window
+releases the foreground lock.
+
+`Set-PangyaTarget -ProcessId N` therefore minimises every instance, restores the chosen one,
+moves it to the origin (verified — the restore animation swallows an early move), gives it one
+real title-bar click to seal the activation, and then *proves* the switch: the engine draws its
+own cursor, so the target's pixels must change under a probe point in step with a synthetic
+mouse move (`Test-PangyaCursorFollows`). If the probe fails after three attempts it throws
+instead of silently driving the wrong client. Non-target instances stay minimised. On screens
+without the lobby chat bar, pass a probe point over static UI — sign-in uses the login dialog's
+`-ProbeX 325 -ProbeY 237`.
 
 ```powershell
 . C:\tools\pangya-client.ps1
 Get-PangyaInstances                       # ProcessId / Hwnd / Path
-Set-PangyaTarget -ProcessId 10652         # park the others, anchor this one
-Invoke-PangyaLogin -Id 'rsp4' -Password 'pangya123'
+Set-PangyaTarget -ProcessId 10652         # minimise the others, anchor + prove this one
+Invoke-PangyaClick 108 570                # opens the Multiplay directory on 10652
 Set-PangyaTarget -ProcessId 8480          # switch back to the first
 ```
 

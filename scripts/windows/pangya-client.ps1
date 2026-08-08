@@ -4,7 +4,7 @@
 # version control so the harness travels with the server it drives; copy it back to the VM after
 # editing, and copy the VM's copy here after editing it there.
 #
-# Four constraints shape everything below, each of which cost a debugging session:
+# Five constraints shape everything below, each of which cost a debugging session:
 #
 # 1. The client reads its mouse through DirectInput. It ignores SetCursorPos entirely, so
 #    ordinary synthetic clicks never reach its widgets. The only thing that works is RELATIVE
@@ -23,6 +23,16 @@
 # 4. The engine drops synthetic clicks often enough that fire-and-forget is the single biggest
 #    source of stuck runs: a missed click looks exactly like a server that never replied. Steps
 #    therefore assert the screen they are meant to produce and retry.
+#
+# 5. With two instances running, input focus decides which client acts on the synthetic input,
+#    and the focused client cannot be dispossessed by any polite means: it holds its DirectInput
+#    devices EXCLUSIVELY, which suppresses Alt+Tab, Alt+Esc and Win shortcuts (synthesised or
+#    real), eats clicks aimed at other windows' title bars and at the taskbar, and the foreground
+#    lock refuses SetForegroundWindow from this process on top of that. All of those were tried
+#    and verified useless. The one thing that works is making the holder LET GO: minimising a
+#    DirectInput game forces it to unacquire, and minimising the foreground window releases the
+#    foreground lock — see Set-PangyaTarget. GetForegroundWindow reports stale values from this
+#    context, so a switch is verified by pixels, never by asking who is foreground.
 #
 # Every coordinate here is a client-area pixel of a window sitting at the screen ORIGIN, and only
 # one window can be there at a time. See docs/RUNNING_THE_CLIENT.md for the surrounding procedure.
@@ -130,10 +140,12 @@ public class PangyaClient {
 # instance once two clients are running: clicks then go to the wrong client and screen waits
 # sample the wrong window and pass falsely. Everything below resolves a window per process.
 #
-# The rule for two instances: park every other one off to the side, put the one being driven at
-# the origin, and only then click. Set-PangyaTarget does all three. Switching instances mid-flow
-# is an explicit Set-PangyaTarget call, not something the click helpers can infer, and driving
-# the wrong window is silent rather than an error.
+# The rule for two instances: every instance that is not being driven sits MINIMISED, the one
+# being driven sits restored at the origin, and only then does anything click. Minimised is not
+# just parking - it is what forces a client to release its exclusive DirectInput grip (see
+# constraint 5 in the header). Switching instances mid-flow is an explicit Set-PangyaTarget
+# call, not something the click helpers can infer, and driving the wrong window is silent
+# rather than an error.
 Add-Type -TypeDefinition @"
 using System;using System.Runtime.InteropServices;using System.Text;using System.Collections.Generic;
 public class PangyaWindows {
@@ -143,10 +155,12 @@ public class PangyaWindows {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
-  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll", EntryPoint="IsIconic")] public static extern bool IsMinimized(IntPtr h);
   [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
   const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004;
+  const int SW_MINIMIZE = 6, SW_RESTORE = 9;
 
   public static List<IntPtr> Find(uint wantPid) {
     var found = new List<IntPtr>();
@@ -165,7 +179,8 @@ public class PangyaWindows {
     SetWindowPos(h, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
   }
 
-  public static void Focus(IntPtr h) { SetForegroundWindow(h); }
+  public static void Minimize(IntPtr h) { ShowWindow(h, SW_MINIMIZE); }
+  public static void Restore(IntPtr h)  { ShowWindow(h, SW_RESTORE); }
 
   // Screen position of a SPECIFIC window's client area, unlike PangyaClient.Origin().
   public static POINT Origin(IntPtr h) {
@@ -176,37 +191,58 @@ public class PangyaWindows {
 }
 "@ -ErrorAction SilentlyContinue
 
-# UNSOLVED: which instance a click reaches is decided by input focus, and focus cannot be taken
-# back from a client that already has it.
-#
-# The engine tracks the cursor through DirectInput as accumulated relative deltas clamped to its
-# own window, so parking a window elsewhere does NOT move its idea of where the pointer is: both
-# instances believe the cursor is over the same client-area pixel, and the one holding input
-# focus is the one that acts. Whichever client was activated last keeps acting, and every
-# attempt below to move focus to the other one failed, silently, while reporting success:
-#
-#   SetForegroundWindow                                   no effect
-#   SPI_SETFOREGROUNDLOCKTIMEOUT=0 then SetForegroundWindow, BringWindowToTop
-#                                                         no effect
-#   absolute SetCursorPos + SendInput click on the title bar
-#                                                         no effect
-#   the same click delivered by the automation host       no effect
-#   ShowWindow(other, SW_MINIMIZE)                        window minimises, target still deaf
-#   clicking the target's taskbar button                  no effect
-#
-# GetForegroundWindow, read from the automation host, is not a usable check either: it kept
-# naming a window that had been minimised. Verify a switch by observed pixels, never by that.
+# Focus decides which instance the synthetic input reaches, and it cannot be TAKEN from a
+# client that holds it — SetForegroundWindow (with and without SPI_SETFOREGROUNDLOCKTIMEOUT=0),
+# absolute clicks on the other title bar or the taskbar, scan-code Alt+Tab / Alt+Esc, and
+# SwitchToThisWindow all failed silently, because the focused client acquires its DirectInput
+# devices exclusively: that suppresses the system task-switch keys and eats clicks aimed at any
+# other window. Focus can only be GIVEN UP: minimising a DirectInput game forces it to
+# unacquire, and minimising the foreground window releases the foreground lock, after which
+# restoring another instance activates it and a single real title-bar click seals the
+# activation, honoured by position now that nothing is grabbing input. The title bar and not
+# the client area, because the engine acts on client-area clicks at wherever its own cursor
+# froze, which would press a random widget.
 #
 # Do NOT reach for AttachThreadInput. Borrowing the input state of a busy game thread hangs the
-# automation host and takes the whole PowerShell channel down with it for minutes.
-#
-# What does work is launching an instance: a new client takes focus and can then be driven. So a
-# two-client run today must interleave launch and use rather than switch between two live
-# clients, and driving a versus hole — which needs both alive at once — is still open.
+# automation host and takes the whole PowerShell channel down with it for minutes. And never
+# verify a switch with GetForegroundWindow: from this context it kept naming a window that had
+# been minimised. A switch is proven by pixels, in Test-PangyaCursorFollows.
+Add-Type -TypeDefinition @"
+using System;using System.Runtime.InteropServices;using System.Threading;
+public class PangyaActivate {
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Explicit)] public struct INPUT { [FieldOffset(0)] public uint type; [FieldOffset(8)] public MOUSEINPUT mi; }
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
 
-# Where non-target instances are parked. Far enough right that no click can reach them.
-$script:PangyaParkedX = 1000
-$script:PangyaParkedY = 40
+  [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] p, int size);
+  [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+
+  const uint LDOWN = 0x0002, LUP = 0x0004;
+
+  public static bool IsAt(IntPtr h, int x, int y) {
+    RECT r;
+    if (!GetWindowRect(h, out r)) return false;
+    return r.Left == x && r.Top == y;
+  }
+
+  // One absolute OS click well inside the title bar: past the icon, short of the caption
+  // buttons. Only meaningful while no client holds input exclusively (i.e. all minimised).
+  public static void TitleClick(IntPtr h) {
+    RECT r;
+    if (!GetWindowRect(h, out r)) return;
+    SetCursorPos(r.Left + 120, r.Top + 14);
+    Thread.Sleep(80);
+    INPUT[] down = new INPUT[1]; down[0].type = 0; down[0].mi.dwFlags = LDOWN;
+    INPUT[] up = new INPUT[1];   up[0].type = 0;   up[0].mi.dwFlags = LUP;
+    SendInput(1, down, Marshal.SizeOf(typeof(INPUT)));
+    Thread.Sleep(50);
+    SendInput(1, up, Marshal.SizeOf(typeof(INPUT)));
+    Thread.Sleep(200);
+  }
+}
+"@ -ErrorAction SilentlyContinue
+
 # The instance currently sitting at the origin, so a click does not re-anchor what is already
 # anchored. See Confirm-PangyaAnchor.
 $script:PangyaAnchoredPid = $null
@@ -220,28 +256,90 @@ function Get-PangyaInstances {
   }
 }
 
+# Proof that the instance behind $Hwnd is the one receiving input: the engine draws its own
+# cursor at its accumulated position, so after a synthetic move the pixels around the probe
+# point must change in step with where the cursor was sent — twice, so a lucky animation frame
+# cannot pass for a cursor. The probe point must sit over STATIC UI of the target's current
+# screen: the default is the lobby chat bar; the login dialog needs (325, 237). This never
+# clicks, so it is safe to run against any screen.
+function Test-PangyaCursorFollows {
+  param(
+    [Parameter(Mandatory=$true)]$Hwnd,
+    [int]$ProbeX = 300, [int]$ProbeY = 545
+  )
+  Add-Type -AssemblyName System.Drawing
+  $origin = [PangyaWindows]::Origin($Hwnd)
+  $awayX = if ($ProbeX -gt 400) { $ProbeX - 250 } else { $ProbeX + 250 }
+  $box = 26; $half = 13
+  for ($round = 1; $round -le 2; $round++) {
+    $samples = foreach ($cursorX in @($awayX, $ProbeX)) {
+      [PangyaClient]::Goto($cursorX, $ProbeY)
+      $bmp = New-Object System.Drawing.Bitmap $box, $box
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      $g.CopyFromScreen($origin.X + $ProbeX - $half, $origin.Y + $ProbeY - $half, 0, 0, $bmp.Size)
+      $g.Dispose()
+      $bmp
+    }
+    $diff = 0
+    for ($px = 0; $px -lt $box; $px++) {
+      for ($py = 0; $py -lt $box; $py++) {
+        $a = $samples[0].GetPixel($px, $py); $b = $samples[1].GetPixel($px, $py)
+        if ([Math]::Abs($a.R - $b.R) -gt 25 -or [Math]::Abs($a.G - $b.G) -gt 25 -or
+            [Math]::Abs($a.B - $b.B) -gt 25) { $diff++ }
+      }
+    }
+    $samples | ForEach-Object { $_.Dispose() }
+    if ($diff -lt 12) { return $false }
+  }
+  return $true
+}
+
 function Set-PangyaTarget {
-  param([Parameter(Mandatory=$true)][int]$ProcessId)
+  param(
+    [Parameter(Mandatory=$true)][int]$ProcessId,
+    [int]$Attempts = 3,
+    [int]$ProbeX = 300, [int]$ProbeY = 545
+  )
   $all = @(Get-PangyaInstances)
   $target = $all | Where-Object ProcessId -eq $ProcessId
   if (-not $target) { throw "no client window for process $ProcessId" }
-  foreach ($other in $all | Where-Object ProcessId -ne $ProcessId) {
-    [PangyaWindows]::Move($other.Hwnd, $script:PangyaParkedX, $script:PangyaParkedY)
+  for ($i = 1; $i -le $Attempts; $i++) {
+    # Make whoever holds input let go: a minimised game unacquires its DirectInput devices,
+    # and a minimised foreground window releases the foreground lock.
+    foreach ($w in $all) { [PangyaWindows]::Minimize($w.Hwnd) }
+    Start-Sleep -Milliseconds 800
+    [PangyaWindows]::Restore($target.Hwnd)
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and [PangyaWindows]::IsMinimized($target.Hwnd)) {
+      Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 500
+    # At the origin, verified: the restore animation swallows a move issued too early, and a
+    # click on a window sitting anywhere else lands outside it (constraint 2).
+    $atOrigin = $false
+    for ($m = 0; $m -lt 5; $m++) {
+      [PangyaWindows]::Move($target.Hwnd, 0, 0)
+      Start-Sleep -Milliseconds 400
+      if ([PangyaActivate]::IsAt($target.Hwnd, 0, 0)) { $atOrigin = $true; break }
+    }
+    if (-not $atOrigin) { continue }
+    [PangyaActivate]::TitleClick($target.Hwnd)
+    Start-Sleep -Milliseconds 700
+    if (Test-PangyaCursorFollows -Hwnd $target.Hwnd -ProbeX $ProbeX -ProbeY $ProbeY) {
+      $script:PangyaTargetPid = $ProcessId
+      $script:PangyaAnchoredPid = $ProcessId
+      return $target
+    }
   }
-  [PangyaWindows]::Move($target.Hwnd, 0, 0)
-  [PangyaWindows]::Focus($target.Hwnd)
-  Start-Sleep -Milliseconds 400
-  $script:PangyaTargetPid = $ProcessId
-  $script:PangyaAnchoredPid = $ProcessId
-  return $target
+  throw ("client $ProcessId never took input focus: its engine cursor ignored the probe move " +
+         "on $Attempts attempt(s); a click now could drive another instance")
 }
 
 function Get-PangyaTarget { $script:PangyaTargetPid }
 
 # Re-asserts the target window's position before a click, instead of PangyaClient.Anchor().
 #
-# Moving or focusing a window costs the click that follows it: the engine needs a moment to take
-# input focus back, and a click inside that moment is swallowed. So this re-anchors only when the
+# The full switch costs seconds and disturbs every window, so this re-runs it only when the
 # instance being driven has changed since the last anchor, which is why a run of clicks on one
 # client — typing an id, then a password, then pressing Login — is not interrupted by window
 # churn. Pass -Force after anything that could have moved a window out from under us.
@@ -252,16 +350,7 @@ function Confirm-PangyaAnchor {
     return
   }
   if (-not $Force -and $script:PangyaAnchoredPid -eq $script:PangyaTargetPid) { return }
-  $all = @(Get-PangyaInstances)
-  $target = $all | Where-Object ProcessId -eq $script:PangyaTargetPid
-  if (-not $target) { throw "target client $($script:PangyaTargetPid) has no window" }
-  foreach ($other in $all | Where-Object ProcessId -ne $script:PangyaTargetPid) {
-    [PangyaWindows]::Move($other.Hwnd, $script:PangyaParkedX, $script:PangyaParkedY)
-  }
-  [PangyaWindows]::Move($target.Hwnd, 0, 0)
-  [PangyaWindows]::Focus($target.Hwnd)
-  Start-Sleep -Milliseconds 500
-  $script:PangyaAnchoredPid = $script:PangyaTargetPid
+  Set-PangyaTarget -ProcessId $script:PangyaTargetPid | Out-Null
 }
 
 # Client-area origin of the instance being driven. Falls back to the single-window lookup when
@@ -333,6 +422,7 @@ $script:PangyaRegions = @{
   ServerList  = @{ X = 228; Y = 183; W = 100; H = 16 }   # the first server row
   ChannelList = @{ X = 470; Y = 215; W = 90;  H = 16 }   # the first channel row
   LobbyBar    = @{ X = 80;  Y = 580; W = 120; H = 20 }   # the bottom menu bar
+  RoomDirectory = @{ X = 562; Y = 92; W = 150; H = 14 }  # "M/F Level Guild" column header
 }
 
 function Wait-PangyaScreen {
@@ -596,11 +686,30 @@ function Start-PangyaClientAt {
   if (([PangyaWindows]::Find([uint32]$pidNew)).Count -eq 0) {
     throw "client $pidNew never created a window"
   }
+  # A window created a moment ago holds focus naturally — Windows grants it to new processes —
+  # so the full switch is skipped: it would even mis-verify here, because the client draws no
+  # cursor until its UI is up. Minimise the others and take the origin directly.
+  $hwndNew = ([PangyaWindows]::Find([uint32]$pidNew))[0]
+  foreach ($w in @(Get-PangyaInstances) | Where-Object ProcessId -ne $pidNew) {
+    [PangyaWindows]::Minimize($w.Hwnd)
+  }
+  Start-Sleep -Milliseconds 500
+  for ($m = 0; $m -lt 5; $m++) {
+    [PangyaWindows]::Move($hwndNew, 0, 0)
+    Start-Sleep -Milliseconds 400
+    if ([PangyaActivate]::IsAt($hwndNew, 0, 0)) { break }
+  }
+  $script:PangyaTargetPid = [int]$pidNew
+  $script:PangyaAnchoredPid = [int]$pidNew
   # The window then exists long before the login dialog: the client fetches its updatelist and
   # theme over HTTP first. Wait for the dialog rather than guessing how long that takes.
-  Set-PangyaTarget -ProcessId ([int]$pidNew) | Out-Null
   if (-not (Wait-PangyaScreen -Name LoginDialog -TimeoutSeconds $TimeoutSeconds)) {
     throw "client $pidNew never reached its login dialog"
+  }
+  # Natural focus is still an assumption; prove it now that the dialog (and with it the engine
+  # cursor) exists, and fall back to the full switch if some other window stole it meanwhile.
+  if (-not (Test-PangyaCursorFollows -Hwnd $hwndNew -ProbeX 325 -ProbeY 237)) {
+    Set-PangyaTarget -ProcessId ([int]$pidNew) -ProbeX 325 -ProbeY 237 | Out-Null
   }
   return [int]$pidNew
 }
@@ -623,7 +732,9 @@ function Invoke-PangyaSignIn {
     [Parameter(Mandatory=$true)][string]$Password,
     [string]$Nickname
   )
-  Set-PangyaTarget -ProcessId $ProcessId | Out-Null
+  # The client shows its login dialog here, so the switch is verified against the dialog's
+  # static pixels — the lobby chat bar it probes by default does not exist yet.
+  Set-PangyaTarget -ProcessId $ProcessId -ProbeX 325 -ProbeY 237 | Out-Null
   Invoke-PangyaLogin -Id $Id -Password $Password
   $screen = Wait-PangyaAnyScreen -Names @('ServerList', 'NickDialog') -TimeoutSeconds 45
   if (-not $screen) { throw "client $ProcessId showed neither a server list nor a nickname prompt" }
