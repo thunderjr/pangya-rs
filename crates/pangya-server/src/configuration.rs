@@ -245,13 +245,23 @@ impl Default for StarterSection {
             character_key: "starter_character".to_owned(),
             character_type_id: 0x0400_0000,
             allowed_character_type_ids: vec![0x0400_0000],
-            items: vec![StarterItemSection {
-                key: "starter_club".to_owned(),
-                item_type_id: 0x1000_0000,
-                quantity: 1,
-            }],
+            items: vec![
+                StarterItemSection {
+                    key: "starter_club".to_owned(),
+                    item_type_id: 0x1000_0000,
+                    quantity: 1,
+                },
+                // A retail client refuses to take a shot with no ball equipped, so a new
+                // account is unplayable without one. `0x14000000` is the first `Ball.iff`
+                // entry, the same id the client's own tables give the default comet.
+                StarterItemSection {
+                    key: "starter_ball".to_owned(),
+                    item_type_id: 0x1400_0000,
+                    quantity: 1,
+                },
+            ],
             equipped_club_key: Some("starter_club".to_owned()),
-            equipped_ball_key: None,
+            equipped_ball_key: Some("starter_ball".to_owned()),
         }
     }
 }
