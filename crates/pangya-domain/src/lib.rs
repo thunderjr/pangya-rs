@@ -3293,6 +3293,8 @@ pub struct MemberCard {
     pub caddie_uid: u32,
     /// Equipped club set's inventory id.
     pub club_set_uid: u32,
+    /// Catalog id of the equipped club set.
+    pub club_set_iff_id: u32,
     /// Equipped ball's catalog id.
     pub comet_iff_id: u32,
     /// Accumulated experience.

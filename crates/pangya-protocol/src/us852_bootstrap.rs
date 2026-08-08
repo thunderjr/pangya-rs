@@ -562,6 +562,7 @@ mod tests {
                 mastery: 0,
             },
             caddie: RetailCaddie::default(),
+            club_set_iff_id: 0x1000_0000,
         }
     }
 
@@ -973,6 +974,11 @@ pub struct RetailPlayerData {
     pub character: RetailCharacter,
     /// Equipped caddie.
     pub caddie: RetailCaddie,
+    /// Catalog id of the equipped club set.
+    ///
+    /// The client resolves the club models from this, not from the inventory id beside it. A
+    /// zero here leaves it without a club set to draw from and it dies building the hole.
+    pub club_set_iff_id: u32,
 }
 
 impl RetailPlayerData {
@@ -994,9 +1000,10 @@ impl RetailPlayerData {
         }
         self.character.encode_body(writer);
         self.caddie.encode_body(writer);
-        // Active club set; the client appears to ignore this block entirely.
+        // Active club set: inventory id then catalog id, the same pair every other item
+        // block uses.
         writer.u32_le(self.equipment.club_set_uid);
-        writer.u32_le(0);
+        writer.u32_le(self.club_set_iff_id);
         for _ in 0..10 {
             writer.u16_le(0);
         }

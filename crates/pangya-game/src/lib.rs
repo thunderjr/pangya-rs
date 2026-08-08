@@ -5607,6 +5607,7 @@ where
                     mastery: 0,
                 },
                 caddie: RetailCaddie::default(),
+                club_set_iff_id: club_set_iff_id(snapshot),
             },
             server_time: retail_now(),
             disabled_features: HandoverReply::DEFAULT_DISABLED_FEATURES,
@@ -6096,6 +6097,7 @@ fn member_card(snapshot: &PlayerSnapshot) -> MemberCard {
             .club_item_id
             .and_then(|id| u32::try_from(id.get()).ok())
             .unwrap_or(0),
+        club_set_iff_id: club_set_iff_id(snapshot),
         comet_iff_id: snapshot
             .equipment
             .ball_item_id
@@ -6116,6 +6118,23 @@ fn member_card(snapshot: &PlayerSnapshot) -> MemberCard {
 ///
 /// The client reads the same record here as in the handover reply that admitted it, so a
 /// roster that describes players any less completely is one it cannot build models from.
+/// The catalog id of a player's equipped club set.
+///
+/// Zero when nothing is equipped, which is what a player with no clubs honestly has.
+fn club_set_iff_id(snapshot: &PlayerSnapshot) -> u32 {
+    snapshot
+        .equipment
+        .club_item_id
+        .and_then(|id| {
+            snapshot
+                .inventory
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.item_type_id.get())
+        })
+        .unwrap_or(0)
+}
+
 /// The current wall clock, packed the way the client reads it.
 ///
 /// Anything the clock cannot supply packs as the Unix epoch rather than as zeros: a zeroed
@@ -6165,6 +6184,7 @@ fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlaye
                 mastery: 0,
             },
             caddie: RetailCaddie::default(),
+            club_set_iff_id: card.club_set_iff_id,
         },
         start_time,
     }
