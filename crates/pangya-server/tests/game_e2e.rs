@@ -6396,7 +6396,13 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         0x0048,
         "and sees the roster it joined"
     );
-    let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
+    // The host is sitting in the room, so it learns the visitor arrived only from a census of
+    // its own. Without one the roster never fills on screen and Start is never offered.
+    let host_frames = drain_available(&mut host, host_key, Duration::from_millis(900)).await;
+    assert!(
+        host_frames.contains(&0x0048),
+        "the host is told the room filled: {host_frames:04x?}"
+    );
 
     // Both mark ready, which is what unlocks Start on a real client.
     send_packet(&mut host, host_key, 4, 0x000d, &[0]).await;

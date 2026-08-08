@@ -3424,12 +3424,24 @@ where
         }
         // Lobby/room broadcasts are still encoded in the synthetic family. Emitting one
         // into a retail stream would desynchronize the client far more badly than the
-        // missing information does, so in retail mode they are dropped while their state
-        // effect is preserved. Room census (`0x0048`) is the retail replacement and is not
-        // implemented yet; see `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
+        // missing information does, so in retail mode the ones with no retail equivalent are
+        // dropped while their state effect is preserved. See
+        // `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
         if self.config.retail_bootstrap {
             match &event {
-                RoomEvent::Snapshot(_) | RoomEvent::Chat { .. } => {
+                // The census is the retail form of a room snapshot, and a client sitting in a
+                // room learns of everyone else only from it: without this the roster never
+                // changes on screen, and a host waiting for a full room is never offered
+                // Start. Only in the room — a census mid-hole would contradict the match.
+                RoomEvent::Snapshot(room) => {
+                    if state == GameState::InRoom {
+                        self.send(framed, &retail_census_from_snapshot(room))
+                            .await?;
+                        self.observer.room(GameRoomObservation::StateSent);
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
+                RoomEvent::Chat { .. } => {
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::SoloStarted(plan) => {
@@ -5208,8 +5220,9 @@ where
                             ))),
                         )
                         .await?;
-                        self.send(framed, &retail_census_from_snapshot(&snapshot))
-                            .await?;
+                        // No census here: joining mutates the room, so the actor broadcasts one
+                        // to everyone in it, this connection included. Sending a second would
+                        // hand the joiner the same roster twice.
                         Ok(GameState::InRoom)
                     }
                     Err(_) => self.reject_retail_join(framed, state).await,
