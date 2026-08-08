@@ -246,6 +246,49 @@ pub enum RoomListKind {
     Modifications = 3,
 }
 
+/// Multiplayer-mode enter acknowledgement, server opcode `0x00f5`.
+///
+/// # Provenance
+///
+/// Empty body, from `pangbox/server` (`game/packet/server.go` `ServerMultiplayerJoined`), ISC
+/// licensed; the vendored PacketDoc `gameservice/server/00f5.ksy` documents the same empty
+/// response to the client's `0x0081`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMultiplayerJoined;
+
+impl EncodePacket for RetailMultiplayerJoined {
+    const OPCODE: u16 = 0x00f5;
+
+    fn encode(
+        &self,
+        _writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)
+    }
+}
+
+/// Multiplayer-mode leave acknowledgement, server opcode `0x00f6`.
+///
+/// # Provenance
+///
+/// Empty body, from `pangbox/server` (`game/packet/server.go` `ServerMultiplayerLeft`), ISC
+/// licensed, matching PacketDoc `gameservice/server/00f6.ksy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMultiplayerLeft;
+
+impl EncodePacket for RetailMultiplayerLeft {
+    const OPCODE: u16 = 0x00f6;
+
+    fn encode(
+        &self,
+        _writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)
+    }
+}
+
 /// Room list, server opcode `0x0047`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailRoomList {

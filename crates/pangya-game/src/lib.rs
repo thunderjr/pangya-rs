@@ -68,30 +68,30 @@ use pangya_protocol::{
     RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailEquipment,
     RetailFinishHole, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
     RetailHoleWind, RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchInfo,
-    RetailMatchStart, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
-    RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomType, RetailSelectChannel, RetailTurnEnd, RetailTurnStart,
-    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
-    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
-    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
-    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
-    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
-    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
-    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
-    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
-    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
-    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
-    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft, RetailPlayerHistory,
+    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerStartHole,
+    RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomType, RetailSelectChannel, RetailTurnEnd, RetailTurnStart, RetailWeather,
+    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
+    RoomCreateRequest, RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest,
+    RoomListKind, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
+    RoomPlayerFlags, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
+    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
+    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
+    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
+    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
+    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
+    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
+    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
+    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
+    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_session_opcode, synthetic_game_hello,
     us852_game_hello,
 };
@@ -4263,6 +4263,20 @@ where
     /// requests map onto the same commands the synthetic path uses, and the actor's
     /// authoritative results map back onto retail replies.
     #[allow(clippy::too_many_arguments)]
+    /// Current rooms as retail list records, bounded by what one list frame can carry.
+    async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
+        let summaries = self
+            .lobby
+            .list()
+            .await
+            .map_err(|_| GameRuntimeError::Protocol)?;
+        Ok(summaries
+            .iter()
+            .take(pangya_protocol::MAX_ROOMS_PER_LIST)
+            .map(retail_room_from_summary_only)
+            .collect())
+    }
+
     async fn handle_retail_room_command(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -4276,6 +4290,31 @@ where
     ) -> Result<GameState, GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         match (state, opcode) {
+            // Opening the room directory. The client wants the current room list before its
+            // acknowledgement, which is what upstream sends on this transition.
+            (GameState::InChannel, RETAIL_C2S_MULTIPLAYER_JOIN) => {
+                if !payload.is_empty() {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                let rooms = self.retail_room_list().await?;
+                self.send(
+                    framed,
+                    &RetailRoomList {
+                        kind: RoomListKind::Initial,
+                        rooms,
+                    },
+                )
+                .await?;
+                self.send(framed, &RetailMultiplayerJoined).await?;
+                Ok(state)
+            }
+            (GameState::InChannel, RETAIL_C2S_MULTIPLAYER_LEAVE) => {
+                if !payload.is_empty() {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.send(framed, &RetailMultiplayerLeft).await?;
+                Ok(state)
+            }
             (GameState::InChannel, RetailRoomCreate::OPCODE) => {
                 let request =
                     decode_packet_payload::<RetailRoomCreate>(payload, profile, ServiceKind::Game)
@@ -4978,6 +5017,10 @@ fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
 
 /// Retail room-leave client opcode.
 const RETAIL_C2S_ROOM_LEAVE: u16 = 0x000f;
+/// Retail multiplayer-mode enter client opcode, sent when the client opens the room directory.
+const RETAIL_C2S_MULTIPLAYER_JOIN: u16 = 0x0081;
+/// Retail multiplayer-mode leave client opcode, sent once the client leaves the directory.
+const RETAIL_C2S_MULTIPLAYER_LEAVE: u16 = 0x0082;
 
 /// Builds a retail room record from a lobby summary plus the settings the creator asked
 /// for. The lobby model stores capacity and identity only, so course, timers, and hole
@@ -5067,7 +5110,11 @@ fn is_retail_match_opcode(opcode: u16) -> bool {
 fn is_retail_room_opcode(opcode: u16) -> bool {
     matches!(
         opcode,
-        RetailRoomCreate::OPCODE | RetailRoomJoin::OPCODE | RETAIL_C2S_ROOM_LEAVE
+        RetailRoomCreate::OPCODE
+            | RetailRoomJoin::OPCODE
+            | RETAIL_C2S_ROOM_LEAVE
+            | RETAIL_C2S_MULTIPLAYER_JOIN
+            | RETAIL_C2S_MULTIPLAYER_LEAVE
     )
 }
 
