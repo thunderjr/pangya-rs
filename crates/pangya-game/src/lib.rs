@@ -90,7 +90,7 @@ use pangya_protocol::{
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
     StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
-    encode_packet_payload, synthetic_game_hello,
+    encode_packet_payload, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -1103,9 +1103,20 @@ where
         );
         let result = async {
             let key = (OsRng.next_u32() & 0x0f) as u8;
-            let hello = synthetic_game_hello(key).map_err(|_| GameRuntimeError::Protocol)?;
+            // The two hellos are different lengths, so this is not cosmetic: a real client that
+            // receives the four-byte synthetic hello reads the next frame at the wrong offset and
+            // drops the connection, which it surfaces as "Server is full" on its server list.
+            let hello: &[u8] = &if self.config.retail_bootstrap {
+                us852_game_hello(key)
+                    .map_err(|_| GameRuntimeError::Protocol)?
+                    .to_vec()
+            } else {
+                synthetic_game_hello(key)
+                    .map_err(|_| GameRuntimeError::Protocol)?
+                    .to_vec()
+            };
             stream
-                .write_all(&hello)
+                .write_all(hello)
                 .await
                 .map_err(|_| GameRuntimeError::Io)?;
             let framed = Framed::new(
@@ -1947,7 +1958,10 @@ where
                 &CompatibilityProfile::US_852,
                 ServiceKind::Game,
             )
-            .map_err(|_| GameRuntimeError::Protocol)?;
+            .map_err(|error| {
+                tracing::debug!(stage = "retail_auth_decode", %error, "game auth rejected");
+                GameRuntimeError::Protocol
+            })?;
             (u64::from(auth.user_id), auth.login_key)
         } else {
             let auth = decode_packet_payload::<GameAuth>(
@@ -1958,18 +1972,32 @@ where
             .map_err(|_| GameRuntimeError::Protocol)?;
             (auth.claimed_account_id, auth.handover)
         };
+        // Each rejection below is logged with the stage that produced it. The bearer itself is
+        // never logged, only its length: an operator debugging a real client otherwise cannot
+        // tell an unusable claimed id from a mangled login key from a consumed token.
         let claimed = i64::try_from(claimed_account_id)
             .ok()
             .and_then(|value| AccountId::new(value).ok())
             .ok_or_else(|| {
+                tracing::debug!(stage = "claimed_account_id", "game auth rejected");
                 self.observer.authentication("rejected");
                 GameRuntimeError::Authentication
             })?;
         let bearer = std::str::from_utf8(&handover).map_err(|_| {
+            tracing::debug!(
+                stage = "bearer_utf8",
+                bearer_bytes = handover.len(),
+                "game auth rejected"
+            );
             self.observer.authentication("rejected");
             GameRuntimeError::Authentication
         })?;
         let parsed = parse_handover(bearer).map_err(|_| {
+            tracing::debug!(
+                stage = "bearer_parse",
+                bearer_bytes = handover.len(),
+                "game auth rejected"
+            );
             self.observer.authentication("rejected");
             GameRuntimeError::Authentication
         })?;
@@ -1985,6 +2013,7 @@ where
         .await
         .map_err(|_| GameRuntimeError::Timeout)?
         .map_err(|_| {
+            tracing::debug!(stage = "handover_consume", "game auth rejected");
             self.observer.authentication("rejected");
             GameRuntimeError::Authentication
         })?;

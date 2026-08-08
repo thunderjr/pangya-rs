@@ -48,6 +48,32 @@ pub fn synthetic_game_hello(key: u8) -> Result<[u8; 4], PacketEncodeError> {
     Ok([0, 0, 0, key])
 }
 
+/// Builds the nine-byte U.S. 852 retail GameService hello.
+///
+/// Unlike the synthetic four-byte hello this is the layout a real client parses: eight
+/// source-observed constant bytes followed by the negotiated transport key. A real U.S. 852
+/// client that receives the shorter synthetic hello instead reads the following frame at the
+/// wrong offset and drops the connection, which it reports on its server list as
+/// "Server is full".
+///
+/// # Provenance
+///
+/// Constants adapted from `pangbox/server` (`game/server/auth.go`, `game/packet/server.go`
+/// `ConnectMessage`), ISC licensed. The hello is written unframed, exactly these bytes.
+///
+/// # Errors
+/// Rejects transport keys outside `0x00..=0x0f`.
+pub fn us852_game_hello(key: u8) -> Result<[u8; 9], PacketEncodeError> {
+    if key > 0x0f {
+        return Err(PacketEncodeError::Limit {
+            field: "transport key",
+            actual: usize::from(key),
+            maximum: 15,
+        });
+    }
+    Ok([0x00, 0x06, 0x00, 0x00, 0x3f, 0x00, 0x01, 0x01, key])
+}
+
 /// Synthetic minimal GameService auth packet, client opcode `0x0002`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct GameAuth {
@@ -283,6 +309,27 @@ mod tests {
         let hello = synthetic_game_hello(9).expect("hello");
         assert_eq!(hello.last(), Some(&9));
         assert!(synthetic_game_hello(16).is_err());
+    }
+
+    /// The retail hello's exact bytes and length are a compatibility surface: a real client that
+    /// gets the shorter synthetic one reads the next frame at the wrong offset and disconnects.
+    #[test]
+    fn retail_game_hello_is_nine_source_observed_bytes_ending_in_the_key() {
+        for key in 0..=0x0f_u8 {
+            let hello = us852_game_hello(key).expect("hello");
+            assert_eq!(
+                hello,
+                [0x00, 0x06, 0x00, 0x00, 0x3f, 0x00, 0x01, 0x01, key],
+                "key {key}"
+            );
+        }
+        assert_eq!(us852_game_hello(0).expect("hello").len(), 9);
+        assert_ne!(
+            us852_game_hello(0).expect("retail").len(),
+            synthetic_game_hello(0).expect("synthetic").len(),
+            "the two hellos must stay distinguishable by length"
+        );
+        assert!(us852_game_hello(0x10).is_err());
     }
 
     #[test]

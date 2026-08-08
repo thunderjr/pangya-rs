@@ -6,7 +6,7 @@
 >
 > Current stage: **The real U.S. 852 client completes the entire LoginService state machine — login, first-character setup, server list, server selection, handover — and connects to GameService**
 >
-> Next gate: **blocker 15 — the GameService retail hello/auth. The client connects to the advertised GameService port and then disconnects, which it reports on the server list as "Server is full"**
+> Next gate: **blocker 15 — the client now accepts the retail GameService hello and sends its retail `0x0002` auth, but the login key it echoes is empty, so the bearer never parses. The session key this server puts in LoginService `0x0003` is the suspect**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -38,7 +38,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | Real client reaches LoginService | ✅ | Client authenticates over encrypted TCP: `connection accepted → account authenticated (account_id 1)`, opcode `0x0001` in and out. First real U.S. 852 protocol ever exchanged with this server |
 | Real client first-character setup | ✅ | Character Creation displayed; the client's own pick (`0x0400000b`) is accepted and persisted; the documented `success` reply unblocks it |
 | Real client server list and selection | ✅ | List renders the configured `PangYa-RS Local`; selection sends `0x0003`, receives the session key, and LoginService closes with `reason: "complete"` — the whole state machine |
-| Real client GameService entry | ⛔ | Blocker 15: the client connects to the advertised GameService port and immediately disconnects; the client surfaces this as "Server is full" |
+| Real client GameService hello | ✅ | Retail nine-byte hello accepted; the client now sends its retail `0x0002` auth instead of disconnecting |
+| Real client GameService auth | ⛔ | Blocker 15: the auth decodes but its `login_key` is empty, so the handover bearer never parses |
 | Protocol/crypto | 🟡 | All local M1 vectors, fixtures, transport boundaries, audits, and bounded fuzz checks pass; real-client acceptance remains |
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
@@ -287,13 +288,13 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 14. **Setup state does not advance after character selection** — **resolved 2026-08-07.** Three separate causes, each found from the wire. The configured character allowlist was one entry while the client offers a wider roster and picked `0x0400000b`, so the selection was refused; the refusal is now logged with the identifier instead of closing silently. Auto-create already grants a starter, so replaying the grant with the player's own character is a drift error by design; a new `select_starter_character` repoints the provisional character while setup is incomplete, and the grant is then replayed so a success proves the aggregate agrees. And nothing was sent in reply at all: upstream documents the login packet being resent with `success` once the character is selected, and the client blocks on "Waiting for server's response." until it arrives. With all three the client proceeds to the server list.
 
-15. **GameService entry is refused** — after LoginService completes, the client connects to the advertised GameService port and immediately closes the connection; the client reports this on the server list as a blinking "Server is full". The server-list entry is not the cause: its layout matches upstream field for field and it advertises 0 of 200. The next thing to check is the GameService hello and the retail `0x0002` auth exchange — note the accepted game connection logs `client_profile: "us_852_synthetic_m3"`, so confirm the retail bootstrap path is actually the one serving this connection.
+15. **GameService auth carries an empty login key** — narrowed from "the client disconnects immediately" to one field. The first cause is fixed: the GameService sent its four-byte *synthetic* hello regardless of `game.retail_bootstrap`, while a real client expects the nine-byte retail hello `00 06 00 00 3f 00 01 01 <key>`; the length difference made the client read the next frame at the wrong offset and drop the connection, which it reports on the server list as a blinking "Server is full". With the retail hello the client now sends its retail `0x0002` auth. That auth *decodes* cleanly — the layout matches upstream field for field — but staged diagnostics report `stage: "bearer_parse", bearer_bytes: 0`: the client echoed an **empty** login key, so there is no bearer to consume. Since LoginService `0x0003` also matches upstream exactly (four bytes then a PangYa string), the suspect is the *value* this server puts in it: the handover bearer is written with `pstring`, so any NUL or non-ASCII byte in it truncates the string to nothing. Check what `generate_handover` produces and whether it survives a `pstring` round trip; the login E2E only asserts the opcode of `0x0003`, never its payload, which is why this was invisible.
 
 ---
 
 ## Immediate next actions
 
-1. **Fix blocker 15.** LoginService is now proven end to end against a real client, so GameService entry is the only thing between here and channel/lobby, and it gates every remaining §19.6 step.
+1. **Fix blocker 15**, starting from the handover bearer's `pstring` round trip in LoginService `0x0003`. GameService entry is the only thing between here and channel/lobby, and it gates every remaining §19.6 step.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

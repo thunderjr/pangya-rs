@@ -26,7 +26,7 @@ pub use error::{ErrorClass, PacketDecodeError, PacketEncodeError};
 pub use game::{
     ChannelJoined, CharacterBootstrap, CharacterInfo, EquipmentInfo, GAME_INVENTORY_SEGMENT_ITEMS,
     GameAuth, InventoryBootstrap, InventorySegment, MAX_GAME_HANDOVER_BYTES, PlayerInfo,
-    SelectChannel, synthetic_game_hello,
+    SelectChannel, synthetic_game_hello, us852_game_hello,
 };
 pub use login::{
     ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList,

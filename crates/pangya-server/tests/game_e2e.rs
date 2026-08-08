@@ -657,6 +657,26 @@ async fn connect_game(address: std::net::SocketAddr) -> (TcpStream, u8) {
     (stream, hello[3])
 }
 
+/// Reads the nine-byte retail GameService hello, pinning its constants over real TCP.
+///
+/// A real client that receives the shorter synthetic hello reads the following frame at the
+/// wrong offset and disconnects, so the length difference is a compatibility surface and is
+/// asserted here rather than only in a unit test.
+async fn connect_game_retail(address: std::net::SocketAddr) -> (TcpStream, u8) {
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let mut hello = [0_u8; 9];
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, stream.read_exact(&mut hello))
+        .await
+        .expect("bounded retail game hello")
+        .expect("hello");
+    assert_eq!(
+        &hello[..8],
+        &[0x00, 0x06, 0x00, 0x00, 0x3f, 0x00, 0x01, 0x01]
+    );
+    assert!(hello[8] <= 0x0f);
+    (stream, hello[8])
+}
+
 async fn connect_login(address: std::net::SocketAddr) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut hello = [0_u8; 14];
@@ -5832,7 +5852,7 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
         ServiceKind::Game,
     )
     .await;
-    let (mut stream, key) = connect_game(address).await;
+    let (mut stream, key) = connect_game_retail(address).await;
     // The retail auth packet a real client sends, not the synthetic one.
     send_typed(
         &mut stream,
@@ -5930,7 +5950,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         username: &str,
     ) -> (TcpStream, u8) {
         let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
-        let (mut stream, key) = connect_game(address).await;
+        let (mut stream, key) = connect_game_retail(address).await;
         send_typed(
             &mut stream,
             key,
@@ -6080,7 +6100,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         ServiceKind::Game,
     )
     .await;
-    let (mut stream, key) = connect_game(address).await;
+    let (mut stream, key) = connect_game_retail(address).await;
     send_typed(
         &mut stream,
         key,
