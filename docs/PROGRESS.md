@@ -4,9 +4,9 @@
 >
 > Last updated: **2026-08-07**
 >
-> Current stage: **The real U.S. 852 client reaches its login screen, authenticates against LoginService, and persists its first character**
+> Current stage: **The real U.S. 852 client completes the entire LoginService state machine — login, first-character setup, server list, server selection, handover — and connects to GameService**
 >
-> Next gate: **blocker 14 — advance the account's setup state after character selection so a returning login moves past Character Creation, then carry the real client through nickname, server selection, and GameService handover**
+> Next gate: **blocker 15 — the GameService retail hello/auth. The client connects to the advertised GameService port and then disconnects, which it reports on the server list as "Server is full"**
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -36,7 +36,9 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | Cargo workspace | ✅ | Ten required Rust 2024 crates, MSRV 1.93.0, Cargo.lock, lints and CI |
 | Client startup contract | ✅ | Real U.S. 852 client answered 33/33 HTTP requests from `[client_web]` and mounted all 84 PAK archives; `updatelist` byte-identical to an independent encoder for the real directory. [`evidence/REAL_CLIENT_STARTUP_2026-08-07.md`](evidence/REAL_CLIENT_STARTUP_2026-08-07.md), ADR-0015 |
 | Real client reaches LoginService | ✅ | Client authenticates over encrypted TCP: `connection accepted → account authenticated (account_id 1)`, opcode `0x0001` in and out. First real U.S. 852 protocol ever exchanged with this server |
-| Real client first-character setup | 🟡 | Character Creation is displayed and Nuri (`0x04000000`) is accepted and persisted; blocker 14 keeps the setup state from advancing, so a returning login repeats it |
+| Real client first-character setup | ✅ | Character Creation displayed; the client's own pick (`0x0400000b`) is accepted and persisted; the documented `success` reply unblocks it |
+| Real client server list and selection | ✅ | List renders the configured `PangYa-RS Local`; selection sends `0x0003`, receives the session key, and LoginService closes with `reason: "complete"` — the whole state machine |
+| Real client GameService entry | ⛔ | Blocker 15: the client connects to the advertised GameService port and immediately disconnects; the client surfaces this as "Server is full" |
 | Protocol/crypto | 🟡 | All local M1 vectors, fixtures, transport boundaries, audits, and bounded fuzz checks pass; real-client acceptance remains |
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
@@ -283,13 +285,15 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 13. **Client-side startup crash before any socket** — **resolved 2026-08-07.** Three separate requirements, each found by satisfying the previous one: the client is WinLicense-protected so it must be diagnosed from inside the process (a first-chance vectored exception handler inside Rugburn, since a debugger is terminated on attach and the packed image's symbols are meaningless); every resource it asks for is a **bare file name**, so the extracted `data/` tree must be flattened into the client directory (41,192 files, zero base-name collisions); and the advertised `patch_number` must not exceed the client's own patch level, or it withholds the login dialog entirely. With all three the client renders its login scene and logs in. Full narrative in [`evidence/REAL_CLIENT_STARTUP_2026-08-07.md`](evidence/REAL_CLIENT_STARTUP_2026-08-07.md).
 
-14. **Setup state does not advance after character selection** — the real client's Character Creation screen is displayed, Nuri (`0x04000000`) is accepted, and the `characters` row is written and durable. But the connection then closes with `reason: "protocol"`, and a fresh login shows Character Creation again rather than moving on, so the account's setup state is never marked complete and the login result keeps reporting "needs character". This is a server-side defect in the retail setup flow and it now gates every remaining §19.6 step. Fixing it needs the retail character-select acknowledgement and the packet the client sends next, which is what the `protocol` close is rejecting; capture it with `pangya_login=debug` and the connection's unknown-opcode diagnostic.
+14. **Setup state does not advance after character selection** — **resolved 2026-08-07.** Three separate causes, each found from the wire. The configured character allowlist was one entry while the client offers a wider roster and picked `0x0400000b`, so the selection was refused; the refusal is now logged with the identifier instead of closing silently. Auto-create already grants a starter, so replaying the grant with the player's own character is a drift error by design; a new `select_starter_character` repoints the provisional character while setup is incomplete, and the grant is then replayed so a success proves the aggregate agrees. And nothing was sent in reply at all: upstream documents the login packet being resent with `success` once the character is selected, and the client blocks on "Waiting for server's response." until it arrives. With all three the client proceeds to the server list.
+
+15. **GameService entry is refused** — after LoginService completes, the client connects to the advertised GameService port and immediately closes the connection; the client reports this on the server list as a blinking "Server is full". The server-list entry is not the cause: its layout matches upstream field for field and it advertises 0 of 200. The next thing to check is the GameService hello and the retail `0x0002` auth exchange — note the accepted game connection logs `client_profile: "us_852_synthetic_m3"`, so confirm the retail bootstrap path is actually the one serving this connection.
 
 ---
 
 ## Immediate next actions
 
-1. **Fix blocker 14.** The real client now reaches setup, so the setup state and the packet the client sends after confirming a character are the only things between here and nickname, server selection, and GameService handover. This outranks all other protocol work.
+1. **Fix blocker 15.** LoginService is now proven end to end against a real client, so GameService entry is the only thing between here and channel/lobby, and it gates every remaining §19.6 step.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

@@ -177,6 +177,11 @@ pub enum LoginResult {
     /// Status `0x00`.
     Success(LoginSuccess),
     /// Status `0xd9` and its observed `0xffff_ffff` constant.
+    ///
+    /// Upstream documents the first-login order as nickname, then character, then success. A real
+    /// U.S. 852 client answers this status by opening a combined creation screen that carries both
+    /// a name field and the character roster, and replies with `0x0008` rather than a nickname
+    /// packet.
     NeedSetNickname,
     /// Status `0xda` with no body.
     NeedSelectCharacter,

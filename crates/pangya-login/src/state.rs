@@ -127,6 +127,15 @@ impl LoginStateMachine {
                     LoginState::IssueHandover
                 }
             }
+            // A real U.S. 852 client answers the nickname status with a combined creation screen
+            // and replies with the character selection, not a nickname packet. Upstream documents
+            // the login packet then being resent with `success`, so the selection completes the
+            // handshake from either setup state. The nickname remains unset on the account, which
+            // is a recorded gap rather than something to paper over here.
+            (LoginState::AwaitNicknameCheckOrSet, LoginEvent::CharacterSelected) => {
+                self.retries = 0;
+                LoginState::IssueHandover
+            }
             (LoginState::AwaitCharacterSelect, LoginEvent::CharacterSelected) => {
                 self.retries = 0;
                 LoginState::IssueHandover

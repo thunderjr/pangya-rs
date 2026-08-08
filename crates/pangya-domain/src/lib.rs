@@ -2948,6 +2948,22 @@ pub trait AccountRepository: Send + Sync {
         grant: StarterGrant,
     ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>>;
 
+    /// Repoints an account's provisional starter character while setup is incomplete.
+    ///
+    /// The starter grant is deliberately strict: replaying it with a different character is a
+    /// drift error, because after setup an account's character must not silently change. But a
+    /// real client chooses its character *after* the account exists, so the character the grant
+    /// provisionally created is not the one the player picked. This is the one operation allowed
+    /// to change it, and only while the account has not finished setup.
+    ///
+    /// It is a no-op when the account already holds the requested character, so a duplicated
+    /// selection packet cannot fail.
+    fn select_starter_character(
+        &self,
+        account_id: AccountId,
+        item_type_id: ItemTypeId,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
     /// Changes account status and revokes outstanding handovers when inactive.
     fn set_status(
         &self,

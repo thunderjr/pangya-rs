@@ -374,6 +374,61 @@ impl PgRepository {
         Ok(aggregate)
     }
 
+    /// Repoints the provisional starter character, refusing once setup is complete.
+    ///
+    /// The same locks as [`apply_starter`] are taken in the same order, so this cannot interleave
+    /// with a concurrent grant. The row count is verified rather than assumed: a silent zero-row
+    /// update would leave the caller believing the player's choice was stored.
+    async fn select_starter_character_inner(
+        &self,
+        account_id: AccountId,
+        item_type_id: ItemTypeId,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        lock_active_account(&mut transaction, account_id).await?;
+        let profile = sqlx::query!(
+            "SELECT setup_state FROM profiles WHERE account_id = $1 FOR UPDATE",
+            account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        if profile.setup_state == "complete" {
+            return Err(RepositoryError::InvalidStarterGrant);
+        }
+        let characters = sqlx::query!(
+            "SELECT id, item_type_id FROM characters WHERE account_id = $1 ORDER BY id FOR UPDATE",
+            account_id.get()
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let [character] = characters.as_slice() else {
+            return Err(RepositoryError::InvalidStarterGrant);
+        };
+        let requested = i64::from(item_type_id.get());
+        if character.item_type_id == requested {
+            transaction.commit().await.map_err(repository_db_error)?;
+            return Ok(());
+        }
+        let affected = sqlx::query!(
+            "UPDATE characters SET item_type_id = $2 WHERE account_id = $1 AND id = $3",
+            account_id.get(),
+            requested,
+            character.id
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .rows_affected();
+        if affected != 1 {
+            return Err(RepositoryError::Storage(StorageFault::UnexpectedRowCount));
+        }
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(())
+    }
+
     async fn load_player_snapshot_inner(
         &self,
         account_id: AccountId,
@@ -1487,6 +1542,14 @@ impl AccountRepository for PgRepository {
         grant: StarterGrant,
     ) -> RepositoryFuture<'_, Result<AccountAggregate, RepositoryError>> {
         Box::pin(self.observed(self.grant_starter_inner(account_id, grant)))
+    }
+
+    fn select_starter_character(
+        &self,
+        account_id: AccountId,
+        item_type_id: ItemTypeId,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.select_starter_character_inner(account_id, item_type_id)))
     }
 
     fn set_status(

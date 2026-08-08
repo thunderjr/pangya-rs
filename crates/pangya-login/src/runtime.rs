@@ -863,27 +863,81 @@ where
                         .await?;
                     handover_token = Some(token);
                 }
-                LoginState::AwaitCharacterSelect if frame.opcode == 0x0008 => {
+                // Accepted in both setup states: the real U.S. 852 client shows character
+                // creation before it asks for a nickname, so a first-time account sends this
+                // while the nickname is still outstanding.
+                LoginState::AwaitCharacterSelect | LoginState::AwaitNicknameCheckOrSet
+                    if frame.opcode == 0x0008 =>
+                {
                     let packet = self.decode_packet::<SelectCharacter>(&frame)?;
                     if !self
                         .config
                         .allowed_character_types
                         .contains(&packet.character_id)
                     {
+                        // The identifier is catalog data, not credential or personal data, and
+                        // an operator whose allowlist is narrower than the client's roster has
+                        // no other way to see which selection was refused.
+                        tracing::debug!(
+                            character_id = packet.character_id,
+                            "refused a character selection outside the configured allowlist"
+                        );
                         return Err(LoginRuntimeError::Protocol);
                     }
-                    let mut starter = self.config.starter.clone();
-                    starter.character.item_type_id = packet.character_id.into();
                     let account_id = account
                         .as_ref()
                         .map(|record| record.account.id)
                         .ok_or(LoginRuntimeError::Protocol)?;
-                    self.repository_call(self.repository.grant_starter(account_id, starter))
-                        .await
-                        .map_err(|_| LoginRuntimeError::Repository)?;
+                    let mut starter = self.config.starter.clone();
+                    starter.character.item_type_id = packet.character_id.into();
+                    // An account that reaches setup without a starter — an operator-created one,
+                    // say — is granted it here, which is the original path. An auto-created
+                    // account already holds a provisionally granted starter, and replaying the
+                    // grant with the character the player actually picked is a drift error by
+                    // design. So on drift, repoint the provisional character and replay: the
+                    // second grant succeeding is what proves the whole aggregate now agrees with
+                    // the selection, rather than assuming the repoint was sufficient.
+                    let granted = self
+                        .repository_call(self.repository.grant_starter(account_id, starter.clone()))
+                        .await;
+                    match granted {
+                        Ok(_) => {}
+                        Err(RepositoryError::InvalidStarterGrant) => {
+                            self.repository_call(
+                                self.repository.select_starter_character(
+                                    account_id,
+                                    packet.character_id.into(),
+                                ),
+                            )
+                            .await
+                            .map_err(|_| LoginRuntimeError::Repository)?;
+                            self.repository_call(
+                                self.repository.grant_starter(account_id, starter),
+                            )
+                            .await
+                            .map_err(|_| LoginRuntimeError::Repository)?;
+                        }
+                        Err(_) => return Err(LoginRuntimeError::Repository),
+                    }
                     machine
                         .apply(LoginEvent::CharacterSelected)
                         .map_err(|_| LoginRuntimeError::Protocol)?;
+                    // Upstream documents the login packet being resent with `success` once the
+                    // character is selected, and a real client blocks on "Waiting for server's
+                    // response." until it arrives. The nickname is deliberately empty: upstream
+                    // records official servers returning an empty one here even when set.
+                    let record = account.as_ref().ok_or(LoginRuntimeError::Protocol)?;
+                    self.send(
+                        &mut framed,
+                        &LoginResult::Success(LoginSuccess {
+                            username: record.account.username_display.as_bytes().to_vec(),
+                            user_id: u32::try_from(record.account.id.get())
+                                .map_err(|_| LoginRuntimeError::Protocol)?,
+                            unknown: UnknownBytes([0; 14]),
+                            nickname: Vec::new(),
+                        }),
+                    )
+                    .await?;
                     let token = self
                         .issue_handover(&mut framed, &mut machine, account.as_ref(), &source)
                         .await?;

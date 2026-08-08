@@ -601,7 +601,9 @@ async fn needs_starter_selects_only_allowlisted_character_and_persists(pool: PgP
     character.extend_from_slice(&0x0400_0000_u32.to_le_bytes());
     character.extend_from_slice(&0_u16.to_le_bytes());
     send_packet(&mut stream, key, 2, 8, &character).await;
-    for expected in [6, 9, 2] {
+    // Upstream documents the login packet being resent with `success` once the character is
+    // selected; a real client blocks until it arrives.
+    for expected in [1, 6, 9, 2] {
         assert_eq!(receive_packet(&mut stream, key).await.0, expected);
     }
     send_packet(&mut stream, key, 3, 3, &[7, 0, 0, 0]).await;
