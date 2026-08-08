@@ -3,10 +3,11 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use pangya_domain::{
-    AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, ChatText,
-    CommitSoloHole, CommitStrokeMatch, MarkSoloInGame, MarkStrokeInGame, MatchAbortReason, MatchId,
-    MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId, RoomError, RoomId, RoomName,
-    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, SoloMatchResult, StrokeMatchResult,
+    AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, CharacterId,
+    ChatText, CommitSoloHole, CommitStrokeMatch, MarkSoloInGame, MarkStrokeInGame,
+    MatchAbortReason, MatchId, MatchResultKey, MemberSnapshot, Nickname, PlayerConnectionId,
+    RoomError, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
+    SoloMatchResult, StrokeMatchResult,
 };
 use pangya_protocol::{
     LoadingComplete, ShotAction, ShotResult, StrokeLoadingComplete, StrokeShotAction,
@@ -40,6 +41,8 @@ pub struct RoomIdentity {
     pub account_id: AccountId,
     /// Validated display nickname.
     pub nickname: Nickname,
+    /// The account's selected character, so a room roster can render it.
+    pub character_id: Option<CharacterId>,
 }
 
 /// Bounded event delivered to a room member.
@@ -220,6 +223,7 @@ impl Member {
             self.identity.nickname.display().to_owned(),
             self.owner,
             self.ready,
+            self.identity.character_id,
         )
     }
 }
@@ -2442,6 +2446,7 @@ mod tests {
             account_id: AccountId::new(i64::try_from(value).unwrap_or(1))
                 .unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
+            character_id: None,
         }
     }
 

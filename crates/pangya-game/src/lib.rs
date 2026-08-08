@@ -2194,6 +2194,9 @@ where
                 connection_id,
                 account_id: session.account_id,
                 nickname,
+                // Carried from the authenticated snapshot so a room roster can render the
+                // player's character instead of an empty slot.
+                character_id: Some(loaded.equipment.character_id),
             },
         ))
     }
@@ -4742,6 +4745,22 @@ where
                     Err(_) => self.reject_retail_join(framed, state).await,
                 }
             }
+            (GameState::InRoom, RETAIL_C2S_ROOM_READY) => {
+                // A single byte, zero meaning ready. The client will not offer Start until the
+                // roster comes back showing the change, so the census is the reply.
+                let ready = payload.first().copied() == Some(0);
+                let routed = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::SetReady(ready))
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                self.send(framed, &retail_census_from_snapshot(&snapshot))
+                    .await?;
+                Ok(state)
+            }
             (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE) => {
                 self.lobby
                     .leave(identity.connection_id)
@@ -5356,7 +5375,10 @@ fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
             connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
             nickname: member.nickname().as_bytes().to_vec(),
             slot: u8::try_from(slot).unwrap_or(u8::MAX),
-            character_uid: 0,
+            character_uid: member
+                .character_id()
+                .and_then(|id| u32::try_from(id.get()).ok())
+                .unwrap_or(0),
             flags: RoomPlayerFlags::new(member.is_owner(), member.is_ready()),
             level: 1,
             user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
@@ -5457,6 +5479,8 @@ fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
 }
 
 /// Retail match client opcodes.
+/// Retail room-ready client opcode. The client sends this before it will offer Start.
+const RETAIL_C2S_ROOM_READY: u16 = 0x000d;
 const RETAIL_C2S_START_MATCH: u16 = 0x000e;
 const RETAIL_C2S_HOLE_LOAD_FINISHED: u16 = 0x0011;
 const RETAIL_C2S_SHOT_COMMIT: u16 = 0x0012;
@@ -5484,6 +5508,7 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
         RetailRoomCreate::OPCODE
             | RetailRoomJoin::OPCODE
             | RETAIL_C2S_ROOM_LEAVE
+            | RETAIL_C2S_ROOM_READY
             | RETAIL_C2S_MULTIPLAYER_JOIN
             | RETAIL_C2S_MULTIPLAYER_LEAVE
     )
@@ -5965,6 +5990,7 @@ mod tests {
             connection_id: PlayerConnectionId::new(1).unwrap_or_else(|_| unreachable!()),
             account_id: AccountId::new(7).unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse("Tester").unwrap_or_else(|_| unreachable!()),
+            character_id: None,
         }
     }
 
@@ -5973,6 +5999,7 @@ mod tests {
             connection_id: PlayerConnectionId::new(2).unwrap_or_else(|_| unreachable!()),
             account_id: AccountId::new(8).unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse("Second").unwrap_or_else(|_| unreachable!()),
+            character_id: None,
         }
     }
 

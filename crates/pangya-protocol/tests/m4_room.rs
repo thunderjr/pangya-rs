@@ -56,6 +56,7 @@ fn member(
         nickname.to_owned(),
         owner,
         ready,
+        None,
     )
 }
 

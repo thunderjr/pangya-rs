@@ -6,7 +6,7 @@
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **playing a hole.** Everything up to and including the room is verified against a real client; §19.6 steps 7-12 still need a started match, a played hole and the results screen.
+> Next gate: **starting the match.** The room ready handshake works and the roster now carries each player's character; what has not been driven yet is the client's Start, and the hole and results screen behind it.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -333,6 +333,14 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     A catalog built from a superseded copy loads and validates cleanly and is still wrong, which is what made this expensive to find. The tell is a purchase refused with `stage: "not_in_catalog"` for an id inside a family's range.
 
 20. **A real client completes a purchase** — verified 2026-08-08. `0x001D` in, then `0x00C8`, `0x0096` and `0x0068` out; the balance moved 5,000,000 to 4,999,999 under `price_override_pang = 1`, `0x10000061` landed in the inventory, and the client rendered the bought clubs on the character.
+
+21. **Room ready and the roster's character** — verified 2026-08-08. Two gaps found by driving a real client into a room it created.
+
+    The client sends `0x000D` before it will offer Start, and nothing answered it, so the room sat inert. It carries a single byte, zero meaning ready; the reply is the room census, because the client waits to see the roster change rather than for an acknowledgement.
+
+    The census also reported every player's character as zero, which renders the roster as empty slots. The selected character now travels on the room member itself, taken from the snapshot at authentication, rather than being looked up per frame.
+
+    Worth recording as a process note: the edit adding `0x000D` to the retail room opcode set silently did not apply, because the surrounding text had been reformatted since it was written. The opcode arrived, matched no branch, and was answered with nothing — indistinguishable from a handler bug until the set was read back. Verify a set membership change by reading the function, not by assuming the edit landed.
 
 ---
 

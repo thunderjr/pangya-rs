@@ -3284,6 +3284,7 @@ pub struct MemberSnapshot {
     nickname: String,
     owner: bool,
     ready: bool,
+    character_id: Option<CharacterId>,
 }
 
 impl MemberSnapshot {
@@ -3295,6 +3296,7 @@ impl MemberSnapshot {
         nickname: String,
         owner: bool,
         ready: bool,
+        character_id: Option<CharacterId>,
     ) -> Self {
         Self {
             connection_id,
@@ -3302,7 +3304,17 @@ impl MemberSnapshot {
             nickname,
             owner,
             ready,
+            character_id,
         }
+    }
+
+    /// The member's selected character, when one is known.
+    ///
+    /// A room roster without it renders every player as an empty slot, so it travels with the
+    /// member rather than being looked up per frame.
+    #[must_use]
+    pub const fn character_id(&self) -> Option<CharacterId> {
+        self.character_id
     }
 
     /// Connection identity.

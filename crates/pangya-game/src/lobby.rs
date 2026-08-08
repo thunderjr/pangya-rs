@@ -1747,6 +1747,7 @@ mod tests {
             account_id: AccountId::new(i64::try_from(value).unwrap_or(1))
                 .unwrap_or_else(|_| unreachable!()),
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
+            character_id: None,
         }
     }
 
@@ -2603,6 +2604,7 @@ mod tests {
                 "one".into(),
                 true,
                 false,
+                None,
             ),
             MemberSnapshot::new(
                 id(2),
@@ -2610,6 +2612,7 @@ mod tests {
                 "two".into(),
                 false,
                 true,
+                None,
             ),
         ];
         assert_eq!(members.iter().filter(|member| member.is_owner()).count(), 1);

@@ -1236,6 +1236,7 @@ fn member(client: &M4Client, connection_id: u64, owner: bool, ready: bool) -> Me
         client.nickname.clone(),
         owner,
         ready,
+        None,
     )
 }
 
@@ -2468,6 +2469,7 @@ async fn game_m4_tcp_room_lifecycle_authority_password_capacity_and_cleanup(pool
             admitted_member.nickname().to_owned(),
             true,
             false,
+            admitted_member.character_id(),
         )],
     );
     if owner_won {

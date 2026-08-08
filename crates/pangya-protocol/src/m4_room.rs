@@ -198,6 +198,8 @@ fn decode_member(reader: &mut PacketReader<'_>) -> Result<MemberSnapshot, Packet
         decode_nickname(reader)?,
         decode_bool(reader, "owner flag")?,
         decode_bool(reader, "ready flag")?,
+        // The synthetic roster frame predates the character field and does not carry one.
+        None,
     ))
 }
 
