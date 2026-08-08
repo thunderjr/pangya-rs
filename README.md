@@ -37,7 +37,7 @@ and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 ## What works against a real client
 
 Each of these was driven from an unmodified U.S. 852 client. The evidence is in
-[`docs/PROGRESS.md`](docs/PROGRESS.md), blockers 13-23.
+[`docs/PROGRESS.md`](docs/PROGRESS.md), blockers 13-26.
 
 | Stage | State |
 |---|---|
@@ -48,16 +48,15 @@ Each of these was driven from an unmodified U.S. 852 client. The evidence is in
 | GameService auth and bootstrap | retail hello, `0x0002` auth, full handover reply announcing `852.00`, rosters, equipment, inventory, channel list, balances |
 | Channel entry and lobby | avatar and menu bar render; login bonus, recent-player history, and ten documented session opcodes answered |
 | Shop and My Room | catalog-priced purchase: balance debited, item in inventory, bought clubs rendered on the character |
-| Rooms | create, join, leave, list, the 341-byte member census, ready |
+| Rooms | create, join, leave, list, ready, and a 341-byte member census that re-sends whenever the roster changes |
 | A two-player versus hole | **server side only.** Proven over TCP by `game_retail_two_players_play_and_settle_one_versus_hole` and by two `pangya-test-client` seats against the release binary; the real client's acceptance of it is the open gate |
 
 ## What is not implemented
 
-- **Live room updates.** The census is sent on create, join, and ready only, so a room does
-  not update while you sit in it. All other lobby broadcasts are dropped in retail mode.
+- **Room chat, settings changes, and kick.** No handler. The roster itself does stay live: a
+  membership or ready change re-sends the census.
 - **Multi-hole and multi-mode matches.** One hole, and versus only. Tournament, battle, and
   chat rooms are accepted and then run as versus.
-- **Retail room settings, chat, and kick.** No handler.
 - **Retail give-up.** A concession has no route; a forfeit can only arrive as a disconnect or
   a turn timeout.
 - **Retail consume, repair, and durable equipment changes.** `0x0020` reports the equipment
