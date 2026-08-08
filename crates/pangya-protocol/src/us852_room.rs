@@ -246,6 +246,278 @@ pub enum RoomListKind {
     Modifications = 3,
 }
 
+/// Shop entry, client opcode `0x0140`.
+///
+/// # Provenance
+///
+/// No payload. Opcode from `pangbox/server` (`game/packet/client.go` `ClientShopJoin`), ISC
+/// licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailShopJoin;
+
+impl DecodePacket for RetailShopJoin {
+    const OPCODE: u16 = 0x0140;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self)
+    }
+}
+
+/// Shop entry acknowledgement, server opcode `0x020e`.
+///
+/// # Provenance
+///
+/// Eight zero bytes, from `pangbox/server` (`game/packet/server.go` `Server020E`), ISC licensed,
+/// which sends it with its unknown block left zeroed. The field meanings are not established.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailShopJoined;
+
+impl EncodePacket for RetailShopJoined {
+    const OPCODE: u16 = 0x020e;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; 8]);
+        Ok(())
+    }
+}
+
+/// My Room entry, client opcode `0x00b5`.
+///
+/// # Provenance
+///
+/// Two `u4`s, from `pangbox/server` (`game/packet/client.go` `ClientEnterMyRoom`), ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomEnter {
+    /// The requesting player.
+    pub user_id: u32,
+    /// Whose room is being entered.
+    pub room_user_id: u32,
+}
+
+impl DecodePacket for RetailMyRoomEnter {
+    const OPCODE: u16 = 0x00b5;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self {
+            user_id: reader.u32_le()?,
+            room_user_id: reader.u32_le()?,
+        })
+    }
+}
+
+/// My Room entry acknowledgement, server opcode `0x012b`.
+///
+/// # Provenance
+///
+/// Three `u4`s then 99 unclassified bytes, from `pangbox/server` (`game/packet/server.go`
+/// `ServerMyRoomEntered`), ISC licensed. The two constants are the values it sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomEntered {
+    /// The player whose room was entered.
+    pub user_id: u32,
+}
+
+impl EncodePacket for RetailMyRoomEntered {
+    const OPCODE: u16 = 0x012b;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(1);
+        writer.u32_le(self.user_id);
+        writer.u32_le(1);
+        writer.bytes(&[0; 99]);
+        Ok(())
+    }
+}
+
+/// My Room furniture request, client opcode `0x00b7`.
+///
+/// # Provenance
+///
+/// A `u4` then a `u1`, from `pangbox/server` (`game/packet/client.go` `ClientRequestInventory`),
+/// ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomInventoryRequest {
+    /// The requesting player.
+    pub user_id: u32,
+}
+
+impl DecodePacket for RetailMyRoomInventoryRequest {
+    const OPCODE: u16 = 0x00b7;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let user_id = reader.u32_le()?;
+        let _unknown = reader.u8()?;
+        Ok(Self { user_id })
+    }
+}
+
+/// My Room furniture layout, server opcode `0x012d`.
+///
+/// This server has no furniture, so the layout is empty. Upstream sends the same empty layout.
+///
+/// # Provenance
+///
+/// A `u4` then a `u2` count, from `pangbox/server` (`game/packet/server.go` `ServerMyRoomLayout`),
+/// ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomLayout;
+
+impl EncodePacket for RetailMyRoomLayout {
+    const OPCODE: u16 = 0x012d;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(1);
+        writer.u16_le(0);
+        Ok(())
+    }
+}
+
+/// Player record for My Room, server opcode `0x0168`.
+///
+/// # Provenance
+///
+/// Carries the same room-player record as the room census, from `pangbox/server`
+/// (`game/packet/server.go` `ServerPlayerInfo`), ISC licensed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailPlayerInfo {
+    /// The player being described.
+    pub player: RetailRoomPlayer,
+}
+
+impl EncodePacket for RetailPlayerInfo {
+    const OPCODE: u16 = 0x0168;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        self.player.encode_body(writer)
+    }
+}
+
+/// Locker inventory request, client opcode `0x00d3`.
+///
+/// # Provenance
+///
+/// Opcode from `pangbox/server` (`game/packet/client.go` `ClientLockerInventoryRequest`), ISC
+/// licensed. The payload is not modelled: upstream answers with a fixed status without reading it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLockerInventoryRequest;
+
+impl DecodePacket for RetailLockerInventoryRequest {
+    const OPCODE: u16 = 0x00d3;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self)
+    }
+}
+
+/// Locker inventory response, server opcode `0x0170`.
+///
+/// The locker is part of the combination/password system, which this server does not implement;
+/// status `76` is what upstream answers with, telling the client the locker is unavailable rather
+/// than presenting an empty but usable one.
+///
+/// # Provenance
+///
+/// Two `u4`s and the status value from `pangbox/server` (`game/packet/server.go`
+/// `ServerLockerInventoryResponse`), ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLockerInventoryResponse;
+
+impl EncodePacket for RetailLockerInventoryResponse {
+    const OPCODE: u16 = 0x0170;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(0);
+        writer.u32_le(76);
+        Ok(())
+    }
+}
+
+/// Locker combination attempt, client opcode `0x00cc`.
+///
+/// # Provenance
+///
+/// Opcode from `pangbox/server` (`game/packet/client.go` `ClientLockerCombinationAttempt`), ISC
+/// licensed. The payload carries the attempted combination and is deliberately not modelled or
+/// logged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLockerCombinationAttempt;
+
+impl DecodePacket for RetailLockerCombinationAttempt {
+    const OPCODE: u16 = 0x00cc;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self)
+    }
+}
+
+/// Locker combination response, server opcode `0x016c`.
+///
+/// # Provenance
+///
+/// A `u4` status, zero, from `pangbox/server` (`game/packet/server.go`
+/// `ServerLockerCombinationResponse`), ISC licensed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLockerCombinationResponse;
+
+impl EncodePacket for RetailLockerCombinationResponse {
+    const OPCODE: u16 = 0x016c;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(0);
+        Ok(())
+    }
+}
+
 /// Multiplayer-mode enter acknowledgement, server opcode `0x00f5`.
 ///
 /// # Provenance

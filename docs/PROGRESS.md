@@ -4,7 +4,7 @@
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
-> Next gate: **the lobby actions.** The client sits in the lobby indefinitely under the shipped `unknown_opcode_policy = "disconnect"`; what has not been driven yet is Start Game, room creation, and playing a hole from the real client.
+> Next gate: **equipment update `0x0020`.** The client opens the room directory, creates and enters a room, opens the shop, and opens My Room. My Room then sends `0x0020` and nothing answers it, which is the last thing between a real client and a stable lobby session.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -302,11 +302,16 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Rather than keep finding these one client restart at a time, the remaining session-level chatter was enumerated from upstream's client opcode table and its handler bodies. Ten opcodes that upstream accepts and answers with nothing (online status, typing indicator, idle status, client exception reports, macro set, messenger list, and four unclassified ones) are now an explicit allowlist, `RETAIL_ACCEPTED_SESSION_OPCODES`. Room and match opcodes are deliberately excluded: those have real state handlers, and silently accepting one would hide a gap in them. The lobby is now stable under the shipped `unknown_opcode_policy = "disconnect"` rather than depending on a permissive policy.
 
+17. **Equipment update `0x0020` is unanswered** — open. Opening My Room, the client sends enter (`0x00B5`), a furniture request (`0x00B7`), a locker inventory request (`0x00D3`), and then `0x0020` repeatedly. The first three are answered — the room renders with its locker, tabs, inventory grid and stat panel — but `0x0020` is not, and three of them exhaust the unknown-opcode strike budget and drop the connection, which the client reports as `Network error occured. (Error 10054)`.
+
+    It was deliberately not stubbed. `0x0020` is a tagged union over eight equipment kinds (character parts, caddie, consumables, ball, decoration, character, and two unclassified), and upstream persists the change before echoing the new state back. Acknowledging it without storing anything would tell the client an equipment change succeeded and then contradict itself on the next login. Implementing it means the equipment system, not a constant reply.
+
 ---
 
 ## Immediate next actions
 
-1. **Drive a room and a hole from the real client.** Lobby entry is done; §19.6 steps 5-12 need Start Game, room creation, and a played hole against the retail room and match packets.
+1. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
+2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

@@ -67,16 +67,19 @@ use pangya_protocol::{
     PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
     RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailEquipment,
     RetailFinishHole, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
-    RetailHoleWind, RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMatchInfo,
-    RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RetailSelectChannel, RetailTurnEnd, RetailTurnStart, RetailWeather,
-    RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse,
-    RoomCreateRequest, RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest,
-    RoomListKind, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
-    RoomPlayerFlags, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    RetailHoleWind, RetailLockerCombinationAttempt, RetailLockerCombinationResponse,
+    RetailLockerInventoryRequest, RetailLockerInventoryResponse, RetailLoginBonusRequest,
+    RetailLoginBonusStatus, RetailMatchInfo, RetailMatchStart, RetailMultiplayerJoined,
+    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
+    RetailMyRoomLayout, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailRoom, RetailRoomCensus,
+    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
+    RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailSelectChannel, RetailShopJoin,
+    RetailShopJoined, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
+    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
     SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
     SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
     SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
@@ -1331,6 +1334,30 @@ where
                                     } => sent,
                                 };
                                 if let Err(error) = sent {
+                                    break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
+                                && matches!(
+                                    frame.opcode,
+                                    RetailShopJoin::OPCODE
+                                        | RetailMyRoomEnter::OPCODE
+                                        | RetailMyRoomInventoryRequest::OPCODE
+                                        | RetailLockerInventoryRequest::OPCODE
+                                        | RetailLockerCombinationAttempt::OPCODE
+                                )
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                let handled = self
+                                    .handle_retail_lobby_service(
+                                        &mut framed,
+                                        established,
+                                        frame.opcode,
+                                        &frame.payload,
+                                    )
+                                    .await;
+                                if let Err(error) = handled {
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
@@ -4259,6 +4286,73 @@ where
 
     /// Handles one retail lobby/room command.
     ///
+    /// Serves the lobby-side services a real client opens from its menu bar: the shop and the
+    /// player's own room. Neither has durable content here yet, so both answer with the empty
+    /// forms upstream sends rather than inventing furniture or stock.
+    async fn handle_retail_lobby_service(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        identity: &RoomIdentity,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        let account_id = u32::try_from(identity.account_id.get()).unwrap_or(0);
+        match opcode {
+            RetailShopJoin::OPCODE => self.send(framed, &RetailShopJoined).await,
+            RetailLockerInventoryRequest::OPCODE => {
+                self.send(framed, &RetailLockerInventoryResponse).await
+            }
+            RetailLockerCombinationAttempt::OPCODE => {
+                self.send(framed, &RetailLockerCombinationResponse).await
+            }
+            RetailMyRoomEnter::OPCODE => {
+                let request =
+                    decode_packet_payload::<RetailMyRoomEnter>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                // Visiting another player's room is not implemented, and answering as though it
+                // were would show this player their own room under someone else's name.
+                if request.user_id != account_id || request.room_user_id != account_id {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.send(
+                    framed,
+                    &RetailMyRoomEntered {
+                        user_id: account_id,
+                    },
+                )
+                .await
+            }
+            _ => {
+                let request = decode_packet_payload::<RetailMyRoomInventoryRequest>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                if request.user_id != account_id {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.send(framed, &RetailMyRoomLayout).await?;
+                self.send(
+                    framed,
+                    &RetailPlayerInfo {
+                        player: RetailRoomPlayer {
+                            connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                            nickname: identity.nickname.display().as_bytes().to_vec(),
+                            slot: 0,
+                            character_uid: 0,
+                            flags: RoomPlayerFlags::new(false, false),
+                            level: 1,
+                            user_id: account_id,
+                        },
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     /// Current rooms as retail list records, bounded by what one list frame can carry.
     async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
         let summaries = self

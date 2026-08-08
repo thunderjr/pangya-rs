@@ -103,10 +103,13 @@ pub use us852_match::{
 };
 pub use us852_room::{
     MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES,
-    ROOM_RECORD_BYTES, RetailHoleProgression, RetailMultiplayerJoined, RetailMultiplayerLeft,
-    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
-    RoomCensusKind, RoomJoinRejection, RoomListKind, RoomPlayerFlags,
+    ROOM_RECORD_BYTES, RetailHoleProgression, RetailLockerCombinationAttempt,
+    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPlayerInfo, RetailRoom,
+    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
+    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType, RetailShopJoin,
+    RetailShopJoined, RoomCensusKind, RoomJoinRejection, RoomListKind, RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 
