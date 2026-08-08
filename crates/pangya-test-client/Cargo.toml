@@ -1,0 +1,23 @@
+[package]
+name = "pangya-test-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pangya-test-client"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pangya-crypto = { version = "0.1.0", path = "../pangya-crypto" }
+pangya-protocol = { version = "0.1.0", path = "../pangya-protocol" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

@@ -93,6 +93,21 @@ pub enum AccountCommand {
     Create(AccountCreateArgs),
     /// Credits an account's pang and point balances.
     Grant(AccountGrantArgs),
+    /// Issues one short-lived GameService handover bearer for an account.
+    Handover(AccountHandoverArgs),
+}
+
+/// Operator handover-issue arguments.
+///
+/// This exists so a headless client can take a seat in a room beside a real one: driving two
+/// real clients on one desktop is not possible today (see `scripts/windows/pangya-client.ps1`),
+/// and a versus hole needs two players. The bearer it prints is the same short-lived, single-use
+/// credential LoginService hands out, and it is printed to stdout only — never logged.
+#[derive(Debug, Args)]
+pub struct AccountHandoverArgs {
+    /// Numeric account identifier.
+    #[arg(long)]
+    pub account_id: i64,
 }
 
 /// Operator balance-grant arguments.
@@ -216,6 +231,9 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
         Command::Account {
             command: AccountCommand::Grant(args),
         } => account_grant(config, args).await,
+        Command::Account {
+            command: AccountCommand::Handover(args),
+        } => account_handover(config, args).await,
     }
 }
 
@@ -1009,6 +1027,36 @@ async fn account_grant(config: AppConfig, args: AccountGrantArgs) -> Result<(), 
         balances.points
     )
     .map_err(|_| ServerError::Runtime)?;
+    pool.close().await;
+    Ok(())
+}
+
+async fn account_handover(config: AppConfig, args: AccountHandoverArgs) -> Result<(), ServerError> {
+    let account_id = AccountId::new(args.account_id).map_err(|_| ServerError::AccountInput)?;
+    let generated = pangya_login::generate_handover(
+        account_id,
+        pangya_domain::ServiceKind::Game,
+        pangya_domain::SourceAddressPrefix::from_ip(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )),
+        std::time::SystemTime::now(),
+    )
+    .map_err(|_| ServerError::AccountInput)?;
+    let pool = connect_and_migrate(&config).await?;
+    let repository = PgRepository::new(pool.clone());
+    repository
+        .issue(generated.record)
+        .await
+        .map_err(|_| ServerError::AccountInput)?;
+    // The bearer itself is deliberately absent from this line, as it is from every other.
+    tracing::info!(
+        action = "account_handover",
+        account_id = account_id.get(),
+        outcome = "success",
+        "operator audit"
+    );
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", generated.token.expose_secret()).map_err(|_| ServerError::Runtime)?;
     pool.close().await;
     Ok(())
 }
