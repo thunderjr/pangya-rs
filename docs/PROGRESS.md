@@ -6,7 +6,7 @@
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **starting the match.** The room ready handshake works and the roster now carries each player's character; what has not been driven yet is the client's Start, and the hole and results screen behind it.
+> Next gate: **a second client.** Everything a single real client can reach is verified. Starting a match is not blocked by anything server-side: the client refuses to start a two-player room holding one player, and only one instance of it will run on a host, so a played hole needs a second client on a second machine.
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -342,11 +342,17 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Worth recording as a process note: the edit adding `0x000D` to the retail room opcode set silently did not apply, because the surrounding text had been reformatted since it was written. The opcode arrived, matched no branch, and was answered with nothing — indistinguishable from a handler bug until the set was read back. Verify a set membership change by reading the function, not by assuming the edit landed.
 
+22. **Playing a hole needs a second client** — open, and not a server defect. Driving a real client as far as it goes: it creates a room, the ready handshake completes, and the room header then reads `3 hole (1/2)`. The client will not offer Start while a two-player room holds one player, and the Make Room dialog's smallest versus capacity is two.
+
+    The obvious workaround does not work either. A second instance cannot be launched on the same host — the client holds a single-instance lock, and the second launch simply does not produce a process. Rugburn hooks `CreateMutexA` only to satisfy GameGuard, so it offers no bypass.
+
+    So the remaining §19.6 steps need a second client on a second machine joining the same room over the Tailnet, which is an infrastructure requirement rather than a protocol gap. The server side of the match is implemented and covered end to end by `game_retail_match_plays_and_settles_one_hole`, which exercises start, hole load, shot commit, hole finish and settlement over TCP against a real database.
+
 ---
 
 ## Immediate next actions
 
-1. **Play a hole from the real client**, the remaining §19.6 steps: start the match, play and complete a hole, and show the results screen.
+1. **Stand up a second client** on a second VM so a two-player room can start, then drive §19.6 steps 7-12 against it. Nothing server-side is known to be missing for this; the match path is already covered end to end.
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. **Play a hole from the real client.** Room creation and entry are verified; §19.6 steps 7-12 still need a started match, a played hole, and the results screen.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.

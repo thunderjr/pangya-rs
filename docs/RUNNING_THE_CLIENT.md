@@ -423,3 +423,14 @@ click; `Dismiss-PangyaNotice` passes `-SkipNoticeCheck` on its own click so it c
 
 Wiring the check into one high-level step is not enough — that was the first attempt, and any
 other step still lost its clicks.
+
+### Playing a hole needs two clients
+
+A real client will not start a versus room that holds fewer players than its capacity, and the
+Make Room dialog's smallest versus capacity is two: the room header reads `3 hole (1/2)` and the
+master's button stays on Ready rather than becoming Start.
+
+A second instance on the same host is not a workaround. The client holds a single-instance lock
+and the second launch produces no process; Rugburn hooks `CreateMutexA` only to satisfy
+GameGuard, so it offers no bypass. Driving a played hole therefore needs a second client on a
+second machine joining the same room over the Tailnet.
