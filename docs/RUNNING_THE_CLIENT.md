@@ -287,11 +287,44 @@ publish it with `scripts/tailnet-forward.py`, which forwards through the interpr
 
 ## 7. Where it stops today
 
-With everything above in place the client renders its login screen, authenticates, and reaches
-Character Creation. Choosing a character is accepted and persisted. Immediately afterwards the
-connection closes with `reason: "protocol"`, and a fresh login shows Character Creation again
-rather than advancing — the account's setup state is never marked complete. That is a server-side
-defect, tracked as blocker 14 in `PROGRESS.md`.
+With everything above in place the client logs in, sets a nickname and first character, picks the
+server and channel, reaches the lobby with its avatar and menu bar, opens the shop and completes a
+purchase, and creates, joins, and leaves rooms. Every one of those is client-verified; the
+evidence is in `PROGRESS.md`, blockers 13-24.
+
+What has not been put in front of a client is the versus hole. The server plays and settles one
+between two headless clients in CI, and the room now stays live while you sit in it so the host's
+Start button unlocks, but no real client has yet loaded the hole. That is the open gate, and
+§7.1 is the procedure for it.
+
+### 7.1 Driving a versus hole
+
+Two clients are needed; see "Playing a hole needs two clients" below for why, and "Running two
+clients on one host" for how. Then:
+
+1. Enable `[game.stroke_two]`. `config/retail-local.example.toml` ships it enabled, with the
+   course and par matching `[game.solo_practice]`. Both describe the one hole this server
+   settles.
+2. **Create the room with one hole, and with the course that matches `game.stroke_two.course_id`.**
+   The room record the client renders is echoed from its own Make Room request, but the match
+   plan is built from the configuration: the server settles exactly one hole on the configured
+   course whatever the room says. A room asking for three holes on another course will load that
+   course and then be told the hole is over after one.
+3. Set `protocol.unknown_opcode_policy = "capture"` for the run. The client sends in-match
+   opcodes this server does not handle; `RETAIL_ACCEPTED_MATCH_OPCODES` covers the ones known
+   from upstream, and capture turns anything else into a bounded metadata record instead of a
+   dropped connection. Collect them all from one pass, implement the batch, then flip back to
+   `disconnect` and re-verify. Do not leave capture on afterwards.
+4. Raise `security.idle_timeout`. The client sends nothing while it sits in the lobby, and the
+   shipped ten minutes is short enough to lose a session while the second client is being set
+   up. The client reports it as "Game Disconnected from the server."
+
+The order on the wire, for reading a log: the host's `0x000e` produces `0x0076`, `0x0052`,
+`0x009e`, and `0x005b` **to both clients**; each client answers `0x0011`; when both have, both
+receive `0x0053` and `0x0063` naming the same player. A shot is `0x0012` — relayed to the other
+client as `0x0055` — then `0x001c`, which ends the turn (`0x00cc`) and starts the next
+(`0x0063`). `0x0031` finishes a player's hole without charging a stroke, and the second one
+settles the match: `0x0065` then `0x0066` with the standings.
 
 ### Automating the client's UI
 
@@ -430,10 +463,8 @@ A real client will not start a versus room that holds fewer players than its cap
 Make Room dialog's smallest versus capacity is two: the room header reads `3 hole (1/2)` and the
 master's button stays on Ready rather than becoming Start.
 
-A second instance on the same host is not a workaround. The client holds a single-instance lock
-and the second launch produces no process; Rugburn hooks `CreateMutexA` only to satisfy
-GameGuard, so it offers no bypass. Driving a played hole therefore needs a second client on a
-second machine joining the same room over the Tailnet.
+The client also holds a single-instance lock, so a second launch produces no process by default.
+That is solved at runtime rather than by a second machine — see the next section.
 
 ### Running two clients on one host
 
