@@ -266,6 +266,7 @@ Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
 
 | Opcode | Meaning | Body |
 |---|---|---|
+| `0x004a` | Room status | `u16` `0xffff`, room type, course, hole count, progression, `u32` natural wind, capacity, `u16` `30`, `u32` shot timer, `u32` game timer, `u32` flags, owner byte, room name |
 | `0x0230` | Pre-match framing, first half | empty |
 | `0x0231` | Pre-match framing, second half | empty |
 | `0x0077` | Pang rate for the match | `u32` percentage, `100` for the plain rate |

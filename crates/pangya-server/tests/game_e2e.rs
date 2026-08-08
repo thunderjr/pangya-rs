@@ -6481,6 +6481,16 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         "the host is told the room filled: {host_frames:04x?}"
     );
 
+    // A real client edits the room on its way into a match. Unanswered it sits on a modal;
+    // unrecognized it used to take the connection down with it, which looked exactly like a
+    // client that had crashed.
+    send_packet(&mut host, host_key, 4, 0x000a, &[0xff, 0xff, 0]).await;
+    let edited = drain_available(&mut host, host_key, Duration::from_millis(900)).await;
+    assert!(
+        edited.contains(&0x004a) && edited.contains(&0x0048),
+        "a room edit is answered with the room and its roster: {edited:04x?}"
+    );
+
     // Only the visitor marks ready. The client's button says Start for the room master and
     // Ready for everyone else, so a master never sends this — pressing Start is what says it.
     send_packet(&mut visitor, visitor_key, 4, 0x000d, &[0]).await;

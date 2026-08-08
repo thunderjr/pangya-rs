@@ -81,10 +81,10 @@ use pangya_protocol::{
     RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
     RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
     RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomType,
-    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync,
-    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus,
+    RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
+    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
     RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
     RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
     RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
@@ -5429,6 +5429,33 @@ where
                     .await?;
                 Ok(state)
             }
+            (GameState::InRoom, RETAIL_C2S_ROOM_EDIT) => {
+                // The requested changes are read but not applied: this server settles exactly
+                // one hole on the course its configuration names, and the room header already
+                // says so. What the client needs is an answer describing the room it is now
+                // in, which upstream gives as the room status followed by the roster
+                // (`pangbox/server`, `game/room/room.go` `handleRoomSettingsChange` ->
+                // `stateUpdated`). Left unanswered the client sits on a modal; left
+                // unrecognized the connection drops mid-room.
+                let routed = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                self.send(
+                    framed,
+                    &RetailRoomStatus {
+                        room: retail_room_from_snapshot(&snapshot),
+                    },
+                )
+                .await?;
+                self.send(framed, &retail_census_from_snapshot(&snapshot))
+                    .await?;
+                Ok(state)
+            }
             (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE) => {
                 self.lobby
                     .leave(identity.connection_id)
@@ -6268,6 +6295,9 @@ fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
 /// Retail match client opcodes.
 /// Retail room-ready client opcode. The client sends this before it will offer Start.
 const RETAIL_C2S_ROOM_READY: u16 = 0x000d;
+/// Retail room-edit client opcode. The client sends it whenever the room master touches the
+/// room's settings, and it sends one on the way into a match.
+const RETAIL_C2S_ROOM_EDIT: u16 = 0x000a;
 const RETAIL_C2S_START_MATCH: u16 = 0x000e;
 const RETAIL_C2S_HOLE_LOAD_FINISHED: u16 = 0x0011;
 const RETAIL_C2S_SHOT_COMMIT: u16 = 0x0012;
@@ -6308,6 +6338,7 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
             | RetailRoomJoin::OPCODE
             | RETAIL_C2S_ROOM_LEAVE
             | RETAIL_C2S_ROOM_READY
+            | RETAIL_C2S_ROOM_EDIT
             | RETAIL_C2S_MULTIPLAYER_JOIN
             | RETAIL_C2S_MULTIPLAYER_LEAVE
     )

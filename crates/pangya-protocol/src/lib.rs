@@ -116,8 +116,8 @@ pub use us852_room::{
     RetailPangSpent, RetailPlayerInfo, RetailPurchaseItem, RetailPurchaseRequest,
     RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
     RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomType, RetailShopJoin, RetailShopJoined, RoomCensusKind, RoomJoinRejection,
-    RoomListKind, RoomPlayerFlags,
+    RetailRoomStatus, RetailRoomType, RetailShopJoin, RetailShopJoined, RoomCensusKind,
+    RoomJoinRejection, RoomListKind, RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 

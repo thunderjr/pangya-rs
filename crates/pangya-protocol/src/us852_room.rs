@@ -232,6 +232,57 @@ impl RetailRoom {
     }
 }
 
+/// The settings of the room a client is sitting in, server opcode `0x004a`.
+///
+/// Sent when a room is joined and whenever its settings change. It is the answer to a client
+/// room edit (`0x000a`): the client asks for a change and learns from this what the room
+/// actually is now, which for this server is what it already was — one hole on the configured
+/// course.
+///
+/// The two constants are pinned by captures rather than derived: the leading `u16` is `0xffff`
+/// in every recorded example, and the `u16` after the capacity is `30`. `pangbox/server` writes
+/// zero for both and its clients cope, but the captures are the stronger evidence.
+///
+/// # Provenance
+///
+/// Layout from `pangbox/server` (`game/packet/server.go` `ServerRoomStatus`, filled by
+/// `game/room/room.go` `roomStatus`), ISC licensed, cross-checked against
+/// `pangbox/packetdoc` `004a.ksy`, `Acrisio-Filho/SuperSS-Dev` `pacote04A` and
+/// `hsreina/pangya-server` `TriggerGameUpdated`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomStatus {
+    /// The room these settings describe.
+    pub room: RetailRoom,
+}
+
+impl EncodePacket for RetailRoomStatus {
+    const OPCODE: u16 = 0x004a;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u16_le(0xffff);
+        writer.u8(self.room.room_type as u8);
+        writer.u8(self.room.course);
+        writer.u8(self.room.hole_count);
+        writer.u8(self.room.hole_progression as u8);
+        writer.u32_le(u32::from(self.room.natural_wind));
+        writer.u8(self.room.max_players);
+        writer.u16_le(30);
+        writer.u32_le(self.room.shot_timer_ms);
+        writer.u32_le(self.room.game_timer_ms);
+        writer.u32_le(0); // flags
+        // Upstream sends the same broadcast to every occupant with this byte set, so it names
+        // the room's own ownership rather than the recipient's.
+        writer.u8(1);
+        writer.pstring(&self.room.name, ROOM_NAME_BYTES)?;
+        Ok(())
+    }
+}
+
 /// How a room list frame relates to what the client already holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -1437,6 +1488,27 @@ mod tests {
         assert_eq!(RoomPlayerFlags::new(true, false).bits(), 1 << 3);
         assert_eq!(RoomPlayerFlags::new(false, true).bits(), 1 << 9);
         assert_eq!(RoomPlayerFlags::new(true, true).bits(), (1 << 3) | (1 << 9));
+    }
+
+    /// The two constants are the whole reason this packet is easy to get subtly wrong: both
+    /// are values the captures carry and the layout does not explain.
+    #[test]
+    fn room_status_carries_the_settings_and_the_two_captured_constants() {
+        let room = sample_room();
+        let payload = encode_packet_payload(&RetailRoomStatus { room: room.clone() }, &profile())
+            .expect("status");
+        assert_eq!(&payload[0..2], &[0xff, 0xff]);
+        assert_eq!(payload[2], room.room_type as u8);
+        assert_eq!(payload[3], room.course);
+        assert_eq!(payload[4], room.hole_count);
+        assert_eq!(payload[5], room.hole_progression as u8);
+        assert_eq!(payload[10], room.max_players);
+        assert_eq!(&payload[11..13], &30_u16.to_le_bytes());
+        assert_eq!(&payload[13..17], &room.shot_timer_ms.to_le_bytes());
+        assert_eq!(&payload[17..21], &room.game_timer_ms.to_le_bytes());
+        assert_eq!(&payload[21..25], &[0, 0, 0, 0]);
+        assert_eq!(payload[25], 1);
+        assert_eq!(payload.len(), 26 + 2 + room.name.len());
     }
 
     #[test]
