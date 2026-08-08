@@ -4259,10 +4259,6 @@ where
 
     /// Handles one retail lobby/room command.
     ///
-    /// The lobby actor is protocol-agnostic, so this is a wire translation only: retail
-    /// requests map onto the same commands the synthetic path uses, and the actor's
-    /// authoritative results map back onto retail replies.
-    #[allow(clippy::too_many_arguments)]
     /// Current rooms as retail list records, bounded by what one list frame can carry.
     async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
         let summaries = self
@@ -4277,6 +4273,10 @@ where
             .collect())
     }
 
+    /// The lobby actor is protocol-agnostic, so this is a wire translation only: retail
+    /// requests map onto the same commands the synthetic path uses, and the actor's
+    /// authoritative results map back onto retail replies.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_retail_room_command(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
