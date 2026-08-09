@@ -78,6 +78,22 @@ SERVER_TABLE_KINDS = {
     "Item.iff": "consumable",
     "Part.iff": "character_part",
     "Course.iff": "course",
+    # The client's own shop has six tabs; the six tables above cover three of them. These eight
+    # are what Caddie, Mascot, Decoration and Card Holic are drawn from — always present in the
+    # client, never parsed by the server, so every purchase from those tabs was refused with
+    # `not_in_catalog`.
+    #
+    # `AddonPart.iff` is excluded on purpose: its type-id tags are 0x04 and 0x08, the same space
+    # Character and CharacterPart occupy, so admitting it would make a type id ambiguous across
+    # families for the sake of three shop rows.
+    "Caddie.iff": "caddie",
+    "CaddieItem.iff": "caddie_item",
+    "Mascot.iff": "mascot",
+    "Card.iff": "card",
+    "Furniture.iff": "furniture",
+    "Skin.iff": "skin",
+    "HairStyle.iff": "hair_style",
+    "SetItem.iff": "set_item",
 }
 
 
