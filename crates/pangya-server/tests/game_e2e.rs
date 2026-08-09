@@ -5974,6 +5974,22 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(&channels[1..10], b"pangya-rs");
     assert_eq!(channels[10], 0);
 
+    // Enter the channel before exercising menu services.
+    send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // Daily quests are Tier D, but the retail button must receive an honest empty response rather
+    // than hang modally or disconnect under the shipped unknown-opcode policy.
+    send_packet(&mut stream, key, 3, 0x0151, &[]).await;
+    let (delta_opcode, delta) = receive_packet(&mut stream, key).await;
+    assert_eq!(delta_opcode, 0x0216);
+    assert_eq!(delta.len(), 8);
+    assert_eq!(&delta[4..], &[0; 4]);
+    let (state_opcode, state) = receive_packet(&mut stream, key).await;
+    assert_eq!(state_opcode, 0x0225);
+    assert_eq!(state, vec![0; 20]);
+
     drop(stream);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());

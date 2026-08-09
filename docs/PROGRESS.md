@@ -667,7 +667,9 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     practice, the second changed nothing — and neither gates Start. Upstream references do not
     cover practice, so the next step is capture rather than inference.
 
-33. **Quest status `0x0151` is unanswered and blocks the client modally** — **open.** The client's Quest button raises "Waiting for server's response" and stays there. Under `capture` it is recorded rather than fatal, but under the shipped `disconnect` it would end the session.
+33. **Quest status `0x0151` is unanswered and blocks the client modally** — **resolved server-side 2026-08-09.** PacketDoc identifies a payload-free `0x0151` request with companion replies `0x0216` and `0x0225` (`gameservice/client/0151.ksy:4-14`). Its response schemas make an empty result unambiguous: time plus zero deltas for `0x0216`, then success, zero dates, zero quest ids, and zero slots for `0x0225` (`server/0216.ksy:16-25`, `server/0225.ksy:14-38`). SuperSS-Dev sends those two frames in that order (`UTIL/mgr_daily_quest.cpp:57-121`; `PACKET/packet_func_sv.cpp:5914-5939`).
+
+    Daily quests remain Tier D, so the server now returns that honest empty state rather than inventing mutable quest records. The retail TCP bootstrap test enters a channel under `unknown_opcode_policy = "disconnect"`, sends exact client `0x0151`, and asserts the eight-byte `0x0216` followed by the twenty-zero-byte `0x0225`. The local real-client config has also been restored from `capture` to `disconnect`; fresh login, My Room/equipment close, shop entry, and room creation remained connected with no unknown-opcode observation.
 
 ---
 

@@ -702,6 +702,11 @@ function Open-PangyaShop {
   }
 }
 
+function Close-PangyaShop {
+  # The shop is an in-world overlay; its X is relative to the 800x600 client area.
+  Invoke-PangyaClick -X 775 -Y 55 -AfterMs 1800
+}
+
 # Selects named tabs rather than repeating coordinates in every evidence run. Top is optional so
 # callers can move between siblings after the shop is already open.
 function Select-PangyaShopCategory {

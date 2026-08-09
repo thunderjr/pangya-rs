@@ -735,6 +735,76 @@ impl EncodePacket for RetailShopJoined {
     }
 }
 
+/// Opens the Daily Quest panel, client opcode `0x0151`.
+///
+/// # Provenance
+///
+/// SuperSS-Dev registers `0x0151` as `packet151` and routes it to `requestDailyQuest`
+/// (`Game Server/game_server.cpp:449`, `PACKET/packet_func_sv.cpp:3499-3512`). The request has no
+/// body (`GAME/channel.cpp:6892-6906`). Daily quests are Tier D, so this server truthfully returns
+/// an empty current state rather than inventing mutable quest records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailDailyQuestRequest;
+
+impl DecodePacket for RetailDailyQuestRequest {
+    const OPCODE: u16 = 0x0151;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self)
+    }
+}
+
+/// Empty achievement delta sent before Daily Quest state, server opcode `0x0216`.
+///
+/// SuperSS-Dev writes UTC Unix time followed by a zero achievement count when there are no new
+/// daily quests (`UTIL/mgr_daily_quest.cpp:110-118`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailDailyQuestDelta {
+    /// UTC Unix time truncated to the client's 32-bit field.
+    pub server_time: u32,
+}
+
+impl EncodePacket for RetailDailyQuestDelta {
+    const OPCODE: u16 = 0x0216;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.server_time);
+        writer.u32_le(0); // achievement count
+        Ok(())
+    }
+}
+
+/// Empty Daily Quest state, server opcode `0x0225`.
+///
+/// The option-zero shape is option, current date, accept date, quest count, and deleted-quest
+/// count (`PACKET/packet_func_sv.cpp:5914-5939`). All are zero because Tier-D quest state is not
+/// implemented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailDailyQuestState;
+
+impl EncodePacket for RetailDailyQuestState {
+    const OPCODE: u16 = 0x0225;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; 20]);
+        Ok(())
+    }
+}
+
 /// My Room entry, client opcode `0x00b5`.
 ///
 /// # Provenance
@@ -1401,6 +1471,26 @@ mod tests {
                 ball_type_id: 0x1400_00c9,
                 club_item_id: 310,
             }
+        );
+    }
+
+    #[test]
+    fn empty_daily_quest_sequence_matches_the_reference_widths() {
+        decode_packet_payload::<RetailDailyQuestRequest>(&[], &profile(), ServiceKind::Game)
+            .expect("empty request");
+        let delta = encode_packet_payload(
+            &RetailDailyQuestDelta {
+                server_time: 0x1234_5678,
+            },
+            &profile(),
+        )
+        .expect("delta");
+        assert_eq!(delta.as_slice(), [0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0]);
+        assert_eq!(
+            encode_packet_payload(&RetailDailyQuestState, &profile())
+                .expect("state")
+                .as_slice(),
+            [0; 20]
         );
     }
 

@@ -69,10 +69,11 @@ use pangya_protocol::{
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailClientException, RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot,
-    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
-    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
-    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLockerCombinationAttempt,
+    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
+    RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
+    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
+    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
+    RetailInventoryItem, RetailLoadProgress, RetailLockerCombinationAttempt,
     RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
     RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
@@ -1432,6 +1433,7 @@ where
                                 && matches!(
                                     frame.opcode,
                                     RetailShopJoin::OPCODE
+                                        | RetailDailyQuestRequest::OPCODE
                                         | RetailMyRoomEnter::OPCODE
                                         | RetailMyRoomInventoryRequest::OPCODE
                                         | RetailLockerInventoryRequest::OPCODE
@@ -5108,6 +5110,22 @@ where
         let account_id = u32::try_from(identity.account_id.get()).unwrap_or(0);
         match opcode {
             RetailShopJoin::OPCODE => self.send(framed, &RetailShopJoined).await,
+            RetailDailyQuestRequest::OPCODE => {
+                decode_packet_payload::<RetailDailyQuestRequest>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                let server_time = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| {
+                        u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
+                    });
+                self.send(framed, &RetailDailyQuestDelta { server_time })
+                    .await?;
+                self.send(framed, &RetailDailyQuestState).await
+            }
             RetailLockerInventoryRequest::OPCODE => {
                 self.send(framed, &RetailLockerInventoryResponse).await
             }
