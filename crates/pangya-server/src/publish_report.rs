@@ -24,6 +24,9 @@ use std::path::Path;
 /// per authorable row (4,031 of them is ~560 KB), so this is generous by an order of magnitude.
 const MAX_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// What a report written before `client_pak_name` existed meant.
+const DEFAULT_CLIENT_PAK: &str = "projectg850gb.pak";
+
 /// The subset of `shop-sync-report.json` this check needs.
 ///
 /// Deliberately not the whole document: the report also carries every authored offer, and
@@ -33,6 +36,15 @@ const MAX_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 struct PublishReport {
     /// SHA-256 of the PAK the authoring run staged for clients.
     client_pak_sha256: String,
+    /// Which archive that was.
+    ///
+    /// Not assumed, because assuming it is how the shop silently failed to reach a client: the
+    /// client loads the LAST archive in its series that provides a file, and
+    /// `data/pangya_gb.iff` is in nearly every one — so authoring `projectg850gb.pak` in a stock
+    /// U.S. 851 install is overridden by `projectg851gb.pak` and changes nothing visible.
+    /// Older reports predate this field; they fall back to the historical default.
+    #[serde(default)]
+    client_pak_name: Option<String>,
     server_iff: ServerIff,
 }
 
@@ -82,25 +94,29 @@ pub enum PublishReportError {
 
 /// Verifies that the served client archive and the loaded catalog came from one authoring run.
 ///
-/// `client_pak` is the archive the report names — `projectg850gb.pak` in every run so far — and
-/// `manifest` is the `manifest.toml` inside the configured `data.iff_directory`.
+/// `client_directory` is the served PAK directory; which archive inside it to hash comes from the
+/// report itself. `manifest` is the `manifest.toml` inside the configured `data.iff_directory`.
 ///
 /// # Errors
 ///
 /// Returns an error when the report is unreadable, when either artifact is missing, or when
 /// either digest disagrees. Every variant names which side is stale, because "these two files
 /// disagree" without saying which one to fix is only half an error message.
-pub fn verify(report: &Path, client_pak: &Path, manifest: &Path) -> Result<(), PublishReportError> {
+pub fn verify(
+    report: &Path,
+    client_directory: &Path,
+    manifest: &Path,
+) -> Result<(), PublishReportError> {
     let bytes = read_bounded(report, MAX_REPORT_BYTES).ok_or(PublishReportError::Unreadable)?;
     let report: PublishReport =
         serde_json::from_slice(&bytes).map_err(|_| PublishReportError::Unreadable)?;
 
-    let pak_name = client_pak
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("client archive")
-        .to_owned();
-    let served = digest_of(client_pak)
+    let pak_name = report
+        .client_pak_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CLIENT_PAK.to_owned());
+    let client_pak = client_directory.join(&pak_name);
+    let served = digest_of(&client_pak)
         .ok_or_else(|| PublishReportError::MissingArtifact(pak_name.clone()))?;
     if !served.eq_ignore_ascii_case(&report.client_pak_sha256) {
         return Err(PublishReportError::ClientPakMismatch {
@@ -168,13 +184,14 @@ mod tests {
     ) -> tempdir::Fixture {
         let dir = std::env::temp_dir().join(format!("pangya-report-{}", uuid_like()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let pak_path = write(&dir, "projectg850gb.pak", pak);
+        let pak_path = write(&dir, "projectg851gb.pak", pak);
         let manifest_path = write(&dir, "manifest.toml", manifest);
         let report_path = write(
             &dir,
             "shop-sync-report.json",
             format!(
                 r#"{{"version":1,"client_pak_sha256":"{report_pak}",
+                     "client_pak_name":"projectg851gb.pak",
                      "server_iff":{{"manifest_sha256":"{report_manifest}"}}}}"#
             )
             .as_bytes(),
@@ -217,7 +234,7 @@ mod tests {
         let pak = b"authored pak bytes";
         let manifest = b"manifest_version = 3\n";
         let f = fixture(pak, manifest, &sha256_of(pak), &sha256_of(manifest));
-        assert!(verify(&f.report, &f.pak, &f.manifest).is_ok());
+        assert!(verify(&f.report, &f.dir, &f.manifest).is_ok());
     }
 
     #[test]
@@ -231,12 +248,12 @@ mod tests {
             &sha256_of(b"the PAK the run authored"),
             &sha256_of(manifest),
         );
-        let error = verify(&f.report, &f.pak, &f.manifest).expect_err("must refuse");
+        let error = verify(&f.report, &f.dir, &f.manifest).expect_err("must refuse");
         assert!(matches!(
             error,
             PublishReportError::ClientPakMismatch { .. }
         ));
-        assert!(error.to_string().contains("projectg850gb.pak"));
+        assert!(error.to_string().contains("projectg851gb.pak"));
     }
 
     #[test]
@@ -250,7 +267,7 @@ mod tests {
             &sha256_of(pak),
             &sha256_of(b"the manifest the run authored"),
         );
-        let error = verify(&f.report, &f.pak, &f.manifest).expect_err("must refuse");
+        let error = verify(&f.report, &f.dir, &f.manifest).expect_err("must refuse");
         assert!(matches!(error, PublishReportError::ManifestMismatch { .. }));
     }
 
@@ -261,7 +278,7 @@ mod tests {
         let f = fixture(pak, manifest, &sha256_of(pak), &sha256_of(manifest));
         std::fs::remove_file(&f.pak).expect("remove");
         assert!(matches!(
-            verify(&f.report, &f.pak, &f.manifest),
+            verify(&f.report, &f.dir, &f.manifest),
             Err(PublishReportError::MissingArtifact(_))
         ));
     }
@@ -273,7 +290,7 @@ mod tests {
         let f = fixture(pak, manifest, &sha256_of(pak), &sha256_of(manifest));
         std::fs::write(&f.report, b"{ not json").expect("write");
         assert!(matches!(
-            verify(&f.report, &f.pak, &f.manifest),
+            verify(&f.report, &f.dir, &f.manifest),
             Err(PublishReportError::Unreadable)
         ));
     }
@@ -290,6 +307,6 @@ mod tests {
             &sha256_of(pak).to_uppercase(),
             &sha256_of(manifest).to_uppercase(),
         );
-        assert!(verify(&f.report, &f.pak, &f.manifest).is_ok());
+        assert!(verify(&f.report, &f.dir, &f.manifest).is_ok());
     }
 }

@@ -58,8 +58,19 @@ digest = hashlib.sha256(payload.read_bytes()).hexdigest()
 expected = report["client_pak_sha256"]
 if digest != expected:
     raise SystemExit(f"staged PAK hash mismatch: {digest} != {expected}")
+
+# Write the deployed archive name back into the report. author-client-iff.py only knows its own
+# output filename, which carries an "-authored" suffix and exists nowhere in a client's folder;
+# the deployed name is decided here, and a server cross-checking the deployment needs that one.
+report["client_pak_name"] = payload.name
+pathlib.Path(sys.argv[1]).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
 print(json.dumps({
     "client_pak": str(payload),
+    # The name it is DEPLOYED as, which is what a server has to hash — not the authoring
+    # tool's output filename, which carries an "-authored" suffix and exists nowhere in a
+    # client's folder.
+    "client_pak_name": payload.name,
     "client_pak_sha256": digest,
     "server_iff": report["server_iff"],
     "offers": report["offers"],

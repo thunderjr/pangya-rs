@@ -668,6 +668,16 @@ def main() -> int:
             "client_pak_sha256": (
                 sha256(args.out_client_pak) if args.out_client_pak is not None else None
             ),
+            # Which archive the authored tables were injected into.
+            #
+            # This is not cosmetic. The client loads the LAST archive in its series that provides
+            # a given file, and `data/pangya_gb.iff` is present in nearly every one — so
+            # authoring `projectg850gb.pak` in a stock U.S. 851 install changes nothing, because
+            # `projectg851gb.pak` supplies a later copy that wins. Anything cross-checking a
+            # deployment has to hash the archive that was actually written, not a guess.
+            "client_pak_name": (
+                args.out_client_pak.name if args.out_client_pak is not None else None
+            ),
             "pak_replacement": replacement,
             "server_iff": server_iff,
             "managed_tables": managed,

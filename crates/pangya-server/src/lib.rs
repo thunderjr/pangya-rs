@@ -9,13 +9,6 @@ pub mod client_web;
 pub mod configuration;
 pub mod publish_report;
 
-/// The one archive `scripts/author-client-iff.py` rewrites.
-///
-/// Named as a constant rather than read from the report because the report attests a digest,
-/// not a path, and every authoring run to date targets this archive. If a future run ever
-/// rewrites a different one, the report gains a filename and this goes away.
-const CUSTOM_SHOP_PAK: &str = "projectg850gb.pak";
-
 use std::{
     env, fs,
     io::{Read as _, Write as _},
@@ -520,14 +513,14 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
             // on it. It needs the catalog side too, which is why it lives here and not inside
             // `ClientWebState::prepare`: `data.iff_directory` is a `[data]` concern.
             if let Some(report) = settings.publish_report.clone() {
-                let client_pak = settings.client_directory.join(CUSTOM_SHOP_PAK);
+                let client_directory = settings.client_directory.clone();
                 let manifest = config
                     .iff_directory
                     .clone()
                     .ok_or(ServerError::Data)?
                     .join(config.data_manifest.clone().ok_or(ServerError::Data)?);
                 let checked = tokio::task::spawn_blocking(move || {
-                    publish_report::verify(&report, &client_pak, &manifest)
+                    publish_report::verify(&report, &client_directory, &manifest)
                 })
                 .await
                 .map_err(|_| ServerError::Runtime)?;
