@@ -107,12 +107,19 @@ level 1, concentrated in `Part.iff`.
 Exit criteria: either a real player level on the wire, or a documented decision to zero
 `minLevel` in authored tables.
 
-### SHOP-006 — the shop overlay does not reach the client ✅ by design
+### SHOP-006 — the shop is operator-controlled on both halves ✅
 
 `shop_offer_overrides` changes what the server charges and permits, live, with no restart. It
-never changes what the client displays. Rows where the two disagree are flagged `drift` in the
-operator console. Changing display requires re-authoring — see
+still never changes what the client displays by itself — but the console can now publish, which
+re-authors the client's own tables from that same overlay and ships the archive. Rows where the
+two disagree are flagged `drift` until then, and the publish panel says whether players' clients
+are behind the server. Mechanism, worker and evidence: PATCH-009 in
 [`SPEC_CLIENT_PATCH_DELIVERY.md`](SPEC_CLIENT_PATCH_DELIVERY.md).
+
+Two things a reader should not over-read. The panel reaches the client's *shop tables*, not the
+client's behaviour: an item enabled here still needs a server-side purchase path, which is why
+SHOP-001 stays blocked. And the publish base is the last published set, so clearing an override
+keeps the published price rather than restoring the retail one.
 
 ### SHOP-007 — item icons are 90% covered 🟡
 

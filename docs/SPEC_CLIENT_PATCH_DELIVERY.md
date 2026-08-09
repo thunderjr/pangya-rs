@@ -14,13 +14,25 @@ The client renders shop names, prices, currency and listing from its **own** IFF
 its PAK series. Nothing the server says changes that. So a re-authored shop only reaches a player
 when the authored archive reaches their disk.
 
-## Two properties that were measured, not assumed
+## Three properties that were measured, not assumed
 
 **The last archive in the series wins.** `data/pangya_gb.iff` is present in nearly every one of
 the 84 retail archives. Authoring `projectg850gb.pak` changed nothing a player saw, because the
 stock `projectg851gb.pak` supplied a later copy. `scripts/extract-client-iff.py --list` reports
 the winner. This cost a full round trip to a real client to discover, and it is the single
 easiest mistake to repeat.
+
+**The client does not mount an archive numbered past its own patch level.** The obvious
+consequence of the rule above — add `projectg852gb.pak` and it wins, leaving every retail archive
+pristine — is false. A one-entry 852 was authored, published, hashed and served correctly, with
+851 restored to its pristine 690,312 bytes; the shop went straight back to retail prices
+(2026-08-10). The mount set is bounded by the patch level, so an archive that sorts last is not
+necessarily an archive that is read.
+
+Those two together are narrower than they look: *the winner is the last archive the client
+mounts*, and the mount set ends at the client's own patch level. Anything that wins by ordering
+must therefore be a retail archive rebuilt in place, because inside that bound every slot is
+already occupied.
 
 **The client is not a downloader.** `ProjectG.exe` validates its archives against the server's
 `updatelist` and refuses to start on a mismatch, but the retail downloader is `update.exe`, a
@@ -42,26 +54,24 @@ server: GET /launcher/v1/manifest   →  size + PangYa CRC + SHA-256 per archive
 launcher: compare → download → verify all three → back up → atomic rename → launch
 ```
 
-### PATCH-001 — a new archive, never a rebuilt retail one ✅
+### PATCH-001 — rebuild the last archive the client mounts ✅
 
-`PANGYA_PATCH_MODE=latest` (the default) emits a **one-entry archive numbered past the retail
-series** — `projectg852gb.pak` — rather than rebuilding a retail archive in place. Three reasons:
+`PANGYA_PATCH_MODE=replace` (the default) rebuilds `projectg851gb.pak` in place, replacing its
+`data/pangya_gb.iff` entry. The pristine copy is kept at `projectg851gb-original.pak`, which is
+both the authoring base and the rollback.
 
-- every retail archive stays byte-for-byte pristine, so a client never re-downloads a mutated
-  1.4 MB base to get a shop change;
-- our patch is ~730 KB and carries only `data/pangya_gb.iff`;
-- rolling updates replace one file we own, so nothing retail is ever overridden and a rollback is
-  deleting it.
+**This is not the design that was wanted.** `PANGYA_PATCH_MODE=latest` emits a one-entry
+`projectg852gb.pak` instead, leaving every retail archive byte-for-byte pristine so a client
+never re-downloads a mutated 1.4 MB base and a shop change ships ~730 KB. It was built, deployed
+and measured, and the client ignored it — see the second measured property above. The mode is
+kept because the code is written and a future client build may bound its mount set differently,
+but it must not be selected without a fresh evidence run. ⛔
 
-`deploy.sh` removes any previously-added archive in the `projectg852..859` range before placing
-the current one, so switching what is authored — or back to pristine — cannot leave two of ours
-in the series at once.
+`deploy.sh` still sweeps `projectg852..859` before placing the authored archive, so a switch
+between modes — or back to pristine — cannot leave a stale one of ours in the series.
 
-`PANGYA_PATCH_MODE=replace` keeps the older behaviour. It is the only mode proven in front of a
-real client, which is why it still exists.
-
-🔬 **Unverified:** that the client mounts an archive numbered past its own patch level. The
-ordering property was proven for 850 vs 851; extending it to 852 is reasoned, not measured.
+The cost of `replace` is honest and small: a shop change re-ships 1.4 MB rather than 730 KB, and
+exactly one retail archive is no longer the file the client shipped with.
 
 ### PATCH-002 — the launcher manifest ✅
 
@@ -117,13 +127,45 @@ is surfaced. A large first download looks like a hang, and reverting needs a con
 The console cannot show what is published: archives, digests, staleness, or whether the publish
 report agrees. Proposed as read-only `GET /admin/v1/client-pak`.
 
-### PATCH-009 — authoring is not driven from the console ⬜
+### PATCH-009 — authoring is driven from the console ✅
 
-`catalog.json` is edited by hand and `sync-client-shop.sh` run from a shell, then the server
-restarted. Deliberately **not** an admin endpoint that shells out: that would put code execution
-on the only HTTP surface that mutates player state, and it would still need a restart. The
-console editing `catalog.json` with a separate worker doing the authoring is the shape that keeps
-one point of control without that.
+The console renders the `catalog.json` and a worker outside the server authors it. Nothing shells
+out from the HTTP surface that mutates player state.
+
+```
+shop_offer_overrides ──► GET  /admin/v1/shop/publish          what a publish would author
+                    └──► POST /admin/v1/shop/publish          queue it (one at a time)
+                                    │
+publish-shop.sh ────────────────────┤ POST /shop/publish/claim      → document + digest
+  author-client-iff.py              │ author, stage, deploy
+  homelab deploy.sh                 │
+                                    └ POST /shop/publish/{id}/finish → archive name + SHA-256
+```
+
+The queued row carries the **exact document bytes** the operator approved, and the worker refuses
+to author unless its own SHA-256 of what it wrote matches. That is why `shop_publish_requests.document`
+is `TEXT` and not `JSONB`: `jsonb` reorders keys and drops whitespace, so a normalising column
+would fail the digest check on every publish. It caught a real defect on its first run — `jq -r`
+appends a newline the console never hashed.
+
+One request may be outstanding at a time (`uq_shop_publish_active`); a second is refused as
+`publish_in_flight` rather than racing two workers over one client tree. A failure keeps the
+worker's reason, so the console can show why rather than sending an operator to a log on a machine
+they may not have open.
+
+**Verified 2026-08-10.** An override of `0x10000000` to 777 Pang showed client 1 / server 777 /
+drift; after a console publish the client's own table read 777 with no drift. Restoring it to 1
+and republishing produced `cff2b454425c67f8…`, byte-identical to the hand-authored archive — so
+the console-driven and hand-run paths agree by construction, not by discipline.
+
+One property to know: the document is rendered from the **server's current catalog** with the
+overlay applied, and that catalog is the last published set. Prices therefore ratchet — clearing
+an override does not restore the retail price, it keeps whatever was last published, because that
+is now what the client's own tables say. Restoring retail means overriding to the retail value
+explicitly, or deploying `PANGYA_SHOP=pristine`.
+
+Deployment default: `deploy.sh` selects the console's set as soon as one exists, so a routine
+deploy cannot silently revert a console publish back to a hand-authored one.
 
 ### PATCH-010 — the flatten question 🔬
 
@@ -142,6 +184,11 @@ un-flattened.
    XML (byte-identical after adding SHA-256), the publish cross-check refusals.
 2. `cargo test --manifest-path src-tauri/Cargo.toml` in `pangya-client` — manifest validation,
    name rejection, stale refusal.
-3. Real client: press Play with an authored archive published, confirm the update stage runs
+3. `cargo test -p pangya-storage --test admin` — the publish queue: one request at a time, a
+   claim that cannot be claimed twice, a resolved request that cannot be rewritten, and the
+   exact-bytes round trip the worker's digest check depends on.
+4. `scripts/publish-shop.sh --dry-run` — what a publish would author, without claiming anything.
+5. Real client: press Play with an authored archive published, confirm the update stage runs
    once, the client starts, and the shop shows the authored prices. **Done 2026-08-09 for the
-   four original tables; not repeated since the eight families were added.**
+   four original tables; not repeated since the eight families were added, nor since the
+   2026-08-10 revert from `latest` back to `replace`.**

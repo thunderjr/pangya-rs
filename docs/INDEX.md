@@ -11,6 +11,7 @@ document disagree, the linked document wins and this one is stale.
 | What the project must do | [`SPEC.md`](SPEC.md) |
 | Which player state is durable, and who may set it | [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md) |
 | What is done, and what blocks the rest | [`PROGRESS.md`](PROGRESS.md) |
+| Which opcodes still need server wiring | [GitHub issues #1–#30](https://github.com/thunderjr/pangya-rs/issues) — umbrella [#30](https://github.com/thunderjr/pangya-rs/issues/30) |
 | Which packets are retail versus generated | [`RETAIL_CONTRACT.md`](RETAIL_CONTRACT.md) |
 | Why a structural decision was made | [`adr/`](adr/) |
 | That a claim actually happened | [`evidence/`](evidence/) |
@@ -52,8 +53,8 @@ Two short operational memories are worth reading before debugging anything:
 |---|---|---|
 | [`SPEC.md`](SPEC.md) | Product scope, architecture, requirements by domain (§22), milestones M0–M9 (§23), definition of done (§27) | 2026-08-07 |
 | [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md) | Which player state is persisted, in which table, and whether an operator can set it. Supersedes `SPEC.md` §14.2's `character_parts` sketch | 2026-08-09 |
-| [`SPEC_SHOP_COVERAGE.md`](SPEC_SHOP_COVERAGE.md) | What the shop sells, what refuses and why — catalog families, currency nibbles, the character-purchase block | 2026-08-09 |
-| [`SPEC_CLIENT_PATCH_DELIVERY.md`](SPEC_CLIENT_PATCH_DELIVERY.md) | How an authored shop reaches a player's disk — the latest-archive model, the launcher manifest, the startup cross-check | 2026-08-09 |
+| [`SPEC_SHOP_COVERAGE.md`](SPEC_SHOP_COVERAGE.md) | What the shop sells, what refuses and why — catalog families, currency nibbles, the character-purchase block | 2026-08-10 |
+| [`SPEC_CLIENT_PATCH_DELIVERY.md`](SPEC_CLIENT_PATCH_DELIVERY.md) | How an authored shop reaches a player's disk — which archive wins, the launcher manifest, console-driven publishing | 2026-08-10 |
 | [`RETAIL_CONTRACT.md`](RETAIL_CONTRACT.md) | Retail versus synthetic packet surface, and the removal plan for the `0x7f**` placeholders | 2026-08-08 |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every configuration key and its bounds | 2026-08-07 |
 
@@ -94,7 +95,7 @@ persist across restart, but retail consume and repair are not claimed. See
 | SHOP-003 | Currency nibbles `0x3`/`0x6` | 🟡 | 298 rows; force-converted under `invent_shop_metadata`, meaning still unidentified |
 | SHOP-004 | Never-sold rows enabled | 🟡 | 3,554 rows given an invented `0x02`; whether they render is unmeasured |
 | SHOP-005 | `minLevel` modelled | 🟡 | Bootstrap hardcodes `level: 1`; ~500 rows sit above it |
-| SHOP-006 | Overlay reaches the client | ✅ | By design it does not — it changes charging, never display |
+| SHOP-006 | Shop controlled on both halves | ✅ | Overlay changes charging live; a console publish re-authors what the client displays |
 | SHOP-007 | Item icons | 🟡 | 7,127/7,918 of the original six families; widened families unmeasured |
 | — | Eight widened families sellable | 🔬 | Caddie, CaddieItem, Mascot, Card, Furniture, Skin, HairStyle, SetItem — parsed and authored, never in front of a client |
 
@@ -102,7 +103,7 @@ persist across restart, but retail consume and repair are not claimed. See
 
 | # | Requirement | Status | Note |
 |---|---|:--:|---|
-| PATCH-001 | Latest-archive model | ✅ | New `projectg852gb.pak`; retail archives stay pristine. 🔬 that the client mounts an archive past its patch level |
+| PATCH-001 | Rebuild the mounted archive | ✅ | `projectg851gb.pak` in place. The `latest` model was built and measured: the client ignores an archive past its patch level ⛔ |
 | PATCH-002 | Launcher manifest | ✅ | `GET /launcher/v1/manifest`, derived from the same `UpdateList` the client validates against |
 | PATCH-003 | Launcher applies patches | ✅ | Verify size + CRC + SHA-256, back up, atomic rename |
 | PATCH-004 | Startup cross-check | ✅ | `client_web.publish_report` refuses a skewed deployment and names the stale side |
@@ -110,7 +111,7 @@ persist across restart, but retail consume and repair are not claimed. See
 | PATCH-006 | Report every mismatch at once | ⬜ | The client names only the first bad archive |
 | PATCH-007 | Progress and revert in the UI | ⬜ | Commands exist; nothing surfaces them |
 | PATCH-008 | Operator visibility | ⬜ | Proposed `GET /admin/v1/client-pak` |
-| PATCH-009 | Authoring from the console | ⬜ | Deliberately not an endpoint that shells out |
+| PATCH-009 | Authoring from the console | ✅ | Console renders and queues the document; `publish-shop.sh` authors it. Verified 2026-08-10 |
 | PATCH-010 | Flatten vs mounted PAK | 🔬 | Partly answered; untested with `IntegratedPak` set properly |
 
 ### Durable-state milestones (`SPEC_DURABLE_PLAYER_STATE.md`)
@@ -148,26 +149,47 @@ The rank and the *why* columns are
 [`protocol/US852_SUBSYSTEM_GAPS.md`](protocol/US852_SUBSYSTEM_GAPS.md) §7's, which orders by
 unblocking value, then evidence quality, then cost. The status column is derived from
 [`PROGRESS.md`](PROGRESS.md) — read the gap analysis for the reasoning, not this table.
+The issue column links the 2026-08-09 protocol-compliance audit
+([#30](https://github.com/thunderjr/pangya-rs/issues/30) is the umbrella; the full list is in
+§4.1 below) — each issue carries the opcode tables, current-state `file:line` pointers, and
+reference handlers for its area.
 
-| Rank | Work | Status | Note |
-|---:|---|:--:|---|
-| 1 | Retail chat `0x0003` → `0x0040` | ⬜ | Only the synthetic `0x7f**` chat path exists today; retail chat under `unknown_opcode_policy = "disconnect"` kills a live session |
-| 2 | Match completion set + live room census | ✅ | Blocker 23; two-seat retail match evidenced |
-| 3 | Room settings `0x000a`, equipment-in-room `0x000c`/`0x000b` | ✅ | Blockers 29 and 32 |
-| 4 | Statistics submit `0x0006`/`0x0031` → `0x0045`, `0x002f` burst | 🟡 | `0x0031` and `0x0006` are handled on the practice path and `0x0045` exists as a bootstrap packet; the submit→reply path and `0x002f` are not claimed |
-| 5 | `0x0216` user status update as a first-class primitive | 🟡 | Emitted as the honest empty pair for daily quests (blocker 33); not yet a reusable grant primitive |
-| 6 | Caddie and mascot rosters `0x0071`/`0x00e1` | ⬜ | `E1`; "Tier D by name and Tier B by cost" |
-| 7 | Locker `0x00cd`–`0x00d5` | ⬜ | |
-| 8 | Mail `0x0143`–`0x0147`, `0x0210` | ⬜ | M8 |
-| 9 | MessageService, `0x008b` → `0x00fc` | ⬜ | M8. `crates/pangya-message` is a 12-line stub |
-| 10 | Login bonus `0x016e`/`0x016f` | ⬜ | |
-| 11 | Rare shop, Papel, scratchy, memorial, lootbox | ⬜ | Needs rank 5 first |
-| 12 | Quests `0x0151`–`0x0154` | 🟡 | Honest empty state served (blocker 33); no mutable quest records |
-| 13 | Achievements `0x0157`, `0x021d`, `0x021e` | ⛔ | Gap analysis trap 5.8 unresolved |
-| 14 | Cards and character mastery | ⬜ | `E4` and part of `E2` |
-| 15 | Events and Grand Prix | ⬜ | See [`protocol/US852_TOURNAMENT_MODE.md`](protocol/US852_TOURNAMENT_MODE.md) |
-| 16 | Personal shop, club workshop, rentals, guilds, MyRoom furniture/UCC | ⛔ | Deferred on evidence, not effort |
-| — | Rings `0x015d` | 🔬 | Opcode exists in two sources; no source documents the body |
+| Rank | Work | Status | Issue | Note |
+|---:|---|:--:|---|---|
+| 1 | Retail chat `0x0003` → `0x0040` | ⬜ | [#12](https://github.com/thunderjr/pangya-rs/issues/12) | Only the synthetic `0x7f**` chat path exists today; retail chat under `unknown_opcode_policy = "disconnect"` kills a live session |
+| 2 | Match completion set + live room census | ✅ | [#1](https://github.com/thunderjr/pangya-rs/issues/1) [#24](https://github.com/thunderjr/pangya-rs/issues/24) | Blocker 23; two-seat retail match evidenced. The relay set and N-player/mode depth remain open |
+| 3 | Room settings `0x000a`, equipment-in-room `0x000c`/`0x000b` | ✅ | [#2](https://github.com/thunderjr/pangya-rs/issues/2) [#3](https://github.com/thunderjr/pangya-rs/issues/3) | Blockers 29 and 32. Settings are still not *applied* and equipment subtypes/broadcast remain open — see the issues |
+| 4 | Statistics submit `0x0006`/`0x0031` → `0x0045`, `0x002f` burst | 🟡 | [#24](https://github.com/thunderjr/pangya-rs/issues/24) [#12](https://github.com/thunderjr/pangya-rs/issues/12) | `0x0031` and `0x0006` are handled on the practice path and `0x0045` exists as a bootstrap packet; the submit→reply path and `0x002f` are not claimed |
+| 5 | `0x0216` user status update as a first-class primitive | 🟡 | [#26](https://github.com/thunderjr/pangya-rs/issues/26) | Emitted as the honest empty pair for daily quests (blocker 33); not yet a reusable grant primitive |
+| 6 | Caddie and mascot rosters `0x0071`/`0x00e1` | ⬜ | [#19](https://github.com/thunderjr/pangya-rs/issues/19) | `E1`; "Tier D by name and Tier B by cost" |
+| 7 | Locker `0x00cd`–`0x00d5` | ⬜ | [#6](https://github.com/thunderjr/pangya-rs/issues/6) | |
+| 8 | Mail `0x0143`–`0x0147`, `0x0210` | ⬜ | [#7](https://github.com/thunderjr/pangya-rs/issues/7) | M8 |
+| 9 | MessageService, `0x008b` → `0x00fc` | ⬜ | [#21](https://github.com/thunderjr/pangya-rs/issues/21) | M8. `crates/pangya-message` is a 12-line stub |
+| 10 | Login bonus `0x016e`/`0x016f` | ⬜ | [#10](https://github.com/thunderjr/pangya-rs/issues/10) | |
+| 11 | Rare shop, Papel, scratchy, memorial, lootbox | ⬜ | [#13](https://github.com/thunderjr/pangya-rs/issues/13) [#4](https://github.com/thunderjr/pangya-rs/issues/4) | Needs rank 5 first |
+| 12 | Quests `0x0151`–`0x0154` | 🟡 | [#8](https://github.com/thunderjr/pangya-rs/issues/8) | Honest empty state served (blocker 33); no mutable quest records |
+| 13 | Achievements `0x0157`, `0x021d`, `0x021e` | ⛔ | [#9](https://github.com/thunderjr/pangya-rs/issues/9) | Gap analysis trap 5.8 unresolved |
+| 14 | Cards and character mastery | ⬜ | [#5](https://github.com/thunderjr/pangya-rs/issues/5) [#17](https://github.com/thunderjr/pangya-rs/issues/17) | `E4` and part of `E2` |
+| 15 | Events and Grand Prix | ⬜ | [#16](https://github.com/thunderjr/pangya-rs/issues/16) | See [`protocol/US852_TOURNAMENT_MODE.md`](protocol/US852_TOURNAMENT_MODE.md) |
+| 16 | Personal shop, club workshop, rentals, guilds, MyRoom furniture/UCC | ⛔ | [#14](https://github.com/thunderjr/pangya-rs/issues/14) [#18](https://github.com/thunderjr/pangya-rs/issues/18) [#26](https://github.com/thunderjr/pangya-rs/issues/26) [#15](https://github.com/thunderjr/pangya-rs/issues/15) [#11](https://github.com/thunderjr/pangya-rs/issues/11) | Deferred on evidence, not effort |
+| — | Rings `0x015d` | 🔬 | [#25](https://github.com/thunderjr/pangya-rs/issues/25) | Opcode exists in two sources; no source documents the body |
+
+### 4.1 GitHub issue ledger — 2026-08-09 protocol-compliance audit
+
+Filed from a full opcode diff of the Rust dispatch against every repo in
+`opensource-references/`. [#30](https://github.com/thunderjr/pangya-rs/issues/30) is the
+umbrella: work breakdown, which reference to trust for what, the cross-reference
+disagreements that need live captures, and the compliance definition (every documented
+opcode is handled, client-safely refused, or deliberately ignored with a documented reason).
+
+| Area | Issues |
+|---|---|
+| Gameplay-visible | [#1](https://github.com/thunderjr/pangya-rs/issues/1) in-match relays · [#2](https://github.com/thunderjr/pangya-rs/issues/2) room settings/management · [#3](https://github.com/thunderjr/pangya-rs/issues/3) equipment wiring · [#24](https://github.com/thunderjr/pangya-rs/issues/24) match flow · [#29](https://github.com/thunderjr/pangya-rs/issues/29) **bug:** unreachable `0x0033` crash-report handler |
+| Economy | [#4](https://github.com/thunderjr/pangya-rs/issues/4) shop · [#6](https://github.com/thunderjr/pangya-rs/issues/6) lockers · [#7](https://github.com/thunderjr/pangya-rs/issues/7) mail · [#13](https://github.com/thunderjr/pangya-rs/issues/13) gacha · [#14](https://github.com/thunderjr/pangya-rs/issues/14) player sale shops · [#20](https://github.com/thunderjr/pangya-rs/issues/20) Tiki/TP shop & recycling · [#26](https://github.com/thunderjr/pangya-rs/issues/26) consumables/rentals/inventory lifecycle |
+| Progression | [#5](https://github.com/thunderjr/pangya-rs/issues/5) cards · [#8](https://github.com/thunderjr/pangya-rs/issues/8) daily quests · [#9](https://github.com/thunderjr/pangya-rs/issues/9) achievements · [#10](https://github.com/thunderjr/pangya-rs/issues/10) login bonus · [#17](https://github.com/thunderjr/pangya-rs/issues/17) character stats/mastery · [#18](https://github.com/thunderjr/pangya-rs/issues/18) club workshop · [#19](https://github.com/thunderjr/pangya-rs/issues/19) caddies · [#28](https://github.com/thunderjr/pangya-rs/issues/28) tutorial |
+| Social & services | [#11](https://github.com/thunderjr/pangya-rs/issues/11) My Room/UCC · [#12](https://github.com/thunderjr/pangya-rs/issues/12) lobby chat & social · [#15](https://github.com/thunderjr/pangya-rs/issues/15) guilds · [#16](https://github.com/thunderjr/pangya-rs/issues/16) Grand Prix · [#21](https://github.com/thunderjr/pangya-rs/issues/21) message server |
+| Infrastructure | [#22](https://github.com/thunderjr/pangya-rs/issues/22) login gaps (ghost/reconnect/refusals) · [#23](https://github.com/thunderjr/pangya-rs/issues/23) session/topology utility opcodes · [#25](https://github.com/thunderjr/pangya-rs/issues/25) effect-item activations · [#27](https://github.com/thunderjr/pangya-rs/issues/27) GM suite |
+| Tracking | [#30](https://github.com/thunderjr/pangya-rs/issues/30) umbrella |
 
 ---
 
@@ -287,7 +309,8 @@ Newest first. Every claim of real-client acceptance in this repository traces to
 
 **Scripts** (`../scripts/`): `grant-balance.sh` (wraps the audited `account grant`),
 `second-seat.sh`, `sync-client-shop.sh` + `author-client-iff.py` + `extract-client-iff.py`
-(client shop authoring), `check-proprietary-assets.sh` (CI guard), `tailnet-forward.py`,
+(client shop authoring), `publish-shop.sh` (the worker that authors what the console queues —
+PATCH-009), `check-proprietary-assets.sh` (CI guard), `tailnet-forward.py`,
 `windows/pangya-client.ps1`.
 
 **Patches** (`../patches/`): the Rugburn `AllowMultipleInstances` patch moved to
