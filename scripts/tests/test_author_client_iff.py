@@ -210,6 +210,33 @@ class AuthorClientIffTests(unittest.TestCase):
             with self.assertRaisesRegex(author.AuthorError, "refusing to invent"):
                 author.author_archive(source, root / "custom.iff", managed, offers)
 
+    def test_a_bare_points_row_authors_to_a_listed_pang_row(self) -> None:
+        """A ``0x01`` row must not clear to ``0x00``.
+
+        ``0x00`` is the disabled encoding, so clearing the nibble unlists the row while the run
+        still reports it as an offer. The U.S. 851 tables carry 956 rows shaped this way — the
+        whole-catalog case loses every one of them without this. ``0x02`` is used because it
+        appears verbatim on 936 pristine rows, so the client is known to render it.
+        """
+        self.assertEqual(author.pang_shop_flag(0x01, "ClubSet.iff", 0x10000001), 0x02)
+
+    def test_a_points_row_with_a_display_nibble_keeps_its_evidenced_conversion(self) -> None:
+        # 0x21 -> 0x20 is what a real client was proven to render; widening the bare case must
+        # not disturb it. See docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md.
+        self.assertEqual(author.pang_shop_flag(0x21, "Ball.iff", 0x14000000), 0x20)
+        self.assertEqual(author.pang_shop_flag(0x61, "Part.iff", 0x08000800), 0x60)
+
+    def test_pang_rows_are_left_exactly_as_they_are(self) -> None:
+        for flag in (0x02, 0x20, 0x22, 0x60, 0x62):
+            self.assertEqual(author.pang_shop_flag(flag, "Item.iff", 0x18000000), flag)
+
+    def test_an_unknown_currency_nibble_is_still_refused(self) -> None:
+        # 0x06 and 0x03 both occur in the pristine U.S. tables (297 and 1 rows). Guessing at
+        # them is exactly what this script exists not to do.
+        for flag in (0x06, 0x03):
+            with self.assertRaisesRegex(author.AuthorError, "unsupported shop currency"):
+                author.pang_shop_flag(flag, "Part.iff", 0x08000800)
+
 
 if __name__ == "__main__":
     unittest.main()

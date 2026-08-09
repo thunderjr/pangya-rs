@@ -167,12 +167,27 @@ def pang_shop_flag(original: int, table: str, type_id: int) -> int:
     while ``0`` and ``2`` are the non-tradeable and tradeable Pang forms. The upper nibble
     controls sale/display state, so converting an existing Points row clears only its currency
     nibble. Unknown forms are refused rather than guessed.
+
+    One degenerate case has to be handled separately. Clearing the nibble of a bare ``0x01``
+    yields ``0x00`` — which is not "Pang, non-tradeable" but the *disabled* encoding this very
+    script writes to unlist a row, and which ``pangya-data`` reads as "not sold". A row authored
+    that way is silently dropped from the shop instead of being repriced, and the run reports it
+    as a successful offer. That is not hypothetical: the U.S. 851 tables carry **956** such rows,
+    so authoring the whole catalog loses every one of them.
+
+    Those rows become ``0x02`` — Pang, tradeable, upper nibble still zero. This is not a guess:
+    ``0x02`` appears verbatim on **936** rows of the pristine U.S. tables, so it is a byte the
+    retail client already renders. Rows whose upper nibble is non-zero keep the previously
+    evidenced behaviour exactly (``0x21`` → ``0x20``, per
+    ``docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md``), so this widens the function without
+    disturbing anything already proven in front of a client.
     """
     currency = original & SHOP_CURRENCY_MASK
     if currency in (SHOP_CURRENCY_PANG_NONTRADEABLE, SHOP_CURRENCY_PANG_TRADEABLE):
         return original
     if currency == SHOP_CURRENCY_POINTS:
-        return original & ~SHOP_CURRENCY_MASK
+        cleared = original & ~SHOP_CURRENCY_MASK
+        return cleared if cleared != 0 else SHOP_CURRENCY_PANG_TRADEABLE
     raise AuthorError(
         f"{table} type {type_id:#010x} has unsupported shop currency nibble {currency:#x}"
     )
@@ -206,6 +221,15 @@ def author_table(data: bytes, table: str, offers: list[Offer]) -> tuple[bytes, l
                 "refusing to invent its metadata"
             )
         authored_flag = pang_shop_flag(original_flag, table, offer.type_id)
+        # A zero flag is the disabled encoding. Reaching it here would mean the run reports a
+        # successful offer for a row the client will not list and the server will not sell —
+        # the exact silent failure that hid 956 lost rows before `pang_shop_flag` handled the
+        # bare-0x01 case. Refuse instead of writing a lie into the report.
+        if authored_flag == 0:
+            raise AuthorError(
+                f"{table} type {offer.type_id:#010x} would author to a disabled shop flag "
+                f"(original {original_flag:#04x}); refusing to report it as an offer"
+            )
         struct.pack_into("<I", output, start + PRICE_OFFSET, offer.pang)
         output[start + SHOP_FLAG_OFFSET] = authored_flag
         report.append(
