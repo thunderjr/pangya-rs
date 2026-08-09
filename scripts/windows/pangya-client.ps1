@@ -55,7 +55,7 @@ public class PangyaClient {
   [DllImport("user32.dll")] static extern short VkKeyScan(char c);
   [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint type);
 
-  const uint MOVE=0x0001, LDOWN=0x0002, LUP=0x0004;
+  const uint MOVE=0x0001, LDOWN=0x0002, LUP=0x0004, RDOWN=0x0008, RUP=0x0010;
   const uint KEYUP=0x0002, SCANCODE=0x0008;
   const uint SWP_NOSIZE=0x0001, SWP_NOZORDER=0x0004;
 
@@ -101,12 +101,22 @@ public class PangyaClient {
 
   public static void Tap() { Mouse(LDOWN,0,0); Thread.Sleep(120); Mouse(LUP,0,0); Thread.Sleep(300); }
   public static void Click(int cx, int cy) { Goto(cx, cy); Tap(); }
+  public static void RightClick(int cx, int cy) {
+    Goto(cx, cy); Mouse(RDOWN,0,0); Thread.Sleep(120); Mouse(RUP,0,0); Thread.Sleep(300);
+  }
   // A double click must land inside the OS double-click time (500 ms by default). Tap()'s
   // trailing settle delay pushed the second press past it, so the list row only ever selected.
   public static void DoubleClick(int cx, int cy) {
     Goto(cx, cy);
     Mouse(LDOWN,0,0); Thread.Sleep(40); Mouse(LUP,0,0); Thread.Sleep(60);
     Mouse(LDOWN,0,0); Thread.Sleep(40); Mouse(LUP,0,0); Thread.Sleep(400);
+  }
+
+  public static void Drag(int fromX, int fromY, int toX, int toY) {
+    Goto(fromX, fromY);
+    Mouse(LDOWN,0,0); Thread.Sleep(250);
+    Mouse(MOVE,toX-fromX,toY-fromY); Thread.Sleep(500);
+    Mouse(LUP,0,0); Thread.Sleep(500);
   }
 
   static void Key(ushort scan, bool shift, bool up) {
@@ -381,6 +391,20 @@ function Invoke-PangyaDoubleClick {
   [PangyaClient]::DoubleClick($X, $Y)
 }
 
+function Invoke-PangyaRightClick {
+  param([int]$X, [int]$Y)
+  Dismiss-PangyaNotice | Out-Null
+  Confirm-PangyaAnchor
+  [PangyaClient]::RightClick($X, $Y)
+}
+
+function Invoke-PangyaDrag {
+  param([int]$FromX, [int]$FromY, [int]$ToX, [int]$ToY)
+  Dismiss-PangyaNotice | Out-Null
+  Confirm-PangyaAnchor
+  [PangyaClient]::Drag($FromX, $FromY, $ToX, $ToY)
+}
+
 function Send-PangyaText { param([string]$Text) [PangyaClient]::Text($Text) }
 
 # ---- Screen recognition -------------------------------------------------------------------
@@ -565,6 +589,11 @@ $script:NickField      = @(407,217)
 $script:NickConfirm    = @(528,217)
 $script:NickYes        = @(353,371)
 $script:ShopButton      = @(224,565)
+$script:MyRoomButton    = @(290,565)
+$script:StartGameButton = @(108,570)
+$script:MakeRoomButton  = @(620,66)
+$script:RoomConfirm     = @(520,479)
+$script:RoomStart       = @(602,463)
 $script:ShopFirstCart   = @(556,224)
 $script:ShopBuyConfirm  = @(351,502)
 $script:ShopSureConfirm = @(351,363)
@@ -572,6 +601,10 @@ $script:ShopTabs = @{
   'Clothes' = @(483,96); 'Item' = @(530,96)
   'Accessories' = @(626,130); 'ClubSets' = @(425,130)
   'Comet' = @(482,130); 'ActiveItems' = @(544,130)
+}
+$script:MyRoomTabs = @{
+  'Clothes' = @(429,96); 'Item' = @(482,96)
+  'ClubSets' = @(431,130); 'Comet' = @(482,130); 'ActiveItems' = @(544,130)
 }
 
 # ---- Flows --------------------------------------------------------------------------------
@@ -686,6 +719,167 @@ function Select-PangyaShopCategory {
     Invoke-PangyaClick @position
     Start-Sleep -Milliseconds 700
   }
+}
+
+# Opens My Room and selects named inventory tabs. Keeping this next to the shop helpers captures
+# another learned client pattern instead of scattering raw coordinates through evidence commands.
+function Open-PangyaMyRoom {
+  Invoke-PangyaClick @script:MyRoomButton
+  if (-not (Wait-PangyaText -X 405 -Y 88 -Width 145 -Height 18 -TimeoutSeconds 15)) {
+    throw 'My Room tabs did not render'
+  }
+}
+
+function Select-PangyaMyRoomCategory {
+  param(
+    [ValidateSet('Clothes','Item')][string]$Top,
+    [ValidateSet('ClubSets','Comet','ActiveItems')][string]$Sub
+  )
+  if ($Top) {
+    $position = $script:MyRoomTabs[$Top]
+    Invoke-PangyaClick @position
+    Start-Sleep -Milliseconds 700
+  }
+  if ($Sub) {
+    $position = $script:MyRoomTabs[$Sub]
+    Invoke-PangyaClick @position
+    Start-Sleep -Milliseconds 700
+  }
+}
+
+# Selects one visible My Room inventory tile. The client only sends the resulting `0x0020`
+# equipment updates when My Room CLOSES; double-clicking does not commit. Rows are 93 pixels high,
+# the two icon columns are 195 pixels apart. Use -Commit for the complete learned interaction.
+function Set-PangyaMyRoomItem {
+  param(
+    [ValidateRange(0,1)][int]$Column = 0,
+    [ValidateRange(0,3)][int]$Row = 0,
+    [switch]$ToggleEquipment,
+    [switch]$Commit
+  )
+  $x = 430 + 195 * $Column
+  $y = 193 + 93 * $Row
+  Invoke-PangyaClick $x $y
+  Start-Sleep -Milliseconds 700
+  # Club sets expose a small equip toggle between the two inventory columns; merely selecting the
+  # tile changes the preview but not the equipped club.
+  if ($ToggleEquipment) {
+    Invoke-PangyaClick 597 ($y + 15)
+    Start-Sleep -Milliseconds 700
+  }
+  if ($Commit) { Close-PangyaMyRoom }
+}
+
+function Close-PangyaMyRoom {
+  Invoke-PangyaClick 783 55
+  Start-Sleep -Seconds 2
+}
+
+# Opens the multiplayer directory, creates the client's default two-seat versus room, and starts
+# it once the second seat reports Ready. The server advertises its configured one-hole course in
+# the created room even though the dialog defaults to three holes.
+function Open-PangyaMultiplay {
+  Invoke-PangyaClick @script:StartGameButton
+  Start-Sleep -Seconds 2
+}
+
+function New-PangyaDefaultVersusRoom {
+  param([switch]$LongTimer)
+  Invoke-PangyaClick @script:MakeRoomButton
+  Start-Sleep -Seconds 1
+  if ($LongTimer) { Invoke-PangyaClick 383 335 } # 120 seconds instead of the 40-second default
+  Invoke-PangyaClick @script:RoomConfirm
+  Start-Sleep -Seconds 2
+}
+
+function Start-PangyaRoomMatch {
+  # DirectInput occasionally drops a click. Repeating this coordinate is harmless once loading
+  # begins and avoids losing the whole short room timer to one missed Start press.
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    Invoke-PangyaClick @script:RoomStart
+    Start-Sleep -Seconds 1
+  }
+  Start-Sleep -Seconds 5
+}
+
+# Drives the three-space PangYa shot meter: start, choose power, then choose impact. Delays are
+# tunable because club/control stats change meter speed; the defaults make a legal stroke rather
+# than aiming for a perfect shot.
+function Invoke-PangyaShotMeter {
+  param([int]$PowerDelayMs = 800, [int]$ImpactDelayMs = 800)
+  Send-PangyaText ' '
+  Start-Sleep -Milliseconds $PowerDelayMs
+  Send-PangyaText ' '
+  Start-Sleep -Milliseconds $ImpactDelayMs
+  Send-PangyaText ' '
+  Start-Sleep -Seconds 5
+}
+
+# A fixed delay is sensitive to club/control stats. This variant observes the meter's moving
+# vertical marker against a baseline image, commits power after it reaches the requested column,
+# then commits impact when it returns to the pink zone. Coordinates are client-area pixels.
+function Invoke-PangyaObservedShotMeter {
+  param([int]$PowerX = 400, [int]$ImpactX = 145, [int]$TimeoutMs = 4000)
+  Add-Type -AssemblyName System.Drawing
+  $origin = Get-PangyaOrigin
+  $left = 105; $top = 534; $width = 410; $height = 22
+  function Capture-Bar {
+    $bitmap = New-Object System.Drawing.Bitmap $width, $height
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.CopyFromScreen($origin.X + $left, $origin.Y + $top, 0, 0, $bitmap.Size)
+    $graphics.Dispose()
+    return $bitmap
+  }
+  function Find-Marker([System.Drawing.Bitmap]$baseline) {
+    $frame = Capture-Bar
+    $bestX = -1; $best = 0
+    for ($x = 2; $x -lt $width - 2; $x++) {
+      $score = 0
+      for ($y = 0; $y -lt $height; $y++) {
+        $a = $baseline.GetPixel($x, $y); $b = $frame.GetPixel($x, $y)
+        if ([Math]::Abs($a.R-$b.R) + [Math]::Abs($a.G-$b.G) + [Math]::Abs($a.B-$b.B) -gt 100) {
+          $score++
+        }
+      }
+      if ($score -gt $best) { $best = $score; $bestX = $x }
+    }
+    $frame.Dispose()
+    if ($best -lt 3) { return -1 }
+    return ($left + $bestX)
+  }
+
+  $baseline = Capture-Bar
+  try {
+    Send-PangyaText ' '
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $powerCommitted = $false
+    while ((Get-Date) -lt $deadline) {
+      $marker = Find-Marker $baseline
+      if ($marker -ge $PowerX) {
+        Send-PangyaText ' '
+        $powerCommitted = $true
+        break
+      }
+      Start-Sleep -Milliseconds 15
+    }
+    if (-not $powerCommitted) { throw 'shot meter never reached the requested power' }
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $impactCommitted = $false
+    while ((Get-Date) -lt $deadline) {
+      $marker = Find-Marker $baseline
+      if ($marker -ge 0 -and $marker -le $ImpactX) {
+        Send-PangyaText ' '
+        $impactCommitted = $true
+        break
+      }
+      Start-Sleep -Milliseconds 15
+    }
+    if (-not $impactCommitted) { throw 'shot meter never returned to the impact zone' }
+  } finally {
+    $baseline.Dispose()
+  }
+  Start-Sleep -Seconds 5
 }
 
 # Purchases the first visible shop cell. The U.S. 852 client requires TWO distinct confirmation

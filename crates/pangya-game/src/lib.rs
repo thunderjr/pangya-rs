@@ -69,22 +69,23 @@ use pangya_protocol::{
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailClientException, RetailEquipment, RetailEquipmentSlot, RetailEquipmentUpdate,
-    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailLoadProgress,
-    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
-    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
-    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
-    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
-    RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem,
-    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
-    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
-    RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin,
-    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd,
-    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailClientException, RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
+    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
+    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLockerCombinationAttempt,
+    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
+    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
+    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
+    RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
+    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
+    RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
+    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -1206,7 +1207,9 @@ where
         // authenticated transport and retain a bounded salt+payload replay window: an exact frame
         // replay reuses its commit, while a later intentional purchase (new salt) is a new command.
         let retail_purchase_scope = uuid::Uuid::new_v4();
-        let mut retail_purchase_replays = RetailPurchaseReplayWindow::new();
+        let mut retail_purchase_replays = RetailWireReplayWindow::new();
+        let retail_equipment_scope = uuid::Uuid::new_v4();
+        let mut retail_equipment_replays = RetailWireReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
@@ -1376,18 +1379,33 @@ where
                             } else if self.config.retail_bootstrap
                                 && frame.opcode == RetailEquipmentUpdate::OPCODE
                             {
-                                let Some(established) = identity.as_ref() else {
+                                let Some(established) = identity.as_mut() else {
                                     break Err(GameRuntimeError::Protocol);
                                 };
-                                if let Err(error) = self
+                                let payload_digest: [u8; 32] = Sha256::digest(&frame.payload).into();
+                                let equipment_sequence = retail_equipment_replays
+                                    .sequence(frame.metadata.salt, payload_digest);
+                                match self
                                     .handle_retail_equipment_update(
                                         &mut framed,
                                         established.account_id,
                                         &frame.payload,
+                                        retail_equipment_scope,
+                                        equipment_sequence,
                                     )
                                     .await
                                 {
-                                    break Err(error);
+                                    Ok(Some(card)) => {
+                                        established.character_id = CharacterId::new(
+                                            i64::from(card.character_uid),
+                                        )
+                                        .ok();
+                                        established.character_iff_id =
+                                            Some(card.character_iff_id).filter(|value| *value != 0);
+                                        established.card = card;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => break Err(error),
                                 }
                             } else if self.config.retail_bootstrap
                                 && frame.opcode == RetailPurchaseRequest::OPCODE
@@ -5152,68 +5170,240 @@ where
         }
     }
 
-    /// Answers an equipment change with the equipment this server actually holds.
+    /// Applies the retail character/ball updates this server can persist and reports stored state.
     ///
-    /// A real client sends this repeatedly the moment My Room opens, and leaving it unanswered
-    /// drops the session. What it deliberately does *not* do is acknowledge the requested change:
-    /// character parts, caddies, consumables and decoration have no durable representation here,
-    /// so echoing the request back would report a change that was never stored and contradict
-    /// itself on the next login. Reporting the stored state instead is accurate, and a client
-    /// that asked for something this server cannot keep simply sees it revert.
+    /// A real client sends `0x0020` repeatedly in My Room. Character parts, caddies, consumables
+    /// and decoration still have no durable aggregate here, so those requests revert to the stored
+    /// zero/current projection rather than being falsely acknowledged. Character and Ball use the
+    /// same owned/catalog-validated optimistic equipment transaction as synthetic M7.
     async fn handle_retail_equipment_update(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         account_id: AccountId,
         payload: &[u8],
-    ) -> Result<(), GameRuntimeError> {
+        operation_scope: uuid::Uuid,
+        operation_sequence: u64,
+    ) -> Result<Option<MemberCard>, GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         let request =
             decode_packet_payload::<RetailEquipmentUpdate>(payload, profile, ServiceKind::Game)
                 .map_err(|_| GameRuntimeError::Protocol)?;
+        tracing::debug!(
+            slot = ?request.slot,
+            requested = ?request.requested,
+            "retail equipment update decoded"
+        );
         // Character parts and the two unclassified slots have no reply this server can form
         // honestly, so they are accepted and left alone rather than answered with a guess.
-        let reply = match request.slot {
-            RetailEquipmentSlot::CharacterParts
-            | RetailEquipmentSlot::UnknownEight
-            | RetailEquipmentSlot::UnknownNine => {
+        let reply = match request.requested {
+            RetailEquipmentRequested::CharacterParts
+            | RetailEquipmentRequested::UnknownEight(_)
+            | RetailEquipmentRequested::UnknownNine { .. } => {
                 self.observer.unknown(GameUnknownObservation::Ignored);
-                return Ok(());
+                return Ok(None);
             }
-            RetailEquipmentSlot::Caddie => RetailEquipmentUpdated::Caddie { caddie_id: 0 },
-            RetailEquipmentSlot::Consumables => RetailEquipmentUpdated::Consumables {
+            RetailEquipmentRequested::Caddie(_) => RetailEquipmentUpdated::Caddie { caddie_id: 0 },
+            RetailEquipmentRequested::Consumables(_) => RetailEquipmentUpdated::Consumables {
                 item_type_ids: [0; pangya_protocol::RETAIL_CONSUMABLE_SLOTS],
             },
-            RetailEquipmentSlot::Decoration => {
+            RetailEquipmentRequested::Decoration(_) => {
                 RetailEquipmentUpdated::Decoration { type_ids: [0; 6] }
             }
-            RetailEquipmentSlot::Ball | RetailEquipmentSlot::Character => {
-                let snapshot = self
+            RetailEquipmentRequested::BallAndClub {
+                ball_type_id,
+                club_item_id: _,
+            }
+            | RetailEquipmentRequested::Character(ball_type_id) => {
+                let Some(economy) = self.config.economy else {
+                    return Err(GameRuntimeError::Catalog);
+                };
+                let mut snapshot = self
                     .repository
                     .load_player_snapshot(account_id)
                     .await
                     .map_err(|_| GameRuntimeError::Snapshot)?;
+                let mut character_id = snapshot.equipment.character_id;
+                let mut ball_item_id = snapshot.equipment.ball_item_id;
+                let mut club_item_id = snapshot.equipment.club_item_id;
+                let mut valid = true;
+                let requested_aux = match request.requested {
+                    RetailEquipmentRequested::BallAndClub {
+                        ball_type_id: 0,
+                        club_item_id: raw_club,
+                    } => {
+                        ball_item_id = None;
+                        club_item_id = InventoryItemId::new(i64::from(raw_club)).ok();
+                        raw_club
+                    }
+                    RetailEquipmentRequested::BallAndClub {
+                        ball_type_id: type_id,
+                        club_item_id: raw_club,
+                    } => {
+                        ball_item_id = snapshot
+                            .inventory
+                            .iter()
+                            .find(|item| {
+                                item.item_type_id.get() == type_id
+                                    && self
+                                        .catalog
+                                        .item_definition(item.item_type_id)
+                                        .is_some_and(|definition| definition.kind == ItemKind::Ball)
+                            })
+                            .map(|item| item.id);
+                        club_item_id = InventoryItemId::new(i64::from(raw_club)).ok();
+                        valid = ball_item_id.is_some();
+                        raw_club
+                    }
+                    RetailEquipmentRequested::Character(raw_id) => {
+                        if let Ok(requested) = CharacterId::new(i64::from(raw_id)) {
+                            character_id = requested;
+                            valid = snapshot
+                                .characters
+                                .iter()
+                                .any(|character| character.id == character_id);
+                        } else {
+                            valid = false;
+                        }
+                        0
+                    }
+                    _ => return Err(GameRuntimeError::Protocol),
+                };
+
+                let selector = |id: Option<InventoryItemId>, expected: ItemKind| {
+                    id.and_then(|inventory_id| {
+                        snapshot
+                            .inventory
+                            .iter()
+                            .find(|item| item.id == inventory_id)
+                            .and_then(|item| {
+                                self.catalog.item_definition(item.item_type_id).and_then(
+                                    |definition| {
+                                        (definition.kind == expected).then_some(
+                                            EconomyItemSelector {
+                                                inventory_id,
+                                                definition: *definition,
+                                            },
+                                        )
+                                    },
+                                )
+                            })
+                    })
+                };
+                let club = selector(club_item_id, ItemKind::ClubSet);
+                let ball = selector(ball_item_id, ItemKind::Ball);
+                if matches!(
+                    request.requested,
+                    RetailEquipmentRequested::BallAndClub { .. }
+                ) {
+                    valid &= club.is_some();
+                }
+                let changed = match request.requested {
+                    RetailEquipmentRequested::BallAndClub { .. } => {
+                        ball_item_id != snapshot.equipment.ball_item_id
+                            || club_item_id != snapshot.equipment.club_item_id
+                    }
+                    RetailEquipmentRequested::Character(_) => {
+                        character_id != snapshot.equipment.character_id
+                    }
+                    _ => false,
+                };
+
+                if valid && changed {
+                    let character = snapshot
+                        .characters
+                        .iter()
+                        .find(|value| value.id == character_id)
+                        .ok_or(GameRuntimeError::Snapshot)?;
+                    let operation_id = retail_equipment_operation_id(
+                        account_id,
+                        request.slot,
+                        ball_type_id,
+                        requested_aux,
+                        operation_scope,
+                        operation_sequence,
+                    );
+                    match timeout(
+                        economy.command_timeout,
+                        self.repository.equip(EquipmentChange {
+                            account_id,
+                            operation_id,
+                            catalog: self.catalog.fingerprint(),
+                            expected_version: snapshot.equipment.version,
+                            character_id,
+                            character_type_id: character.item_type_id,
+                            club,
+                            ball,
+                        }),
+                    )
+                    .await
+                    {
+                        Err(_) => return Err(GameRuntimeError::Timeout),
+                        Ok(Err(
+                            EconomyError::ArithmeticOverflow
+                            | EconomyError::CorruptData
+                            | EconomyError::Storage(_),
+                        )) => return Err(GameRuntimeError::EconomyPersistence),
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, "retail equipment update reverted");
+                        }
+                        Ok(Ok(EconomyCommit::Committed(_) | EconomyCommit::Replayed(_))) => {
+                            snapshot = self
+                                .repository
+                                .load_player_snapshot(account_id)
+                                .await
+                                .map_err(|_| GameRuntimeError::Snapshot)?;
+                        }
+                    }
+                } else if !valid {
+                    tracing::debug!(
+                        ball_type_id,
+                        requested_aux,
+                        "retail equipment item is not owned"
+                    );
+                }
+
                 if request.slot == RetailEquipmentSlot::Character {
                     RetailEquipmentUpdated::Character {
                         character_id: u32::try_from(snapshot.equipment.character_id.get())
                             .unwrap_or(0),
                     }
                 } else {
-                    let ball = snapshot.equipment.ball_item_id.and_then(|id| {
-                        snapshot
-                            .inventory
-                            .iter()
-                            .find(|item| item.id == id)
-                            .map(|item| (id.get(), item.item_type_id.get()))
-                    });
-                    let (item_id, item_type_id) = ball.unwrap_or((0, 0));
-                    RetailEquipmentUpdated::Ball {
-                        item_id: u32::try_from(item_id).unwrap_or(0),
-                        item_type_id,
-                    }
+                    let ball_type_id = snapshot
+                        .equipment
+                        .ball_item_id
+                        .and_then(|id| {
+                            snapshot
+                                .inventory
+                                .iter()
+                                .find(|item| item.id == id)
+                                .map(|item| item.item_type_id.get())
+                        })
+                        .unwrap_or(0);
+                    let club_item_id = snapshot
+                        .equipment
+                        .club_item_id
+                        .and_then(|id| u32::try_from(id.get()).ok())
+                        .unwrap_or(0);
+                    let reply = RetailEquipmentUpdated::BallAndClub {
+                        ball_type_id,
+                        club_item_id,
+                    };
+                    self.send(framed, &reply).await?;
+                    return Ok(Some(member_card(&snapshot)));
                 }
             }
         };
-        self.send(framed, &reply).await
+        self.send(framed, &reply).await?;
+        if matches!(request.slot, RetailEquipmentSlot::Character) {
+            let snapshot = self
+                .repository
+                .load_player_snapshot(account_id)
+                .await
+                .map_err(|_| GameRuntimeError::Snapshot)?;
+            Ok(Some(member_card(&snapshot)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Buys the items a real client's shop asked for, priced from this server's catalog.
@@ -5601,6 +5791,14 @@ where
                     .await?;
                 Ok(state)
             }
+            (GameState::InRoom, RETAIL_C2S_LOUNGE_ACTION) => {
+                // The room UI emits this for avatar-stage clicks. Pangbox relays rotations as
+                // `0x00c4`; ignoring the cosmetic action is honest until that projection exists,
+                // and prevents one missed Start-button click from becoming a protocol disconnect
+                // (`pangbox/server`, `game/server/conn.go:224-231`).
+                self.observer.unknown(GameUnknownObservation::Ignored);
+                Ok(state)
+            }
             (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE) => {
                 self.lobby
                     .leave(identity.connection_id)
@@ -5775,10 +5973,24 @@ where
 
         let mut inventory = Vec::with_capacity(snapshot.inventory.len());
         for item in &snapshot.inventory {
+            let class = match self
+                .catalog
+                .item_definition(item.item_type_id)
+                .map(|definition| definition.kind)
+            {
+                Some(ItemKind::ClubSet | ItemKind::Ball) => RetailInventoryClass::Equipment,
+                Some(ItemKind::Consumable) => RetailInventoryClass::Consumable,
+                Some(ItemKind::CharacterPart) => RetailInventoryClass::Miscellaneous,
+                Some(ItemKind::Character) | None => return Err(GameRuntimeError::Catalog),
+            };
             let mut writer = PacketWriter::default();
-            writer.u32_le(narrow(item.id.get())?);
-            writer.u32_le(item.item_type_id.get());
-            writer.u32_le(item.quantity);
+            RetailInventoryItem {
+                item_id: narrow(item.id.get())?,
+                item_type_id: item.item_type_id.get(),
+                quantity: item.quantity,
+                class,
+            }
+            .encode_body(&mut writer);
             inventory.push(writer.into_inner());
         }
         self.send_container(framed, IffContainerKind::Inventory, inventory)
@@ -6386,12 +6598,12 @@ const RETAIL_PURCHASE_REPLAY_WINDOW: usize = 128;
 /// while retaining an exact frame replay long enough to cover transport retries. Bounded storage
 /// prevents an authenticated client from growing per-connection state without limit.
 #[derive(Debug)]
-struct RetailPurchaseReplayWindow {
+struct RetailWireReplayWindow {
     next_sequence: u64,
     entries: VecDeque<(u8, [u8; 32], u64)>,
 }
 
-impl RetailPurchaseReplayWindow {
+impl RetailWireReplayWindow {
     fn new() -> Self {
         Self {
             next_sequence: 1,
@@ -6413,6 +6625,29 @@ impl RetailPurchaseReplayWindow {
         self.entries.push_back((salt, payload_digest, sequence));
         sequence
     }
+}
+
+/// Derives a stable operation key for one retail equipment frame.
+fn retail_equipment_operation_id(
+    account_id: AccountId,
+    slot: RetailEquipmentSlot,
+    requested: u32,
+    requested_aux: u32,
+    operation_scope: uuid::Uuid,
+    operation_sequence: u64,
+) -> EconomyOperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"retail-equipment");
+    hasher.update(operation_scope.as_bytes());
+    hasher.update(account_id.get().to_le_bytes());
+    hasher.update(operation_sequence.to_le_bytes());
+    hasher.update([slot.tag()]);
+    hasher.update(requested.to_le_bytes());
+    hasher.update(requested_aux.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    EconomyOperationId::new(uuid::Uuid::from_bytes(bytes))
 }
 
 /// Derives a stable economy operation key for one retail purchase line.
@@ -6529,6 +6764,8 @@ const RETAIL_C2S_ROOM_READY: u16 = 0x000d;
 /// Retail room-edit client opcode. The client sends it whenever the room master touches the
 /// room's settings, and it sends one on the way into a match.
 const RETAIL_C2S_ROOM_EDIT: u16 = 0x000a;
+/// Cosmetic lounge/avatar action sent by clicks in the room's character stage.
+const RETAIL_C2S_LOUNGE_ACTION: u16 = 0x0063;
 const RETAIL_C2S_START_MATCH: u16 = 0x000e;
 const RETAIL_C2S_HOLE_LOAD_FINISHED: u16 = 0x0011;
 const RETAIL_C2S_SHOT_COMMIT: u16 = 0x0012;
@@ -6570,6 +6807,7 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
             | RETAIL_C2S_ROOM_LEAVE
             | RETAIL_C2S_ROOM_READY
             | RETAIL_C2S_ROOM_EDIT
+            | RETAIL_C2S_LOUNGE_ACTION
             | RETAIL_C2S_MULTIPLAYER_JOIN
             | RETAIL_C2S_MULTIPLAYER_LEAVE
     )
@@ -6750,7 +6988,7 @@ mod tests {
 
     #[test]
     fn retail_purchase_replay_window_reuses_only_exact_bounded_wire_keys() {
-        let mut window = RetailPurchaseReplayWindow::new();
+        let mut window = RetailWireReplayWindow::new();
         let digest = [0x42; 32];
         let first = window.sequence(7, digest);
         assert_eq!(window.sequence(7, digest), first, "exact frame replay");

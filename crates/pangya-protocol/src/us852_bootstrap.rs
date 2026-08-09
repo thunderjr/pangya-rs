@@ -412,6 +412,65 @@ impl IffContainerChunk {
     }
 }
 
+/// Exact width of one U.S. 852 `0x0073` inventory row.
+pub const RETAIL_INVENTORY_ENTRY_BYTES: usize = 196;
+
+/// Retail presentation class in an inventory row.
+///
+/// # Provenance
+///
+/// `opensource-references/pangbox--packetdoc/src/packets/gameservice/server/0073.ksy:30-59`
+/// documents the full row and observes class `1` for clubs/comets and class `5` for consumables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RetailInventoryClass {
+    /// Character parts and miscellaneous unique items.
+    Miscellaneous = 0,
+    /// Club sets and comets.
+    Equipment = 1,
+    /// Stackable active/passive items.
+    Consumable = 5,
+}
+
+/// One owned inventory row carried by server opcode `0x0073`.
+///
+/// The retail client strides 196 bytes per row. Sending only id/type/quantity makes it read the
+/// next row 184 bytes early, so bought equipment never appears correctly in My Room.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailInventoryItem {
+    /// Durable owner-local inventory id.
+    pub item_id: u32,
+    /// Catalog type id.
+    pub item_type_id: u32,
+    /// Owned quantity (`1` for one unique row).
+    pub quantity: u32,
+    /// Client presentation class.
+    pub class: RetailInventoryClass,
+}
+
+impl RetailInventoryItem {
+    /// Encodes the exact entry body embedded in [`IffContainerKind::Inventory`].
+    pub fn encode_body(&self, writer: &mut PacketWriter) {
+        let start = writer.as_slice().len();
+        writer.u32_le(self.item_id);
+        writer.u32_le(self.item_type_id);
+        writer.u32_le(0);
+        writer.u32_le(self.quantity);
+        writer.bytes(&[0; 7]);
+        writer.u8(self.class as u8);
+        writer.u32_le(0); // rental start
+        writer.u32_le(0);
+        writer.u32_le(0); // rental end
+        writer.u32_le(0);
+        writer.u8(2);
+        writer.bytes(&[0; 155]);
+        debug_assert_eq!(
+            writer.as_slice().len() - start,
+            RETAIL_INVENTORY_ENTRY_BYTES
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +588,26 @@ mod tests {
             assert_eq!(chunk.total_entries, 120);
             assert_eq!(chunk.opcode(), 0x0073);
         }
+    }
+
+    #[test]
+    fn retail_inventory_row_matches_packetdoc_stride_and_offsets() {
+        let item = RetailInventoryItem {
+            item_id: 0x1122_3344,
+            item_type_id: 0x1400_00c9,
+            quantity: 1,
+            class: RetailInventoryClass::Equipment,
+        };
+        let mut writer = PacketWriter::default();
+        item.encode_body(&mut writer);
+        let bytes = writer.into_inner();
+        assert_eq!(bytes.len(), RETAIL_INVENTORY_ENTRY_BYTES);
+        assert_eq!(&bytes[0..4], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0x1400_00c9_u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &1_u32.to_le_bytes());
+        assert_eq!(bytes[23], RetailInventoryClass::Equipment as u8);
+        assert_eq!(bytes[40], 2);
+        assert!(bytes[41..].iter().all(|value| *value == 0));
     }
 
     #[test]

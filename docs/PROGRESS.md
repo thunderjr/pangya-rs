@@ -133,7 +133,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
 | M5 — Solo first playable | 🟡 | Local synthetic one-hole solo finishes and persists exactly one reward; real-client hole remains open |
 | M6 — Multiplayer stroke | 🟡 | Local synthetic exactly-two one-hole flow and complete matrix pass; real two-client/Course acceptance remains open |
-| M7 — Inventory/shop depth | 🟡 | Real-client mounted-PAK catalog-priced purchase and restart retention pass; retail equip/consume/repair remain open |
+| M7 — Inventory/shop depth | 🟡 | Real-client mounted-PAK purchase plus ClubSet/Ball equip and restart retention pass; consume/repair remain open |
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
 
@@ -236,7 +236,7 @@ Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-t
 
 ## M7 — synthetic inventory, shop, and equipment
 
-**Status: 🟡 local synthetic exit complete; retail purchase accepted, equip/consume/repair gates open**
+**Status: 🟡 local synthetic exit complete; retail purchase/equipment accepted, consume/repair gates open**
 - [x] Add generated `0x7f40..=0x7f44` / `0x7fc0..=0x7fc5` layouts, 11 generated fixture/provenance pairs, and closed command/outcome discriminator validation.
 - [x] Make the immutable catalog the sole price, stack, durability, and repair-rate authority; the wire never carries a price, and catalog items that are not shop offers are refused.
 - [x] Add migration 0008 for the operation, currency, item, and equipment ledgers with exactly-once commits keyed by a client-chosen operation id that survives process restart.
@@ -248,9 +248,10 @@ Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-t
 - [x] Verify current compiled inventories: 74 game tests, 5 M7 protocol tests, 26 real-PostgreSQL Game E2E tests, 53 storage tests, and 27 server tests; workspace total 330 passed.
 - [x] Pass the local release matrix: format, strict Clippy, SQLx migrate/prepare with no drift, workspace/all-target/all-feature PostgreSQL tests, and the asset guard.
 - [x] Validate a catalog-priced purchase against the legally held U.S. client with legally supplied data: the client and server are generated from one authored archive, the mounted PAK displays four exact Pang offers, a 77-Pang Ball purchase commits, and balance/inventory survive restart.
-- [ ] Validate retail equip, consume, and repair behavior against that client; do not infer those gates from purchase acceptance.
+- [x] Validate owned/catalog-checked ClubSet and Ball equipment against the retail client: the exact 196-byte inventory row exposes purchased equipment, type `3` persists Ball type plus ClubSet row atomically, and My Room/room gear survive restart.
+- [ ] Validate retail consume and repair behavior against that client; do not infer those gates from purchase/equipment acceptance.
 
-Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md), [`protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](protocol/M7_SYNTHETIC_ECONOMY_FLOW.md), [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md), and [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md).
+Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md), [`protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](protocol/M7_SYNTHETIC_ECONOMY_FLOW.md), [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md), [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md), and [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md).
 
 ## Research proof ledger
 
@@ -280,7 +281,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 6. **Real M5 solo exit** — complete the evidence file's external 12-step gate for real Course/IFF interpretation and start/loading/action/result/finish/reward acceptance; never identify `0x7f20`/`0x7fa0` or `solo-v1` as retail behavior.
 7. **M6 local validation** — the complete format/Clippy/workspace/PostgreSQL/doc/SQLx/deny/asset/link/diff/fuzz matrix passed; preserve this evidence.
 8. **Real M6 two-client/Course exit** — complete the M6 evidence file's external gate with two legally held clients and legally supplied data; never identify `0x7f30`/`0x7fb0`, `stroke-two-v1`, generated standings, or record rules as retail behavior.
-9. **Real M7 economy exit** — mounted-PAK catalog-priced purchase and restart retention are verified; equip/consume/repair remain. Never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
+9. **Real M7 economy exit** — mounted-PAK purchase and owned/catalog-checked ClubSet/Ball equipment with restart retention are verified; consume/repair remain. Never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
 10. **Synthetic-to-retail protocol pivot** — the `0x7f**` families are placeholders no real client will ever send. Every M3–M7 real-client gate is blocked behind replacing them with layouts derived from the vendored PacketDoc definitions, and behind correcting the three M3 bootstrap opcodes whose current meanings disagree with PacketDoc (`0x0070`, `0x0072`, `0x004d`).
 11. **Client runtime host** — **resolved 2026-08-07.** The client runs on Windows 11 under QEMU/KVM with Rugburn, which identifies it as US 852 and patches GameGuard out. Two host prerequisites were found: the host must expose at least one audio device, and `IntegratedPak` must exist in the registry. Both are in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 12. **Undiagnosed storage flake** — `concurrent_stroke_matches_with_shared_accounts_are_deadlock_free` has failed once in CI with `MatchRepositoryError::Storage`, and passes on re-run. It did not reproduce in 67 isolated runs or in repeated full-suite runs under heavy contention, and a lock cycle is not reachable: both commits sort their account ids and take `FOR UPDATE` on the same shared profile row, so one simply waits. **Now instrumented rather than open**: `Storage` carries a classified `StorageFault`, so the next occurrence names its own cause in the panic message — `deadlock` and `serialization` would disprove the analysis above, `unexpected_row_count` or `write_verification` would move the fault to the repository's own invariants, and `insufficient_resources` or `pool_timed_out` would make it contention rather than a defect. No guess was committed; the recurrence now identifies itself.
@@ -305,11 +306,11 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Rather than keep finding these one client restart at a time, the remaining session-level chatter was enumerated from upstream's client opcode table and its handler bodies. Ten opcodes that upstream accepts and answers with nothing (online status, typing indicator, idle status, client exception reports, macro set, messenger list, and four unclassified ones) are now an explicit allowlist, `RETAIL_ACCEPTED_SESSION_OPCODES`. Room and match opcodes are deliberately excluded: those have real state handlers, and silently accepting one would hide a gap in them. The lobby is now stable under the shipped `unknown_opcode_policy = "disconnect"` rather than depending on a permissive policy.
 
-17. **Equipment update `0x0020` is unanswered** — **resolved 2026-08-08.** Opening My Room, the client sends this repeatedly, and three unanswered ones exhausted the unknown-opcode strike budget and dropped the connection, which the client reported as `Network error occured. (Error 10054)`.
+17. **Equipment update `0x0020` is unanswered** — **resolved 2026-08-08 and completed for minimum durable equipment 2026-08-09.** Opening My Room, the client sends this repeatedly, and three unanswered ones exhausted the unknown-opcode strike budget and dropped the connection, which the client reported as `Network error occured. (Error 10054)`.
 
-    It is a tagged union over eight equipment kinds. What this server sends back is the equipment it *actually holds*, not an acknowledgement of the requested change: character parts, caddies, consumables and decoration have no durable representation here, so echoing the request would report a change that was never stored and contradict itself on the next login. Reporting stored state is accurate, and a client that asks for something this server cannot keep simply sees it revert. Character parts and the two unclassified kinds are accepted without a reply, because none could be formed honestly.
+    It is a tagged union over eight equipment kinds. Character parts, caddies, consumables and decoration still have no durable representation here, so they report stored zero/current state rather than a change that was never committed. Character and type `3` now use the same optimistic owned/catalog-validated equipment transaction as M7. SuperSS-Dev revealed that type `3` is not only a Comet word as the older Pangbox model says: it carries Ball catalog id **and ClubSet inventory id together** (`GAME/channel.cpp:5233-5299`), and `0x006b` returns the same pair (`PACKET/packet_func_sv.cpp:4964-4970`).
 
-    My Room now opens and stays open under the shipped `unknown_opcode_policy = "disconnect"`.
+    A second wire defect sat in front of that acceptance: `0x0073` inventory rows are 196 bytes (`pangbox--packetdoc` `gameservice/server/0073.ksy:30-59`), while the server sent 12. The corrected row makes purchased Papel and Cobra equipment visible in My Room. The real client selected Cobra plus Papel, closing My Room committed one operation, PostgreSQL held ClubSet `310`/`0x10000061` and Ball `311`/`0x140000c9`, and restart/room gear retained both. Current-state frames are no-ops. See [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md).
 
 18. **The catalog yields no item definitions for real client data** — **resolved 2026-08-08.** The client-schema path parsed identity only and always set `definition: None`, so `shop_offers()` was empty and every purchase was refused for want of a price. Real client records do carry the item header `pangbox/server` (`pangya/iff/item.go`) documents — a four-byte active flag and id, a 40-byte name, a rank byte, a 40-byte icon, then price — and reading it back against the acquired client reproduces the client's own shop exactly: "Air Knight Utility Set" at 10000 and "Candy Club Set" at 7500. Loading now yields **2,664** priced offers across club sets, balls, consumables and character parts.
 

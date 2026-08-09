@@ -95,8 +95,9 @@ pub use us852_bootstrap::{
     CHARACTER_PARTS, CHARACTER_STATS, EQUIPPED_ITEM_SLOTS, HISTORY_COURSES, HISTORY_SEASONS,
     HandoverControl, HandoverRejection, HandoverReply, IFF_CONTAINER_CHUNK_ENTRIES,
     IffContainerChunk, IffContainerKind, MAX_BOOTSTRAP_STRING_BYTES, MAX_SERVER_CHANNELS,
-    PLAYER_STATISTICS_BYTES, PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter,
-    RetailCourseStatistics, RetailEquipment, RetailGameAuth, RetailPangBalance, RetailPlayerData,
+    PLAYER_STATISTICS_BYTES, PLAYER_TROPHIES_BYTES, RETAIL_INVENTORY_ENTRY_BYTES, RetailCaddie,
+    RetailChannel, RetailCharacter, RetailCourseStatistics, RetailEquipment, RetailGameAuth,
+    RetailInventoryClass, RetailInventoryItem, RetailPangBalance, RetailPlayerData,
     RetailPlayerIdentity, RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
     STATISTICS_COURSE_SLOTS, ServerChannelList, US852_SERVER_VERSION, packed_system_time,
 };
@@ -110,8 +111,8 @@ pub use us852_match::{
 };
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,
-    ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES, RetailEquipmentSlot,
-    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailHoleProgression,
+    ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES, RetailEquipmentRequested,
+    RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated, RetailHoleProgression,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailMultiplayerJoined, RetailMultiplayerLeft,
     RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,

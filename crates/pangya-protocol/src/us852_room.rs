@@ -500,15 +500,53 @@ impl RetailEquipmentSlot {
     }
 }
 
-/// Equipment change, client opcode `0x0020`.
+/// Requested value carried by an equipment update.
 ///
-/// Only the slot is decoded. The bodies vary per slot and several are large; this server reports
-/// the equipment it actually holds rather than acting on a requested change it cannot persist, so
-/// the requested values are deliberately not read.
+/// # Provenance
+///
+/// `pangbox/server` `game/packet/client.go:296-357` documents every tagged body. Character parts
+/// remain opaque until their complete mutable model exists; the bounded packet decoder still owns
+/// and drops that tail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentRequested {
+    /// Full 513-byte character/part/card body, not yet mutable in this server.
+    CharacterParts,
+    /// Owned caddie id.
+    Caddie(u32),
+    /// Ten consumable catalog ids.
+    Consumables([u32; RETAIL_CONSUMABLE_SLOTS]),
+    /// Ball catalog id and club-set inventory id, updated together by retail type `3`.
+    ///
+    /// SuperSS-Dev `GAME/channel.cpp:5233-5299` reads both request words; the older Pangbox
+    /// model names only the first and is incomplete for U.S. 852.
+    BallAndClub {
+        /// Ball/comet catalog id.
+        ball_type_id: u32,
+        /// Owned club-set row.
+        club_item_id: u32,
+    },
+    /// Six profile-decoration catalog ids.
+    Decoration([u32; 6]),
+    /// Owned character id.
+    Character(u32),
+    /// Unclassified four-byte body.
+    UnknownEight(u32),
+    /// Unclassified character id plus four words.
+    UnknownNine {
+        /// Owned character id.
+        character_id: u32,
+        /// Unclassified body words.
+        values: [u32; 4],
+    },
+}
+
+/// Equipment change, client opcode `0x0020`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetailEquipmentUpdate {
     /// Which equipment the client is changing.
     pub slot: RetailEquipmentSlot,
+    /// Requested value for that tagged slot.
+    pub requested: RetailEquipmentRequested,
 }
 
 impl DecodePacket for RetailEquipmentUpdate {
@@ -522,7 +560,44 @@ impl DecodePacket for RetailEquipmentUpdate {
         let tag = reader.u8()?;
         let slot = RetailEquipmentSlot::from_tag(tag)
             .ok_or_else(|| reader.invalid("unknown equipment slot"))?;
-        Ok(Self { slot })
+        let requested = match slot {
+            RetailEquipmentSlot::CharacterParts => RetailEquipmentRequested::CharacterParts,
+            RetailEquipmentSlot::Caddie => RetailEquipmentRequested::Caddie(reader.u32_le()?),
+            RetailEquipmentSlot::Consumables => {
+                let mut values = [0_u32; RETAIL_CONSUMABLE_SLOTS];
+                for value in &mut values {
+                    *value = reader.u32_le()?;
+                }
+                RetailEquipmentRequested::Consumables(values)
+            }
+            RetailEquipmentSlot::Ball => RetailEquipmentRequested::BallAndClub {
+                ball_type_id: reader.u32_le()?,
+                club_item_id: reader.u32_le()?,
+            },
+            RetailEquipmentSlot::Decoration => {
+                let mut values = [0_u32; 6];
+                for value in &mut values {
+                    *value = reader.u32_le()?;
+                }
+                RetailEquipmentRequested::Decoration(values)
+            }
+            RetailEquipmentSlot::Character => RetailEquipmentRequested::Character(reader.u32_le()?),
+            RetailEquipmentSlot::UnknownEight => {
+                RetailEquipmentRequested::UnknownEight(reader.u32_le()?)
+            }
+            RetailEquipmentSlot::UnknownNine => {
+                let character_id = reader.u32_le()?;
+                let mut values = [0_u32; 4];
+                for value in &mut values {
+                    *value = reader.u32_le()?;
+                }
+                RetailEquipmentRequested::UnknownNine {
+                    character_id,
+                    values,
+                }
+            }
+        };
+        Ok(Self { slot, requested })
     }
 }
 
@@ -544,12 +619,12 @@ pub enum RetailEquipmentUpdated {
         /// Catalog type in each slot; zero when empty.
         item_type_ids: [u32; RETAIL_CONSUMABLE_SLOTS],
     },
-    /// The ball in use; zeroes when none is.
-    Ball {
-        /// Owned inventory row.
-        item_id: u32,
-        /// Catalog type.
-        item_type_id: u32,
+    /// The ball and club set in use; retail updates and acknowledges them together.
+    BallAndClub {
+        /// Ball/comet catalog type.
+        ball_type_id: u32,
+        /// Owned club-set row.
+        club_item_id: u32,
     },
     /// Profile decoration; zeroes when none is set.
     Decoration {
@@ -573,7 +648,7 @@ impl RetailEquipmentUpdated {
         match self {
             Self::Caddie { .. } => RetailEquipmentSlot::Caddie,
             Self::Consumables { .. } => RetailEquipmentSlot::Consumables,
-            Self::Ball { .. } => RetailEquipmentSlot::Ball,
+            Self::BallAndClub { .. } => RetailEquipmentSlot::Ball,
             Self::Decoration { .. } => RetailEquipmentSlot::Decoration,
             Self::Character { .. } => RetailEquipmentSlot::Character,
         }
@@ -598,12 +673,12 @@ impl EncodePacket for RetailEquipmentUpdated {
                     writer.u32_le(*type_id);
                 }
             }
-            Self::Ball {
-                item_id,
-                item_type_id,
+            Self::BallAndClub {
+                ball_type_id,
+                club_item_id,
             } => {
-                writer.u32_le(*item_id);
-                writer.u32_le(*item_type_id);
+                writer.u32_le(*ball_type_id);
+                writer.u32_le(*club_item_id);
             }
             Self::Decoration { type_ids } => {
                 for type_id in type_ids {
@@ -1262,9 +1337,9 @@ mod tests {
                 2 + 4 * RETAIL_CONSUMABLE_SLOTS,
             ),
             (
-                RetailEquipmentUpdated::Ball {
-                    item_id: 1,
-                    item_type_id: 2,
+                RetailEquipmentUpdated::BallAndClub {
+                    ball_type_id: 1,
+                    club_item_id: 2,
                 },
                 RetailEquipmentSlot::Ball,
                 2 + 8,
@@ -1309,6 +1384,24 @@ mod tests {
 
     fn profile() -> CompatibilityProfile {
         CompatibilityProfile::US_852
+    }
+
+    #[test]
+    fn equipment_update_decodes_requested_ball_type() {
+        let mut payload = vec![RetailEquipmentSlot::Ball.tag()];
+        payload.extend_from_slice(&0x1400_00c9_u32.to_le_bytes());
+        payload.extend_from_slice(&310_u32.to_le_bytes());
+        let decoded =
+            decode_packet_payload::<RetailEquipmentUpdate>(&payload, &profile(), ServiceKind::Game)
+                .expect("decode ball update");
+        assert_eq!(decoded.slot, RetailEquipmentSlot::Ball);
+        assert_eq!(
+            decoded.requested,
+            RetailEquipmentRequested::BallAndClub {
+                ball_type_id: 0x1400_00c9,
+                club_item_id: 310,
+            }
+        );
     }
 
     fn sample_room() -> RetailRoom {
