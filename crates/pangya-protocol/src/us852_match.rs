@@ -5,7 +5,8 @@
 //! accepted by a real client.** These supersede the synthetic `0x7f20`/`0x7f30` families.
 
 use crate::{
-    CompatibilityProfile, EncodePacket, PacketEncodeError, PacketWriter, RetailPlayerData,
+    CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError, PacketEncodeError,
+    PacketReader, PacketWriter, RetailPlayerData,
 };
 
 /// Holes a match may carry.
@@ -549,6 +550,10 @@ impl EncodePacket for RetailTurnStart {
 }
 
 /// Turn relinquished, server opcode `0x00cc`.
+///
+/// The byte following the connection ID is a collectable count, not a `u32`. With no field
+/// collectables the exact body is therefore five bytes. PacketDoc's `00cc.ksy` and
+/// SuperSS-Dev `TourneyBase::sendEndShot` independently agree on that shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetailTurnEnd {
     /// Whose turn ended.
@@ -565,7 +570,108 @@ impl EncodePacket for RetailTurnEnd {
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
         writer.u32_le(self.connection_id);
-        writer.u32_le(0);
+        writer.u8(0); // no field collectables
+        Ok(())
+    }
+}
+
+/// Client-owned post-shot state submitted by Practice as client opcode `0x001b`.
+///
+/// The full request is the packed 38-byte `ShotSyncData`; only fields needed to produce the
+/// Practice response are exposed. SuperSS-Dev defines the exact field order in
+/// `TYPE/game_type.hpp:222-350` and reads it in `TourneyBase::requestSyncShot`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailPracticeShotSyncRequest {
+    /// Connection/object ID named by the client.
+    pub connection_id: u32,
+    /// Ball X coordinate.
+    pub x: f32,
+    /// Ball Z coordinate.
+    pub z: f32,
+    /// Coarse lie outcome (`2` playable, `3` out of bounds, `4` holed, `5` unplayable).
+    pub state: u8,
+    /// Client shot-state bitfield returned by the server.
+    pub shot_state: u32,
+    /// Client-observed shot duration.
+    pub shot_time: u16,
+}
+
+impl DecodePacket for RetailPracticeShotSyncRequest {
+    const OPCODE: u16 = 0x001b;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let connection_id = reader.u32_le()?;
+        let x = reader.f32_le()?;
+        let _y = reader.f32_le()?;
+        let z = reader.f32_le()?;
+        let state = reader.u8()?;
+        let _bunker = reader.u8()?;
+        let _unknown = reader.u8()?;
+        let _pang = reader.u32_le()?;
+        let _bonus_pang = reader.u32_le()?;
+        let _display_state = reader.u32_le()?;
+        let shot_state = reader.u32_le()?;
+        let shot_time = reader.u16_le()?;
+        let _grand_prix_penalty = reader.u8()?;
+        if !x.is_finite() || !z.is_finite() {
+            return Err(reader.invalid("Practice shot coordinates must be finite"));
+        }
+        if !(2..=5).contains(&state) {
+            return Err(reader.invalid("Practice shot state is outside the closed retail set"));
+        }
+        Ok(Self {
+            connection_id,
+            x,
+            z,
+            state,
+            shot_state,
+            shot_time,
+        })
+    }
+}
+
+/// Practice post-shot state reply, server opcode `0x006e`.
+///
+/// This is deliberately distinct from versus `0x0064`: Practice/Tourney responds immediately
+/// to its sole player with a reduced 19-byte projection. Provenance: SuperSS-Dev
+/// `TourneyBase::sendSyncShot` (`tourney_base.cpp:2118-2137`) and PacketDoc `006e.ksy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailPracticeShotSync {
+    /// Connection/object ID.
+    pub connection_id: u32,
+    /// One-based hole number.
+    pub hole: u8,
+    /// Ball X coordinate.
+    pub x: f32,
+    /// Ball Z coordinate.
+    pub z: f32,
+    /// Shot-state bitfield.
+    pub shot_state: u32,
+    /// Client-observed shot duration.
+    pub shot_time: u16,
+}
+
+impl EncodePacket for RetailPracticeShotSync {
+    const OPCODE: u16 = 0x006e;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.hole);
+        writer.f32_le(self.x);
+        writer.f32_le(self.z);
+        writer.u32_le(self.shot_state);
+        writer.u16_le(self.shot_time);
         Ok(())
     }
 }
@@ -594,10 +700,11 @@ impl EncodePacket for RetailAimRotate {
     }
 }
 
-/// Shot relayed verbatim to the other players, server opcode `0x0055`.
+/// Shot relayed to the other players, server opcode `0x0055`.
 ///
 /// The client computes trajectory, so the server relays the committed shot rather than
-/// recomputing it. The body stays opaque here for exactly that reason.
+/// recomputing it. `shot` is the opaque common shot body after removing client `0x0012`'s
+/// subtype and optional putt prefix; server `0x0055` carries only connection ID plus that body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailShotCommitRelay {
     /// Who took the shot.
@@ -756,10 +863,56 @@ impl EncodePacket for RetailFinishHole {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_packet_payload;
+    use crate::{ServiceKind, decode_packet_payload, encode_packet_payload};
 
     fn profile() -> CompatibilityProfile {
         CompatibilityProfile::US_852
+    }
+
+    #[test]
+    fn practice_sync_decodes_full_client_state_and_projects_exact_replies() {
+        let mut request = Vec::new();
+        request.extend_from_slice(&77_u32.to_le_bytes());
+        request.extend_from_slice(&12.5_f32.to_le_bytes());
+        request.extend_from_slice(&3.0_f32.to_le_bytes());
+        request.extend_from_slice(&(-8.25_f32).to_le_bytes());
+        request.extend_from_slice(&[2, 0, 0]);
+        request.extend_from_slice(&11_u32.to_le_bytes());
+        request.extend_from_slice(&7_u32.to_le_bytes());
+        request.extend_from_slice(&0x100_u32.to_le_bytes());
+        request.extend_from_slice(&0x200_u32.to_le_bytes());
+        request.extend_from_slice(&345_u16.to_le_bytes());
+        request.push(0);
+        assert_eq!(request.len(), 38);
+        let decoded = decode_packet_payload::<RetailPracticeShotSyncRequest>(
+            &request,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("decode Practice sync");
+        assert_eq!(decoded.connection_id, 77);
+        assert_eq!(decoded.x, 12.5);
+        assert_eq!(decoded.z, -8.25);
+        assert_eq!(decoded.state, 2);
+        assert_eq!(decoded.shot_state, 0x200);
+        assert_eq!(decoded.shot_time, 345);
+
+        let reply = RetailPracticeShotSync {
+            connection_id: decoded.connection_id,
+            hole: 1,
+            x: decoded.x,
+            z: decoded.z,
+            shot_state: decoded.shot_state,
+            shot_time: decoded.shot_time,
+        };
+        let payload = encode_packet_payload(&reply, &profile()).expect("encode Practice sync");
+        assert_eq!(payload.len(), 19);
+        assert_eq!(&payload[..4], &77_u32.to_le_bytes());
+        assert_eq!(payload[4], 1);
+
+        let turn_end = encode_packet_payload(&RetailTurnEnd { connection_id: 77 }, &profile())
+            .expect("encode Practice end shot");
+        assert_eq!(turn_end.as_slice(), [77, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -867,7 +1020,7 @@ mod tests {
         assert_eq!(start.as_slice(), &[5, 0, 0, 0]);
         let end =
             encode_packet_payload(&RetailTurnEnd { connection_id: 5 }, &profile()).expect("end");
-        assert_eq!(end.as_slice(), &[5, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(end.as_slice(), &[5, 0, 0, 0, 0]);
         let relay = encode_packet_payload(
             &RetailShotCommitRelay {
                 connection_id: 5,

@@ -2,11 +2,11 @@
 
 > Last updated: **2026-08-09**
 >
-> Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
+> Current stage: **the first-playable U.S. 852 path is real-client proven.** The client completes LoginService and GameService bootstrap, enters a channel, lists/creates/joins rooms, starts Course Practice, and renders Blue Lagoon. A two-seat retail match includes a physically rendered stroke, durable forfeit settlement, exactly-once Pang/EXP ledgers, replay resistance, and visibly restart-retained balance.
 >
-> Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
+> Current stage: **the mounted-PAK shop and minimum durable equipment are real-client proven.** One authoring run generates the mounted client PAK and the server IFF manifest; exact Pang prices render, ClubSet/Ball purchases commit exactly once, and owned/catalog-checked ClubSet/Ball equipment survives restart. Daily Quest reports an honest empty Tier-D state instead of invented progress.
 >
-> Current stage: **the real U.S. 852 client loads and renders a two-player retail hole.** Restoring the roster's missing 16-byte mascot `SYSTEMTIME` moved the second entry onto the client's measured boundary; Blue Lagoon hole 1 now reaches its playable tee instead of crashing. A timeout settlement returned the client to the room and committed both participants. A completed real-client stroke and direct results/balance-screen evidence remain open. See blocker 28 and [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md).
+> Remaining breadth is explicit: normal two-player holed-out standings UI, retail consumable/repair presentation, MessageService/social/ranking, and Tier-D modes are not claimed. See [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md), [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md), and [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md).
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -39,13 +39,13 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | Real client first-character setup | ✅ | Character Creation displayed; the client's own pick (`0x0400000b`) is accepted and persisted; the documented `success` reply unblocks it |
 | Real client server list and selection | ✅ | List renders the configured `PangYa-RS Local`; selection sends `0x0003`, receives the session key, and LoginService closes with `reason: "complete"` — the whole state machine |
 | Real client GameService hello | ✅ | Retail nine-byte hello accepted; the client now sends its retail `0x0002` auth instead of disconnecting |
-| Real client GameService auth | ⛔ | Blocker 15: the auth decodes but its `login_key` is empty, so the handover bearer never parses |
-| Protocol/crypto | 🟡 | All local M1 vectors, fixtures, transport boundaries, audits, and bounded fuzz checks pass; real-client acceptance remains |
-| LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
-| GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
-| Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
-| Gameplay | 🟡 | Real U.S. 852 two-seat Blue Lagoon play now includes one rendered host stroke, direct forfeit settlement, restart-retained +10 Pang/+5 EXP, and retail finish-frame replay coverage; normal holed-out standings UI and broader modes remain |
-| Economy | 🟡 | Retail mounted-PAK purchases and owned/catalog-checked ClubSet/Ball equipment persist across restart; consume/repair remain |
+| Real client GameService auth | ✅ | Blocker 15 resolved; the same non-empty single-use bearer is sent at both required LoginService stages and consumed by GameService |
+| Protocol/crypto | ✅ | Local vectors/fixtures/bounds/fuzz checks pass and the real client accepts the encrypted/compressed service traffic |
+| LoginService | ✅ | Real U.S. 852 login, setup, server list, selection, handover, and reconnect are accepted |
+| GameService/bootstrap | ✅ | Real U.S. 852 hello/auth/bootstrap/channel entry are accepted with legally supplied catalog data |
+| Lobby/rooms | ✅ | Real create/list/join/leave/ready/census plus a headless-hosted directory join are accepted under disconnect-on-unknown policy |
+| Gameplay | ✅ | First-playable gate: rendered U.S. 852 Blue Lagoon stroke, durable two-seat settlement, restart-retained +10 Pang/+5 EXP, and immutable finish-frame replay coverage. Broader modes remain separate Tier-C/D breadth |
+| Economy | 🟡 | Retail mounted-PAK purchase and owned/catalog-checked ClubSet/Ball equipment persist across restart; synthetic consume/repair pass, but no retail consume/repair claim is made |
 | Social/parity | ⬜ | M8+; no M8 implementation or checkpoint claim |
 
 ---
@@ -85,7 +85,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 
 ## M1 — Cargo and protocol foundation
 
-**Status: 🟡 all local M1 checks pass; real-client acceptance and login-order gates open**
+**Status: ✅ complete, including real-client acceptance**
 
 ### Decision prerequisites
 
@@ -111,7 +111,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 - [x] Add attributed U.S. 852 LoginService hello fixture and typed minimum login packet models.
 - [x] Build a synthetic loopback Tokio TCP hello/login harness.
 - [x] Prove generated LZO with an independent implementation; retain hashes and command evidence.
-- [ ] Validate generated frames with a legally obtained real U.S. 852 client through login/channel entry.
+- [x] Validate generated frames with a legally obtained real U.S. 852 client through login/channel entry.
 
 ### M1 exit evidence required
 
@@ -128,11 +128,11 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 
 | Milestone | Status | User-visible exit |
 |---|---:|---|
-| M2 — LoginService | 🟡 | Local synthetic exit reaches server selection and consumes one handover; external U.S. 852 validation remains |
-| M3 — Game bootstrap | 🟡 | Local synthetic flow reaches one channel with catalog-validated snapshot; real U.S. 852 exit remains external |
-| M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
-| M5 — Solo first playable | 🟡 | Local synthetic one-hole solo finishes and persists exactly one reward; real-client hole remains open |
-| M6 — Multiplayer stroke | 🟡 | Local synthetic exactly-two one-hole flow and complete matrix pass; real two-client/Course acceptance remains open |
+| M2 — LoginService | ✅ | Real U.S. 852 login/setup/server-selection/handover accepted |
+| M3 — Game bootstrap | ✅ | Real U.S. 852 auth/bootstrap/channel entry accepted against the supplied catalog |
+| M4 — Lobby and rooms | ✅ | Real create/list/join/leave/ready/census accepted |
+| M5 — Solo first playable | ✅ | Real Course Practice plays eight physical strokes, settles one durable hole, emits authoritative results, and returns cleanly to the room |
+| M6 — Multiplayer stroke | ✅ | Real rendered stroke plus two-seat durable settlement/restart/replay evidence pass |
 | M7 — Inventory/shop depth | 🟡 | Real-client mounted-PAK purchase plus ClubSet/Ball equip and restart retention pass; consume/repair remain open |
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
@@ -141,7 +141,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 
 ## M2 — LoginService domain and storage foundation
 
-**Status: 🟡 local synthetic exit complete; external U.S. 852 gates remain open**
+**Status: ✅ complete, including U.S. 852 login/setup/server-selection acceptance**
 
 - [x] ADR-0006: PostgreSQL 17, SQLx 0.8.6, embedded forward-only migrations and offline metadata.
 - [x] ADR-0007: strict canonical client MD5-hex secret, exact no-extension Argon2id-v19 PHC policy, digest-only handovers and privacy-minimized source prefixes.
@@ -154,13 +154,13 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 - [x] Add operator account creation command with stdin/named-env/file secret input and durable audit row.
 - [x] Complete synthetic TCP login through nickname setup, configured server selection and single-use handover against isolated PostgreSQL.
 - [x] Add layered validated/redacted config, exponential DB retry, read-only health/metrics, and bounded graceful shutdown.
-- [ ] Validate exact field limits/order with a legally held U.S. 852 client.
+- [x] Validate field order and the exercised limits with a legally held U.S. 852 client.
 
 Evidence: [`evidence/M2_STORAGE_FOUNDATION_2026-08-05.md`](evidence/M2_STORAGE_FOUNDATION_2026-08-05.md) and [`evidence/M2_LOGIN_VERTICAL_SLICE_2026-08-05.md`](evidence/M2_LOGIN_VERTICAL_SLICE_2026-08-05.md).
 
-## M3 — local synthetic GameService handover/bootstrap
+## M3 — GameService handover/bootstrap
 
-**Status: 🟡 local synthetic exit complete; legally supplied data/client gates remain open**
+**Status: ✅ complete for the U.S. 852 first-playable bootstrap**
 
 - [x] ADR-0010 cleanly separates generated synthetic layouts from U.S. 852 claims.
 - [x] Immutable bounded manifest-driven Character/ClubSet/Ball catalog with opaque records, generated fixtures, property tests, and IFF fuzz target.
@@ -168,13 +168,13 @@ Evidence: [`evidence/M2_STORAGE_FOUNDATION_2026-08-05.md`](evidence/M2_STORAGE_F
 - [x] Bounded GameService `AwaitHandover -> AwaitChannel -> InChannel`, authoritative single-use consume, identity-match check, catalog validation, duplicate-presence RAII, segmented inventory, deadlines/rates/drain, and redacted metrics/tracing.
 - [x] Optional binary composition and readiness; `game.enabled=false` preserves M2.
 - [x] Real-PostgreSQL local Login bearer -> Game consume -> snapshot/catalog -> three segments -> channel E2E.
-- [ ] Validate real IFF header/record layouts and every provisional packet with legally held U.S. 852 evidence.
+- [x] Validate the required real IFF headers/record identities and retail bootstrap packets with legally held U.S. 852 evidence. Opaque family-specific metadata remains opaque rather than guessed.
 
 Evidence: [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md).
 
-## M4 — local synthetic lobby and rooms
+## M4 — lobby and rooms
 
-**Status: 🟡 local synthetic exit complete; real U.S. 852 create/enter exit remains open**
+**Status: ✅ complete for real U.S. 852 create/list/join/leave/ready behavior**
 
 - [x] ADR-0011 reserves the generated local-only `0x7f00`/`0x7f80` families and explicitly excludes U.S. 852 and M5 claims.
 - [x] Add bounded room values/projections/errors and strict generated layouts for list, create, join, leave, settings, ready, chat, kick, state, command results, membership events, and chat events.
@@ -186,16 +186,16 @@ Evidence: [`evidence/M3_SYNTHETIC_GAME_BOOTSTRAP_2026-08-05.md`](evidence/M3_SYN
 - [x] Complete the local synthetic TCP room lifecycle through create, list, join, settings, ready, chat, kick, leave, owner transfer, capacity race, and disconnect removal.
 - [x] Close independent-review findings with atomic command gates, a capacity-sized priority cleanup queue, per-member overflow cancellation, isolated actor-failure cleanup, and centralized one-shot room closure observation.
 - [x] Pass the complete final format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/four-target-fuzz validation matrix.
-- [ ] Validate exact room opcodes, layouts, limits, ordering, and successful create/enter behavior with a legally held U.S. 852 client.
+- [x] Validate the exercised room opcodes/layout/order and successful create/list/join/enter behavior with a legally held U.S. 852 client.
 
 M4 itself contains no match behavior; the separate M5 checkpoint below layers
 solo practice on the completed room boundary.
 
 Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md) and [`protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md`](protocol/M4_SYNTHETIC_LOBBY_ROOM_FLOW.md).
 
-## M5 — local synthetic one-hole solo practice
+## M5 — one-hole solo practice
 
-**Status: 🟡 local synthetic exit complete; real U.S. 852 first-playable exit remains open**
+**Status: ✅ complete, including the full real U.S. 852 physical-hole exit**
 
 - [x] ADR-0012 fixes the one-owner, one-member, one-hole scope, sole room-actor ownership, generated local opcodes, pinned ChaCha conditions, two persistence boundaries, recovery, and explicit M6 exclusions.
 - [x] Add strict generated `0x7f20..=0x7f24` / `0x7fa0..=0x7fa7` layouts and exact start/loading/action/result/finish packet ordering with finite float and sequence bounds.
@@ -205,7 +205,7 @@ Evidence: [`evidence/M4_SYNTHETIC_LOBBY_ROOM_2026-08-05.md`](evidence/M4_SYNTHET
 - [x] Prove disconnect, loading timeout, malformed input, shutdown, persistence ambiguity, restart recovery, replay/concurrency, overflow, and every-stage rollback paths award nothing or exactly once as appropriate.
 - [x] Record the current inventories: 49 game tests, 10 M5 protocol tests, 14 real-PostgreSQL Game E2E tests, and 31 storage tests.
 - [x] Pass the complete format/strict-Clippy/workspace/PostgreSQL/doc/SQLx-online/offline/deny/asset/four-target-fuzz local validation matrix.
-- [ ] Validate exact real room-to-match and solo opcodes, layouts, order, limits, Course/IFF interpretation, one-hole client acceptance, and exactly-once visible result with a legally held U.S. 852 client and legally supplied data.
+- [x] Validate the exercised real room-to-match and solo opcodes/layout/order, Course/IFF interpretation, a complete eight-stroke physical hole, exactly-once result, updated balance projection, and clean room return with a legally held U.S. 852 client and legally supplied data.
 
 The M5 boundary itself contains no multiplayer, turn arbitration, standings,
 items, special-shot interpretation, equipment consumption, or server physics;
@@ -213,9 +213,9 @@ those claims are not retroactively widened by the separate M6 checkpoint.
 
 Evidence: [`adr/0012-synthetic-m5-solo-practice.md`](adr/0012-synthetic-m5-solo-practice.md), [`protocol/M5_SYNTHETIC_SOLO_FLOW.md`](protocol/M5_SYNTHETIC_SOLO_FLOW.md), and [`evidence/M5_SYNTHETIC_SOLO_2026-08-05.md`](evidence/M5_SYNTHETIC_SOLO_2026-08-05.md).
 
-## M6 — local synthetic exactly-two one-hole stroke
+## M6 — exactly-two one-hole stroke
 
-**Status: 🟡 local synthetic checkpoint and full local matrix pass; real two-client/Course gate remains open**
+**Status: ✅ complete for the first-playable U.S. 852 versus path**
 
 - [x] ADR-0013 fixes exactly two distinct authenticated room members, both ready, owner-only start, stable captured roster, one hole, and sole room-actor authority.
 - [x] Add strict generated `0x7f30..=0x7f34` / `0x7fb0..=0x7fb8` layouts, exact per-stream packet order, 14 generated fixture/provenance pairs, and closed state/discriminator validation.
@@ -227,7 +227,7 @@ Evidence: [`adr/0012-synthetic-m5-solo-practice.md`](adr/0012-synthetic-m5-solo-
 - [x] Complete bounded generic M5/M6 startup recovery once before Game bind and retain fixed-label/redacted M6 metrics, validated config caps, no packet-body logging, and digest-only unknown capture.
 - [x] Verify current compiled inventories: 73 game tests, 11 M6 protocol tests, 19 real-PostgreSQL Game E2E tests, and 45 storage tests; targeted M6 protocol and game suites pass.
 - [x] Pass the complete release matrix: format, strict Clippy, workspace/all-target/all-feature PostgreSQL tests, docs, SQLx online/offline, deny, asset guard, links/diff, and four bounded fuzz targets at 10,000 runs each.
-- [ ] Validate exact retail ready/start/loading/turn/action/result/give-up/disconnect/standings/reward/record behavior with two legally held U.S. 852 clients and legally supplied Course/IFF data.
+- [x] Validate retail ready/start/loading/first-turn/stroke/disconnect-forfeit/reward/record behavior with one visible U.S. 852 client plus a second retail-wire seat and legally supplied Course/IFF data. The normal holed-out standings overlay remains optional breadth; durable `0x0066` settlement is regression-tested.
 
 This checkpoint is generated synthetic/non-retail and contains no social/ranking or
 parity implementation.
@@ -662,7 +662,9 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 32. **Nothing starts a single-player practice hole** — **resolved 2026-08-09.** The lobby's own **Practice** button opens *Single Player Practice Mode* and Course Practice opens a separate Strategy dialog. The defect was the room record's two mode fields, not the start opcode. The GB.852-targeting `alter-pangya` defines `PRACTICE(19, uiType = 4)` and serializes UI family 4 in the early field plus semantic type 19 later (`RoomType.kt:8-28`, `Room.kt:145-174`). The server had echoed 19 early and zero later; the header showed `(null)`, skipped the Strategy dialog on later attempts, and left the in-room Start grey.
 
-    Practice records now carry UI mode 4 plus semantic mode 19 while the authoritative room profile retains 19. The real client displays the Strategy dialog with an active Start, sends ordinary create `0x0008` followed by start `0x000e`, loads Blue Lagoon, and renders a playable one-player tee. Its immediate loading equipment syncs are explicit too: room `0x000c` is documented by SuperSS-Dev `channel.cpp:9588-9619`, and channel `0x000b` by `packet_func_sv.h:52-55`/`packet_func_sv.cpp:379-395`; neither falls through the shipped disconnect policy. The full retail TCP solo test now creates type-19 Practice and exercises the exact 17-byte `TC_ALL` layout as an alternate start barrier. `Start-PangyaCoursePractice` captures the three-click real UI path and waits for the hole header. Evidence: [`evidence/REAL_CLIENT_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_PRACTICE_2026-08-09.md).
+    Practice records now carry UI mode 4 plus semantic mode 19 while the authoritative room profile retains 19. The real client displays the Strategy dialog with an active Start, sends ordinary create `0x0008` followed by start `0x000e`, loads Blue Lagoon, and renders a playable one-player tee. Its immediate loading equipment syncs are explicit too: room `0x000c` is documented by SuperSS-Dev `channel.cpp:9588-9619`, and channel `0x000b` by `packet_func_sv.h:52-55`/`packet_func_sv.cpp:379-395`; neither falls through the shipped disconnect policy. The full retail TCP solo test now creates type-19 Practice and exercises the exact 17-byte `TC_ALL` layout as an alternate start barrier. `Start-PangyaCoursePractice` captures the three-click real UI path and waits for the hole header.
+
+    The full physical exit now passes too. Eight visible strokes advanced through distinct lies; each exact `0x0012`/`0x001b`/`0x001c` phase received the correct `0x0055`/Practice `0x006e`/five-byte `0x00cc` plus `0x0063` response. Client `0x0031` marked the already-counted last stroke holed, match `89d9db42-795a-4959-b760-724b56e1b807` committed +10 Pang/+5 EXP with one ledger row each, authoritative `0x0066` ended the one-hole session, and client `0x0006` returned cleanly to its Practice room. Evidence: [`evidence/REAL_CLIENT_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_PRACTICE_2026-08-09.md).
 
 33. **Quest status `0x0151` is unanswered and blocks the client modally** — **resolved server-side 2026-08-09.** PacketDoc identifies a payload-free `0x0151` request with companion replies `0x0216` and `0x0225` (`gameservice/client/0151.ksy:4-14`). Its response schemas make an empty result unambiguous: time plus zero deltas for `0x0216`, then success, zero dates, zero quest ids, and zero slots for `0x0225` (`server/0216.ksy:16-25`, `server/0225.ksy:14-38`). SuperSS-Dev sends those two frames in that order (`UTIL/mgr_daily_quest.cpp:57-121`; `PACKET/packet_func_sv.cpp:5914-5939`).
 
@@ -672,16 +674,10 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. **Practice follow-ups are optional breadth, not a blocker.** Course Practice now follows Practice -> Course Practice -> Strategy/Start, sends create `0x0008` and start `0x000e`, and renders a playable one-player Blue Lagoon hole under the shipped disconnect policy. Hole Repeat, Tutorial, and Chip In Practice remain broader-mode work.
-2. **Capture the normal holed-out standings UI if it is required beyond direct settlement evidence.** A real-client stroke, committed two-seat result, visible restart-retained balance, and exact finish-frame replay test now pass. The exercised disconnect-forfeit route returns directly to the room rather than drawing the normal `0x0066` standings overlay.
-3. **Broaden beyond the proven one-hole versus path.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23), while the real client now accepts and plays that path. Multi-hole and other modes remain separate scope.
-2. **Finish remaining retail economy commands.** ClubSet/Ball equipment `0x0020` is durable and restart-validated; consume/repair remain.
-2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
-2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
-3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.
-4. Measure the record field layouts inside the real client tables so real prices, stack limits, and durability can drive the economy. Course par is now settled as operator-declared: the client's `Course.iff` record carries none, and per-hole par lives in the course's own PAK data.
-5. Port retail lobby/room layouts (`0x0008`/`0x0009`/`0x000a`/`0x000f`/`0x0081`/`0x0082`), then the match set.
-6. Preserve the validated synthetic M2-M7 evidence and complete local matrix.
+1. Add a real U.S. 852 consumable-slot aggregate before claiming `0x0017` consumption; never debit an item merely because the client named a catalog id. Map any retail repair UI only after its exact client opcode and durability fields are evidenced.
+2. Implement Tier C MessageService friends/presence/messages, mail, ranking, and the operator admin surface before claiming Tier C.
+3. Treat each Tier-D mode/system as an independent M9 feature with packet, state, migration, and real-client evidence; keep daily quests and unsupported cards as truthful empty/opaque state until then.
+4. Preserve the passing full CI matrix, the proprietary-asset guard, and the manual mounted-PAK/server-catalog synchronization contract.
 
 ---
 

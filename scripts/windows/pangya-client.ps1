@@ -859,60 +859,60 @@ function Invoke-PangyaObservedShotMeter {
     $graphics.Dispose()
     return $bitmap
   }
-  function Find-Marker([System.Drawing.Bitmap]$baseline) {
-    $frame = Capture-Bar
+  function Find-Marker {
+    # Compare adjacent live frames rather than the pre-shot image. Power/impact changes the bar's
+    # fill permanently, and rain plus UI animation also make an old baseline look different; only
+    # the moving vertical marker changes between these two close captures.
+    $before = Capture-Bar
+    Start-Sleep -Milliseconds 15
+    $after = Capture-Bar
     $bestX = -1; $best = 0
     # Exclude the animated Start/Power label at the far left; it otherwise dominates the diff.
     for ($x = 70; $x -lt $width - 2; $x++) {
       $score = 0
       for ($y = 0; $y -lt $height; $y++) {
-        $a = $baseline.GetPixel($x, $y); $b = $frame.GetPixel($x, $y)
+        $a = $before.GetPixel($x, $y); $b = $after.GetPixel($x, $y)
         if ([Math]::Abs($a.R-$b.R) + [Math]::Abs($a.G-$b.G) + [Math]::Abs($a.B-$b.B) -gt 100) {
           $score++
         }
       }
       if ($score -gt $best) { $best = $score; $bestX = $x }
     }
-    $frame.Dispose()
+    $before.Dispose(); $after.Dispose()
     if ($Trace -and $best -gt 0) { Write-Host "meter marker=$($left + $bestX) score=$best" }
     if ($best -lt 1) { return -1 }
     return ($left + $bestX)
   }
 
-  $baseline = Capture-Bar
-  try {
-    Send-PangyaText ' '
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    $powerCommitted = $false
-    while ((Get-Date) -lt $deadline) {
-      $marker = Find-Marker $baseline
-      if ($marker -ge $PowerX) {
-        Send-PangyaText ' '
-        $powerCommitted = $true
-        # The Practice meter takes a render frame to enter its impact phase; an immediate third
-        # Space is dropped while the power transition is still active.
-        Start-Sleep -Milliseconds 200
-        break
-      }
-      Start-Sleep -Milliseconds 15
+  Send-PangyaText ' '
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  $powerCommitted = $false
+  while ((Get-Date) -lt $deadline) {
+    $marker = Find-Marker
+    if ($marker -ge $PowerX) {
+      Send-PangyaText ' '
+      $powerCommitted = $true
+      # The Practice meter takes a render frame to enter its impact phase; an immediate third
+      # Space is dropped while the power transition is still active.
+      Start-Sleep -Milliseconds 200
+      break
     }
-    if (-not $powerCommitted) { throw 'shot meter never reached the requested power' }
-
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    $impactCommitted = $false
-    while ((Get-Date) -lt $deadline) {
-      $marker = Find-Marker $baseline
-      if ($marker -ge 0 -and $marker -le $ImpactX) {
-        Send-PangyaText ' '
-        $impactCommitted = $true
-        break
-      }
-      Start-Sleep -Milliseconds 15
-    }
-    if (-not $impactCommitted) { throw 'shot meter never returned to the impact zone' }
-  } finally {
-    $baseline.Dispose()
+    Start-Sleep -Milliseconds 15
   }
+  if (-not $powerCommitted) { throw 'shot meter never reached the requested power' }
+
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  $impactCommitted = $false
+  while ((Get-Date) -lt $deadline) {
+    $marker = Find-Marker
+    if ($marker -ge 0 -and $marker -le $ImpactX) {
+      Send-PangyaText ' '
+      $impactCommitted = $true
+      break
+    }
+    Start-Sleep -Milliseconds 15
+  }
+  if (-not $impactCommitted) { throw 'shot meter never returned to the impact zone' }
   Start-Sleep -Seconds 5
 }
 

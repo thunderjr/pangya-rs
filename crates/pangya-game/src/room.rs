@@ -761,6 +761,26 @@ impl RoomState {
         Ok(disposition)
     }
 
+    fn solo_hole_out(
+        &mut self,
+        caller: PlayerConnectionId,
+    ) -> Result<RelayDisposition, SoloMatchError> {
+        self.solo_owner(caller)?;
+        let match_id = self
+            .solo
+            .start_plan()
+            .map(|plan| plan.begin().match_id())
+            .ok_or(SoloMatchError::InvalidPhase)?;
+        let disposition = self.solo.hole_out()?;
+        if disposition == RelayDisposition::Accepted {
+            self.deliver_solo(RoomEvent::SoloPhase {
+                match_id,
+                phase: self.solo.phase(),
+            });
+        }
+        Ok(disposition)
+    }
+
     fn prepare_solo_finish(
         &mut self,
         caller: PlayerConnectionId,
@@ -1500,6 +1520,10 @@ enum RoomCommand {
         result: ShotResult,
         reply: oneshot::Sender<Result<RelayDisposition, SoloMatchError>>,
     },
+    SoloHoleOut {
+        caller: PlayerConnectionId,
+        reply: oneshot::Sender<Result<RelayDisposition, SoloMatchError>>,
+    },
     PrepareSoloFinish {
         caller: PlayerConnectionId,
         reply: oneshot::Sender<Result<CommitSoloHole, SoloMatchError>>,
@@ -1897,6 +1921,16 @@ impl RoomHandle {
             result,
             reply,
         })?;
+        receive.await.map_err(|_| SoloMatchError::Closed)?
+    }
+
+    /// Marks the already-counted retail shot as holed.
+    pub async fn solo_hole_out(
+        &self,
+        caller: PlayerConnectionId,
+    ) -> Result<RelayDisposition, SoloMatchError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_solo(RoomCommand::SoloHoleOut { caller, reply })?;
         receive.await.map_err(|_| SoloMatchError::Closed)?
     }
 
@@ -2500,6 +2534,10 @@ fn handle_normal(
             reply,
         } => {
             let _ignored = reply.send(state.solo_result(caller, result));
+            true
+        }
+        RoomCommand::SoloHoleOut { caller, reply } => {
+            let _ignored = reply.send(state.solo_hole_out(caller));
             true
         }
         RoomCommand::PrepareSoloFinish { caller, reply } => {

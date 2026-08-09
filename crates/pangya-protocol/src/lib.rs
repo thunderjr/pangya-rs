@@ -105,9 +105,9 @@ pub use us852_match::{
     MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RATE_TABLE_BYTES, RETAIL_STANDING_BYTES, RetailAimRotate,
     RetailFinishHole, RetailHole, RetailHoleWeather, RetailHoleWind, RetailLoadProgress,
     RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
-    RetailMatchPlayer, RetailMatchStart, RetailPangRate, RetailPlayerStartHole, RetailRateTable,
-    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
-    RetailWeather,
+    RetailMatchPlayer, RetailMatchStart, RetailPangRate, RetailPlayerStartHole,
+    RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailRateTable, RetailShotCommitRelay,
+    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,

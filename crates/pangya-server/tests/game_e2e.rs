@@ -6323,10 +6323,12 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     assert_eq!(opcode, 0x005b, "wind");
     // No reference server ever reports a still hole as zero wind.
     assert!(wind.first().is_some_and(|&strength| strength >= 1));
-    assert_eq!(
-        receive_packet(&mut stream, key).await.0,
-        0x0053,
-        "hole intro"
+    let (opcode, hole_intro) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0053, "hole intro");
+    let connection_id = u32::from_le_bytes(
+        hole_intro[..4]
+            .try_into()
+            .expect("hole intro connection ID"),
     );
     // `0x0053` names the opening player itself, so no `0x0063` follows it — the three rate
     // tables do. A `0x0063` here reaches a client whose per-player scene objects do not exist
@@ -6339,25 +6341,67 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         );
     }
 
-    // A shot is one stroke; the turn is handed back so the next can be played.
-    send_packet(&mut stream, key, 6, 0x0012, &[0xaa; 8]).await;
-    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00cc, "turn end");
-    assert_eq!(
-        receive_packet(&mut stream, key).await.0,
-        0x0063,
-        "turn start"
-    );
+    // This U.S. 852 Practice flow waits for its own `0x0055` animation barrier. The frame does
+    // not count a stroke; sync below does.
+    let mut init_shot = vec![0, 0]; // normal-shot subtype, absent from the server announce
+    init_shot.extend_from_slice(&[0xaa; 77]);
+    send_packet(&mut stream, key, 6, 0x0012, &init_shot).await;
+    let (opcode, init_echo) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0055, "Practice Init Shot animation barrier");
+    assert_eq!(&init_echo[..4], &connection_id.to_le_bytes());
+    assert_eq!(&init_echo[4..], &[0xaa; 77]);
 
-    // Finishing holes out and settles durably.
-    send_packet(&mut stream, key, 7, 0x0031, &[]).await;
+    // Sync is the one authoritative stroke boundary and gets Practice's reduced 0x006e reply.
+    let mut shot_sync = pangya_protocol::PacketWriter::default();
+    shot_sync.u32_le(connection_id);
+    shot_sync.f32_le(12.5);
+    shot_sync.f32_le(3.0);
+    shot_sync.f32_le(-8.25);
+    shot_sync.bytes(&[2, 0, 0]); // playable, no bunker metadata
+    shot_sync.u32_le(11);
+    shot_sync.u32_le(7);
+    shot_sync.u32_le(0x100);
+    shot_sync.u32_le(0x200);
+    shot_sync.u16_le(345);
+    shot_sync.u8(0);
+    send_packet(&mut stream, key, 7, 0x001b, &shot_sync.into_inner()).await;
+    let (opcode, sync_reply) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x006e, "Practice shot sync");
+    assert_eq!(sync_reply.len(), 19);
+    assert_eq!(&sync_reply[..4], &connection_id.to_le_bytes());
+    assert_eq!(sync_reply[4], 1, "hole number");
+
+    // End Shot closes the animation and hands this flow's perpetual solo turn back.
+    send_packet(&mut stream, key, 8, 0x001c, &[]).await;
+    let (opcode, end_shot) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x00cc, "Practice end shot");
+    assert_eq!(
+        end_shot,
+        [connection_id.to_le_bytes().as_slice(), &[0]].concat()
+    );
+    let (opcode, next_shot) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0063, "next Practice shot released");
+    assert_eq!(next_shot, connection_id.to_le_bytes());
+
+    // Finishing marks that already-counted stroke as holed and settles durably.
+    send_packet(&mut stream, key, 9, 0x0031, &[]).await;
     assert_eq!(
         receive_packet(&mut stream, key).await.0,
         0x0065,
         "hole finished"
     );
+    let (opcode, standings) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0066, "Practice match finished");
+    assert_eq!(standings[0], 1, "one authoritative standing");
+    assert_eq!(&standings[1..5], &connection_id.to_le_bytes());
+    assert_eq!(standings[5], 1, "first place");
+    let (opcode, balance) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x0095, "committed Pang balance");
+    assert_eq!(u16::from_le_bytes([balance[0], balance[1]]), 273);
 
-    let (pang, currency_rows, progression_rows): (i64, i64, i64) = sqlx::query_as(
+    let (pang, strokes, currency_rows, progression_rows): (i64, i16, i64, i64) = sqlx::query_as(
         "SELECT (SELECT pang FROM profiles WHERE account_id=$1), \
+         (SELECT strokes FROM match_players WHERE account_id=$1), \
          (SELECT count(*) FROM currency_ledger), \
          (SELECT count(*) FROM progression_ledger)",
     )
@@ -6365,8 +6409,10 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("settlement");
-    // Two strokes against a par-3 hole: the server scored it, not the client.
+    // One physical shot is one authoritative stroke: 0x0012/0x001b/0x001c/0x0031 are phases,
+    // not four separate shots.
     assert!(pang > 0, "the hole paid a Pang reward");
+    assert_eq!(strokes, 1, "one physical shot counted once");
     assert_eq!(currency_rows, 1, "exactly one immutable Pang ledger row");
     assert_eq!(progression_rows, 1, "exactly one immutable EXP ledger row");
 
@@ -6652,7 +6698,9 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             } else {
                 (&mut visitor, visitor_key)
             };
-            send_packet(from, from_key, salt, 0x0012, &[0xab; 8]).await;
+            let mut committed_shot = vec![0, 0]; // normal-shot subtype is not relayed
+            committed_shot.extend_from_slice(&[0xab; 62]); // observed U.S. 852 opaque body
+            send_packet(from, from_key, salt, 0x0012, &committed_shot).await;
         }
         {
             let (other, other_key) = if host_shoots {

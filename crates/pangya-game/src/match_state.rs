@@ -415,6 +415,23 @@ impl SoloMatchState {
         Ok(RelayDisposition::Accepted)
     }
 
+    /// Marks the already-counted completed shot as holed without charging another stroke.
+    ///
+    /// Retail Practice reports shot physics first and sends its hole-finish frame afterwards.
+    /// At that point the aggregate is waiting for the next action; treating the announcement as
+    /// another result would score every hole one stroke too high.
+    pub fn hole_out(&mut self) -> Result<RelayDisposition, SoloMatchError> {
+        let active = self.active.as_mut().ok_or(SoloMatchError::InvalidPhase)?;
+        if active.phase == ActivePhase::HoleComplete {
+            return Ok(RelayDisposition::Duplicate);
+        }
+        if active.phase != ActivePhase::AwaitAction || active.strokes == 0 {
+            return Err(SoloMatchError::InvalidPhase);
+        }
+        active.phase = ActivePhase::HoleComplete;
+        Ok(RelayDisposition::Accepted)
+    }
+
     /// Builds the server-owned commit request only after authoritative hole completion.
     pub fn prepare_finish(&mut self) -> Result<CommitSoloHole, SoloMatchError> {
         let active = self.active.as_mut().ok_or(SoloMatchError::InvalidPhase)?;
@@ -935,6 +952,31 @@ mod tests {
             Err(SoloMatchError::InvalidSequence)
         );
         assert_eq!(state, next);
+    }
+
+    #[test]
+    fn retail_hole_out_completes_the_last_counted_stroke_without_adding_one() {
+        let mut state = SoloMatchState::new();
+        let plan = plan(3);
+        begin_playing(&mut state, &plan);
+        assert_eq!(
+            state.accept_action(action(1, 10.0)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state.accept_result(result(1, 1.0, false)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(state.hole_out(), Ok(RelayDisposition::Accepted));
+        assert_eq!(state.hole_out(), Ok(RelayDisposition::Duplicate));
+        let commit = state
+            .prepare_finish()
+            .expect("one counted stroke can finish");
+        assert_eq!(commit.strokes().get(), 1);
+
+        let mut before_shot = SoloMatchState::new();
+        begin_playing(&mut before_shot, &plan);
+        assert_eq!(before_shot.hole_out(), Err(SoloMatchError::InvalidPhase));
     }
 
     #[test]

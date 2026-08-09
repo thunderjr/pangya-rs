@@ -196,6 +196,8 @@ pub enum LobbySoloCommand {
     ShotAction(ShotAction),
     /// Validated result for the pending action.
     ShotResult(ShotResult),
+    /// Mark the already-counted retail shot as holed.
+    HoleOut,
     /// Prepare the server-owned commit request.
     PrepareFinish,
     /// Apply an exact trusted repository result.
@@ -1269,6 +1271,10 @@ impl LobbyRegistry {
                 .map(LobbySoloRouteResult::Relay),
             LobbySoloCommand::ShotResult(result) => handle
                 .solo_result(connection_id, result)
+                .await
+                .map(LobbySoloRouteResult::Relay),
+            LobbySoloCommand::HoleOut => handle
+                .solo_hole_out(connection_id)
                 .await
                 .map(LobbySoloRouteResult::Relay),
             LobbySoloCommand::PrepareFinish => handle

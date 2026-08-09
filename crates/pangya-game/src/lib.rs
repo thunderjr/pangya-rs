@@ -81,15 +81,16 @@ use pangya_protocol::{
     RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
     RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
     RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeStart, RetailPurchaseItem,
-    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
-    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
-    RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType, RetailSelectChannel,
-    RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
-    RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
-    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
-    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
-    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeShotSync,
+    RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin,
+    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd,
+    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
     SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
     SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
@@ -3367,7 +3368,7 @@ where
         commit: pangya_domain::CommitSoloHole,
         shutdown: &CancellationToken,
         idle_deadline: Instant,
-    ) -> Result<(), GameRuntimeError> {
+    ) -> Result<SoloMatchResult, GameRuntimeError> {
         let solo = self
             .config
             .solo_practice
@@ -3406,7 +3407,7 @@ where
         {
             Ok(LobbySoloRouteResult::Committed(_)) => {
                 self.observer.match_event(GameMatchObservation::Finished);
-                Ok(())
+                Ok(committed)
             }
             _ => {
                 self.observer.commit(GameCommitObservation::Failed);
@@ -4713,43 +4714,86 @@ where
                     .match_event(GameMatchObservation::LoadingComplete);
                 Ok(state)
             }
-            // A solo hole has no other participant, so there is nothing to echo this to.
-            (GameState::InMatch, RETAIL_C2S_SHOT_SYNC) => {
-                self.observer.unknown(GameUnknownObservation::Ignored);
-                Ok(state)
-            }
-            (GameState::InMatch, RETAIL_C2S_SHOT_COMMIT | RETAIL_C2S_SHOT_END) => {
+            // SuperSS documents silent Practice Init Shot, while pangbox and alter broadcast an
+            // acknowledgement. The real U.S. 852 client exercised here follows the latter path:
+            // without `0x0055` it remains frozen at Impact and never begins ball animation. This
+            // echo is only an animation barrier; the stroke is counted later at sync.
+            (GameState::InMatch, RETAIL_C2S_SHOT_COMMIT) => {
                 if !shots.admit_count(solo.shot_packets_per_window) {
                     self.observer
                         .rate_limited(GameRateClass::ShotPacketsConnection);
                     self.observer.shot(GameShotObservation::RateLimited);
                     return Ok(state);
                 }
-                // The retail shot payload is the client's own and carries nothing the
-                // server can trust, so a shot is recorded as one stroke rather than
-                // interpreted. Scoring stays server-authoritative through the stroke count.
-                self.record_retail_stroke(identity.connection_id, strokes, false)
-                    .await?;
                 self.send(
                     framed,
-                    &RetailTurnEnd {
-                        connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
-                    },
-                )
-                .await?;
-                self.send(
-                    framed,
-                    &RetailTurnStart {
-                        connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    &RetailShotCommitRelay {
+                        connection_id: u32::try_from(identity.connection_id.get())
+                            .unwrap_or_default(),
+                        shot: retail_shot_announce_payload(payload)?,
                     },
                 )
                 .await?;
                 Ok(state)
             }
-            (GameState::InMatch, RETAIL_C2S_HOLE_FINISH) => {
-                // The finishing stroke is the one that holes out.
-                self.record_retail_stroke(identity.connection_id, strokes, true)
+            // Practice answers sync immediately with its reduced `0x006e` body. It is also the
+            // point at which the reference increments the authoritative stroke count.
+            (GameState::InMatch, RETAIL_C2S_SHOT_SYNC) => {
+                if !shots.admit_count(solo.shot_packets_per_window) {
+                    self.observer
+                        .rate_limited(GameRateClass::ShotPacketsConnection);
+                    self.observer.shot(GameShotObservation::RateLimited);
+                    return Ok(state);
+                }
+                let sync = decode_packet_payload::<RetailPracticeShotSyncRequest>(
+                    payload,
+                    &CompatibilityProfile::US_852,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                let expected_connection =
+                    u32::try_from(identity.connection_id.get()).unwrap_or_default();
+                if sync.connection_id != expected_connection {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.record_retail_stroke(identity.connection_id, strokes, false)
                     .await?;
+                self.send(
+                    framed,
+                    &RetailPracticeShotSync {
+                        connection_id: sync.connection_id,
+                        hole: 1,
+                        x: sync.x,
+                        z: sync.z,
+                        shot_state: sync.shot_state,
+                        shot_time: sync.shot_time,
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            // This U.S. 852 flow uses the versus-shaped hole intro, so the end-shot barrier must
+            // hand the perpetual one-player turn back as well. Without `0x0063` the client waits
+            // exactly sixty seconds after landing, reports an exception, and disconnects.
+            (GameState::InMatch, RETAIL_C2S_SHOT_END) => {
+                let connection_id = u32::try_from(identity.connection_id.get()).unwrap_or_default();
+                self.send(framed, &RetailTurnEnd { connection_id }).await?;
+                self.send(framed, &RetailTurnStart { connection_id })
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InMatch, RETAIL_C2S_HOLE_FINISH) => {
+                // The client announces hole completion after the already-counted sync/end pair.
+                // Mark that stroke holed without fabricating another one.
+                match self
+                    .lobby
+                    .route_solo(identity.connection_id, LobbySoloCommand::HoleOut)
+                    .await
+                {
+                    Ok(LobbySoloRouteResult::Relay(_)) => {}
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                    Err(_) => return Ok(state),
+                }
                 let commit = match self
                     .lobby
                     .route_solo(identity.connection_id, LobbySoloCommand::PrepareFinish)
@@ -4759,14 +4803,44 @@ where
                     Ok(_) => return Err(GameRuntimeError::Protocol),
                     Err(_) => return Ok(state),
                 };
-                self.persist_and_apply_commit(
-                    identity.connection_id,
-                    commit,
-                    shutdown,
-                    idle_deadline,
+                let committed = self
+                    .persist_and_apply_commit(
+                        identity.connection_id,
+                        commit,
+                        shutdown,
+                        idle_deadline,
+                    )
+                    .await?;
+                self.send(framed, &RetailFinishHole).await?;
+                self.send(
+                    framed,
+                    &RetailMatchFinish {
+                        standings: vec![RetailStanding {
+                            connection_id: u32::try_from(identity.connection_id.get())
+                                .unwrap_or_default(),
+                            place: 1,
+                            score: i8::try_from(committed.score()).unwrap_or(
+                                if committed.score() < 0 {
+                                    i8::MIN
+                                } else {
+                                    i8::MAX
+                                },
+                            ),
+                            experience: u16::try_from(committed.experience_reward())
+                                .unwrap_or(u16::MAX),
+                            pang: committed.pang_reward(),
+                            bonus_pang: 0,
+                        }],
+                    },
                 )
                 .await?;
-                self.send(framed, &RetailFinishHole).await?;
+                self.send(
+                    framed,
+                    &RetailPangBalance {
+                        pang: committed.pang_balance(),
+                    },
+                )
+                .await?;
                 Ok(GameState::InRoom)
             }
             _ => Err(GameRuntimeError::Protocol),
@@ -4937,7 +5011,7 @@ where
                 }
                 self.relay_retail_match_frame(
                     identity.connection_id,
-                    RetailMatchRelay::Shot(payload.to_vec()),
+                    RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
                 )
                 .await;
                 Ok(Some(state))
@@ -6839,6 +6913,32 @@ const RETAIL_SOLO_GAME_TIMER: Duration = Duration::from_secs(600);
 const RETAIL_C2S_SHOT_SYNC: u16 = 0x001b;
 const RETAIL_C2S_SHOT_END: u16 = 0x001c;
 const RETAIL_C2S_HOLE_FINISH: u16 = 0x0031;
+/// Removes the client-only shot subtype before relaying a committed shot as server `0x0055`.
+fn retail_shot_announce_payload(payload: &[u8]) -> Result<Vec<u8>, GameRuntimeError> {
+    let subtype = payload
+        .get(..2)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or(GameRuntimeError::Protocol)?;
+    tracing::debug!(
+        shot_subtype = subtype,
+        shot_payload_bytes = payload.len(),
+        "retail shot commit shape"
+    );
+    let prefix = match subtype {
+        0 => 2,
+        1 => 11, // putt carries nine subtype bytes
+        _ => return Err(GameRuntimeError::Protocol),
+    };
+    let shot = payload
+        .get(prefix..)
+        // The references disagree on the opaque tail width (PacketDoc and pangbox model distinct
+        // revisions). The frame is already hard-capped; preserve every supplied byte instead of
+        // guessing one width, while still refusing an empty trajectory.
+        .filter(|shot| !shot.is_empty())
+        .ok_or(GameRuntimeError::Protocol)?;
+    Ok(shot.to_vec())
+}
 const RETAIL_C2S_LOAD_PROGRESS: u16 = 0x0048;
 
 fn is_retail_match_opcode(opcode: u16) -> bool {
