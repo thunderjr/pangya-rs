@@ -550,9 +550,18 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     - The stored entry begins at entry offset zero and reads `slot=1`, `user='rsp8'`,
       `nick='HostEight'` at the offsets this server writes them. **The entry layout is right**
       and the copy is verbatim.
-    - With the roster entry's trailing card-count byte present, the client stores **exactly one**
-      entry in that array; with the byte removed, a **second** entry appears. The entry ends at
-      the start time. The byte made every entry after the first land one byte late.
+    - The trailing card-count byte **is** required, and removing it was a mistake since
+      corrected. `Acrisio-Filho/SuperSS-Dev` (`GAME/versus_base.cpp`
+      `VersusBase::sendInitialData`) writes `addUint8(count)` after the start time and then
+      that many card records, so a roster without it makes the client read the *next* entry's
+      first byte as a card count and eat the entry. Reading the array directly shows index 1
+      empty either way, so the byte was never the difference.
+    - **That array is not the roster.** Reversing the order the two seats are written in moves
+      which player lands at index 0, and splitting the roster into one frame per player still
+      leaves everything at index 0 with the last frame winning. It holds one entry, not a
+      player list, so "the second entry is not stored" was measured against the wrong
+      structure. The array the crash walks is a different one — `[esi+0x6c]`, stride `0x358` —
+      and what fills *it* is the open question.
 
     What has not moved: the fault is still `0x00b65c25`, `[null + 0x6c]`, with `EBX = 1` — the
     second player still has no character model even though its entry now reaches memory. The

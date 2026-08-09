@@ -122,6 +122,13 @@ impl EncodePacket for RetailMatchStart {
                     writer.u16_le(seat.slot);
                     seat.player.encode_body(writer)?;
                     writer.bytes(&seat.start_time);
+                    // Cards in hand, then that many card records. Zero here, but the byte is
+                    // not optional: `Acrisio-Filho/SuperSS-Dev`
+                    // (`GAME/versus_base.cpp` `VersusBase::sendInitialData`) writes
+                    // `addUint8(count)` after the start time and then the records, so a
+                    // client reading a roster without it takes the next entry's first byte as
+                    // the count and consumes that many card records out of the entry itself.
+                    writer.u8(0);
                     if std::env::var_os("PANGYA_MARK_ROSTER").is_some() {
                         writer.mark_zero_words_from(entry);
                     }

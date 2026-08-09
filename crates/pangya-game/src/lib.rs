@@ -4094,17 +4094,13 @@ where
         self.send(framed, &RetailMatchOpen).await?;
         self.send(framed, &RetailMatchOpenAck).await?;
         self.send(framed, &RetailPangRate::default()).await?;
-        self.send(
-            framed,
-            &RetailMatchStart::Roster(
-                roster
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, member)| retail_match_player(slot, member))
-                    .collect(),
-            ),
-        )
-        .await?;
+        let seats: Vec<_> = roster
+            .iter()
+            .enumerate()
+            .map(|(slot, member)| retail_match_player(slot, member))
+            .collect();
+        tracing::info!(players = seats.len(), "retail match roster");
+        self.send(framed, &RetailMatchStart::Roster(seats)).await?;
         // Each player's own statistics, which the client asks for by starting the game and
         // waits on before it will finish building the hole. Sent between the roster and the
         // plan, where both reference servers put it.
