@@ -45,6 +45,13 @@ struct CatalogItem {
     kind: &'static str,
     /// The client's own display name, absent for a table that carries none.
     name: Option<String>,
+    /// The client's own icon base name — a bare stem such as `club01_01`, with no directory and
+    /// no extension. Absent for the roughly one row in ten that carries none.
+    ///
+    /// The server does not resolve this to a file and holds no artwork; it publishes the stem so
+    /// an operator surface can pair a row with the icon the client would draw, if that surface
+    /// has been given the converted assets. See the panel's `/icons` mount.
+    icon: Option<String>,
     /// The price the client's tables carry, or `null` when the client does not sell it.
     client_pang: Option<u64>,
     max_stack: Option<u32>,
@@ -112,6 +119,7 @@ pub(crate) async fn list(
                 type_id_hex: format!("0x{:08x}", record.type_id.get()),
                 kind: kind_text(family),
                 name: record.name().map(str::to_owned),
+                icon: record.icon().map(str::to_owned),
                 client_pang: definition.and_then(|definition| match definition.sale {
                     ItemSale::Pang(price) => Some(price),
                     ItemSale::NotSold => None,

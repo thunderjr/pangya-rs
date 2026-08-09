@@ -45,6 +45,8 @@ struct ShopRow {
     type_id_hex: String,
     kind: &'static str,
     name: Option<String>,
+    /// The client's own icon stem, for the same reason the catalog carries one.
+    icon: Option<String>,
     /// What the client's own tables say, for comparison.
     client_pang: Option<u64>,
     /// The override on this item, if any.
@@ -104,6 +106,7 @@ pub(crate) async fn list(
                 type_id_hex: format!("0x{:08x}", definition.type_id.get()),
                 kind: crate::catalog::kind_text(kind),
                 name: record.name().map(str::to_owned),
+                icon: record.icon().map(str::to_owned),
                 client_pang,
                 override_enabled: entry.and_then(|entry| entry.enabled),
                 override_pang: entry.and_then(|entry| entry.pang),

@@ -57,6 +57,15 @@ pub const CLIENT_TYPE_ID_OFFSET: usize = 4;
 pub const CLIENT_NAME_OFFSET: usize = 0x08;
 /// Fixed width of that name field.
 pub const CLIENT_NAME_BYTES: usize = 40;
+/// Byte offset of a real client record's icon base name.
+///
+/// Same shared base, one byte past `minLevel`. The value is a bare stem with no directory and
+/// no extension — `club01_01`, `ball_01`, `item0_00` — which the client resolves against its own
+/// mounted texture tree. This server never resolves it: it is read so an operator surface can
+/// pair a row with the artwork the client would draw, and nothing on the wire derives from it.
+pub const CLIENT_ICON_OFFSET: usize = 0x31;
+/// Fixed width of that icon field.
+pub const CLIENT_ICON_BYTES: usize = 40;
 /// Byte offset of a real client record's Pang price.
 pub const CLIENT_PRICE_OFFSET: usize = 0x5c;
 /// Offset of the shop availability flag, immediately after price/discount/condition.
@@ -145,6 +154,7 @@ pub struct CatalogRecord {
     definition: Option<ItemDefinition>,
     character_part_slot: Option<u8>,
     name: Option<Box<str>>,
+    icon: Option<Box<str>>,
 }
 
 impl CatalogRecord {
@@ -163,6 +173,16 @@ impl CatalogRecord {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Returns the client's own icon base name, when the record carries one.
+    ///
+    /// A bare stem — `club01_01` — with no directory and no extension, exactly as the table
+    /// stores it. Resolving it to a file is the caller's problem and deliberately so: the
+    /// artwork lives in the client's mounted PAK tree, which this server does not read.
+    #[must_use]
+    pub fn icon(&self) -> Option<&str> {
+        self.icon.as_deref()
     }
 
     /// Returns the exact immutable v2 economy definition, if this is an item family.
@@ -645,8 +665,9 @@ pub fn parse_iff_bytes(
             local_one_hole_par,
             definition: None,
             character_part_slot: None,
-            // The synthetic schemas carry no name field.
+            // The synthetic schemas carry no name or icon field.
             name: None,
+            icon: None,
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
@@ -710,8 +731,27 @@ fn client_definition(
 /// ASCII, but a byte outside it must not cost the whole catalog its load — the name is
 /// cosmetic, and every gameplay decision is made from the type id.
 fn client_name(record: &[u8]) -> Option<Box<str>> {
-    let end = CLIENT_NAME_OFFSET.checked_add(CLIENT_NAME_BYTES)?;
-    let field = record.get(CLIENT_NAME_OFFSET..end)?;
+    client_text(record, CLIENT_NAME_OFFSET, CLIENT_NAME_BYTES)
+}
+
+/// Reads a real client record's icon base name.
+///
+/// Shares [`client_text`] with the display name because the two fields have identical shape.
+/// Roughly a tenth of rows carry an empty icon — decorative parts and unreleased rows — and
+/// those yield `None` rather than an empty string, so a caller cannot build a path from nothing.
+fn client_icon(record: &[u8]) -> Option<Box<str>> {
+    client_text(record, CLIENT_ICON_OFFSET, CLIENT_ICON_BYTES)
+}
+
+/// Reads one fixed-width NUL-terminated field from a real client record.
+///
+/// Returns `None` for a record too narrow to carry the field, and for a value that is empty
+/// after trimming. Bytes are taken up to the first NUL, and decoded lossily: the U.S. tables are
+/// ASCII, but a byte outside it must not cost the whole catalog its load — these fields are
+/// cosmetic, and every gameplay decision is made from the type id.
+fn client_text(record: &[u8], offset: usize, width: usize) -> Option<Box<str>> {
+    let end = offset.checked_add(width)?;
+    let field = record.get(offset..end)?;
     let bytes = field.split(|byte| *byte == 0).next().unwrap_or(field);
     let text = String::from_utf8_lossy(bytes);
     let trimmed = text.trim();
@@ -813,6 +853,7 @@ pub fn parse_client_iff_bytes(
             definition: client_definition(entry.kind, ItemTypeId::new(type_id), record)?,
             character_part_slot: None,
             name: client_name(record),
+            icon: client_icon(record),
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
@@ -874,8 +915,9 @@ fn parse_iff_bytes_for_schema(
             local_one_hole_par: minimal.local_one_hole_par,
             definition,
             character_part_slot: slot,
-            // The synthetic schemas carry no name field.
+            // The synthetic v2 schemas carry neither field.
             name: None,
+            icon: None,
         };
         parsed.insert(record.type_id.get(), record);
     }
@@ -1374,6 +1416,7 @@ mod tests {
             definition: None,
             character_part_slot: None,
             name: None,
+            icon: None,
         };
         let part = CatalogRecord {
             type_id: ItemTypeId::new(20),
@@ -1389,6 +1432,7 @@ mod tests {
             }),
             character_part_slot: Some(0),
             name: None,
+            icon: None,
         };
         let records = BTreeMap::from([
             (CatalogKind::Character, BTreeMap::from([(10, character)])),
@@ -1573,5 +1617,28 @@ mod name_tests {
         name.resize(CLIENT_NAME_BYTES, 0);
         let parsed = client_name(&priced_record(&name)).expect("a lossy name is still a name");
         assert!(parsed.starts_with("Caf"), "got {parsed:?}");
+    }
+
+    #[test]
+    fn an_icon_is_read_from_its_own_offset_and_does_not_disturb_the_name() {
+        // The two fields are 0x29 bytes apart and share a decoder, so the risk is reading one
+        // through the other's offset — which would still return a plausible-looking string.
+        let mut record = priced_record(b"Papel Training Club Set");
+        record[CLIENT_ICON_OFFSET..CLIENT_ICON_OFFSET + 9].copy_from_slice(b"club01_01");
+        assert_eq!(client_icon(&record).as_deref(), Some("club01_01"));
+        assert_eq!(
+            client_name(&record).as_deref(),
+            Some("Papel Training Club Set")
+        );
+    }
+
+    #[test]
+    fn an_absent_icon_is_none_rather_than_an_empty_string() {
+        // Roughly a tenth of real rows carry no icon. A caller must not be handed "" and build
+        // a path out of it.
+        assert_eq!(client_icon(&priced_record(b"Named")), None);
+        // Narrower than 0x31 + 40: the same families that carry no name carry no icon.
+        assert_eq!(client_icon(&[0_u8; 0x40]), None);
+        assert_eq!(client_icon(&[]), None);
     }
 }
