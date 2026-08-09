@@ -5361,8 +5361,23 @@ where
         );
         // Character parts and the two unclassified slots have no reply this server can form
         // honestly, so they are accepted and left alone rather than answered with a guess.
+        //
+        // The part set is now decoded rather than dropped — see `RetailCharacterParts` — but
+        // nothing persists it yet, so this still ends here. Logging the worn slot count makes
+        // the gap visible in a live session instead of silent. Migration 0011 adds the table
+        // this will write to; wiring it is the remaining half of `SPEC_DURABLE_PLAYER_STATE`
+        // milestone E2.
+        if let RetailEquipmentRequested::CharacterParts(parts) = request.requested {
+            let worn = parts.part_type_ids.iter().filter(|id| **id != 0).count();
+            tracing::debug!(
+                character_id = parts.character_id,
+                character_type_id = parts.character_type_id,
+                worn_slots = worn,
+                "retail character parts decoded but not yet persisted"
+            );
+        }
         let reply = match request.requested {
-            RetailEquipmentRequested::CharacterParts
+            RetailEquipmentRequested::CharacterParts(_)
             | RetailEquipmentRequested::UnknownEight(_)
             | RetailEquipmentRequested::UnknownNine { .. } => {
                 self.observer.unknown(GameUnknownObservation::Ignored);
