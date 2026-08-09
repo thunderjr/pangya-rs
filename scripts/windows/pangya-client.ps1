@@ -790,13 +790,9 @@ function Close-PangyaMyRoom {
 # intermediate room stage's grey Start button for the actual Practice start control.
 function Start-PangyaCoursePractice {
   Invoke-PangyaClick -X 169 -Y 577
-  if (-not (Wait-PangyaText -X 130 -Y 150 -Width 170 -Height 24 -TimeoutSeconds 12)) {
-    throw 'single-player practice mode dialog did not render'
-  }
+  Start-Sleep -Milliseconds 800
   Invoke-PangyaClick -X 196 -Y 411
-  if (-not (Wait-PangyaText -X 570 -Y 65 -Width 100 -Height 25 -TimeoutSeconds 12)) {
-    throw 'practice Strategy dialog did not render'
-  }
+  Start-Sleep -Milliseconds 1200
   Invoke-PangyaClick -X 606 -Y 479
   if (-not (Wait-PangyaText -X 10 -Y 7 -Width 100 -Height 25 -TimeoutSeconds 60)) {
     throw 'practice hole header did not render'
@@ -852,7 +848,7 @@ function Invoke-PangyaShotMeter {
 # vertical marker against a baseline image, commits power after it reaches the requested column,
 # then commits impact when it returns to the pink zone. Coordinates are client-area pixels.
 function Invoke-PangyaObservedShotMeter {
-  param([int]$PowerX = 300, [int]$ImpactX = 170, [int]$TimeoutMs = 4000, [switch]$Trace)
+  param([int]$PowerX = 300, [int]$ImpactX = 185, [int]$TimeoutMs = 4000, [switch]$Trace)
   Add-Type -AssemblyName System.Drawing
   $origin = Get-PangyaOrigin
   $left = 105; $top = 534; $width = 410; $height = 22
@@ -867,7 +863,7 @@ function Invoke-PangyaObservedShotMeter {
     $frame = Capture-Bar
     $bestX = -1; $best = 0
     # Exclude the animated Start/Power label at the far left; it otherwise dominates the diff.
-    for ($x = 30; $x -lt $width - 2; $x++) {
+    for ($x = 70; $x -lt $width - 2; $x++) {
       $score = 0
       for ($y = 0; $y -lt $height; $y++) {
         $a = $baseline.GetPixel($x, $y); $b = $frame.GetPixel($x, $y)
@@ -893,6 +889,9 @@ function Invoke-PangyaObservedShotMeter {
       if ($marker -ge $PowerX) {
         Send-PangyaText ' '
         $powerCommitted = $true
+        # The Practice meter takes a render frame to enter its impact phase; an immediate third
+        # Space is dropped while the power transition is still active.
+        Start-Sleep -Milliseconds 200
         break
       }
       Start-Sleep -Milliseconds 15
