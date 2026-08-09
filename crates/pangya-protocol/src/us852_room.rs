@@ -1117,8 +1117,20 @@ pub struct RetailRoomPlayer {
     pub character: RetailCharacter,
 }
 
+/// Exact wire width of the identity half of a room census record, without the character block.
+///
+/// A modification frame carries only this half: both reference descriptions of `0x0048` give
+/// the modification case a bare user record and no trailing character data.
+pub const ROOM_PLAYER_IDENTITY_BYTES: usize = 341;
+
 impl RetailRoomPlayer {
     fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
+        self.encode_identity(writer)?;
+        self.character.encode_body(writer);
+        Ok(())
+    }
+
+    fn encode_identity(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
         let start = writer.as_slice().len();
         writer.u32_le(self.connection_id);
         writer.fixed_nul(&self.nickname, 22)?;
@@ -1157,8 +1169,7 @@ impl RetailRoomPlayer {
         writer.u8(0); // invited
         writer.f32_le(0.0); // average score
         writer.f32_le(0.0);
-        self.character.encode_body(writer);
-        debug_assert_eq!(writer.as_slice().len() - start, ROOM_PLAYER_RECORD_BYTES);
+        debug_assert_eq!(writer.as_slice().len() - start, ROOM_PLAYER_IDENTITY_BYTES);
         Ok(())
     }
 }
@@ -1216,11 +1227,15 @@ impl EncodePacket for RetailRoomCensus {
             }
             Self::Update(player) => {
                 writer.u8(RoomCensusKind::Update as u8);
+                // The same `-1` every other census kind carries between the kind byte and its
+                // body; a modification frame is not an exception to it.
+                writer.u16_le(0xffff);
                 // The connection id is intentionally repeated: once here and again as the
                 // first field of the record itself.
                 writer.u32_le(player.connection_id);
-                player.encode_body(writer)?;
-                writer.u8(0);
+                // Identity only. A modification frame carries no character block and no
+                // terminator after the record.
+                player.encode_identity(writer)?;
             }
         }
         Ok(())
@@ -1480,14 +1495,17 @@ mod tests {
             &profile(),
         )
         .expect("update");
-        // Update writes the connection id, then the record which repeats it.
-        assert_eq!(update.len(), 1 + 4 + ROOM_PLAYER_RECORD_BYTES + 1);
+        // Update carries the same 0xffff every other kind does, then the connection id,
+        // then the identity half of the record — which repeats that id — and nothing else.
+        // It is the only kind whose record has no character block and no terminator.
+        assert_eq!(update.len(), 1 + 2 + 4 + ROOM_PLAYER_IDENTITY_BYTES);
+        assert_eq!(u16::from_le_bytes([update[1], update[2]]), 0xffff);
         assert_eq!(
-            u32::from_le_bytes([update[1], update[2], update[3], update[4]]),
+            u32::from_le_bytes([update[3], update[4], update[5], update[6]]),
             11
         );
         assert_eq!(
-            u32::from_le_bytes([update[5], update[6], update[7], update[8]]),
+            u32::from_le_bytes([update[7], update[8], update[9], update[10]]),
             11
         );
     }

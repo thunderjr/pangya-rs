@@ -157,10 +157,18 @@ character_key = "starter_character"
 character_type_id = 67108864
 allowed_character_type_ids = [67108864]
 equipped_club_key = "starter_club"
+# A client will not take a shot with no ball equipped, so a new account needs one to be
+# playable at all. 335544320 is 0x14000000, the first Ball.iff entry.
+equipped_ball_key = "starter_ball"
 
 [[starter.items]]
 key = "starter_club"
 item_type_id = 268435456
+quantity = 1
+
+[[starter.items]]
+key = "starter_ball"
+item_type_id = 335544320
 quantity = 1
 
 [data]

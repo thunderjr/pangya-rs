@@ -567,20 +567,22 @@ mod tests {
     }
 
     /// The record the client reads is identical in the lobby and in a match roster, so the
-    /// roster entry is exactly the reply's player block plus its seat, time and card count.
+    /// roster entry is exactly the reply's player block plus its room number, time and card
+    /// count. The lobby reply writes `0xffff` in that leading field because the player is in
+    /// no room; a roster entry writes the room the match is in.
     #[test]
     fn a_match_roster_entry_carries_the_same_player_record_as_the_lobby() {
         let reply = encode_packet_payload(&sample_reply(), &profile()).expect("reply");
         let roster = encode_packet_payload(
             &crate::RetailMatchStart::Roster(vec![crate::RetailMatchPlayer {
-                number: 1,
+                room_number: 1,
                 player: sample_player_data(),
                 start_time: [0; 16],
             }]),
             &profile(),
         )
         .expect("roster");
-        // Subtype and count, then the seat number, then the record.
+        // Subtype and count, then the room number, then the record.
         assert_eq!(roster[0], 0x00);
         assert_eq!(roster[1], 1);
         assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
@@ -769,6 +771,52 @@ impl RetailPlayerStatistics {
         writer.u32_le(0);
         writer.bytes(&[0; 8]);
         debug_assert_eq!(writer.as_slice().len() - start, PLAYER_STATISTICS_BYTES);
+    }
+}
+
+/// Course-record slots the statistics frame always carries.
+pub const STATISTICS_COURSE_SLOTS: usize = 12;
+
+/// Player statistics, server opcode `0x0045`.
+///
+/// Sent to each player as part of starting a hole, between the roster and the match plan. The
+/// client answers `0x000E` expecting it: without it the per-player record it builds the hole
+/// from is never completed.
+///
+/// The twelve course slots are the "no record" form. Each is one signed byte, and `-1` means
+/// the slot is empty, so the whole tail is `0xff` twelve times and no record bodies follow.
+///
+/// # Provenance
+///
+/// `pangbox/packetdoc` (`gameservice/server/0045.ksy`: `user_statistic_data`, then
+/// `user_statistic_data_ext`, then twelve `course_stat_slot`s whose body is present only when
+/// the leading `s1` is not `-1`; documented there as a response to "GameService Client 0x000E
+/// Game Start"), and `Acrisio-Filho/SuperSS-Dev`
+/// (`Server Lib/Game Server/GAME/game.cpp` `Game::sendUpdateInfoAndMapStatistics`, which for
+/// its `-1` option writes `UserInfo`, `TrofelInfo`, then `addInt64(-1)` and `addInt32(-1)` —
+/// the same twelve `0xff` bytes).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPlayerStatisticsReport {
+    /// The statistics themselves.
+    pub statistics: RetailPlayerStatistics,
+}
+
+impl EncodePacket for RetailPlayerStatisticsReport {
+    const OPCODE: u16 = 0x0045;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        self.statistics.encode_body(writer);
+        // The trophy block, written the same way the handover record writes it.
+        writer.u16_le(1);
+        writer.bytes(&[0; PLAYER_TROPHIES_BYTES - 4]);
+        writer.u16_le(1);
+        writer.bytes(&[0xff; STATISTICS_COURSE_SLOTS]);
+        Ok(())
     }
 }
 

@@ -79,12 +79,12 @@ use pangya_protocol::{
     RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
     RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
     RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
-    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
-    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus,
-    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync,
-    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
+    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
     RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
     RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
     RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
@@ -3481,10 +3481,12 @@ where
                     let begin = plan.begin();
                     // A solo hole has no turn arbitration, so the client's own timers are the
                     // only ones, and it is told the same defaults it shows for practice.
-                    let roster = self.retail_match_roster(connection_id).await;
+                    let (room_number, roster) = self.retail_match_roster(connection_id).await;
                     match_context.atmosphere = Some(
                         self.send_retail_hole_intro(
                             framed,
+                            connection_id,
+                            room_number,
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
@@ -3545,10 +3547,12 @@ where
                     // The timers the client counts down with are the ones the room actor will
                     // actually enforce, so a shot that runs out on screen is the shot the
                     // server forfeits.
-                    let roster = self.retail_match_roster(connection_id).await;
+                    let (room_number, roster) = self.retail_match_roster(connection_id).await;
                     let atmosphere = self
                         .send_retail_hole_intro(
                             framed,
+                            connection_id,
+                            room_number,
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
@@ -4021,14 +4025,22 @@ where
     /// Read from the room rather than from the match plan: the plan names connections, and the
     /// roster has to describe whole players. An empty answer sends an empty roster, which the
     /// client renders as a match with nobody in it rather than misreading the frame.
-    async fn retail_match_roster(&self, connection_id: PlayerConnectionId) -> Vec<MemberSnapshot> {
+    /// Returns the room's own number alongside the roster, because every seat in the match
+    /// roster carries it; see [`RetailMatchPlayer::room_number`].
+    async fn retail_match_roster(
+        &self,
+        connection_id: PlayerConnectionId,
+    ) -> (u16, Vec<MemberSnapshot>) {
         match self
             .lobby
             .route(connection_id, LobbyRoomCommand::GetState)
             .await
         {
-            Ok(LobbyRouteResult::Snapshot(snapshot)) => snapshot.members().to_vec(),
-            _ => Vec::new(),
+            Ok(LobbyRouteResult::Snapshot(snapshot)) => (
+                u16::try_from(snapshot.summary().id().get()).unwrap_or(0xffff),
+                snapshot.members().to_vec(),
+            ),
+            _ => (0xffff, Vec::new()),
         }
     }
 
@@ -4045,6 +4057,8 @@ where
     async fn send_retail_hole_intro(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
+        connection_id: PlayerConnectionId,
+        room_number: u16,
         roster: &[MemberSnapshot],
         hole: RetailHoleIntro,
     ) -> Result<RetailHoleAtmosphere, GameRuntimeError> {
@@ -4072,12 +4086,31 @@ where
             &RetailMatchStart::Roster(
                 roster
                     .iter()
-                    .enumerate()
-                    .map(|(seat, member)| retail_match_player(seat, member))
+                    .map(|member| retail_match_player(room_number, member))
                     .collect(),
             ),
         )
         .await?;
+        // Each player's own statistics, which the client asks for by starting the game and
+        // waits on before it will finish building the hole. Sent between the roster and the
+        // plan, where both reference servers put it.
+        if let Some(member) = roster
+            .iter()
+            .find(|member| member.connection_id() == connection_id)
+        {
+            let card = member.card();
+            self.send(
+                framed,
+                &RetailPlayerStatisticsReport {
+                    statistics: RetailPlayerStatistics {
+                        experience: card.experience,
+                        pang: card.pang,
+                        ..RetailPlayerStatistics::default()
+                    },
+                },
+            )
+            .await?;
+        }
         self.send(
             framed,
             &RetailMatchInfo {
@@ -4098,6 +4131,20 @@ where
         )
         .await?;
         self.send(framed, &RetailMascotSeed::default()).await?;
+        // The census modification that closes the start sequence. `SuperSS-Dev`
+        // (`GAME/room.cpp` `room::startGame`) sends exactly this for a stroke or match room,
+        // right after the initial data, addressed to the player who started.
+        if let Some((slot, member)) = roster
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.connection_id() == connection_id)
+        {
+            self.send(
+                framed,
+                &RetailRoomCensus::Update(Box::new(retail_room_player(slot, member))),
+            )
+            .await?;
+        }
         Ok(RetailHoleAtmosphere { weather, wind })
     }
 
@@ -6168,11 +6215,11 @@ fn retail_now() -> [u8; 16] {
     )
 }
 
-fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlayer {
+fn retail_match_player(room_number: u16, member: &MemberSnapshot) -> RetailMatchPlayer {
     let card = member.card();
     let start_time = retail_now();
     RetailMatchPlayer {
-        number: u16::try_from(seat.saturating_add(1)).unwrap_or(u16::MAX),
+        room_number,
         player: RetailPlayerData {
             identity: RetailPlayerIdentity {
                 username: card.username.as_bytes().to_vec(),
@@ -6209,36 +6256,44 @@ fn retail_match_player(seat: usize, member: &MemberSnapshot) -> RetailMatchPlaye
 }
 
 /// Builds a retail census roster from a room's authoritative snapshot.
+/// Builds one room census record.
+///
+/// `slot` is one-based: `pangbox/packetdoc` (`gameservice/server/0048.ksy`, `room_user_slot`)
+/// documents it as "from 1 to the user_max", and the client numbers the seats it draws from it.
+fn retail_room_player(slot: usize, member: &MemberSnapshot) -> RetailRoomPlayer {
+    RetailRoomPlayer {
+        connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
+        nickname: member.nickname().as_bytes().to_vec(),
+        slot: u8::try_from(slot.saturating_add(1)).unwrap_or(u8::MAX),
+        character_iff_id: member.character_iff_id().unwrap_or(0),
+        flags: RoomPlayerFlags::new(member.is_owner(), member.is_ready()),
+        level: 1,
+        user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
+        // The client builds every player's model from this block when the hole loads, so
+        // the catalog id has to be one its own Character.iff holds. Fitted parts are not
+        // carried by a room member and stay zero: they change how a character looks, not
+        // whether it can be instantiated.
+        character: RetailCharacter {
+            iff_id: member.character_iff_id().unwrap_or(0),
+            uid: member
+                .character_id()
+                .and_then(|id| u32::try_from(id.get()).ok())
+                .unwrap_or(0),
+            hair_color: 0,
+            part_iff_ids: [0; CHARACTER_PARTS],
+            part_uids: [0; CHARACTER_PARTS],
+            stats: [0; CHARACTER_STATS],
+            mastery: 0,
+        },
+    }
+}
+
 fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
     let players = snapshot
         .members()
         .iter()
         .enumerate()
-        .map(|(slot, member)| RetailRoomPlayer {
-            connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
-            nickname: member.nickname().as_bytes().to_vec(),
-            slot: u8::try_from(slot).unwrap_or(u8::MAX),
-            character_iff_id: member.character_iff_id().unwrap_or(0),
-            flags: RoomPlayerFlags::new(member.is_owner(), member.is_ready()),
-            level: 1,
-            user_id: u32::try_from(member.account_id().get()).unwrap_or(0),
-            // The client builds every player's model from this block when the hole loads, so
-            // the catalog id has to be one its own Character.iff holds. Fitted parts are not
-            // carried by a room member and stay zero: they change how a character looks, not
-            // whether it can be instantiated.
-            character: RetailCharacter {
-                iff_id: member.character_iff_id().unwrap_or(0),
-                uid: member
-                    .character_id()
-                    .and_then(|id| u32::try_from(id.get()).ok())
-                    .unwrap_or(0),
-                hair_color: 0,
-                part_iff_ids: [0; CHARACTER_PARTS],
-                part_uids: [0; CHARACTER_PARTS],
-                stats: [0; CHARACTER_STATS],
-                mastery: 0,
-            },
-        })
+        .map(|(slot, member)| retail_room_player(slot, member))
         .collect();
     RetailRoomCensus::List(players)
 }

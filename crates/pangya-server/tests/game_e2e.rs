@@ -6258,6 +6258,13 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         0x0076,
         "match start"
     );
+    // The player's own statistics, which both reference servers send between the roster and
+    // the plan and which the client waits on before it finishes building the hole.
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0045,
+        "player statistics"
+    );
     let (opcode, info) = receive_packet(&mut stream, key).await;
     assert_eq!(opcode, 0x0052, "match plan");
     // Four header bytes, three u32 fields, eighteen holes, the seed, then eighteen collectible
@@ -6268,6 +6275,12 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         receive_packet(&mut stream, key).await.0,
         0x016a,
         "mascot seed"
+    );
+    // The census modification that closes the start sequence.
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0048,
+        "start-of-match census update"
     );
 
     // Loading finished releases the withheld weather and wind, moves the hole into play, and
@@ -6529,7 +6542,9 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     ] {
         let received = drain_frames(stream, key, Duration::from_millis(1200)).await;
         let frames: Vec<u16> = received.iter().map(|(opcode, _)| *opcode).collect();
-        for expected in [0x0230_u16, 0x0231, 0x0077, 0x0076, 0x0052, 0x016a] {
+        for expected in [
+            0x0230_u16, 0x0231, 0x0077, 0x0076, 0x0045, 0x0052, 0x016a, 0x0048,
+        ] {
             assert!(
                 frames.contains(&expected),
                 "{who} receives {expected:#06x} of the hole intro: {frames:04x?}"

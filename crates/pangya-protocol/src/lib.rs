@@ -96,8 +96,8 @@ pub use us852_bootstrap::{
     IffContainerChunk, IffContainerKind, MAX_BOOTSTRAP_STRING_BYTES, MAX_SERVER_CHANNELS,
     PLAYER_STATISTICS_BYTES, PLAYER_TROPHIES_BYTES, RetailCaddie, RetailChannel, RetailCharacter,
     RetailCourseStatistics, RetailEquipment, RetailGameAuth, RetailPangBalance, RetailPlayerData,
-    RetailPlayerIdentity, RetailPlayerStatistics, RetailPointBalance, ServerChannelList,
-    US852_SERVER_VERSION, packed_system_time,
+    RetailPlayerIdentity, RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
+    STATISTICS_COURSE_SLOTS, ServerChannelList, US852_SERVER_VERSION, packed_system_time,
 };
 pub use us852_match::{
     MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RETAIL_STANDING_BYTES, RetailAimRotate, RetailFinishHole,

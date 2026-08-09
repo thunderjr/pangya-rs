@@ -53,8 +53,21 @@ impl RetailHole {
 /// One seat in the match roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailMatchPlayer {
-    /// One-based seat within the room.
-    pub number: u16,
+    /// The number of the room the match is being played in, repeated on every seat.
+    ///
+    /// This is **not** a seat index. It is the same field `0x0044` writes ahead of the player
+    /// record, where a player outside a room gets `0xffff`; here every seat carries the room
+    /// they are playing in. Sending a seat index leaves the first seat holding zero, which is
+    /// not a room the client knows, and the lookup it does with this value at hole load
+    /// returns nothing.
+    ///
+    /// # Provenance
+    ///
+    /// `pangbox/packetdoc` (`common/user_name_data.ksy`, first field `room_id`, "0xFFFF (-1)
+    /// when not in room"), and `Acrisio-Filho/SuperSS-Dev`
+    /// (`Server Lib/Game Server/GAME/versus_base.cpp` `VersusBase::sendInitialData`, which
+    /// writes `p.addInt16(m_ri.numero)` — the room's own number — ahead of each player).
+    pub room_number: u16,
     /// The whole player, as the lobby describes them.
     pub player: RetailPlayerData,
     /// Packed match start time.
@@ -106,7 +119,7 @@ impl EncodePacket for RetailMatchStart {
                 writer.u8(0x00);
                 writer.u8(count);
                 for seat in players {
-                    writer.u16_le(seat.number);
+                    writer.u16_le(seat.room_number);
                     seat.player.encode_body(writer)?;
                     writer.bytes(&seat.start_time);
                     writer.u8(0); // cards in hand
