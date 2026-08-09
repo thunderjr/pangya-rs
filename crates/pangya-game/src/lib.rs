@@ -45,13 +45,13 @@ use pangya_domain::{
     BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome,
     CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, EconomyCommit, EconomyError,
     EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
-    HandoverRepository, InventoryItemId, ItemDurability, ItemKind, ItemStacking, ItemTypeId,
-    MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
+    HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
+    ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
     MemberSnapshot, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
     PurchaseRequest, RepairItem, RepositoryError, RoomError, RoomId, RoomName, RoomPassword,
     RoomProfile, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind,
-    SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
+    ShopOverlay, SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
     StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
@@ -116,7 +116,7 @@ use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt as _,
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch},
     task::JoinSet,
     time::{sleep_until, timeout},
 };
@@ -753,6 +753,13 @@ where
 {
     repository: Arc<R>,
     catalog: Catalog,
+    /// Operator overrides layered on the immutable catalog at purchase time.
+    ///
+    /// A `watch` receiver rather than a repository query: a purchase is on the player's
+    /// critical path and the overlay changes at operator speed, so the admin surface
+    /// republishes a whole snapshot and every connection reads it without touching the
+    /// database. Defaults to empty, which resolves to exactly the catalog's own answers.
+    shop_overlay: watch::Receiver<ShopOverlay>,
     config: GameRuntimeConfig,
     observer: Arc<dyn GameObserver>,
     lobby: LobbyHandle,
@@ -787,6 +794,45 @@ impl<R> GameService<R>
 where
     R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
+    /// Subscribes this service to a live operator shop overlay.
+    ///
+    /// Kept out of [`Self::new`] so the dozens of existing composition sites and tests keep
+    /// working with the empty default, which resolves to exactly the catalog's own answers.
+    #[must_use]
+    pub fn with_shop_overlay(mut self, overlay: watch::Receiver<ShopOverlay>) -> Self {
+        self.shop_overlay = overlay;
+        self
+    }
+
+    /// Resolves what the server will actually sell one item for, right now.
+    ///
+    /// Starts from **any** catalog record rather than only the already-sold ones, because an
+    /// overlay's whole purpose is to be able to offer something the client's own tables mark
+    /// as unavailable. It still cannot reach a type the catalog has never heard of, so the
+    /// client's data remains the outer bound on what exists.
+    fn resolve_offer(&self, type_id: ItemTypeId) -> Option<ItemDefinition> {
+        let definition = self.catalog.item_definition(type_id).copied()?;
+        self.shop_overlay.borrow().resolve(definition)
+    }
+
+    /// Returns every item the server currently sells, in deterministic type-ID order.
+    fn resolved_offers(&self) -> Vec<ItemDefinition> {
+        let overlay = self.shop_overlay.borrow();
+        if overlay.is_empty() {
+            // The overwhelmingly common case: no overrides, so the catalog's precomputed
+            // sorted slice is already the answer and there is nothing to rebuild.
+            return self.catalog.shop_offers().to_vec();
+        }
+        let mut offers = self
+            .catalog
+            .records()
+            .filter_map(|(_, record)| record.definition().copied())
+            .filter_map(|definition| overlay.resolve(definition))
+            .collect::<Vec<_>>();
+        offers.sort_by_key(|definition| definition.type_id);
+        offers
+    }
+
     /// Creates a GameService after validating every direct and actor bound.
     pub fn new(
         repository: Arc<R>,
@@ -937,6 +983,9 @@ where
         Ok(Self {
             repository,
             catalog,
+            // Empty by default; composition swaps in a live receiver when the operator
+            // admin surface is enabled.
+            shop_overlay: watch::channel(ShopOverlay::default()).1,
             connection_ids: AtomicU64::new(1),
             global_connections: Arc::new(Semaphore::new(limits.global_connections)),
             source_connections: KeyedCapacityRegistry::new(
@@ -1694,7 +1743,7 @@ where
                 let request =
                     decode_packet_payload::<ShopPageRequest>(payload, profile, ServiceKind::Game)
                         .map_err(|_| GameRuntimeError::Protocol)?;
-                let offers = self.catalog.shop_offers();
+                let offers = self.resolved_offers();
                 let page_size = economy.page_size;
                 let total_pages_usize = offers.len().div_ceil(page_size).max(1);
                 let total_pages = u16::try_from(total_pages_usize)
@@ -1745,7 +1794,7 @@ where
                         .await;
                 }
                 let type_id = ItemTypeId::new(request.type_id());
-                let Some(definition) = self.catalog.shop_offer(type_id).copied() else {
+                let Some(definition) = self.resolve_offer(type_id) else {
                     return self
                         .send_economy_result(
                             framed,
@@ -5561,17 +5610,13 @@ where
                 );
                 return self.refuse_retail_purchase(framed, account_id).await;
             }
-            let Some(definition) = self
-                .catalog
-                .shop_offer(ItemTypeId::new(item.item_type_id))
-                .copied()
-            else {
+            let Some(definition) = self.resolve_offer(ItemTypeId::new(item.item_type_id)) else {
                 // The item id is catalog data, not player data, and without it a refusal is
                 // indistinguishable from a pricing bug.
                 tracing::debug!(
                     stage = "not_in_catalog",
                     item_type_id = item.item_type_id,
-                    shop_offers = self.catalog.shop_offers().len(),
+                    shop_offers = self.resolved_offers().len(),
                     "retail purchase refused"
                 );
                 return self.refuse_retail_purchase(framed, account_id).await;
