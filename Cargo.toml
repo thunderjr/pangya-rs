@@ -33,7 +33,7 @@ sqlx = { version = "=0.8.6", default-features = false, features = ["chrono", "ma
 subtle = "2.6.1"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", default-features = false, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.18", default-features = false, features = ["codec", "rt"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["codec", "io", "rt"] }
 toml = "1.0"
 uuid = { version = "1.19.0", features = ["v4"] }
 unicode-normalization = "0.1.25"

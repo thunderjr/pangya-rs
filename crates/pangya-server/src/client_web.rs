@@ -14,8 +14,9 @@
 //! request.
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use cap_std::ambient_authority;
@@ -24,9 +25,11 @@ use pangya_updater::{
     EntrySelection, Theme, UpdateListRegion, build_from_directory, encode_translation_catalog,
     extra_contents_xml,
 };
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum bytes served for one theme image.
@@ -82,10 +85,17 @@ pub enum ClientWebError {
 /// Everything the routes serve, prepared once.
 struct Prepared {
     update_list: Vec<u8>,
+    patch_files: HashMap<String, PatchFile>,
     translation: String,
     extra_contents: String,
     theme_document: String,
     theme_directory: Option<Dir>,
+}
+
+/// An allowlisted patch payload held open from startup so request text never becomes a path.
+struct PatchFile {
+    file: Arc<std::fs::File>,
+    size: u64,
 }
 
 /// Shared handle for the router.
@@ -147,8 +157,21 @@ impl ClientWebState {
             settings.entries,
             &settings.patch_version,
             settings.patch_number,
-        )?
-        .to_encrypted(settings.region.key());
+        )?;
+        let mut patch_files = HashMap::with_capacity(update_list.entries.len());
+        for entry in &update_list.entries {
+            let file = client_directory
+                .open(&entry.name)
+                .map_err(|_| ClientWebError::ClientDirectory)?;
+            patch_files.insert(
+                entry.name.clone(),
+                PatchFile {
+                    file: Arc::new(file.into_std()),
+                    size: entry.size,
+                },
+            );
+        }
+        let update_list = update_list.to_encrypted(settings.region.key());
 
         let base_url = format!(
             "http://{}/new/Service/S4_Patch/extracontents/default/",
@@ -209,6 +232,7 @@ impl ClientWebState {
 
         Ok(Self(Arc::new(Prepared {
             update_list,
+            patch_files,
             translation,
             extra_contents,
             theme_document,
@@ -237,6 +261,7 @@ pub fn client_web_router(state: ClientWebState) -> Router {
     for prefix in PREFIXES {
         router = router
             .route(&format!("{prefix}/updatelist"), get(updatelist))
+            .route(&format!("{prefix}/{{name}}"), get(patch_file))
             .route(
                 &format!("{prefix}/extracontents/extracontents.xml"),
                 get(extracontents),
@@ -250,7 +275,12 @@ pub fn client_web_router(state: ClientWebState) -> Router {
                 get(theme_image),
             );
     }
-    router.with_state(state)
+    router.fallback(client_web_not_found).with_state(state)
+}
+
+async fn client_web_not_found(uri: Uri) -> StatusCode {
+    tracing::info!(path = %uri.path(), "client web request did not match a route");
+    StatusCode::NOT_FOUND
 }
 
 async fn translation(State(state): State<ClientWebState>) -> Response {
@@ -263,12 +293,45 @@ async fn translation(State(state): State<ClientWebState>) -> Response {
 }
 
 async fn updatelist(State(state): State<ClientWebState>) -> Response {
+    tracing::info!("serving client update list");
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
         state.0.update_list.clone(),
     )
         .into_response()
+}
+
+async fn patch_file(State(state): State<ClientWebState>, Path(name): Path<String>) -> Response {
+    // `pname` in the update list appends `.zip`, but the retail format reports the raw file size
+    // as `psize`: the payload itself is the listed file, not a second ZIP envelope.
+    let Some(listed_name) = name.strip_suffix(".zip") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(patch) = state.0.patch_files.get(listed_name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    tracing::info!(
+        file = listed_name,
+        bytes = patch.size,
+        "serving client patch payload"
+    );
+    let Ok(file) = patch.file.try_clone() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(content_length) = HeaderValue::from_str(&patch.size.to_string()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let stream = ReaderStream::new(tokio::fs::File::from_std(file));
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, content_length);
+    response
 }
 
 async fn extracontents(State(state): State<ClientWebState>) -> Response {
@@ -373,11 +436,51 @@ mod router_tests {
     fn router_builds_for_every_prefix() {
         let state = ClientWebState(Arc::new(Prepared {
             update_list: Vec::new(),
+            patch_files: HashMap::new(),
             translation: String::new(),
             extra_contents: String::new(),
             theme_document: String::new(),
             theme_directory: None,
         }));
         let _router = client_web_router(state);
+    }
+
+    #[tokio::test]
+    async fn patch_payload_is_streamed_only_for_an_allowlisted_packed_name() {
+        let root = std::env::temp_dir().join(format!("pangya-patch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("temp directory");
+        let path = root.join("projectg852gb.pak");
+        std::fs::write(&path, b"authored-pak").expect("write patch");
+        let file = std::fs::File::open(&path).expect("open patch");
+        let state = ClientWebState(Arc::new(Prepared {
+            update_list: Vec::new(),
+            patch_files: HashMap::from([(
+                "projectg852gb.pak".to_owned(),
+                PatchFile {
+                    file: Arc::new(file),
+                    size: 12,
+                },
+            )]),
+            translation: String::new(),
+            extra_contents: String::new(),
+            theme_document: String::new(),
+            theme_directory: None,
+        }));
+
+        let response = patch_file(
+            State(state.clone()),
+            Path("projectg852gb.pak.zip".to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "12");
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .expect("stream body");
+        assert_eq!(&body[..], b"authored-pak");
+
+        let response = patch_file(State(state), Path("../secret.zip".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(root).expect("remove temp directory");
     }
 }
