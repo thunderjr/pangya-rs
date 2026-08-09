@@ -710,6 +710,17 @@ fn inventory_class_text(kind: ItemKind) -> Result<&'static str, EconomyError> {
         ItemKind::Ball => Ok("ball"),
         ItemKind::Consumable => Ok("consumable"),
         ItemKind::CharacterPart => Ok("character_part"),
+        ItemKind::Caddie => Ok("caddie"),
+        ItemKind::CaddieItem => Ok("caddie_item"),
+        ItemKind::Mascot => Ok("mascot"),
+        ItemKind::Card => Ok("card"),
+        ItemKind::Furniture => Ok("furniture"),
+        ItemKind::Skin => Ok("skin"),
+        ItemKind::HairStyle => Ok("hair_style"),
+        ItemKind::SetItem => Ok("set_item"),
+        // A character is not an inventory row — owned characters live in `characters`, with
+        // their own hair colour and mastery. Selling one needs a destination this path does not
+        // have, so it stays refused. See docs/SPEC_SHOP_COVERAGE.md.
         ItemKind::Character => Err(EconomyError::Invalid),
     }
 }

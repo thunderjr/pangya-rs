@@ -507,6 +507,14 @@ const fn inventory_class_text(value: pangya_domain::InventoryClass) -> &'static 
         pangya_domain::InventoryClass::Ball => "ball",
         pangya_domain::InventoryClass::Consumable => "consumable",
         pangya_domain::InventoryClass::CharacterPart => "character_part",
+        pangya_domain::InventoryClass::Caddie => "caddie",
+        pangya_domain::InventoryClass::CaddieItem => "caddie_item",
+        pangya_domain::InventoryClass::Mascot => "mascot",
+        pangya_domain::InventoryClass::Card => "card",
+        pangya_domain::InventoryClass::Furniture => "furniture",
+        pangya_domain::InventoryClass::Skin => "skin",
+        pangya_domain::InventoryClass::HairStyle => "hair_style",
+        pangya_domain::InventoryClass::SetItem => "set_item",
     }
 }
 

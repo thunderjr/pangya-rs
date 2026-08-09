@@ -587,6 +587,22 @@ pub enum InventoryClass {
     Consumable,
     /// Unique character-part row (purchase only in M7).
     CharacterPart,
+    /// Owned caddie row.
+    Caddie,
+    /// Caddie-equippable item row.
+    CaddieItem,
+    /// Owned mascot row.
+    Mascot,
+    /// Owned card row.
+    Card,
+    /// My-room furniture row.
+    Furniture,
+    /// Character skin row.
+    Skin,
+    /// Hair style row.
+    HairStyle,
+    /// Bundled clothing set row.
+    SetItem,
 }
 
 /// Current durability for an inventory row.
@@ -633,6 +649,22 @@ pub enum ItemKind {
     Consumable,
     /// Character-compatible part (equip is deferred).
     CharacterPart,
+    /// Owned caddie.
+    Caddie,
+    /// Caddie-equippable item.
+    CaddieItem,
+    /// Owned mascot.
+    Mascot,
+    /// Owned card.
+    Card,
+    /// My-room furniture.
+    Furniture,
+    /// Character skin.
+    Skin,
+    /// Hair style.
+    HairStyle,
+    /// Bundled clothing set.
+    SetItem,
 }
 
 /// Closed shop sale policy.

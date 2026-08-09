@@ -94,6 +94,14 @@ pub(crate) async fn grant(
         ItemKind::Ball => InventoryClass::Ball,
         ItemKind::Consumable => InventoryClass::Consumable,
         ItemKind::CharacterPart => InventoryClass::CharacterPart,
+        ItemKind::Caddie => InventoryClass::Caddie,
+        ItemKind::CaddieItem => InventoryClass::CaddieItem,
+        ItemKind::Mascot => InventoryClass::Mascot,
+        ItemKind::Card => InventoryClass::Card,
+        ItemKind::Furniture => InventoryClass::Furniture,
+        ItemKind::Skin => InventoryClass::Skin,
+        ItemKind::HairStyle => InventoryClass::HairStyle,
+        ItemKind::SetItem => InventoryClass::SetItem,
         // A character is granted through the character endpoint, which writes a different
         // table; silently doing that here would be surprising.
         ItemKind::Character => return Err(AdminError::Conflict("use_character_endpoint")),
@@ -315,5 +323,13 @@ const fn class_text(value: InventoryClass) -> &'static str {
         InventoryClass::Ball => "ball",
         InventoryClass::Consumable => "consumable",
         InventoryClass::CharacterPart => "character_part",
+        InventoryClass::Caddie => "caddie",
+        InventoryClass::CaddieItem => "caddie_item",
+        InventoryClass::Mascot => "mascot",
+        InventoryClass::Card => "card",
+        InventoryClass::Furniture => "furniture",
+        InventoryClass::Skin => "skin",
+        InventoryClass::HairStyle => "hair_style",
+        InventoryClass::SetItem => "set_item",
     }
 }

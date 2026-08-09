@@ -892,6 +892,14 @@ const fn inventory_class_text_admin(value: InventoryClass) -> &'static str {
         InventoryClass::Ball => "ball",
         InventoryClass::Consumable => "consumable",
         InventoryClass::CharacterPart => "character_part",
+        InventoryClass::Caddie => "caddie",
+        InventoryClass::CaddieItem => "caddie_item",
+        InventoryClass::Mascot => "mascot",
+        InventoryClass::Card => "card",
+        InventoryClass::Furniture => "furniture",
+        InventoryClass::Skin => "skin",
+        InventoryClass::HairStyle => "hair_style",
+        InventoryClass::SetItem => "set_item",
     }
 }
 

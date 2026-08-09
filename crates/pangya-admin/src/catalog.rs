@@ -176,6 +176,14 @@ fn parse_kind(value: &str) -> Result<CatalogKind, AdminError> {
         "consumable" => Ok(CatalogKind::Consumable),
         "character_part" => Ok(CatalogKind::CharacterPart),
         "course" => Ok(CatalogKind::Course),
+        "caddie" => Ok(CatalogKind::Caddie),
+        "caddie_item" => Ok(CatalogKind::CaddieItem),
+        "mascot" => Ok(CatalogKind::Mascot),
+        "card" => Ok(CatalogKind::Card),
+        "furniture" => Ok(CatalogKind::Furniture),
+        "skin" => Ok(CatalogKind::Skin),
+        "hair_style" => Ok(CatalogKind::HairStyle),
+        "set_item" => Ok(CatalogKind::SetItem),
         _ => Err(AdminError::BadRequest("invalid_kind")),
     }
 }
@@ -188,6 +196,14 @@ pub(crate) const fn kind_text(value: CatalogKind) -> &'static str {
         CatalogKind::Consumable => "consumable",
         CatalogKind::CharacterPart => "character_part",
         CatalogKind::Course => "course",
+        CatalogKind::Caddie => "caddie",
+        CatalogKind::CaddieItem => "caddie_item",
+        CatalogKind::Mascot => "mascot",
+        CatalogKind::Card => "card",
+        CatalogKind::Furniture => "furniture",
+        CatalogKind::Skin => "skin",
+        CatalogKind::HairStyle => "hair_style",
+        CatalogKind::SetItem => "set_item",
     }
 }
 
@@ -212,15 +228,29 @@ mod tests {
             "consumable",
             "character_part",
             "course",
+            // Added when the shop was widened past the original six.
+            "caddie",
+            "caddie_item",
+            "mascot",
+            "card",
+            "furniture",
+            "skin",
+            "hair_style",
+            "set_item",
         ] {
             let kind = parse_kind(name).expect("known kind");
             assert_eq!(kind_text(kind), name);
         }
-        assert_eq!(
-            parse_kind("caddie"),
-            Err(AdminError::BadRequest("invalid_kind")),
-            "a family the loader does not parse must be refused, not silently ignored"
-        );
+        // Still-unparsed client tables. `addon_part` is the pointed one: it is excluded on
+        // purpose because its type-id tags collide with Character and CharacterPart, so it must
+        // not become accepted by someone widening this list mechanically.
+        for name in ["addon_part", "club", "achievement", "quest_item", ""] {
+            assert_eq!(
+                parse_kind(name),
+                Err(AdminError::BadRequest("invalid_kind")),
+                "a family the loader does not parse must be refused, not silently ignored"
+            );
+        }
     }
 
     #[test]

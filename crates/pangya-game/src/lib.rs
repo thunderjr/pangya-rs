@@ -6158,6 +6158,19 @@ where
                 Some(ItemKind::ClubSet | ItemKind::Ball) => RetailInventoryClass::Equipment,
                 Some(ItemKind::Consumable) => RetailInventoryClass::Consumable,
                 Some(ItemKind::CharacterPart) => RetailInventoryClass::Miscellaneous,
+                // Everything the widened catalog added is Miscellaneous on the wire: the retail
+                // class byte only separates equipment from consumables from the rest, and none
+                // of these are equipment or consumables as the client counts them.
+                Some(
+                    ItemKind::Caddie
+                    | ItemKind::CaddieItem
+                    | ItemKind::Mascot
+                    | ItemKind::Card
+                    | ItemKind::Furniture
+                    | ItemKind::Skin
+                    | ItemKind::HairStyle
+                    | ItemKind::SetItem,
+                ) => RetailInventoryClass::Miscellaneous,
                 Some(ItemKind::Character) | None => return Err(GameRuntimeError::Catalog),
             };
             let mut writer = PacketWriter::default();
@@ -6381,7 +6394,19 @@ fn protocol_shop_offer(
         ItemKind::Ball => EconomyItemKind::Ball,
         ItemKind::Consumable => EconomyItemKind::Consumable,
         ItemKind::CharacterPart => EconomyItemKind::CharacterPart,
-        ItemKind::Character => return Err(GameRuntimeError::Catalog),
+        // This is the *synthetic* M7 shop's own kind vocabulary, which predates the widened
+        // families and has no value for them. That path is local-protocol only — the retail
+        // client never reaches it — so the widened families are simply not offered there rather
+        // than being mapped onto a kind that means something else.
+        ItemKind::Caddie
+        | ItemKind::CaddieItem
+        | ItemKind::Mascot
+        | ItemKind::Card
+        | ItemKind::Furniture
+        | ItemKind::Skin
+        | ItemKind::HairStyle
+        | ItemKind::SetItem
+        | ItemKind::Character => return Err(GameRuntimeError::Catalog),
     };
     let price = definition.pang_price().ok_or(GameRuntimeError::Catalog)?;
     let max_stack = match definition.stacking {

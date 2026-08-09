@@ -111,6 +111,28 @@ pub enum CatalogKind {
     CharacterPart,
     /// Optional locally generated one-hole course records.
     Course,
+    // ── families added when the shop was widened past the original six ──
+    //
+    // Every one of these is a table the client already ships and already lists in its shop; the
+    // server simply never parsed them, so three of the client's six shop tabs had no catalog
+    // behind them and every purchase from them was refused. They share the same 0x90-byte record
+    // base as the original families, which is why they need no new parsing — only naming.
+    /// Caddie records, the client's Caddie tab.
+    Caddie,
+    /// Caddie-equippable item records.
+    CaddieItem,
+    /// Mascot records, the client's Mascot tab.
+    Mascot,
+    /// Card records, the client's Card Holic tab.
+    Card,
+    /// My-room furniture records, part of the Decoration tab.
+    Furniture,
+    /// Character skin records, part of the Decoration tab.
+    Skin,
+    /// Hair-style records.
+    HairStyle,
+    /// Bundled clothing-set records.
+    SetItem,
 }
 
 /// One versioned manifest entry.
@@ -693,6 +715,14 @@ fn client_definition(
         CatalogKind::Ball => ItemKind::Ball,
         CatalogKind::Consumable => ItemKind::Consumable,
         CatalogKind::CharacterPart => ItemKind::CharacterPart,
+        CatalogKind::Caddie => ItemKind::Caddie,
+        CatalogKind::CaddieItem => ItemKind::CaddieItem,
+        CatalogKind::Mascot => ItemKind::Mascot,
+        CatalogKind::Card => ItemKind::Card,
+        CatalogKind::Furniture => ItemKind::Furniture,
+        CatalogKind::Skin => ItemKind::Skin,
+        CatalogKind::HairStyle => ItemKind::HairStyle,
+        CatalogKind::SetItem => ItemKind::SetItem,
     };
     // A table narrower than the priced header carries no price to read. That is not a
     // structural fault — identity still parses and the rest of the catalog stays usable — so
@@ -788,6 +818,18 @@ const fn client_family_tags(kind: CatalogKind) -> &'static [u8] {
         // last only on rows added after the revision this was first measured from.
         CatalogKind::Consumable => &[0x18, 0x1a, 0x1b],
         CatalogKind::Course => &[0x28],
+        // Measured from the acquired client the same way the six above were. `AddonPart.iff` is
+        // deliberately absent: its rows carry tags 0x04 and 0x08, the same space Character and
+        // CharacterPart occupy, so admitting it would make `find_record` ambiguous for three
+        // shop rows. Not worth an ambiguous type-id space.
+        CatalogKind::Caddie => &[0x1c],
+        CatalogKind::CaddieItem => &[0x20, 0x22, 0x23],
+        CatalogKind::SetItem => &[0x24, 0x25],
+        CatalogKind::Skin => &[0x38, 0x39],
+        CatalogKind::HairStyle => &[0x3c, 0x3e],
+        CatalogKind::Mascot => &[0x40],
+        CatalogKind::Furniture => &[0x48],
+        CatalogKind::Card => &[0x7c, 0x7d],
     }
 }
 
@@ -892,6 +934,17 @@ fn parse_iff_bytes_for_schema(
         CatalogKind::Consumable => 17,
         CatalogKind::CharacterPart => 18,
         CatalogKind::Course => 5,
+        // The widened families exist only in real client tables. The synthetic v2 schemas were
+        // authored before them and define no record layout, so declaring one here is a manifest
+        // error rather than something to invent a size for.
+        CatalogKind::Caddie
+        | CatalogKind::CaddieItem
+        | CatalogKind::Mascot
+        | CatalogKind::Card
+        | CatalogKind::Furniture
+        | CatalogKind::Skin
+        | CatalogKind::HairStyle
+        | CatalogKind::SetItem => return Err(CatalogError::Manifest),
     };
     if entry.record_size != exact_size {
         return Err(CatalogError::Manifest);
@@ -943,6 +996,17 @@ fn parse_v2_definition(
     };
     let output = match kind {
         CatalogKind::Character | CatalogKind::Course => (None, None),
+        // Unreachable in practice: `parse_v2_definition` is only called for a v2 manifest, and
+        // the size check above already refused these. Stated rather than left to a catch-all so
+        // adding a family cannot silently acquire synthetic semantics it has no schema for.
+        CatalogKind::Caddie
+        | CatalogKind::CaddieItem
+        | CatalogKind::Mascot
+        | CatalogKind::Card
+        | CatalogKind::Furniture
+        | CatalogKind::Skin
+        | CatalogKind::HairStyle
+        | CatalogKind::SetItem => return Err(CatalogError::Manifest),
         CatalogKind::ClubSet => {
             let sale = parse_sale(record[4], le_u64(record, 5)?)?;
             let max = le_u32(record, 13)?;
@@ -1060,6 +1124,14 @@ const fn inventory_class(kind: ItemKind) -> InventoryClass {
         ItemKind::Ball => InventoryClass::Ball,
         ItemKind::Consumable => InventoryClass::Consumable,
         ItemKind::CharacterPart => InventoryClass::CharacterPart,
+        ItemKind::Caddie => InventoryClass::Caddie,
+        ItemKind::CaddieItem => InventoryClass::CaddieItem,
+        ItemKind::Mascot => InventoryClass::Mascot,
+        ItemKind::Card => InventoryClass::Card,
+        ItemKind::Furniture => InventoryClass::Furniture,
+        ItemKind::Skin => InventoryClass::Skin,
+        ItemKind::HairStyle => InventoryClass::HairStyle,
+        ItemKind::SetItem => InventoryClass::SetItem,
     }
 }
 
@@ -1132,6 +1204,19 @@ const fn catalog_kind_tag(kind: CatalogKind) -> u8 {
         CatalogKind::Course => 4,
         CatalogKind::Consumable => 5,
         CatalogKind::CharacterPart => 6,
+        // Appended, never renumbered. These tags feed `canonical_fingerprint`, so changing an
+        // existing one would invalidate every historical `matches.catalog_sha256` and
+        // `economy_operations.catalog_sha256` row. A manifest that declares one of these new
+        // families legitimately fingerprints differently — it is a different catalog — but a
+        // manifest that does not is byte-identical to before.
+        CatalogKind::Caddie => 7,
+        CatalogKind::CaddieItem => 8,
+        CatalogKind::Mascot => 9,
+        CatalogKind::Card => 10,
+        CatalogKind::Furniture => 11,
+        CatalogKind::Skin => 12,
+        CatalogKind::HairStyle => 13,
+        CatalogKind::SetItem => 14,
     }
 }
 
@@ -1561,6 +1646,9 @@ mod tests {
                 CatalogKind::Consumable => 17,
                 CatalogKind::CharacterPart => 18,
                 CatalogKind::Course => 5,
+                // The proptest strategy above only generates the six synthetic families; the
+                // widened ones have no v2 schema, which the parser refuses by design.
+                other => unreachable!("strategy does not generate {other:?}"),
             };
             let mut declaration = entry(count, size);
             declaration.kind = kind;
