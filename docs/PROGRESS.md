@@ -133,7 +133,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | M4 — Lobby and rooms | 🟡 | Local synthetic create/enter and concurrent actor state pass; real-client create/enter exit remains open |
 | M5 — Solo first playable | 🟡 | Local synthetic one-hole solo finishes and persists exactly one reward; real-client hole remains open |
 | M6 — Multiplayer stroke | 🟡 | Local synthetic exactly-two one-hole flow and complete matrix pass; real two-client/Course acceptance remains open |
-| M7 — Inventory/shop depth | 🟡 | Local synthetic catalog-priced, exactly-once purchases/equipment/consume/repair pass the full outcome matrix; real-client acceptance remains open |
+| M7 — Inventory/shop depth | 🟡 | Real-client mounted-PAK catalog-priced purchase and restart retention pass; retail equip/consume/repair remain open |
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
 
@@ -236,7 +236,7 @@ Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-t
 
 ## M7 — synthetic inventory, shop, and equipment
 
-**Status: 🟡 local synthetic exit complete; external retail gates remain open**
+**Status: 🟡 local synthetic exit complete; retail purchase accepted, equip/consume/repair gates open**
 - [x] Add generated `0x7f40..=0x7f44` / `0x7fc0..=0x7fc5` layouts, 11 generated fixture/provenance pairs, and closed command/outcome discriminator validation.
 - [x] Make the immutable catalog the sole price, stack, durability, and repair-rate authority; the wire never carries a price, and catalog items that are not shop offers are refused.
 - [x] Add migration 0008 for the operation, currency, item, and equipment ledgers with exactly-once commits keyed by a client-chosen operation id that survives process restart.
@@ -247,9 +247,10 @@ Evidence: [`adr/0013-synthetic-m6-two-player-stroke.md`](adr/0013-synthetic-m6-t
 - [x] Add fixed-label economy metrics bounded to 15 series carrying no account, item, inventory, or operation identifier.
 - [x] Verify current compiled inventories: 74 game tests, 5 M7 protocol tests, 26 real-PostgreSQL Game E2E tests, 53 storage tests, and 27 server tests; workspace total 330 passed.
 - [x] Pass the local release matrix: format, strict Clippy, SQLx migrate/prepare with no drift, workspace/all-target/all-feature PostgreSQL tests, and the asset guard.
-- [ ] Validate catalog-priced purchase, equip, consume, and repair behavior against a legally held U.S. client with legally supplied data, after the synthetic family is replaced by retail layouts.
+- [x] Validate a catalog-priced purchase against the legally held U.S. client with legally supplied data: the client and server are generated from one authored archive, the mounted PAK displays four exact Pang offers, a 77-Pang Ball purchase commits, and balance/inventory survive restart.
+- [ ] Validate retail equip, consume, and repair behavior against that client; do not infer those gates from purchase acceptance.
 
-Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md), [`protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](protocol/M7_SYNTHETIC_ECONOMY_FLOW.md), and [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md).
+Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md), [`protocol/M7_SYNTHETIC_ECONOMY_FLOW.md`](protocol/M7_SYNTHETIC_ECONOMY_FLOW.md), [`evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md`](evidence/M7_SYNTHETIC_ECONOMY_2026-08-07.md), and [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md).
 
 ## Research proof ledger
 
@@ -279,7 +280,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 6. **Real M5 solo exit** — complete the evidence file's external 12-step gate for real Course/IFF interpretation and start/loading/action/result/finish/reward acceptance; never identify `0x7f20`/`0x7fa0` or `solo-v1` as retail behavior.
 7. **M6 local validation** — the complete format/Clippy/workspace/PostgreSQL/doc/SQLx/deny/asset/link/diff/fuzz matrix passed; preserve this evidence.
 8. **Real M6 two-client/Course exit** — complete the M6 evidence file's external gate with two legally held clients and legally supplied data; never identify `0x7f30`/`0x7fb0`, `stroke-two-v1`, generated standings, or record rules as retail behavior.
-9. **Real M7 economy exit** — validate catalog-priced purchase/equip/consume/repair against a legally held client; never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
+9. **Real M7 economy exit** — mounted-PAK catalog-priced purchase and restart retention are verified; equip/consume/repair remain. Never identify `0x7f40`/`0x7fc0`, generated prices, durability rules, or ledger shapes as retail behavior.
 10. **Synthetic-to-retail protocol pivot** — the `0x7f**` families are placeholders no real client will ever send. Every M3–M7 real-client gate is blocked behind replacing them with layouts derived from the vendored PacketDoc definitions, and behind correcting the three M3 bootstrap opcodes whose current meanings disagree with PacketDoc (`0x0070`, `0x0072`, `0x004d`).
 11. **Client runtime host** — **resolved 2026-08-07.** The client runs on Windows 11 under QEMU/KVM with Rugburn, which identifies it as US 852 and patches GameGuard out. Two host prerequisites were found: the host must expose at least one audio device, and `IntegratedPak` must exist in the registry. Both are in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 12. **Undiagnosed storage flake** — `concurrent_stroke_matches_with_shared_accounts_are_deadlock_free` has failed once in CI with `MatchRepositoryError::Storage`, and passes on re-run. It did not reproduce in 67 isolated runs or in repeated full-suite runs under heavy contention, and a lock cycle is not reachable: both commits sort their account ids and take `FOR UPDATE` on the same shared profile row, so one simply waits. **Now instrumented rather than open**: `Storage` carries a classified `StorageFault`, so the next occurrence names its own cause in the panic message — `deadlock` and `serialization` would disprove the analysis above, `unexpected_row_count` or `write_verification` would move the fault to the repository's own invariants, and `insufficient_resources` or `pool_timed_out` would make it contention rather than a defect. No guess was committed; the recurrence now identifies itself.
@@ -332,7 +333,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     A catalog built from a superseded copy loads and validates cleanly and is still wrong, which is what made this expensive to find. The tell is a purchase refused with `stage: "not_in_catalog"` for an id inside a family's range.
 
-20. **A real client completes a purchase** — verified 2026-08-08. `0x001D` in, then `0x00C8`, `0x0096` and `0x0068` out; the balance moved 5,000,000 to 4,999,999 under `price_override_pang = 1`, `0x10000061` landed in the inventory, and the client rendered the bought clubs on the character.
+20. **A real client completes a purchase** — verified 2026-08-08 and strengthened 2026-08-09. The first acceptance used `price_override_pang = 1`. The later run authored the client's actual mounted `projectg850gb.pak` and generated the server manifest from the same ZIP: Cowboy Hat 4,321 Pang, Papel Training Club Set 1,234 Pang, Cobra Comet (50) 77 Pang, and Spin Mastery 5 Pang all rendered exactly. A Cobra purchase decoded retail quantity 50, committed one durable Ball row, debited exactly 77, and retained its balance/inventory across a GameService restart and full relog. Retail frame replay keys are connection-scoped and bounded, while new intentional purchases receive distinct operation IDs. See [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md).
 
 21. **Room ready and the roster's character** — verified 2026-08-08. Two gaps found by driving a real client into a room it created.
 

@@ -564,6 +564,15 @@ $script:ChannelFirstRow = @(494,222)
 $script:NickField      = @(407,217)
 $script:NickConfirm    = @(528,217)
 $script:NickYes        = @(353,371)
+$script:ShopButton      = @(224,565)
+$script:ShopFirstCart   = @(556,224)
+$script:ShopBuyConfirm  = @(351,502)
+$script:ShopSureConfirm = @(351,363)
+$script:ShopTabs = @{
+  'Clothes' = @(483,96); 'Item' = @(530,96)
+  'Accessories' = @(626,130); 'ClubSets' = @(425,130)
+  'Comet' = @(482,130); 'ActiveItems' = @(544,130)
+}
 
 # ---- Flows --------------------------------------------------------------------------------
 # The password field is the one place a swallowed click is invisible: the field masks its
@@ -649,6 +658,57 @@ function Enter-PangyaChannel {
     -What 'server selection' | Out-Null
   Invoke-PangyaVerified -Action { Invoke-PangyaDoubleClick @script:ChannelFirstRow } `
     -Until LobbyBar -Attempts $Attempts -TimeoutSeconds 15 -What 'channel entry' | Out-Null
+}
+
+# Opens the retail shop and proves that its top-level tabs rendered. This replaces the raw click
+# sequence that was first learned while validating authored IFF data.
+function Open-PangyaShop {
+  Invoke-PangyaClick @script:ShopButton
+  if (-not (Wait-PangyaText -X 405 -Y 88 -Width 145 -Height 18 -TimeoutSeconds 15)) {
+    throw 'shop tabs did not render'
+  }
+}
+
+# Selects named tabs rather than repeating coordinates in every evidence run. Top is optional so
+# callers can move between siblings after the shop is already open.
+function Select-PangyaShopCategory {
+  param(
+    [ValidateSet('Clothes','Item')][string]$Top,
+    [ValidateSet('Accessories','ClubSets','Comet','ActiveItems')][string]$Sub
+  )
+  if ($Top) {
+    $position = $script:ShopTabs[$Top]
+    Invoke-PangyaClick @position
+    Start-Sleep -Milliseconds 700
+  }
+  if ($Sub) {
+    $position = $script:ShopTabs[$Sub]
+    Invoke-PangyaClick @position
+    Start-Sleep -Milliseconds 700
+  }
+}
+
+# Purchases the first visible shop cell. The U.S. 852 client requires TWO distinct confirmation
+# clicks: the Buy Item form and then its nested "Are you sure" Notice. The second click bypasses
+# automatic notice dismissal deliberately; otherwise Invoke-PangyaClick would consume the modal
+# before the intended coordinate is pressed. The final success/refusal Notice remains open for a
+# screenshot unless -DismissResult is requested.
+function Invoke-PangyaShopFirstItemPurchase {
+  param([switch]$DismissResult)
+  Invoke-PangyaClick @script:ShopFirstCart
+  if (-not (Wait-PangyaText -X 250 -Y 105 -Width 190 -Height 70 -TimeoutSeconds 10)) {
+    throw 'Buy Item form did not render'
+  }
+  Invoke-PangyaClick @script:ShopBuyConfirm
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline -and -not (Test-PangyaNotice)) {
+    Start-Sleep -Milliseconds 250
+  }
+  if (-not (Test-PangyaNotice)) { throw 'purchase confirmation Notice did not render' }
+  Invoke-PangyaClick @script:ShopSureConfirm -SkipNoticeCheck
+  Start-Sleep -Seconds 3
+  if (-not (Test-PangyaNotice)) { throw 'purchase result Notice did not render' }
+  if ($DismissResult) { Dismiss-PangyaNotice | Out-Null }
 }
 
 # ---- Instance lifecycle -------------------------------------------------------------------

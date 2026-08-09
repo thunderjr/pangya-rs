@@ -1202,6 +1202,11 @@ where
         let mut chats = LocalRateWindow::new(self.config.limits.rate_window);
         let mut shots = LocalRateWindow::new(self.config.limits.rate_window);
         let mut economy_commands = LocalRateWindow::new(self.config.limits.rate_window);
+        // A retail purchase has no application operation ID. Scope generated IDs to this
+        // authenticated transport and retain a bounded salt+payload replay window: an exact frame
+        // replay reuses its commit, while a later intentional purchase (new salt) is a new command.
+        let retail_purchase_scope = uuid::Uuid::new_v4();
+        let mut retail_purchase_replays = RetailPurchaseReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
@@ -1390,11 +1395,16 @@ where
                                 let Some(established) = identity.as_ref() else {
                                     break Err(GameRuntimeError::Protocol);
                                 };
+                                let payload_digest: [u8; 32] = Sha256::digest(&frame.payload).into();
+                                let purchase_sequence = retail_purchase_replays
+                                    .sequence(frame.metadata.salt, payload_digest);
                                 if let Err(error) = self
                                     .handle_retail_purchase(
                                         &mut framed,
                                         established.account_id,
                                         &frame.payload,
+                                        retail_purchase_scope,
+                                        purchase_sequence,
                                     )
                                     .await
                                 {
@@ -5217,6 +5227,8 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         account_id: AccountId,
         payload: &[u8],
+        purchase_scope: uuid::Uuid,
+        purchase_sequence: u64,
     ) -> Result<(), GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         let request =
@@ -5233,7 +5245,7 @@ where
 
         let mut spent = 0_u64;
         let mut pang_balance = None;
-        for item in &request.items {
+        for (line_index, item) in request.items.iter().enumerate() {
             if item.quantity == 0 || item.quantity > economy.max_purchase_quantity {
                 tracing::debug!(
                     stage = "quantity",
@@ -5257,8 +5269,38 @@ where
                 );
                 return self.refuse_retail_purchase(framed, account_id).await;
             };
-            // The operation id makes a retried line replay its own commit instead of buying twice.
-            let operation_id = retail_purchase_operation_id(account_id, item);
+            // Retail balls are sold as packs: the packet quantity is the pack's displayed ball
+            // count (for example 50), while the durable inventory/equipment model owns one ball
+            // definition. Other kinds use the packet quantity as their purchase quantity.
+            let committed_quantity = if matches!(
+                (definition.kind, definition.stacking),
+                (ItemKind::Ball, pangya_domain::ItemStacking::Unique)
+            ) {
+                1
+            } else {
+                item.quantity
+            };
+            // These client assertions are safe to log and are indispensable when a retail row's
+            // package semantics disagree with the server definition.
+            tracing::debug!(
+                item_type_id = item.item_type_id,
+                retail_quantity = item.quantity,
+                committed_quantity,
+                claimed_cost_pang = item.claimed_cost_pang,
+                claimed_cost_point = item.claimed_cost_point,
+                kind = ?definition.kind,
+                stacking = ?definition.stacking,
+                "retail purchase line decoded"
+            );
+            // The scoped operation id makes an exact encrypted-frame replay reuse its commit while
+            // a later intentional purchase with a new client salt receives a new sequence.
+            let operation_id = retail_purchase_operation_id(
+                account_id,
+                item,
+                purchase_scope,
+                purchase_sequence,
+                line_index,
+            );
             let committed = timeout(
                 economy.command_timeout,
                 self.repository.purchase(PurchaseRequest {
@@ -5266,7 +5308,7 @@ where
                     operation_id,
                     catalog: self.catalog.fingerprint(),
                     definition,
-                    quantity: item.quantity,
+                    quantity: committed_quantity,
                 }),
             )
             .await;
@@ -5279,7 +5321,7 @@ where
                         definition
                             .pang_price()
                             .unwrap_or(0)
-                            .saturating_mul(u64::from(item.quantity)),
+                            .saturating_mul(u64::from(committed_quantity)),
                     );
                     pang_balance = Some(result.pang_balance);
                 }
@@ -6336,19 +6378,62 @@ fn retail_census_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoomCensus {
     RetailRoomCensus::List(players)
 }
 
+const RETAIL_PURCHASE_REPLAY_WINDOW: usize = 128;
+
+/// Bounded, connection-local translation from wire replay identity to a purchase sequence.
+///
+/// The client's salt plus the full plaintext digest distinguishes ordinary repeated purchases
+/// while retaining an exact frame replay long enough to cover transport retries. Bounded storage
+/// prevents an authenticated client from growing per-connection state without limit.
+#[derive(Debug)]
+struct RetailPurchaseReplayWindow {
+    next_sequence: u64,
+    entries: VecDeque<(u8, [u8; 32], u64)>,
+}
+
+impl RetailPurchaseReplayWindow {
+    fn new() -> Self {
+        Self {
+            next_sequence: 1,
+            entries: VecDeque::with_capacity(RETAIL_PURCHASE_REPLAY_WINDOW),
+        }
+    }
+
+    fn sequence(&mut self, salt: u8, payload_digest: [u8; 32]) -> u64 {
+        if let Some((_, _, sequence)) = self.entries.iter().find(|(seen_salt, seen_digest, _)| {
+            *seen_salt == salt && *seen_digest == payload_digest
+        }) {
+            return *sequence;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        if self.entries.len() == RETAIL_PURCHASE_REPLAY_WINDOW {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((salt, payload_digest, sequence));
+        sequence
+    }
+}
+
 /// Derives a stable economy operation key for one retail purchase line.
 ///
-/// The retail purchase packet carries no operation identifier, so one is derived from the
-/// account, the item and the quantity. A client that resends the same purchase replays the same
-/// commit instead of buying twice; a genuinely new purchase of the same item differs by the
-/// balance the replay check sees, and the economy path treats an exact replay as idempotent.
+/// The retail purchase packet carries no application operation identifier. The connection loop
+/// assigns a sequence per distinct bounded `(salt, payload)` replay key, scoped by a fresh UUID for
+/// that transport. Exact frame replays therefore derive the same key; intentional later purchases
+/// with a new client salt derive a different key, including when the item and quantity are equal.
 fn retail_purchase_operation_id(
     account_id: AccountId,
     item: &RetailPurchaseItem,
+    purchase_scope: uuid::Uuid,
+    purchase_sequence: u64,
+    line_index: usize,
 ) -> EconomyOperationId {
     let mut hasher = Sha256::new();
     hasher.update(b"retail-purchase");
+    hasher.update(purchase_scope.as_bytes());
     hasher.update(account_id.get().to_le_bytes());
+    hasher.update(purchase_sequence.to_le_bytes());
+    hasher.update(line_index.to_le_bytes());
     hasher.update(item.item_type_id.to_le_bytes());
     hasher.update(item.quantity.to_le_bytes());
     let digest = hasher.finalize();
@@ -6662,6 +6747,54 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn retail_purchase_replay_window_reuses_only_exact_bounded_wire_keys() {
+        let mut window = RetailPurchaseReplayWindow::new();
+        let digest = [0x42; 32];
+        let first = window.sequence(7, digest);
+        assert_eq!(window.sequence(7, digest), first, "exact frame replay");
+        assert_ne!(window.sequence(8, digest), first, "new client salt");
+        assert_ne!(window.sequence(7, [0x43; 32]), first, "new payload");
+
+        for value in 0..RETAIL_PURCHASE_REPLAY_WINDOW {
+            let mut other = [0_u8; 32];
+            other[..8].copy_from_slice(&(value as u64).to_le_bytes());
+            window.sequence(99, other);
+        }
+        assert_ne!(
+            window.sequence(7, digest),
+            first,
+            "an evicted replay key becomes a new bounded command"
+        );
+    }
+
+    #[test]
+    fn retail_purchase_operation_id_scopes_replays_and_distinct_lines() {
+        let account = AccountId::new(7).unwrap_or_else(|_| unreachable!());
+        let item = RetailPurchaseItem {
+            item_type_id: 0x1400_00c9,
+            quantity: 50,
+            claimed_cost_pang: 77,
+            claimed_cost_point: 0,
+        };
+        let scope = uuid::Uuid::from_u128(9);
+        let replay = retail_purchase_operation_id(account, &item, scope, 3, 0);
+        assert_eq!(
+            retail_purchase_operation_id(account, &item, scope, 3, 0),
+            replay
+        );
+        assert_ne!(
+            retail_purchase_operation_id(account, &item, scope, 4, 0),
+            replay,
+            "a later intentional purchase has a distinct sequence"
+        );
+        assert_ne!(
+            retail_purchase_operation_id(account, &item, scope, 3, 1),
+            replay,
+            "equal line items in one basket remain distinct"
+        );
+    }
 
     struct FakeRepository {
         begin_calls: AtomicUsize,
