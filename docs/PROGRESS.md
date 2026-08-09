@@ -545,6 +545,25 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     player index 1 does not** — the first roster entry produces a player and the second does
     not, which is the signature of a per-entry width error rather than a per-field one.
 
+    Two further measured facts, from the marker instrument:
+
+    - The stored entry begins at entry offset zero and reads `slot=1`, `user='rsp8'`,
+      `nick='HostEight'` at the offsets this server writes them. **The entry layout is right**
+      and the copy is verbatim.
+    - With the roster entry's trailing card-count byte present, the client stores **exactly one**
+      entry in that array; with the byte removed, a **second** entry appears. The entry ends at
+      the start time. The byte made every entry after the first land one byte late.
+
+    What has not moved: the fault is still `0x00b65c25`, `[null + 0x6c]`, with `EBX = 1` — the
+    second player still has no character model even though its entry now reaches memory. The
+    two entry bases the scan reports are `0x2b63` apart rather than the `0x2f84` the client's
+    own stride instruction uses, which is not yet explained and is the next thread to pull.
+
+    Client opcode `0x0033` is now decoded and logged: it is the client's own exception report
+    (`pangbox/server` `game/packet/client.go` `ClientException`), and it is the one channel
+    through which this closed-source client explains itself. It fired once, under the marker
+    diagnostic, and is the fastest route to the remaining cause.
+
     The next measurement is the one that settles it. With `PANGYA_MARK_ROSTER` set, dump the
     window around the *second* record and decode the markers there: each names its own offset
     within its entry, so the difference between what they read and what they should read is
