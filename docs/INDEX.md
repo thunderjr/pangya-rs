@@ -52,6 +52,8 @@ Two short operational memories are worth reading before debugging anything:
 |---|---|---|
 | [`SPEC.md`](SPEC.md) | Product scope, architecture, requirements by domain (§22), milestones M0–M9 (§23), definition of done (§27) | 2026-08-07 |
 | [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md) | Which player state is persisted, in which table, and whether an operator can set it. Supersedes `SPEC.md` §14.2's `character_parts` sketch | 2026-08-09 |
+| [`SPEC_SHOP_COVERAGE.md`](SPEC_SHOP_COVERAGE.md) | What the shop sells, what refuses and why — catalog families, currency nibbles, the character-purchase block | 2026-08-09 |
+| [`SPEC_CLIENT_PATCH_DELIVERY.md`](SPEC_CLIENT_PATCH_DELIVERY.md) | How an authored shop reaches a player's disk — the latest-archive model, the launcher manifest, the startup cross-check | 2026-08-09 |
 | [`RETAIL_CONTRACT.md`](RETAIL_CONTRACT.md) | Retail versus synthetic packet surface, and the removal plan for the `0x7f**` placeholders | 2026-08-08 |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every configuration key and its bounds | 2026-08-07 |
 
@@ -83,6 +85,34 @@ the ledger; this is a shortcut with links.
 persist across restart, but retail consume and repair are not claimed. See
 [`PROGRESS.md`](PROGRESS.md) blocker 9.
 
+### Shop coverage (`SPEC_SHOP_COVERAGE.md`)
+
+| # | Requirement | Status | Note |
+|---|---|:--:|---|
+| SHOP-001 | Characters purchasable | ⛔ | An owned character is a `characters` row, not inventory; the economy path has no destination for it |
+| SHOP-002 | `AddonPart.iff` admitted | ⛔ | Type-id tags collide with Character/CharacterPart; excluded for 3 shop rows |
+| SHOP-003 | Currency nibbles `0x3`/`0x6` | 🟡 | 298 rows; force-converted under `invent_shop_metadata`, meaning still unidentified |
+| SHOP-004 | Never-sold rows enabled | 🟡 | 3,554 rows given an invented `0x02`; whether they render is unmeasured |
+| SHOP-005 | `minLevel` modelled | 🟡 | Bootstrap hardcodes `level: 1`; ~500 rows sit above it |
+| SHOP-006 | Overlay reaches the client | ✅ | By design it does not — it changes charging, never display |
+| SHOP-007 | Item icons | 🟡 | 7,127/7,918 of the original six families; widened families unmeasured |
+| — | Eight widened families sellable | 🔬 | Caddie, CaddieItem, Mascot, Card, Furniture, Skin, HairStyle, SetItem — parsed and authored, never in front of a client |
+
+### Client patch delivery (`SPEC_CLIENT_PATCH_DELIVERY.md`)
+
+| # | Requirement | Status | Note |
+|---|---|:--:|---|
+| PATCH-001 | Latest-archive model | ✅ | New `projectg852gb.pak`; retail archives stay pristine. 🔬 that the client mounts an archive past its patch level |
+| PATCH-002 | Launcher manifest | ✅ | `GET /launcher/v1/manifest`, derived from the same `UpdateList` the client validates against |
+| PATCH-003 | Launcher applies patches | ✅ | Verify size + CRC + SHA-256, back up, atomic rename |
+| PATCH-004 | Startup cross-check | ✅ | `client_web.publish_report` refuses a skewed deployment and names the stale side |
+| PATCH-005 | Range / conditional GET | ⬜ | No resume on a 1.1 GB first install |
+| PATCH-006 | Report every mismatch at once | ⬜ | The client names only the first bad archive |
+| PATCH-007 | Progress and revert in the UI | ⬜ | Commands exist; nothing surfaces them |
+| PATCH-008 | Operator visibility | ⬜ | Proposed `GET /admin/v1/client-pak` |
+| PATCH-009 | Authoring from the console | ⬜ | Deliberately not an endpoint that shells out |
+| PATCH-010 | Flatten vs mounted PAK | 🔬 | Partly answered; untested with `IntegratedPak` set properly |
+
 ### Durable-state milestones (`SPEC_DURABLE_PLAYER_STATE.md`)
 
 Ordered to match [`protocol/US852_SUBSYSTEM_GAPS.md`](protocol/US852_SUBSYSTEM_GAPS.md) §7 so
@@ -91,7 +121,7 @@ the two documents cannot drift.
 | # | Milestone | Status | Covers |
 |---|---|:--:|---|
 | E1 | Caddie and mascot | ⬜ | `DPS-010…019` — rosters `0x0071`/`0x00e1`, `Caddie.iff`/`Mascot.iff` |
-| E2 | Character parts, aux parts, hair colour, mastery | ⬜ | `DPS-020…039` — 24 + 5 slots, and two columns already stored but sent as zero |
+| E2 | Character parts, aux parts, hair colour, mastery | 🟡 | `DPS-020…039` — 24 + 5 slots. Wire decoded and `character_part_slots` created (migration 0011); storage and bootstrap emission not wired |
 | E3 | Consumable and decoration slots | ⬜ | `DPS-040…059` — 10 + 7 slots |
 | E4 | Cards | ⬜ | `DPS-060…069` — 12 slots, container `0x0138`, `Card.iff` |
 

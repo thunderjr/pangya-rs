@@ -52,7 +52,7 @@ Wire surface versus durable surface, as of 2026-08-09.
 | Character mastery | `RetailCharacter.mastery` | 1 | `characters.mastery` — **stored, sent as zero** | ⬜ |
 | Character stats | `RetailCharacter.stats` (power, control, accuracy, spin, curve) | 5 | — | ⬜ |
 | Caddie | `RetailEquipment.caddie_uid`, `RetailCaddie` block, roster `0x0071` | 1 | — | ⬜ |
-| Character parts | `RetailCharacter.part_iff_ids` + `.part_uids` | 24 | — | ⬜ |
+| Character parts | `RetailCharacter.part_iff_ids` + `.part_uids` | 24 | `character_part_slots` (migration 0011) | 🟡 wire decoded, table exists, storage not wired |
 | Aux parts | character block, `CHARACTER_AUX_PARTS` | 5 | — | ⬜ |
 | Cut-in | character block, and `RetailEquipmentUpdated::Decoration` slot 5 | 1 | — | ⬜ |
 | Cards | character block, `CHARACTER_CARDS`, container `0x0138` | 12 | — | ⬜ |
@@ -135,6 +135,26 @@ The manifest declares six tables (`local-data/us851-data/pak-iff/iff/manifest.to
 
 ### 4.4 Character parts and aux parts (`DPS-030`–`DPS-039`) — `E2`, gap rank 14
 
+> **Progress, 2026-08-09.** Two of the three blocking pieces are done.
+>
+> - **The wire is decoded.** `RetailEquipmentRequested::CharacterParts` used to carry *nothing* —
+>   the 513-byte character block was read and dropped whole, which is why nothing downstream
+>   could persist an outfit. It now yields character id, hair colour, and both 24-slot arrays,
+>   at the offsets `pangbox/server` `pangya/player.go:141-159` documents. Two tests pin it: one
+>   asserting slot 23 is not clipped, one asserting a one-byte-short body is refused rather than
+>   decoding a shifted outfit.
+> - **The table exists.** Migration `0011_character_part_slots.sql`, keyed
+>   `(account_id, character_id, slot_index)` — per character, because each character wears its
+>   own outfit and the update arrives inside that character's block. Ownership rides the
+>   composite key so a row cannot attach one account's character to another's.
+> - **Not wired.** No storage read or write, and the three `RetailCharacter` construction sites
+>   in `pangya-game` still emit `[0; 24]`. The handler logs the decoded slot count so the gap is
+>   visible in a live session rather than silent.
+>
+> Remaining: a repository load/save pair, filling those three sites from it, and a real-client
+> run proving an outfit survives relog.
+
+
 | ID | Requirement |
 |---|---|
 | `DPS-030` | 24 part slots stored as `slot_family = 'character_part'`, `slot_index 0..=23`. |
@@ -192,7 +212,7 @@ the two documents cannot drift.
 | # | Milestone | Requirements | Gap rank | Status |
 |---|---|---|---:|:--:|
 | `E1` | Caddie and mascot | `DPS-010`–`DPS-015`, `DPS-020`, `DPS-052`, `DPS-070`–`DPS-072` | 6 | ⬜ |
-| `E2` | Character parts, aux parts, hair colour, mastery, stats | `DPS-001`–`DPS-004`, `DPS-021`, `DPS-030`–`DPS-034` | 14 | ⬜ |
+| `E2` | Character parts, aux parts, hair colour, mastery, stats | `DPS-001`–`DPS-004`, `DPS-021`, `DPS-030`–`DPS-034` | 14 | 🟡 |
 | `E3` | Consumable and decoration slots | `DPS-040`–`DPS-042`, `DPS-050`, `DPS-051`, `DPS-053` | — | ⬜ |
 | `E4` | Cards | `DPS-022`, `DPS-060`–`DPS-062` | 14 | ⬜ |
 
