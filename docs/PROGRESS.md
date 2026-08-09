@@ -500,6 +500,32 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     in isolation: the entry's total width already matches the client's stride exactly, so any
     twenty bytes added ahead of the club set have to come out of somewhere behind it.
 
+    **The lookup was a catalog lookup, and the missing key was the club set's catalog id.**
+    Writing `ClubSetInfo::_typeid` on entry offset `0x2f2e` — reached by carrying the sixteen
+    bytes this server's equipment block is short of the reference `UserEquip` in front of the
+    club set, so the entry's total width still matches the record stride — resolves it. The
+    null dereference at `0x00883983` is gone, and the client goes much further: it answers
+    `0x000c`, `0x0048` and `0x001a`, runs its whole progress ramp, and **sends `0x0011`**.
+
+    It still does not reach the hole. It shows the course loading screen, the one carrying the
+    course name, and the process exits there. The new fault is `0x00b65bb5`, reading
+    `[null + 0x6c]`, reached from `0x0074160d`. That path is a loop over players:
+
+    ```
+    00741570  push ebx / push 0xceb500 / call 0x97cc70   ; format "PLAYER_%d" for this index
+    007415f0  mov  ecx, [esi + 0x6c]                     ; per-player array, stride 0x358
+    007415f6  add  ecx, edi
+    00741601  call 0x8a1420                              ; == mov eax,[ecx+4]; ret
+    00741606  mov  ecx, eax
+    00741608  call 0xb65b60                              ; faults: this == 0
+    ```
+
+    The string constants name the subsystem, and they are decisive: `0xceb500` is `"PLAYER_%d"`,
+    `0xcd8860` is `"Bip01 Head"`, `0xcf2a48` is `"Breathe"`, and `0xd266b0`/`0xd266bc` are both
+    `"Recursive"`. This is character-model setup — a Biped skeleton bone, an idle animation and a
+    recursive visibility flag, per scene node `PLAYER_n`. So `[record + 4]` is **that player's 3D
+    character model**, and it is null: the client did not build a model for player index 0.
+
     The **mascot** was eliminated by experiment — a real mascot catalog id in the block left the
     key zero and the crash unchanged — as was the **caddie**.
 
