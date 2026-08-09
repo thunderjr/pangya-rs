@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE admin_sessions SET revoked_at = $2 WHERE account_id = $1 AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6b5bd95c8ac7f7e7509033c2c74eaee384e1b14cd3bae480c2d04cbc511ef3a2"
+}

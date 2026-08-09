@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO admin_audit_events (actor_account_id, action, target_account_id, detail) VALUES ($1, $2, $3, ($4::text)::jsonb)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c635ea8c2dc6123bb03d354b2906a95997945c2d51307bc2bcd5c38eb2fa3a7a"
+}

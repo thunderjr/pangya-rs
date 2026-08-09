@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.account_id, a.username_display, r.course_id, r.mode, r.best_score, r.best_strokes, r.rounds_completed, r.first_achieved_at FROM course_records r JOIN accounts a ON a.id = r.account_id WHERE ($1::bigint IS NULL OR r.course_id = $1) ORDER BY r.best_score ASC, r.best_strokes ASC, r.first_achieved_at ASC LIMIT $2 OFFSET $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "username_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "course_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "best_score",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "best_strokes",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "rounds_completed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "first_achieved_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c7e362c1d2a466ee5c73231a182f5dec84a0ab62c4ddf085cf9b423ffa0a02a4"
+}

@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT source AS \"source!\", delta AS \"delta!\", balance_after,\n                      reason AS \"reason!\", reference AS \"reference!\",\n                      created_at AS \"created_at!\"\n               FROM (\n                 SELECT 'match_pang' AS source, delta, balance_after, reason,\n                        match_id::text AS reference, created_at\n                   FROM currency_ledger WHERE account_id = $1\n                 UNION ALL\n                 SELECT 'match_experience', delta, balance_after, reason,\n                        match_id::text, created_at\n                   FROM progression_ledger WHERE account_id = $1\n                 UNION ALL\n                 SELECT 'shop_pang', delta, balance_after, reason,\n                        operation_id::text, created_at\n                   FROM shop_currency_ledger WHERE account_id = $1\n                 UNION ALL\n                 SELECT 'item', quantity_delta, quantity_after, reason,\n                        inventory_id::text, created_at\n                   FROM item_ledger WHERE account_id = $1\n               ) merged\n               ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "delta!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "balance_after",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "reference!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b34ab977472d6f7292b78da5ea8dffbd698fa97a428b06f42351391e9ef880e7"
+}

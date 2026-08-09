@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE equipment_sets SET character_id = $2, club_item_id = $3, ball_item_id = $4, version = version + 1, updated_at = now() WHERE account_id = $1 RETURNING id, account_id, character_id, club_item_id, ball_item_id, version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "club_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "ball_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "e8916abe5c2398a781ac99071c99d4d2f86083a944c8a33e0f61c53ccf2f60a5"
+}

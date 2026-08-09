@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT m.id, m.mode, m.course_id, m.status, m.created_at, mp.strokes, mp.score, mp.place, mp.completion, mp.pang_reward, mp.experience_reward FROM match_players mp JOIN matches m ON m.id = mp.match_id WHERE mp.account_id = $1 ORDER BY m.created_at DESC LIMIT $2 OFFSET $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "course_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "strokes",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "score",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "place",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "pang_reward",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "experience_reward",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "906e89eac4cc845b699c510053664851deaa5df2461d51c39496b4e3897e33b8"
+}

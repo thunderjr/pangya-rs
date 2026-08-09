@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.username_display, a.status, a.role, a.created_at,\n                      p.nickname_display, p.setup_state, p.rank, p.experience, p.pang, p.points,\n                      p.selected_character_id\n               FROM accounts a JOIN profiles p ON p.account_id = a.id\n               WHERE a.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "username_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "nickname_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "setup_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "rank",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "experience",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "pang",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "points",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "selected_character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9df56754eee6fbfb98a306bac24aaf7c4b45b9e0c0e5a46832f339cbd9c93239"
+}

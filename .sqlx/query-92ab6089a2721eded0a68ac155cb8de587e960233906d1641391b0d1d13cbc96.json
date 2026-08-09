@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE profiles SET pang = COALESCE($2, pang), points = COALESCE($3, points), updated_at = now() WHERE account_id = $1 RETURNING pang, points",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pang",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "points",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "92ab6089a2721eded0a68ac155cb8de587e960233906d1641391b0d1d13cbc96"
+}

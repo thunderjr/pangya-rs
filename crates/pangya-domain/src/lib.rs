@@ -6,6 +6,7 @@
 //! Technology-neutral domain types and repository contracts for account storage.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -327,6 +328,43 @@ pub enum AccountStatus {
     Banned,
     /// Access is administratively disabled.
     Disabled,
+}
+
+/// Operator authorisation level held by an account.
+///
+/// This is deliberately a property of the same account a player logs in with rather than a
+/// separate operator identity: an admin action is then attributable to a real, auditable
+/// account, and there is one credential policy to keep correct instead of two.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccountRole {
+    /// No operator authority.
+    #[default]
+    Player,
+    /// May use the operator admin surface.
+    Admin,
+}
+
+impl AccountRole {
+    /// Returns the stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Player => "player",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// Parses a stored spelling.
+    ///
+    /// # Errors
+    /// Returns [`IdError::OutOfRange`] for any value the schema does not permit.
+    pub fn parse(value: &str) -> Result<Self, IdError> {
+        match value {
+            "player" => Ok(Self::Player),
+            "admin" => Ok(Self::Admin),
+            _ => Err(IdError::OutOfRange),
+        }
+    }
 }
 
 /// Progress through first-login setup.
@@ -1016,6 +1054,108 @@ pub struct AuthenticatedSession {
     pub account_id: AccountId,
     /// Consumed selector for audit correlation.
     pub handover_id: HandoverId,
+}
+
+/// The nonsecret selector for an operator admin session.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AdminSessionId(Uuid);
+
+impl AdminSessionId {
+    /// Creates a selector from a UUID.
+    #[must_use]
+    pub const fn new(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Returns the UUID representation.
+    #[must_use]
+    pub const fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl From<Uuid> for AdminSessionId {
+    fn from(value: Uuid) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Digest-only admin session persistence request.
+///
+/// Mirrors [`NewHandover`] deliberately: an admin session is a bearer like any other, so it
+/// gets the same nonsecret-selector-plus-digest treatment rather than a second scheme.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAdminSession {
+    /// Nonsecret selector.
+    pub id: AdminSessionId,
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Stored bearer digest.
+    pub digest: HandoverDigest,
+    /// Privacy-minimized source network; a raw peer address is never persisted.
+    pub source_address_prefix: SourceAddressPrefix,
+    /// Creation time supplied by the application clock.
+    pub issued_at: SystemTime,
+    /// Strict expiry time.
+    pub expires_at: SystemTime,
+}
+
+/// Request to validate a presented admin session bearer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolveAdminSession {
+    /// Nonsecret selector.
+    pub id: AdminSessionId,
+    /// Digest derived from the presented bearer.
+    pub digest: HandoverDigest,
+    /// Current time supplied by the application clock.
+    pub now: SystemTime,
+}
+
+/// An authenticated, still-valid admin session and the account behind it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminSession {
+    /// Selector, retained for audit correlation and revocation.
+    pub id: AdminSessionId,
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Display username, so the panel need not issue a second query to greet its operator.
+    pub username_display: String,
+    /// Authorisation level at resolution time, not at issue time.
+    pub role: AccountRole,
+    /// Strict expiry time.
+    pub expires_at: SystemTime,
+}
+
+/// One append-only record of an operator action taken through the admin surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAdminAuditEvent {
+    /// Signed-in account that performed the action.
+    pub actor_account_id: AccountId,
+    /// Lowercase dotted verb, for example `account.balance.grant`.
+    pub action: String,
+    /// Account the action was performed against, when there is one.
+    pub target_account_id: Option<AccountId>,
+    /// Nonsecret structured detail. Must serialise to a JSON object.
+    pub detail: String,
+}
+
+/// One persisted admin audit row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAuditEvent {
+    /// Monotonic identifier.
+    pub id: i64,
+    /// Signed-in account that performed the action.
+    pub actor_account_id: AccountId,
+    /// Display username of the actor.
+    pub actor_username: String,
+    /// Lowercase dotted verb.
+    pub action: String,
+    /// Account the action was performed against, when there is one.
+    pub target_account_id: Option<AccountId>,
+    /// Nonsecret structured detail as JSON text.
+    pub detail: String,
+    /// Server time the row was written.
+    pub occurred_at: SystemTime,
 }
 
 /// Validation failure for synthetic one-hole match values.
@@ -2988,6 +3128,634 @@ pub trait AccountRepository: Send + Sync {
         account_id: AccountId,
         grant: BalanceGrant,
     ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>>;
+}
+
+/// Technology-neutral operator admin surface repository contract.
+///
+/// Every mutating method here is expected to take the same row locks and satisfy the same
+/// triggers the gameplay path does, and to write exactly one [`NewAdminAuditEvent`] inside the
+/// same transaction. An admin action that is not audited is a defect, not a convenience.
+pub trait AdminRepository: Send + Sync {
+    /// Loads the authentication projection for an operator sign-in attempt.
+    ///
+    /// Returns `None` for an unknown username. It deliberately does not filter on role or
+    /// status, so the caller can apply one uniform failure response and avoid turning this
+    /// into an account-enumeration oracle.
+    fn load_admin_authentication<'a>(
+        &'a self,
+        username: &'a NormalizedUsername,
+    ) -> RepositoryFuture<'a, Result<Option<AdminAuthenticationRecord>, RepositoryError>>;
+
+    /// Persists a digest-only admin session.
+    fn issue_admin_session(
+        &self,
+        request: NewAdminSession,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Resolves a presented bearer, refreshing `last_seen_at` when it is still valid.
+    ///
+    /// Returns `None` for an unknown, expired, revoked, or digest-mismatched session, and for
+    /// an account that has since lost the admin role or ceased to be active. Authorisation is
+    /// therefore re-checked on every request rather than frozen at sign-in.
+    fn resolve_admin_session(
+        &self,
+        request: ResolveAdminSession,
+    ) -> RepositoryFuture<'_, Result<Option<AdminSession>, RepositoryError>>;
+
+    /// Revokes one session. Revoking an already-revoked session is not an error.
+    fn revoke_admin_session(
+        &self,
+        id: AdminSessionId,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Revokes every outstanding session for an account.
+    ///
+    /// Called whenever an account loses the admin role or stops being active, so authority is
+    /// withdrawn immediately rather than at the next expiry.
+    fn revoke_admin_sessions_for_account(
+        &self,
+        account_id: AccountId,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Sets an account's operator authorisation level, revoking its sessions when demoted.
+    fn set_account_role(
+        &self,
+        account_id: AccountId,
+        role: AccountRole,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Appends one admin audit row.
+    fn record_admin_audit(
+        &self,
+        event: NewAdminAuditEvent,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Returns admin audit rows newest first.
+    fn list_admin_audit(
+        &self,
+        page: AdminPage,
+    ) -> RepositoryFuture<'_, Result<Vec<AdminAuditEvent>, RepositoryError>>;
+
+    /// Lists accounts for the operator console.
+    fn list_accounts(
+        &self,
+        query: AdminAccountQuery,
+    ) -> RepositoryFuture<'_, Result<Vec<AdminAccountSummary>, RepositoryError>>;
+
+    /// Loads one account's full operator view.
+    fn load_account_detail(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<AdminAccountDetail, RepositoryError>>;
+
+    /// Returns one account's merged ledger history, newest first.
+    fn list_account_ledger(
+        &self,
+        account_id: AccountId,
+        page: AdminPage,
+    ) -> RepositoryFuture<'_, Result<Vec<AdminLedgerEntry>, RepositoryError>>;
+
+    /// Returns the matches one account took part in, newest first.
+    fn list_account_matches(
+        &self,
+        account_id: AccountId,
+        page: AdminPage,
+    ) -> RepositoryFuture<'_, Result<Vec<AdminMatchEntry>, RepositoryError>>;
+
+    /// Sets an account's balances to exact values under a row lock.
+    ///
+    /// The credit path ([`AccountRepository::grant_balance`]) refuses to reduce a balance, so
+    /// correcting one downward needs its own operation rather than a negative grant.
+    fn set_balances(
+        &self,
+        account_id: AccountId,
+        assignment: BalanceAssignment,
+    ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>>;
+
+    /// Places an item in an account's inventory and returns the new row.
+    fn grant_item(
+        &self,
+        request: AdminItemGrant,
+    ) -> RepositoryFuture<'_, Result<InventoryItem, AdminMutationError>>;
+
+    /// Edits one owned inventory row.
+    fn update_item(
+        &self,
+        request: AdminItemUpdate,
+    ) -> RepositoryFuture<'_, Result<InventoryItem, AdminMutationError>>;
+
+    /// Removes one owned inventory row, refusing while it is equipped.
+    fn delete_item(
+        &self,
+        account_id: AccountId,
+        inventory_id: InventoryItemId,
+    ) -> RepositoryFuture<'_, Result<(), AdminMutationError>>;
+
+    /// Grants an owned character and returns it.
+    fn grant_character(
+        &self,
+        account_id: AccountId,
+        item_type_id: ItemTypeId,
+    ) -> RepositoryFuture<'_, Result<Character, AdminMutationError>>;
+
+    /// Replaces an account's equipment selection under optimistic concurrency.
+    fn set_equipment(
+        &self,
+        request: AdminEquipmentUpdate,
+    ) -> RepositoryFuture<'_, Result<EquipmentSet, AdminMutationError>>;
+
+    /// Loads the current overlay snapshot and its revision.
+    fn load_shop_overlay(&self) -> RepositoryFuture<'_, Result<ShopOverlay, RepositoryError>>;
+
+    /// Creates or replaces one override, returning the new revision.
+    fn set_shop_override(
+        &self,
+        actor: AccountId,
+        entry: ShopOverride,
+        note: Option<String>,
+    ) -> RepositoryFuture<'_, Result<i64, RepositoryError>>;
+
+    /// Removes one override, returning the new revision. Removing an absent one is not an error.
+    fn clear_shop_override(
+        &self,
+        item_type_id: ItemTypeId,
+    ) -> RepositoryFuture<'_, Result<i64, RepositoryError>>;
+
+    /// Returns course records, best first.
+    fn list_leaderboard(
+        &self,
+        course_id: Option<CourseId>,
+        page: AdminPage,
+    ) -> RepositoryFuture<'_, Result<Vec<AdminLeaderboardEntry>, RepositoryError>>;
+
+    /// Replaces an account's stored credential.
+    ///
+    /// Takes an already-hashed value: hashing is expensive and belongs on a bounded worker,
+    /// not inside a repository call.
+    fn set_credential(
+        &self,
+        account_id: AccountId,
+        hash: CredentialHash,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+}
+
+/// One row of the operator account list.
+///
+/// Deliberately a flat projection rather than a `PlayerSnapshot`: a list of two hundred
+/// accounts must not load two hundred inventories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAccountSummary {
+    /// Identifier.
+    pub id: AccountId,
+    /// Display username.
+    pub username: String,
+    /// Display nickname, absent until first-login setup picks one.
+    pub nickname: Option<String>,
+    /// Access status.
+    pub status: AccountStatus,
+    /// Operator authorisation level.
+    pub role: AccountRole,
+    /// Progress through first-login setup.
+    pub setup_state: SetupState,
+    /// Rank. There is no separate level column; the retail wire hardcodes level 1.
+    pub rank: u32,
+    /// Accumulated experience.
+    pub experience: u64,
+    /// Pang balance.
+    pub pang: u64,
+    /// Point ("cookie") balance.
+    pub points: u64,
+    /// Owned character count.
+    pub character_count: i64,
+    /// Owned inventory row count.
+    pub inventory_count: i64,
+    /// Creation time.
+    pub created_at: SystemTime,
+}
+
+/// Filter and ordering for the operator account list.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdminAccountQuery {
+    /// Case-insensitive substring matched against username and nickname.
+    pub search: Option<String>,
+    /// Restricts to one access status.
+    pub status: Option<AccountStatus>,
+    /// Restricts to one authorisation level.
+    pub role: Option<AccountRole>,
+    /// Ordering.
+    pub sort: AdminAccountSort,
+    /// Bounded page.
+    pub page: AdminPage,
+}
+
+/// Closed ordering vocabulary for the account list.
+///
+/// A closed enum rather than a column name from the request: the query is built with the
+/// checked `query_as!` macro, so an operator-supplied ordering string could not reach SQL
+/// anyway, and this keeps it that way if the query ever becomes dynamic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AdminAccountSort {
+    /// Newest accounts first.
+    #[default]
+    CreatedDesc,
+    /// Oldest accounts first.
+    CreatedAsc,
+    /// Highest pang balance first.
+    PangDesc,
+    /// Highest experience first.
+    ExperienceDesc,
+    /// Alphabetical by normalized username.
+    UsernameAsc,
+}
+
+/// The full operator view of one account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAccountDetail {
+    /// Flat summary fields.
+    pub summary: AdminAccountSummary,
+    /// Owned characters.
+    pub characters: Vec<Character>,
+    /// Owned inventory rows.
+    pub inventory: Vec<InventoryItem>,
+    /// Equipment selection, absent only for an account whose setup never completed.
+    pub equipment: Option<EquipmentSet>,
+    /// Currently selected character, when one is set.
+    pub selected_character_id: Option<CharacterId>,
+}
+
+/// One merged balance-affecting event, drawn from every ledger an account touches.
+///
+/// The four ledgers are separate tables with different authority triggers, but an operator
+/// asking "where did this player's pang go" needs one ordered answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminLedgerEntry {
+    /// Which ledger the row came from.
+    pub source: AdminLedgerSource,
+    /// Signed change. Match rewards are positive; purchases and repairs are negative.
+    pub delta: i64,
+    /// Balance after the change, when the source records one.
+    pub balance_after: Option<i64>,
+    /// The reason recorded by the ledger.
+    pub reason: String,
+    /// Correlating identifier, as text: a match id, an operation id, or an inventory id.
+    pub reference: String,
+    /// When it happened.
+    pub created_at: SystemTime,
+}
+
+/// Which ledger an [`AdminLedgerEntry`] came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminLedgerSource {
+    /// `currency_ledger` — pang awarded by a committed match.
+    MatchPang,
+    /// `progression_ledger` — experience awarded by a committed match.
+    MatchExperience,
+    /// `shop_currency_ledger` — pang spent on a purchase or repair.
+    ShopPang,
+    /// `item_ledger` — an inventory quantity or durability change.
+    Item,
+}
+
+impl AdminLedgerSource {
+    /// Returns the stable wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchPang => "match_pang",
+            Self::MatchExperience => "match_experience",
+            Self::ShopPang => "shop_pang",
+            Self::Item => "item",
+        }
+    }
+}
+
+/// One committed match an account took part in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminMatchEntry {
+    /// Match identifier.
+    pub match_id: MatchId,
+    /// Mode.
+    pub mode: String,
+    /// Course.
+    pub course_id: CourseId,
+    /// Lifecycle status.
+    pub status: String,
+    /// Strokes taken, when the row settled.
+    pub strokes: Option<i16>,
+    /// Score relative to par, when the row settled.
+    pub score: Option<i16>,
+    /// Finishing place, when the mode ranks.
+    pub place: Option<i16>,
+    /// How the player's participation ended.
+    pub completion: Option<String>,
+    /// Pang awarded.
+    pub pang_reward: Option<i64>,
+    /// Experience awarded.
+    pub experience_reward: Option<i64>,
+    /// When the match was created.
+    pub created_at: SystemTime,
+}
+
+/// An operator's absolute balance assignment.
+///
+/// Distinct from [`BalanceGrant`], which credits. Setting is the operation an operator
+/// actually wants when correcting a broken balance, and it cannot be expressed as a credit
+/// because credits refuse to go down.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BalanceAssignment {
+    /// New pang balance, or `None` to leave it alone.
+    pub pang: Option<u64>,
+    /// New point balance, or `None` to leave it alone.
+    pub points: Option<u64>,
+}
+
+impl BalanceAssignment {
+    /// Returns whether this assignment would change anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.pang.is_none() && self.points.is_none()
+    }
+}
+
+/// An operator's request to place an item in an account's inventory.
+///
+/// Deliberately *not* routed through `EconomyRepository::purchase`: that path debits a
+/// balance and writes `economy_operations` plus its ledgers, which exist to record what a
+/// *player* did. An operator grant is a different act and gets a different record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminItemGrant {
+    /// Owning account.
+    pub account_id: AccountId,
+    /// Catalog type.
+    pub item_type_id: ItemTypeId,
+    /// Persisted classification, which the schema cross-checks against quantity.
+    pub class: InventoryClass,
+    /// How many. Must be one for every class except `Consumable`.
+    pub quantity: u32,
+    /// Optional durability, refused for a consumable.
+    pub durability: Option<u32>,
+}
+
+/// An operator's edit to one owned inventory row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminItemUpdate {
+    /// Owning account, checked against the row so one account cannot edit another's item.
+    pub account_id: AccountId,
+    /// Target row.
+    pub inventory_id: InventoryItemId,
+    /// New quantity, or `None` to leave it.
+    pub quantity: Option<u32>,
+    /// New durability, or `None` to leave it. `Some(None)` clears it.
+    pub durability: Option<Option<u32>>,
+}
+
+/// An operator's replacement of an account's equipment selection.
+///
+/// Carries `expected_version` for exactly the reason the in-game path does: two writers must
+/// not silently overwrite each other, and a client holding a stale version must be told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminEquipmentUpdate {
+    /// Owning account.
+    pub account_id: AccountId,
+    /// Selected owned character.
+    pub character_id: CharacterId,
+    /// Equipped owned club set, or `None` to clear.
+    pub club_item_id: Option<InventoryItemId>,
+    /// Equipped owned ball, or `None` to clear.
+    pub ball_item_id: Option<InventoryItemId>,
+    /// The version the operator read.
+    pub expected_version: u32,
+}
+
+/// Why an operator inventory or equipment write was refused.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AdminMutationError {
+    /// The addressed row or account does not exist.
+    #[error("record was not found")]
+    NotFound,
+    /// The row exists but belongs to a different account.
+    #[error("record belongs to another account")]
+    NotOwned,
+    /// The requested shape violates a schema invariant, such as a stacked club set.
+    #[error("requested item shape is invalid")]
+    InvalidShape,
+    /// The account already holds a stacked row of this consumable type.
+    #[error("a stacked row of this type already exists")]
+    AlreadyStacked,
+    /// The item is currently equipped and must be unequipped first.
+    #[error("item is currently equipped")]
+    Equipped,
+    /// Another writer changed the equipment first.
+    #[error("equipment version is stale")]
+    VersionConflict,
+    /// Persisted data violated domain range or invariant checks.
+    #[error("persisted data is invalid")]
+    CorruptData,
+    /// Storage is temporarily or permanently unavailable.
+    #[error("storage is unavailable")]
+    Storage(StorageFault),
+}
+
+impl StorageFaulted for AdminMutationError {
+    fn storage_fault(&self) -> Option<StorageFault> {
+        match self {
+            Self::Storage(fault) => Some(*fault),
+            _ => None,
+        }
+    }
+}
+
+/// One operator override layered on top of the immutable catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShopOverride {
+    /// Catalog type this applies to.
+    pub item_type_id: ItemTypeId,
+    /// Whether the server offers it. `None` inherits the client's own shop flag.
+    pub enabled: Option<bool>,
+    /// What the server charges. `None` inherits the client's own price.
+    pub pang: Option<u64>,
+}
+
+/// The complete set of overrides, plus the revision it was read at.
+///
+/// Held as one immutable snapshot rather than queried per purchase: a purchase is on the
+/// player's critical path, and the overlay changes at operator speed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShopOverlay {
+    revision: i64,
+    entries: BTreeMap<u32, ShopOverride>,
+}
+
+impl ShopOverlay {
+    /// Builds a snapshot from repository rows.
+    #[must_use]
+    pub fn new(revision: i64, entries: Vec<ShopOverride>) -> Self {
+        Self {
+            revision,
+            entries: entries
+                .into_iter()
+                .map(|entry| (entry.item_type_id.get(), entry))
+                .collect(),
+        }
+    }
+
+    /// Returns the revision this snapshot was read at.
+    #[must_use]
+    pub const fn revision(&self) -> i64 {
+        self.revision
+    }
+
+    /// Returns the override for one type, if any.
+    #[must_use]
+    pub fn get(&self, type_id: ItemTypeId) -> Option<&ShopOverride> {
+        self.entries.get(&type_id.get())
+    }
+
+    /// Returns every override, in type-ID order.
+    pub fn entries(&self) -> impl Iterator<Item = &ShopOverride> {
+        self.entries.values()
+    }
+
+    /// Returns how many overrides this snapshot holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether this snapshot holds no overrides.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Applies this overlay to a catalog definition.
+    ///
+    /// Returns the definition the server should trade on, or `None` when the result is not
+    /// for sale. Unlike the startup `price_override_pang` aid, this **can** make an item the
+    /// client does not sell purchasable — that is the whole point — but it can only reach
+    /// items the catalog already knows, so an id the client has never heard of stays
+    /// unreachable.
+    #[must_use]
+    pub fn resolve(&self, definition: ItemDefinition) -> Option<ItemDefinition> {
+        let entry = self.get(definition.type_id);
+        let inherited_enabled = matches!(definition.sale, ItemSale::Pang(_));
+        let enabled = entry
+            .and_then(|entry| entry.enabled)
+            .unwrap_or(inherited_enabled);
+        if !enabled {
+            return None;
+        }
+        let price = entry
+            .and_then(|entry| entry.pang)
+            .or(match definition.sale {
+                ItemSale::Pang(price) => Some(price),
+                ItemSale::NotSold => None,
+            })?;
+        if price == 0 {
+            // A zero price is how the client's tables spell "unavailable"; honouring it as
+            // "free" would let an overlay hand out unlimited items by accident.
+            return None;
+        }
+        Some(ItemDefinition {
+            sale: ItemSale::Pang(price),
+            ..definition
+        })
+    }
+}
+
+/// One row of the course-record leaderboard.
+///
+/// `course_records` is re-derived from `matches` and `match_players` by an authority trigger
+/// on every write, so these rows cannot be fabricated — which is exactly why they are worth
+/// showing an operator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminLeaderboardEntry {
+    /// Holder.
+    pub account_id: AccountId,
+    /// Holder's display username.
+    pub username: String,
+    /// Course.
+    pub course_id: CourseId,
+    /// Mode; only `stroke_two` records exist today.
+    pub mode: String,
+    /// Best score relative to par.
+    pub best_score: i16,
+    /// Strokes taken in that round.
+    pub best_strokes: i16,
+    /// Rounds completed on this course.
+    pub rounds_completed: i64,
+    /// When the record was first set.
+    pub first_achieved_at: SystemTime,
+}
+
+/// The minimum projection an operator sign-in needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAuthenticationRecord {
+    /// Account identifier.
+    pub account_id: AccountId,
+    /// Display username.
+    pub username_display: String,
+    /// Stored credential hash, in the single supported scheme.
+    pub credential_hash: CredentialHash,
+    /// Access status.
+    pub status: AccountStatus,
+    /// Authorisation level.
+    pub role: AccountRole,
+}
+
+/// A bounded offset page for admin listings.
+///
+/// Both bounds are enforced by the constructor rather than by each caller, so a listing
+/// endpoint cannot be turned into an unbounded table scan by a query parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdminPage {
+    limit: i64,
+    offset: i64,
+}
+
+impl AdminPage {
+    /// Largest page any admin listing will return.
+    pub const MAX_LIMIT: i64 = 200;
+    /// Largest offset any admin listing will accept.
+    pub const MAX_OFFSET: i64 = 1_000_000;
+
+    /// Creates a page, clamping the limit and rejecting an out-of-range offset.
+    ///
+    /// # Errors
+    /// Returns [`IdError::OutOfRange`] for a negative or excessive offset.
+    pub fn new(limit: i64, offset: i64) -> Result<Self, IdError> {
+        if !(0..=Self::MAX_OFFSET).contains(&offset) {
+            return Err(IdError::OutOfRange);
+        }
+        Ok(Self {
+            limit: limit.clamp(1, Self::MAX_LIMIT),
+            offset,
+        })
+    }
+
+    /// Returns the clamped row limit.
+    #[must_use]
+    pub const fn limit(self) -> i64 {
+        self.limit
+    }
+
+    /// Returns the validated row offset.
+    #[must_use]
+    pub const fn offset(self) -> i64 {
+        self.offset
+    }
+}
+
+impl Default for AdminPage {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            offset: 0,
+        }
+    }
 }
 
 /// An operator-authorised credit to one account's balances.

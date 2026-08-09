@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT e.id, e.actor_account_id, a.username_display, e.action, e.target_account_id, e.detail::text AS \"detail!\", e.occurred_at FROM admin_audit_events e JOIN accounts a ON a.id = e.actor_account_id ORDER BY e.occurred_at DESC, e.id DESC LIMIT $1 OFFSET $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "actor_account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "username_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "target_account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "detail!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "occurred_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      false
+    ]
+  },
+  "hash": "8d0d66e7a2b5004839a9f8e469da75adf6f4c41679d523a90da74ba04aea839c"
+}

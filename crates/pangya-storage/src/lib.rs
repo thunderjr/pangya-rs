@@ -44,6 +44,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod admin;
 mod economy;
 
 /// Embedded forward-only PostgreSQL migrations.

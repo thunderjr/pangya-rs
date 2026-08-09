@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE inventory_items SET quantity = $2, updated_at = now() WHERE id = $1 RETURNING id, account_id, item_type_id, quantity, starter_key, inventory_class, durability, expires_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "starter_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "inventory_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "durability",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "516a9307915dbe31d5a7e5bece2d2b3306fd56c29466015712a507352fcb3b9f"
+}

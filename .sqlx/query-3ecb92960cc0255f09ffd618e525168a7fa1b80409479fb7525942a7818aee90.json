@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO shop_offer_overrides (item_type_id, enabled, pang, note, updated_by, updated_at) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (item_type_id) DO UPDATE SET enabled = EXCLUDED.enabled, pang = EXCLUDED.pang, note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bool",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3ecb92960cc0255f09ffd618e525168a7fa1b80409479fb7525942a7818aee90"
+}

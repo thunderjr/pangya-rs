@@ -1,0 +1,99 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.username_display, a.status, a.role, a.created_at,\n                      p.nickname_display, p.setup_state, p.rank, p.experience, p.pang, p.points,\n                      (SELECT count(*) FROM characters c WHERE c.account_id = a.id)\n                        AS \"character_count!\",\n                      (SELECT count(*) FROM inventory_items i WHERE i.account_id = a.id)\n                        AS \"inventory_count!\"\n               FROM accounts a JOIN profiles p ON p.account_id = a.id\n               WHERE ($1::text IS NULL\n                      OR a.username_normalized ILIKE $1\n                      OR p.nickname_normalized ILIKE $1)\n                 AND ($2::text IS NULL OR a.status = $2)\n                 AND ($3::text IS NULL OR a.role = $3)\n               ORDER BY\n                 CASE WHEN $4 = 0 THEN a.created_at END DESC,\n                 CASE WHEN $4 = 1 THEN a.created_at END ASC,\n                 CASE WHEN $4 = 2 THEN p.pang END DESC,\n                 CASE WHEN $4 = 3 THEN p.experience END DESC,\n                 CASE WHEN $4 = 4 THEN a.username_normalized END ASC,\n                 a.id DESC\n               LIMIT $5 OFFSET $6",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "username_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "nickname_display",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "setup_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "rank",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "experience",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "pang",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "points",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "character_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "inventory_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "9538d7915a2ac53afac5f1f3d40c54b20fce9afd506b6b7eeb99499a80c1e362"
+}

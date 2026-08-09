@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM shop_offer_overrides WHERE item_type_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7d1938973827ea481717da1f25e189187764f53a6ac6cf17ec5c6376c308c6d9"
+}
