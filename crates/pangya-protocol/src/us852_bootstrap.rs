@@ -1048,20 +1048,23 @@ impl RetailPlayerData {
         }
         self.character.encode_body(writer);
         self.caddie.encode_body(writer);
-        // Active club set: inventory id then catalog id, the same pair every other item
-        // block uses, followed by `ClubSetInfo`'s five stat slots and five enchant slots
-        // (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`
-        // `struct ClubSetInfo`).
+        // Sixteen bytes the equipment block above is short of `UserEquip`
+        // (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`, whose
+        // `skin_id[6]`, `skin_typeid[6]`, `mascot_id` and `poster[2]` total sixty against the
+        // eleven zeroed words written there). They are carried here rather than in the
+        // equipment block so the roster entry's total width, which matches the client's own
+        // per-player record stride exactly, does not change.
         //
-        // The client takes its hole-load lookup key from entry offset `0x2f2e`, twenty bytes
-        // past where this block starts; moving the block there so the inventory id landed on
-        // that offset did not satisfy the lookup, so the twenty bytes are not simply missing
-        // from in front of it. See `docs/PROGRESS.md` blocker 28.
+        // Their effect is to put the club set where the client reads it. The client takes its
+        // hole-load lookup key from entry offset `0x2f2e` — measured, by stamping every zero
+        // word of a roster entry with its own offset and reading back the word the client
+        // keys on — and with these sixteen bytes in front, `0x2f2e` is exactly
+        // `ClubSetInfo::_typeid`, the catalog id the club models are resolved from. A catalog
+        // lookup that misses is the null the client then dereferences.
+        writer.bytes(&[0; 16]);
         writer.u32_le(self.equipment.club_set_uid);
         writer.u32_le(self.club_set_iff_id);
-        for _ in 0..10 {
-            writer.u16_le(0);
-        }
+        writer.bytes(&[0; 4]);
         // Active mascot.
         writer.u32_le(0);
         writer.u32_le(0);
