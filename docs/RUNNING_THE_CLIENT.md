@@ -1,5 +1,13 @@
 # Running the U.S. client against this server
 
+> **There is an installer for most of this.**
+> [`thunderjr/pangya-client`](https://github.com/thunderjr/pangya-client) automates §1, §5, and §6
+> — acquiring the client, writing `rugburn.json`, installing Rugburn, and the registry profile.
+> This document remains the specification it implements, and the reference for the parts it does
+> not cover: §2–§4 (catalog extraction and server configuration) and §7 (QA automation).
+>
+> Note that §6's `IntegratedPak = "0"` is **disputed**; see [`RELATED.md`](RELATED.md).
+
 Operator guide for pointing a legally held PangYa U.S. client at a local `pangya-rs`
 instance. Nothing described here is committed to the repository: the client, its PAK
 archives, and everything extracted from them live only under the gitignored `local-data/`

@@ -77,6 +77,12 @@ obtained client. [`docs/RUNNING_THE_CLIENT.md`](docs/RUNNING_THE_CLIENT.md) is t
 operator procedure: acquiring and flattening the client tree, extracting its item tables from
 the PAK chain, writing the catalog manifest, and pointing Rugburn at a local instance.
 
+**Setting up the client side is now a Windows app.**
+[`thunderjr/pangya-client`](https://github.com/thunderjr/pangya-client) points a client at a
+server without the manual procedure — pick the folder, fill in the address, install, play. The
+manual path above remains authoritative and is what operators and QA use.
+[`docs/RELATED.md`](docs/RELATED.md) explains which repository owns what.
+
 ```bash
 cp config/retail-local.example.toml config/local.toml
 
