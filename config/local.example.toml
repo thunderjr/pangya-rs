@@ -75,6 +75,26 @@ bind = "127.0.0.1:8080"
 metrics = true
 heartbeat_stale_after = "5s"
 
+# The operator admin API, nested at /admin/v1 on this same listener because its audience is
+# the operator — the same audience health and metrics already have.
+# See docs/adr/0016-admin-api-on-the-http-listener.md.
+#
+# Disabled by default: this is the only HTTP surface in the project that can mutate player
+# state. Enabling it logs a warning saying so.
+#
+# The first admin is created out of band, because the API can only grant the role to someone
+# who already holds it:
+#     pangya-server account role --account-id 1 --role admin
+[http.admin_api]
+enabled = false
+# Capped at 24h by configuration validation; beyond that a forgotten browser tab becomes a
+# standing credential.
+session_lifetime = "12h"
+logins_per_window = 10
+rate_window = "60s"
+# The panel is a separate service (pangya-admin, port 5173) that proxies /admin/v1 here, so
+# the session cookie stays same-origin without CORS. This listener serves no HTML.
+
 # The static HTTP contract a retail client needs before it will speak the game protocol at all:
 # a string catalog, the XTEA-encrypted patch updatelist, and the theme documents plus their
 # images. Without these the client aborts during startup; see docs/RUNNING_THE_CLIENT.md.

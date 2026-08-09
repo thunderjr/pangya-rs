@@ -157,7 +157,16 @@ section_default!(GameSection {
 section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
     metrics: bool = true,
-    heartbeat_stale_after: String = "5s".to_owned()
+    heartbeat_stale_after: String = "5s".to_owned(),
+    admin_api: AdminApiSection = AdminApiSection::default()
+});
+section_default!(AdminApiSection {
+    // Off by default, like [game] and [client_web]: it is the only mutating HTTP surface in
+    // the project, and a server nobody administers over the web should not expose one.
+    enabled: bool = false,
+    session_lifetime: String = "12h".to_owned(),
+    logins_per_window: u32 = 10,
+    rate_window: String = "60s".to_owned()
 });
 section_default!(ClientWebSection {
     // Off by default: it publishes an operator's client directory listing, and a server with no
@@ -362,6 +371,8 @@ pub struct AppConfig {
     pub http_bind: SocketAddr,
     /// Optional validated client patch/theme web service.
     pub client_web: Option<ValidatedClientWeb>,
+    /// Optional validated operator admin API, mounted on the `[http]` listener.
+    pub admin_api: Option<ValidatedAdminApi>,
     /// Enables read-only metrics exposition.
     pub metrics_enabled: bool,
     /// Event-loop heartbeat stale threshold.
@@ -462,6 +473,25 @@ pub struct ValidatedClientWeb {
     pub translation_catalog: Option<PathBuf>,
     /// Optional theme image directory.
     pub theme_directory: Option<PathBuf>,
+}
+
+/// Validated operator admin API policy.
+///
+/// Deliberately mounted on the existing `[http]` listener rather than a listener of its own:
+/// its audience is the operator, which is the same audience health and metrics already have.
+/// ADR-0015's separate-listener rule exists because the *client's* machine must reach the
+/// patch surface, and that reasoning does not apply here. Recorded in ADR-0016.
+///
+/// The panel itself is **not** served from here. It is its own service on its own port and
+/// proxies `/admin/v1` to this listener, which is what keeps the session cookie same-origin.
+#[derive(Clone, Debug)]
+pub struct ValidatedAdminApi {
+    /// How long an issued session remains valid.
+    pub session_lifetime: Duration,
+    /// Sign-in attempts permitted per source prefix per window.
+    pub logins_per_window: u32,
+    /// Sign-in rate window.
+    pub rate_window: Duration,
 }
 
 /// Validated local-only synthetic economy policy.
@@ -622,6 +652,7 @@ fn validate(
         .then(|| socket(&raw.client_web.bind, "client_web.bind", &mut issues))
         .flatten();
     let client_web = validated_client_web(&raw.client_web, &mut issues);
+    let admin_api = validated_admin_api(&raw.http.admin_api, &mut issues);
     if let Some(address) = game_advertise {
         if !matches!(address.ip(), IpAddr::V4(_)) {
             issue(
@@ -1635,6 +1666,7 @@ fn validate(
         retail_bootstrap: raw.game.retail_bootstrap,
         http_bind: required(http_bind)?,
         client_web,
+        admin_api,
         metrics_enabled: raw.http.metrics,
         heartbeat_stale_after: required(heartbeat)?,
         database_url: required(database_url)?,
@@ -1738,6 +1770,42 @@ fn declared_course_par(raw: u8, field: &'static str, issues: &mut Vec<ConfigIssu
 }
 
 /// Validates the client web-service section, or reports why it cannot start.
+fn validated_admin_api(
+    raw: &AdminApiSection,
+    issues: &mut Vec<ConfigIssue>,
+) -> Option<ValidatedAdminApi> {
+    if !raw.enabled {
+        return None;
+    }
+    let session_lifetime = duration(
+        &raw.session_lifetime,
+        "http.admin_api.session_lifetime",
+        issues,
+    );
+    let rate_window = duration(&raw.rate_window, "http.admin_api.rate_window", issues);
+    // A day is already generous for an operator console; beyond that a forgotten browser tab
+    // becomes a standing credential.
+    if session_lifetime.is_some_and(|value| value > Duration::from_secs(86_400)) {
+        issue(
+            issues,
+            "http.admin_api.session_lifetime",
+            "must not exceed 24h",
+        );
+    }
+    if raw.logins_per_window == 0 {
+        issue(
+            issues,
+            "http.admin_api.logins_per_window",
+            "must be nonzero, or no operator could ever sign in",
+        );
+    }
+    Some(ValidatedAdminApi {
+        session_lifetime: session_lifetime?,
+        logins_per_window: raw.logins_per_window,
+        rate_window: rate_window?,
+    })
+}
+
 fn validated_client_web(
     raw: &ClientWebSection,
     issues: &mut Vec<ConfigIssue>,

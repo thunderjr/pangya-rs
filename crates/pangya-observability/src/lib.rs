@@ -171,6 +171,33 @@ impl M2Metrics {
         self.db_ready.store(u64::from(ready), Ordering::Relaxed);
     }
 
+    /// Returns the live LoginService connection gauge.
+    ///
+    /// These four accessors exist so the operator admin API can report the same numbers as
+    /// `/metrics` without parsing the exposition text it just rendered.
+    #[must_use]
+    pub fn login_connections_active(&self) -> u64 {
+        self.active_login.load(Ordering::Relaxed)
+    }
+
+    /// Returns the live GameService connection gauge.
+    #[must_use]
+    pub fn game_connections_active(&self) -> u64 {
+        self.game_active.load(Ordering::Relaxed)
+    }
+
+    /// Returns the live room gauge.
+    #[must_use]
+    pub fn game_active_rooms(&self) -> u64 {
+        self.game_active_rooms.load(Ordering::Relaxed)
+    }
+
+    /// Returns the live match gauge.
+    #[must_use]
+    pub fn game_matches_active(&self) -> u64 {
+        self.game_matches_active.load(Ordering::Relaxed)
+    }
+
     /// Renders stable Prometheus text without attacker-controlled labels.
     /// Packet byte counters are plaintext `opcode + payload` bytes in both directions.
     #[must_use]
@@ -1385,6 +1412,12 @@ struct HealthBody {
     status: &'static str,
 }
 
+/// Path the optional operator admin API is nested under.
+///
+/// Held here rather than imported from `pangya-admin` so this crate keeps no dependency on
+/// it; the two constants are pinned to each other by a test in `pangya-server`.
+pub const ADMIN_API_PREFIX: &str = "/admin/v1";
+
 /// Builds the read-only admin router.
 pub fn admin_router(state: Arc<HealthState>) -> Router {
     Router::new()
@@ -1432,10 +1465,22 @@ pub async fn serve_admin(
     listener: TcpListener,
     state: Arc<HealthState>,
     shutdown: CancellationToken,
+    api: Option<Router>,
 ) -> Result<(), std::io::Error> {
-    axum::serve(listener, admin_router(state))
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
+    // Nested rather than merged, so this crate never needs to know the admin API's paths and
+    // it cannot accidentally shadow `/health` or `/metrics`.
+    let mut router = admin_router(state);
+    if let Some(api) = api {
+        router = router.nest(ADMIN_API_PREFIX, api);
+    }
+    // `into_make_service_with_connect_info` so handlers can see the peer address; the admin
+    // API reduces it to a masked prefix for rate limiting and session records.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.cancelled_owned())
+    .await
 }
 
 fn now_millis() -> u64 {

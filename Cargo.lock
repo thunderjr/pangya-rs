@@ -1222,6 +1222,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "pangya-admin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "md-5",
+ "pangya-data",
+ "pangya-domain",
+ "pangya-login",
+ "pangya-observability",
+ "rand 0.8.7",
+ "rand_chacha 0.3.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "pangya-crypto"
 version = "0.1.0"
 dependencies = [
@@ -1342,6 +1367,7 @@ dependencies = [
  "clap",
  "config",
  "humantime",
+ "pangya-admin",
  "pangya-crypto",
  "pangya-data",
  "pangya-domain",

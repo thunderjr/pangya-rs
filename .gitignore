@@ -10,3 +10,4 @@
 local-data/
 .env
 .DS_Store
+scripts/__pycache__/

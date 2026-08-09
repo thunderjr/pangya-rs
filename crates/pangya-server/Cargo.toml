@@ -11,6 +11,7 @@ cap-std.workspace = true
 clap.workspace = true
 config.workspace = true
 humantime.workspace = true
+pangya-admin = { version = "0.1.0", path = "../pangya-admin" }
 pangya-data = { version = "0.1.0", path = "../pangya-data" }
 pangya-domain = { version = "0.1.0", path = "../pangya-domain" }
 pangya-game = { version = "0.1.0", path = "../pangya-game" }

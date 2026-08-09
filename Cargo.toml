@@ -25,6 +25,7 @@ bytes = "1.11.1"
 cap-std = "4.0.2"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 lzokay = "2.0.1"
+md-5 = "0.10.6"
 proptest = "1.9.0"
 rand = "0.8.5"
 rand_chacha = "=0.3.1"

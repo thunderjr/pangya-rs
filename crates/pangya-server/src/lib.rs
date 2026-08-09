@@ -22,9 +22,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::{Catalog, CatalogKind, CatalogPricing};
 use pangya_domain::{
-    AccountId, AccountRepository, BalanceGrant, CourseId, EconomyRepository, HandoverRepository,
-    ItemTypeId, MatchRepository, NewAccount, Nickname, OneHoleConfig, PlayerRepository,
-    RepositoryError, StorageObserver, Username,
+    AccountId, AccountRepository, AccountRole, AdminRepository, BalanceGrant, CourseId,
+    EconomyRepository, HandoverRepository, ItemTypeId, MatchRepository, NewAccount, Nickname,
+    OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver, Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -95,6 +95,22 @@ pub enum AccountCommand {
     Grant(AccountGrantArgs),
     /// Issues one short-lived GameService handover bearer for an account.
     Handover(AccountHandoverArgs),
+    /// Sets an account's operator authorisation level.
+    Role(AccountRoleArgs),
+}
+
+/// Operator role arguments.
+///
+/// This is how the first admin comes into existence: the admin API can grant the role, but
+/// only to an operator who already holds it, so the bootstrap has to happen out of band.
+#[derive(Debug, Args)]
+pub struct AccountRoleArgs {
+    /// Numeric account identifier.
+    #[arg(long)]
+    pub account_id: i64,
+    /// Authorisation level to set.
+    #[arg(long, value_parser = ["player", "admin"])]
+    pub role: String,
 }
 
 /// Operator handover-issue arguments.
@@ -234,6 +250,9 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
         Command::Account {
             command: AccountCommand::Handover(args),
         } => account_handover(config, args).await,
+        Command::Account {
+            command: AccountCommand::Role(args),
+        } => account_role(config, args).await,
     }
 }
 
@@ -357,11 +376,16 @@ fn compose_game_service<R>(
     catalog: Catalog,
     config: GameRuntimeConfig,
     observer: Arc<dyn GameObserver>,
+    shop_overlay: Option<tokio::sync::watch::Receiver<pangya_domain::ShopOverlay>>,
 ) -> Result<Arc<GameService<R>>, ServerError>
 where
     R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     GameService::new(repository, catalog, config, observer)
+        .map(|service| match shop_overlay {
+            Some(overlay) => service.with_shop_overlay(overlay),
+            None => service,
+        })
         .map(Arc::new)
         .map_err(|error| {
             tracing::error!(service = "game", %error, "service composition rejected the configuration");
@@ -420,6 +444,27 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         page_size: value.page_size,
         max_purchase_quantity: value.max_purchase_quantity,
     });
+    // Cloned before the game service takes it: `Catalog` is an `Arc` wrapper, so the admin
+    // surface shares the same immutable tables rather than parsing them a second time.
+    let admin_catalog = catalog.clone();
+    // The overlay is read once at startup and republished by the admin surface on every
+    // write, so a purchase resolves it from memory rather than querying per transaction.
+    let shop_overlay = if config.admin_api.is_some() && catalog.is_some() {
+        let loaded = repository.load_shop_overlay().await.map_err(|error| {
+            tracing::error!(%error, "the shop overlay could not be loaded");
+            ServerError::Database
+        })?;
+        if !loaded.is_empty() {
+            tracing::warn!(
+                overrides = loaded.len(),
+                revision = loaded.revision(),
+                "operator shop overrides are active; the server's prices differ from the client's"
+            );
+        }
+        Some(Arc::new(tokio::sync::watch::channel(loaded).0))
+    } else {
+        None
+    };
     let game = match catalog {
         Some(catalog) => Some(compose_game_service(
             Arc::clone(&repository),
@@ -434,6 +479,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 retail_bootstrap: config.retail_bootstrap,
             },
             metrics.clone(),
+            shop_overlay.as_ref().map(|sender| sender.subscribe()),
         )?),
         None => None,
     };
@@ -573,10 +619,46 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
             })
         });
     }
+    // The read-only health/metrics router and the optional mutating admin API share one
+    // listener because they share one audience: the operator. ADR-0016.
+    //
+    // It gets its own bounded credential executor rather than borrowing LoginService's: an
+    // operator signing in must not be able to exhaust the permits a player's login needs, and
+    // a slow Argon2id verification on one surface must not stall the other.
+    let admin_api = match config.admin_api.clone() {
+        Some(settings) => {
+            tracing::warn!(
+                session_lifetime_secs = settings.session_lifetime.as_secs(),
+                "the operator admin API is enabled; this listener can now mutate player state"
+            );
+            let policy = Arc::new(CredentialPolicy::new().map_err(|_| ServerError::Credential)?);
+            let executor = BoundedCredentialExecutor::new(
+                policy,
+                config.credential_concurrency,
+                config.credential_queue_timeout,
+                config.credential_operation_timeout,
+            )
+            .map_err(|_| ServerError::Credential)?;
+            Some(pangya_admin::router(pangya_admin::AdminState::new(
+                Arc::clone(&repository) as Arc<dyn pangya_admin::AdminSurface>,
+                Arc::new(executor),
+                admin_catalog,
+                shop_overlay.clone(),
+                Some(Arc::clone(&health)),
+                Some(Arc::clone(&metrics)),
+                pangya_admin::AdminApiConfig {
+                    session_lifetime: settings.session_lifetime,
+                    logins_per_window: settings.logins_per_window,
+                    rate_window: settings.rate_window,
+                },
+            )))
+        }
+        None => None,
+    };
     let http_shutdown = shutdown.child_token();
     let http_health = Arc::clone(&health);
     tasks.spawn(async move {
-        serve_admin(http_listener, http_health, http_shutdown)
+        serve_admin(http_listener, http_health, http_shutdown, admin_api)
             .await
             .map_err(|error| {
                 tracing::error!(service = "admin_http", %error, "listener stopped with an error");
@@ -1031,6 +1113,38 @@ async fn account_grant(config: AppConfig, args: AccountGrantArgs) -> Result<(), 
     Ok(())
 }
 
+async fn account_role(config: AppConfig, args: AccountRoleArgs) -> Result<(), ServerError> {
+    let account_id = AccountId::new(args.account_id).map_err(|_| ServerError::AccountInput)?;
+    let role = AccountRole::parse(&args.role).map_err(|_| ServerError::AccountInput)?;
+    let pool = connect_and_migrate(&config).await?;
+    let repository = PgRepository::new(pool.clone());
+    let outcome = repository
+        .set_account_role(account_id, role, std::time::SystemTime::now())
+        .await;
+    let result = match outcome {
+        Ok(()) => {
+            tracing::info!(
+                action = "account_role",
+                account_id = account_id.get(),
+                role = role.as_str(),
+                outcome = "success",
+                "operator audit"
+            );
+            let mut stdout = std::io::stdout().lock();
+            writeln!(
+                stdout,
+                "role set: id={} role={}",
+                account_id.get(),
+                role.as_str()
+            )
+            .map_err(|_| ServerError::Runtime)
+        }
+        Err(_) => Err(ServerError::AccountInput),
+    };
+    pool.close().await;
+    result
+}
+
 async fn account_handover(config: AppConfig, args: AccountHandoverArgs) -> Result<(), ServerError> {
     let account_id = AccountId::new(args.account_id).map_err(|_| ServerError::AccountInput)?;
     let generated = pangya_login::generate_handover(
@@ -1407,6 +1521,7 @@ mod tests {
                     ..GameRuntimeConfig::default()
                 },
                 Arc::new(M2Metrics::default()),
+                None,
             ),
             Err(ServerError::Runtime)
         ));
@@ -1511,5 +1626,23 @@ mod tests {
         assert!(matches!(result, Err(ServerError::Data)));
         drop(runtime);
         assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn the_admin_api_is_nested_where_the_crate_itself_says_it_lives() {
+        // `pangya-observability` deliberately holds no dependency on `pangya-admin`, so the
+        // mount path is duplicated. This is the assertion that keeps the two in step; without
+        // it, changing one silently 404s every admin route.
+        assert_eq!(
+            pangya_observability::ADMIN_API_PREFIX,
+            pangya_admin::ADMIN_PREFIX
+        );
+    }
+
+    #[test]
+    fn the_session_cookie_path_covers_the_api() {
+        // The cookie is issued with `Path=/admin`. If the API mount moved outside that prefix
+        // the browser would stop sending the session with it.
+        assert!(pangya_observability::ADMIN_API_PREFIX.starts_with("/admin"));
     }
 }
