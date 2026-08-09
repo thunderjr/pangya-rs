@@ -293,6 +293,45 @@ publish it with `scripts/tailnet-forward.py`, which forwards through the interpr
 ./scripts/tailnet-forward.py <this-host-ip> 10103 20201 8090
 ```
 
+### Two startup failures that produce no server-side diagnostic
+
+Both were hit deploying to a container host on 2026-08-09; neither logs anything.
+[`evidence/REAL_CLIENT_HOMELAB_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_HOMELAB_PRACTICE_2026-08-09.md)
+is the full account.
+
+**"string load failed" can mean another service holds the client web port.** `[client_web]`
+defaults to `8090`, which is a popular port. The client issues plain HTTP to whatever address it
+is told; if something else is there — especially anything terminating TLS — it answers wrongly and
+the client exits with the same message it shows when the service is absent. `pangya-server` never
+sees the request, so its log is silent. Check the port answers *your* server before anything else:
+
+```bash
+curl -s -o /dev/null -w '%{http_code} %{size_download}\n' http://<server>:8090/Translation/Read.aspx
+# expect: 200 24324
+```
+
+**"`<name>.pak` file has been corrupted" means the updatelist disagrees with the client's copy of
+that archive.** The client validates the series in order and names only the first failure, so a
+set with several wrong archives surfaces one error at a time and rewards fixing them one at a time
+with another error. Diff the whole set instead. `PangYa_Client_US_851.zip` carries every archive's
+CRC-32 in its central directory, so no extraction is needed:
+
+```bash
+unzip -v PangYa_Client_US_851.zip | grep -i '\.pak' \
+  | awk '{print $8, $1, $7}' | sed 's|.*/||' | sort > /tmp/pristine.txt
+```
+
+**`local-data/us851/` is not a clean client.** `scripts/sync-client-shop.sh` writes its authored
+`projectg850gb.pak` back into that tree, and `--replace-in-pak` runs have also left an authored
+`projectg700gb+.pak` and `projectg851gb.pak` there, plus a stray `projectg852gb.pak` that is a
+duplicate of `851` and not in the retail series. Serve archives from the zip, or from a directory
+you know has never been authored into — the pristine copies displaced by those runs are kept in
+`local-data/custom-shop/original-*.pak`.
+
+The authored archive and the authored catalog (`custom-shop/iff-gb`) are a matched pair. Serving
+one with the other is its own silent failure: purchases refused with `stage: "not_in_catalog"` for
+items the client displays perfectly happily.
+
 ## 7. Where it stops today
 
 With everything above in place the client logs in, sets a nickname and first character, picks the
