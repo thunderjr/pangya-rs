@@ -109,7 +109,7 @@ def parse_type_id(value: object) -> int:
     return parsed
 
 
-def load_catalog(path: pathlib.Path) -> tuple[list[str], list[Offer]]:
+def load_catalog(path: pathlib.Path) -> tuple[list[str], list[Offer], bool]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -145,7 +145,19 @@ def load_catalog(path: pathlib.Path) -> tuple[list[str], list[Offer]]:
             raise AuthorError(f"duplicate offer {table}:{type_id:#010x}")
         seen.add(key)
         offers.append(Offer(table, type_id, pang))
-    return managed, offers
+
+    # Opt-in, and deliberately not the default. Without it this tool refuses to author a row the
+    # client never listed, because it would be inventing metadata no evidence covers. With it,
+    # such a row is given shop flag 0x02 — "Pang, tradeable", which 936 rows of the pristine
+    # U.S. tables carry verbatim, so it is a byte the retail client is known to render.
+    #
+    # What it cannot promise: that a row the client never intended to sell *looks* right in the
+    # shop. Quest and reward rows may have no icon, no description, or a minimum level that hides
+    # them. Enabling everything is an operator's decision to accept that.
+    invent = value.get("invent_shop_metadata", False)
+    if not isinstance(invent, bool):
+        raise AuthorError("invent_shop_metadata must be a boolean")
+    return managed, offers, invent
 
 
 def table_shape(data: bytes, table: str) -> tuple[int, int]:
@@ -160,7 +172,7 @@ def table_shape(data: bytes, table: str) -> tuple[int, int]:
     return count, record_size
 
 
-def pang_shop_flag(original: int, table: str, type_id: int) -> int:
+def pang_shop_flag(original: int, table: str, type_id: int, invent: bool = False) -> int:
     """Returns the U.S. retail money byte for a Pang offer.
 
     Retail evidence and the archived IFF research agree on the low nibble: ``1`` is Points,
@@ -182,18 +194,34 @@ def pang_shop_flag(original: int, table: str, type_id: int) -> int:
     ``docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md``), so this widens the function without
     disturbing anything already proven in front of a client.
     """
+    # A row the client never listed has no metadata to preserve. Only an explicit opt-in may
+    # supply one.
+    if original == 0:
+        if invent:
+            return SHOP_CURRENCY_PANG_TRADEABLE
+        raise AuthorError(
+            f"{table} type {type_id:#010x} was not a client shop row; "
+            "refusing to invent its metadata"
+        )
     currency = original & SHOP_CURRENCY_MASK
     if currency in (SHOP_CURRENCY_PANG_NONTRADEABLE, SHOP_CURRENCY_PANG_TRADEABLE):
         return original
     if currency == SHOP_CURRENCY_POINTS:
         cleared = original & ~SHOP_CURRENCY_MASK
         return cleared if cleared != 0 else SHOP_CURRENCY_PANG_TRADEABLE
+    # 0x3 and 0x6 occur on 298 U.S. rows and mean something this project has never identified.
+    # Rewriting the nibble to a Pang form keeps the row's display state and makes it purchasable;
+    # guessing at what the original nibble meant is what the opt-in is acknowledging.
+    if invent:
+        return (original & ~SHOP_CURRENCY_MASK) | SHOP_CURRENCY_PANG_TRADEABLE
     raise AuthorError(
         f"{table} type {type_id:#010x} has unsupported shop currency nibble {currency:#x}"
     )
 
 
-def author_table(data: bytes, table: str, offers: list[Offer]) -> tuple[bytes, list[dict[str, object]]]:
+def author_table(
+    data: bytes, table: str, offers: list[Offer], invent: bool = False
+) -> tuple[bytes, list[dict[str, object]]]:
     count, record_size = table_shape(data, table)
     output = bytearray(data)
     rows: dict[int, tuple[int, int]] = {}
@@ -215,12 +243,9 @@ def author_table(data: bytes, table: str, offers: list[Offer]) -> tuple[bytes, l
         if row is None:
             raise AuthorError(f"{table} does not contain active type {offer.type_id:#010x}")
         start, original_flag = row
-        if original_flag == 0:
-            raise AuthorError(
-                f"{table} type {offer.type_id:#010x} was not a client shop row; "
-                "refusing to invent its metadata"
-            )
-        authored_flag = pang_shop_flag(original_flag, table, offer.type_id)
+        # The never-a-shop-row refusal now lives in `pang_shop_flag`, so both it and the unknown
+        # currency case are governed by the same opt-in rather than by two separate rules.
+        authored_flag = pang_shop_flag(original_flag, table, offer.type_id, invent)
         # A zero flag is the disabled encoding. Reaching it here would mean the run reports a
         # successful offer for a row the client will not list and the server will not sell —
         # the exact silent failure that hid 956 lost rows before `pang_shop_flag` handled the
@@ -261,8 +286,12 @@ def atomic_write(path: pathlib.Path, data: bytes) -> None:
         raise
 
 
-def author_archive(
-    source: pathlib.Path, destination: pathlib.Path, managed: list[str], offers: list[Offer]
+def author_archive(  # noqa: PLR0913 - one more flag than ideal; splitting it hides the pairing
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    managed: list[str],
+    offers: list[Offer],
+    invent: bool = False,
 ) -> list[dict[str, object]]:
     per_table = {table: [offer for offer in offers if offer.table == table] for table in managed}
     if any(not rows for rows in per_table.values()):
@@ -288,7 +317,9 @@ def author_archive(
         with zipfile.ZipFile(temporary, "w") as output:
             for info, data in members:
                 if info.filename in per_table:
-                    data, authored = author_table(data, info.filename, per_table[info.filename])
+                    data, authored = author_table(
+                        data, info.filename, per_table[info.filename], invent
+                    )
                     report.extend(authored)
                 output.writestr(info, data)
         os.replace(temporary, destination)
@@ -640,8 +671,10 @@ def main() -> int:
     try:
         if (args.replace_in_pak is None) != (args.out_client_pak is None):
             raise AuthorError("--replace-in-pak and --out-client-pak must be provided together")
-        managed, offers = load_catalog(args.catalog)
-        authored = author_archive(args.base_archive, args.out_archive, managed, offers)
+        managed, offers, invent = load_catalog(args.catalog)
+        authored = author_archive(
+            args.base_archive, args.out_archive, managed, offers, invent
+        )
         authored_bytes = args.out_archive.read_bytes()
         if args.out_pak is not None:
             atomic_write(

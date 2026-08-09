@@ -95,7 +95,7 @@ class AuthorClientIffTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            managed, offers = author.load_catalog(catalog)
+            managed, offers, invent = author.load_catalog(catalog)
             destination = root / "custom.iff"
             report = author.author_archive(source, destination, managed, offers)
             self.assertEqual(report[0]["type_id"], "0x10000002")
@@ -206,9 +206,28 @@ class AuthorClientIffTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            managed, offers = author.load_catalog(catalog)
+            managed, offers, invent = author.load_catalog(catalog)
             with self.assertRaisesRegex(author.AuthorError, "refusing to invent"):
                 author.author_archive(source, root / "custom.iff", managed, offers)
+
+    def test_a_never_sold_row_stays_refused_unless_explicitly_opted_into(self) -> None:
+        """The default must keep refusing; the opt-in must be the only way through.
+
+        Enabling a row the client never listed is inventing metadata no evidence covers, so it
+        is the operator's call and never a silent default.
+        """
+        with self.assertRaisesRegex(author.AuthorError, "refusing to invent"):
+            author.pang_shop_flag(0x00, "Part.iff", 0x08000800)
+        self.assertEqual(
+            author.pang_shop_flag(0x00, "Part.iff", 0x08000800, invent=True), 0x02
+        )
+
+    def test_an_unknown_currency_nibble_converts_only_under_the_opt_in(self) -> None:
+        # 0x60 keeps its display nibble and becomes tradeable Pang; the meaning of 0x6 as a
+        # currency remains unidentified, which is exactly what the opt-in acknowledges.
+        self.assertEqual(
+            author.pang_shop_flag(0x66, "Part.iff", 0x08000800, invent=True), 0x62
+        )
 
     def test_a_bare_points_row_authors_to_a_listed_pang_row(self) -> None:
         """A ``0x01`` row must not clear to ``0x00``.
