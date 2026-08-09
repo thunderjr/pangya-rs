@@ -464,6 +464,48 @@ manifest built from their real counts, versions and record sizes.
 Do not skip this and use a loose `pangya_gb.iff`: an older copy loads and validates cleanly while
 silently lacking every item added since.
 
+### Authoring and manually synchronizing a custom shop
+
+Keep the pristine winning PAK and extracted IFF archive under ignored `local-data/`. Define offers
+in `local-data/custom-shop/catalog.json`; every offer must name an active row already present in
+the supplied client data. The author refuses invented metadata, hides all other managed rows, and
+normalizes the retail money nibble to Pang (`0`/`2`; a Points row with nibble `1` becomes the
+non-tradeable Pang form).
+
+One command builds both sides from the **same authored ZIP**:
+
+```bash
+scripts/sync-client-shop.sh
+```
+
+Defaults are:
+
+- base archive: `local-data/us851-data/pak-iff/pangya_gb.iff`
+- pristine mounted PAK: `local-data/custom-shop/projectg850gb-original.pak`
+- offer catalog: `local-data/custom-shop/catalog.json`
+- server output: `local-data/custom-shop/iff-gb`
+- client/patch output: `local-data/us851/projectg850gb.pak`
+
+Override any path with `PANGYA_BASE_IFF`, `PANGYA_BASE_PAK`, `PANGYA_SHOP_CATALOG`,
+`PANGYA_SHOP_OUTPUT_DIR`, `PANGYA_SERVER_IFF_DIR`, or `PANGYA_PATCH_DIR`. The command emits the
+client PAK SHA-256, server manifest SHA-256, and authored offer report. It writes all generated
+proprietary data only under `local-data/`, writes the server manifest last, and atomically stages
+the client PAK only after authoring succeeds.
+
+Restart the server after the command so `data.iff_directory` reloads the new manifest, then copy
+or download the reported `projectg850gb.pak` into the client's install while the client is
+stopped. This is intentionally a manual synchronization flow; updater transport belongs to the
+future dedicated updater. Never use a reconstructed PAK as the pristine base.
+
+The reusable retail verification flow now includes both purchase confirmations:
+
+```powershell
+. C:\tools\pangya-client.ps1
+Open-PangyaShop
+Select-PangyaShopCategory -Top Item -Sub Comet
+Invoke-PangyaShopFirstItemPurchase  # Buy Item, then nested "Are you sure"
+```
+
 ### The notice dialog trap
 
 A stray click on the player-list pane opens a "You have left a message" notice. While it is up it

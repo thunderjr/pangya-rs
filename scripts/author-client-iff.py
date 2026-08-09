@@ -67,6 +67,18 @@ REGION_KEYS = {
 }
 CLIENT_UNAVAILABLE_PRICE = 10_000_000
 MAX_PANG_PRICE = 0xFFFF_FFFE
+SHOP_CURRENCY_MASK = 0x0F
+SHOP_CURRENCY_PANG_NONTRADEABLE = 0x00
+SHOP_CURRENCY_POINTS = 0x01
+SHOP_CURRENCY_PANG_TRADEABLE = 0x02
+SERVER_TABLE_KINDS = {
+    "Character.iff": "character",
+    "ClubSet.iff": "club_set",
+    "Ball.iff": "ball",
+    "Item.iff": "consumable",
+    "Part.iff": "character_part",
+    "Course.iff": "course",
+}
 
 
 class AuthorError(ValueError):
@@ -148,6 +160,24 @@ def table_shape(data: bytes, table: str) -> tuple[int, int]:
     return count, record_size
 
 
+def pang_shop_flag(original: int, table: str, type_id: int) -> int:
+    """Returns the U.S. retail money byte for a Pang offer.
+
+    Retail evidence and the archived IFF research agree on the low nibble: ``1`` is Points,
+    while ``0`` and ``2`` are the non-tradeable and tradeable Pang forms. The upper nibble
+    controls sale/display state, so converting an existing Points row clears only its currency
+    nibble. Unknown forms are refused rather than guessed.
+    """
+    currency = original & SHOP_CURRENCY_MASK
+    if currency in (SHOP_CURRENCY_PANG_NONTRADEABLE, SHOP_CURRENCY_PANG_TRADEABLE):
+        return original
+    if currency == SHOP_CURRENCY_POINTS:
+        return original & ~SHOP_CURRENCY_MASK
+    raise AuthorError(
+        f"{table} type {type_id:#010x} has unsupported shop currency nibble {currency:#x}"
+    )
+
+
 def author_table(data: bytes, table: str, offers: list[Offer]) -> tuple[bytes, list[dict[str, object]]]:
     count, record_size = table_shape(data, table)
     output = bytearray(data)
@@ -175,14 +205,16 @@ def author_table(data: bytes, table: str, offers: list[Offer]) -> tuple[bytes, l
                 f"{table} type {offer.type_id:#010x} was not a client shop row; "
                 "refusing to invent its metadata"
             )
+        authored_flag = pang_shop_flag(original_flag, table, offer.type_id)
         struct.pack_into("<I", output, start + PRICE_OFFSET, offer.pang)
-        output[start + SHOP_FLAG_OFFSET] = original_flag
+        output[start + SHOP_FLAG_OFFSET] = authored_flag
         report.append(
             {
                 "table": table,
                 "type_id": f"0x{offer.type_id:08x}",
                 "pang": offer.pang,
-                "shop_flag": original_flag,
+                "original_shop_flag": original_flag,
+                "shop_flag": authored_flag,
             }
         )
     return bytes(output), report
@@ -243,6 +275,62 @@ def author_archive(
             pass
         raise
     return report
+
+
+def write_server_iff_directory(archive_path: pathlib.Path, destination: pathlib.Path) -> dict[str, object]:
+    """Writes the server catalog from the exact authored archive used in the client PAK.
+
+    Files are written before ``manifest.toml`` so a failed run cannot leave a new manifest that
+    attests incomplete payloads. The server performs its own hash/header/record validation at
+    startup; this function makes client/server drift impossible within one successful authoring
+    run.
+    """
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            payloads = {name: archive.read(name) for name in SERVER_TABLE_KINDS}
+    except (OSError, KeyError, zipfile.BadZipFile, RuntimeError) as error:
+        raise AuthorError(f"cannot build server IFF directory from {archive_path}: {error}") from error
+
+    destination.mkdir(parents=True, exist_ok=True)
+    manifest = ["manifest_version = 3", ""]
+    files: list[dict[str, object]] = []
+    for filename, kind in SERVER_TABLE_KINDS.items():
+        payload = payloads[filename]
+        count, record_size = table_shape(payload, filename)
+        binding, version = struct.unpack_from("<HI", payload, 2)
+        digest = hashlib.sha256(payload).hexdigest()
+        atomic_write(destination / filename, payload)
+        manifest.extend(
+            [
+                "[[files]]",
+                f'filename = "{filename}"',
+                f'sha256 = "{digest}"',
+                f'kind = "{kind}"',
+                f"count = {count}",
+                f"binding = {binding}",
+                f"version = {version}",
+                f"record_size = {record_size}",
+                "",
+            ]
+        )
+        files.append(
+            {
+                "filename": filename,
+                "sha256": digest,
+                "kind": kind,
+                "count": count,
+                "binding": binding,
+                "version": version,
+                "record_size": record_size,
+            }
+        )
+    manifest_bytes = ("\n".join(manifest).rstrip() + "\n").encode("utf-8")
+    atomic_write(destination / "manifest.toml", manifest_bytes)
+    return {
+        "directory": str(destination),
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "files": files,
+    }
 
 
 def encode_pak_path(entry_name: str) -> bytes:
@@ -506,6 +594,11 @@ def main() -> int:
         help="optional one-entry diagnostic/overlay PAK",
     )
     parser.add_argument(
+        "--out-server-iff-dir",
+        type=pathlib.Path,
+        help="write server tables/manifest from this same authored archive",
+    )
+    parser.add_argument(
         "--replace-in-pak",
         type=pathlib.Path,
         help="retail PAK whose winning entry must be replaced",
@@ -531,6 +624,9 @@ def main() -> int:
                 args.out_pak,
                 build_retail_pak(args.pak_entry, authored_bytes, args.region),
             )
+        server_iff = None
+        if args.out_server_iff_dir is not None:
+            server_iff = write_server_iff_directory(args.out_archive, args.out_server_iff_dir)
         replacement = None
         if args.replace_in_pak is not None:
             replacement = replace_pak_entry(
@@ -549,6 +645,7 @@ def main() -> int:
                 sha256(args.out_client_pak) if args.out_client_pak is not None else None
             ),
             "pak_replacement": replacement,
+            "server_iff": server_iff,
             "managed_tables": managed,
             "offers": authored,
         }

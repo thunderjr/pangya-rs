@@ -80,7 +80,7 @@ class AuthorClientIffTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             source = self.make_source(
                 root,
-                [(0x10000001, 5000, 7), (0x10000002, 6000, 9)],
+                [(0x10000001, 5000, 0x20), (0x10000002, 6000, 0x21)],
             )
             catalog = root / "catalog.json"
             catalog.write_text(
@@ -110,7 +110,11 @@ class AuthorClientIffTests(unittest.TestCase):
                 struct.unpack_from("<I", authored, first + author.PRICE_OFFSET)[0],
                 author.CLIENT_UNAVAILABLE_PRICE,
             )
-            self.assertEqual(authored[second + author.SHOP_FLAG_OFFSET], 9)
+            self.assertEqual(
+                authored[second + author.SHOP_FLAG_OFFSET],
+                0x20,
+                "a Points row is converted to the non-tradeable Pang form",
+            )
             self.assertEqual(struct.unpack_from("<I", authored, second + author.PRICE_OFFSET)[0], 1234)
 
             pak = author.build_basic_pak("data/pangya_gb.iff", destination.read_bytes())
@@ -120,6 +124,19 @@ class AuthorClientIffTests(unittest.TestCase):
             entries = extract.read_file_table(pak, extract.REGION_KEYS["us"])
             self.assertEqual(entries[0][0], "data/pangya_gb.iff")
             self.assertEqual(extract.entry_bytes(pak, entries[0][1]), destination.read_bytes())
+
+            # A production run writes the server tables from this exact authored ZIP, never
+            # from a separately edited copy.
+            for required in author.SERVER_TABLE_KINDS:
+                if required == "ClubSet.iff":
+                    continue
+                with zipfile.ZipFile(destination, "a", zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr(required, table([(0x10000003, 1, 0x20)]))
+            server_dir = root / "server-iff"
+            server_report = author.write_server_iff_directory(destination, server_dir)
+            self.assertEqual((server_dir / "ClubSet.iff").read_bytes(), authored)
+            self.assertEqual(len(server_report["files"]), len(author.SERVER_TABLE_KINDS))
+            self.assertIn("manifest_version = 3", (server_dir / "manifest.toml").read_text())
 
             retail_pak = author.build_retail_pak(
                 "data/pangya_gb.iff", destination.read_bytes(), "us"
