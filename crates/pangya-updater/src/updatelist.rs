@@ -65,7 +65,18 @@ pub struct FileEntry {
     /// Size in bytes.
     pub size: u64,
     /// PangYa file checksum in the signed form the attribute carries.
+    ///
+    /// This is what decides whether the client starts, so it is the authority for "is this
+    /// archive the one the server expects". It is also only 32 bits and not a cryptographic
+    /// digest, which is why [`FileEntry::sha256`] exists alongside it.
     pub checksum: i32,
+    /// SHA-256 of the same bytes, lowercase hex.
+    ///
+    /// Never written to the retail document — the client has no field for it. It exists so the
+    /// launcher can verify a *download* before letting it near a client directory: a 32-bit
+    /// checksum is a compatibility signal, not an integrity boundary for a network transfer.
+    /// Computed in the same read pass as the checksum so publishing it costs no extra I/O.
+    pub sha256: String,
     /// Modification date as `YYYY-MM-DD`.
     pub date: String,
     /// Modification time as `HH:MM:SS`.
@@ -232,6 +243,7 @@ fn entry_for(directory: &Dir, name: &str) -> Result<FileEntry, UpdateListError> 
     let (date, time) = format_timestamp(modified.into_std());
 
     let mut hasher = FileChecksum::new();
+    let mut digest = <sha2::Sha256 as sha2::Digest>::new();
     let mut buffer = vec![0_u8; CHECKSUM_CHUNK_BYTES];
     loop {
         let read = file.read(&mut buffer).map_err(|_| UpdateListError::File)?;
@@ -239,12 +251,14 @@ fn entry_for(directory: &Dir, name: &str) -> Result<FileEntry, UpdateListError> 
             break;
         }
         hasher.update(&buffer[..read]);
+        sha2::Digest::update(&mut digest, &buffer[..read]);
     }
 
     Ok(FileEntry {
         name: name.to_owned(),
         size,
         checksum: hasher.finish_signed(),
+        sha256: format!("{:x}", sha2::Digest::finalize(digest)),
         date,
         time,
     })
@@ -276,6 +290,7 @@ mod tests {
                     name: "projectg700gb+.pak".to_owned(),
                     size: 1_131_201_576,
                     checksum: -1_234_567,
+                    sha256: String::new(),
                     date: "2016-04-15".to_owned(),
                     time: "09:41:58".to_owned(),
                 },
@@ -283,6 +298,7 @@ mod tests {
                     name: "projectg851gb.pak".to_owned(),
                     size: 690_331,
                     checksum: 42,
+                    sha256: String::new(),
                     date: "2016-11-02".to_owned(),
                     time: "00:30:00".to_owned(),
                 },
@@ -339,6 +355,7 @@ mod tests {
                 name: "we\"ird<&>'.pak".to_owned(),
                 size: 1,
                 checksum: 0,
+                sha256: String::new(),
                 date: "2016-01-01".to_owned(),
                 time: "00:00:00".to_owned(),
             }],

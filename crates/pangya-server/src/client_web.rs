@@ -85,11 +85,52 @@ pub enum ClientWebError {
 /// Everything the routes serve, prepared once.
 struct Prepared {
     update_list: Vec<u8>,
+    /// Pre-serialized launcher manifest, minus the staleness flag which is computed per request.
+    launcher_paks: Vec<LauncherPak>,
+    /// What `prepare` observed for each listed archive, so a swap under a running server can be
+    /// detected. This matters more than it looks: replacing a served file with `mv -f` leaves
+    /// the held `File` pointing at the unlinked old inode, so the server goes on serving the old
+    /// bytes with the old update list and nothing anywhere reports a problem.
+    stat_snapshot: Vec<(String, u64, Option<std::time::SystemTime>)>,
+    patch_version: String,
+    patch_number: u32,
+    client_directory_path: std::path::PathBuf,
     patch_files: HashMap<String, PatchFile>,
     translation: String,
     extra_contents: String,
     theme_document: String,
     theme_directory: Option<Dir>,
+}
+
+/// One archive as the launcher sees it.
+///
+/// `pangya_crc` is the authority for *will the client start* — it is literally the `fcrc` the
+/// client compares. `sha256` is the authority for *did I receive the right bytes*; a 32-bit
+/// checksum is a compatibility signal, not an integrity boundary for a network transfer. A
+/// launcher must satisfy size, CRC and digest before a download may touch a client directory.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LauncherPak {
+    /// File name, no directory component.
+    pub name: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// PangYa checksum, in the signed form the retail document carries.
+    pub pangya_crc: i32,
+    /// SHA-256 of the same bytes, lowercase hex.
+    pub sha256: String,
+}
+
+/// What `GET /launcher/v1/manifest` answers.
+#[derive(Debug, serde::Serialize)]
+struct LauncherManifest<'a> {
+    manifest_version: u32,
+    patch_version: &'a str,
+    patch_number: u32,
+    /// True when a listed archive no longer matches what startup observed. The launcher must
+    /// refuse to patch against a stale manifest: the update list it would be validated against
+    /// was built at startup and no longer describes what is on disk.
+    stale: bool,
+    paks: &'a [LauncherPak],
 }
 
 /// An allowlisted patch payload held open from startup so request text never becomes a path.
@@ -171,6 +212,40 @@ impl ClientWebState {
                 },
             );
         }
+        // Built before the document is encrypted, from the same `FileEntry` values the client
+        // will be validated against. Computing these independently could drift; taking them from
+        // one structure means launcher and client cannot disagree.
+        let launcher_paks: Vec<LauncherPak> = update_list
+            .entries
+            .iter()
+            .filter(|entry| {
+                std::path::Path::new(&entry.name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+            })
+            .map(|entry| LauncherPak {
+                name: entry.name.clone(),
+                size: entry.size,
+                pangya_crc: entry.checksum,
+                sha256: entry.sha256.clone(),
+            })
+            .collect();
+        let stat_snapshot = launcher_paks
+            .iter()
+            .map(|pak| {
+                let observed = client_directory.metadata(&pak.name).ok().map(|meta| {
+                    (
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .map(cap_std::time::SystemTime::into_std),
+                    )
+                });
+                let (size, modified) = observed.unwrap_or((0, None));
+                (pak.name.clone(), size, modified)
+            })
+            .collect();
+
         let update_list = update_list.to_encrypted(settings.region.key());
 
         let base_url = format!(
@@ -232,6 +307,11 @@ impl ClientWebState {
 
         Ok(Self(Arc::new(Prepared {
             update_list,
+            launcher_paks,
+            stat_snapshot,
+            patch_version: settings.patch_version.clone(),
+            patch_number: settings.patch_number,
+            client_directory_path: settings.client_directory.clone(),
             patch_files,
             translation,
             extra_contents,
@@ -257,7 +337,11 @@ pub fn client_web_router(state: ClientWebState) -> Router {
         "/S4_Patch",
         "/pangya/season4/patch",
     ];
-    let mut router = Router::new().route("/Translation/Read.aspx", get(translation));
+    // Registered outside the three retail prefixes so it can never shadow a path the client
+    // asks for. Nothing retail requests this; it exists for the launcher.
+    let mut router = Router::new()
+        .route("/Translation/Read.aspx", get(translation))
+        .route("/launcher/v1/manifest", get(launcher_manifest));
     for prefix in PREFIXES {
         router = router
             .route(&format!("{prefix}/updatelist"), get(updatelist))
@@ -276,6 +360,50 @@ pub fn client_web_router(state: ClientWebState) -> Router {
             );
     }
     router.fallback(client_web_not_found).with_state(state)
+}
+
+/// Answers the launcher's manifest.
+///
+/// Unauthenticated by necessity — the same audience and the same listener as the update list
+/// this is derived from, and a player's launcher holds no credential. It publishes only what the
+/// client is already told in the update list, plus a digest of bytes the same listener already
+/// serves in full.
+///
+/// Staleness is re-stat'd per request rather than cached: it is two `metadata` calls per
+/// archive, and the whole point is to notice a change made *after* startup.
+async fn launcher_manifest(State(state): State<ClientWebState>) -> Response {
+    let stale = state.0.stat_snapshot.iter().any(|(name, size, modified)| {
+        let path = state.0.client_directory_path.join(name);
+        match std::fs::metadata(&path) {
+            Ok(current) => current.len() != *size || current.modified().ok() != *modified,
+            // A listed archive that has vanished is at least as stale as one that changed.
+            Err(_) => true,
+        }
+    });
+    if stale {
+        tracing::warn!(
+            "a served client archive changed after startup; the update list no longer describes \
+             the directory and the server needs restarting"
+        );
+    }
+    let manifest = LauncherManifest {
+        manifest_version: 1,
+        patch_version: &state.0.patch_version,
+        patch_number: state.0.patch_number,
+        stale,
+        paks: &state.0.launcher_paks,
+    };
+    match serde_json::to_vec(&manifest) {
+        Ok(body) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            body,
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn client_web_not_found(uri: Uri) -> StatusCode {
@@ -435,6 +563,11 @@ mod router_tests {
     #[test]
     fn router_builds_for_every_prefix() {
         let state = ClientWebState(Arc::new(Prepared {
+            launcher_paks: Vec::new(),
+            stat_snapshot: Vec::new(),
+            patch_version: "PangYa-RS".to_owned(),
+            patch_number: 851,
+            client_directory_path: std::path::PathBuf::new(),
             update_list: Vec::new(),
             patch_files: HashMap::new(),
             translation: String::new(),
@@ -453,6 +586,11 @@ mod router_tests {
         std::fs::write(&path, b"authored-pak").expect("write patch");
         let file = std::fs::File::open(&path).expect("open patch");
         let state = ClientWebState(Arc::new(Prepared {
+            launcher_paks: Vec::new(),
+            stat_snapshot: Vec::new(),
+            patch_version: "PangYa-RS".to_owned(),
+            patch_number: 851,
+            client_directory_path: root.clone(),
             update_list: Vec::new(),
             patch_files: HashMap::from([(
                 "projectg852gb.pak".to_owned(),
