@@ -7,6 +7,14 @@
 
 pub mod client_web;
 pub mod configuration;
+pub mod publish_report;
+
+/// The one archive `scripts/author-client-iff.py` rewrites.
+///
+/// Named as a constant rather than read from the report because the report attests a digest,
+/// not a path, and every authoring run to date targets this archive. If a future run ever
+/// rewrites a different one, the report gains a filename and this goes away.
+const CUSTOM_SHOP_PAK: &str = "projectg850gb.pak";
 
 use std::{
     env, fs,
@@ -214,6 +222,9 @@ pub enum ServerError {
     /// The client patch/theme web content could not be prepared.
     #[error("the client web service content could not be prepared")]
     ClientWeb,
+    /// The served client archive and the loaded catalog are not from one authoring run.
+    #[error("the client archive and the server catalog are out of step: {0}")]
+    PublishSkew(#[from] publish_report::PublishReportError),
     /// The loaded catalog carries no par and configuration declared none either.
     #[error(
         "the configured catalog carries no course par, so course_par must be declared for \
@@ -504,6 +515,28 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     // actionable message instead of becoming the client's "please re-install the game" dialog.
     let client_web = match config.client_web.clone() {
         Some(settings) => {
+            // The cross-check runs BEFORE the update list is built, so a skewed deployment is
+            // refused by name rather than after the server has spent a full directory checksum
+            // on it. It needs the catalog side too, which is why it lives here and not inside
+            // `ClientWebState::prepare`: `data.iff_directory` is a `[data]` concern.
+            if let Some(report) = settings.publish_report.clone() {
+                let client_pak = settings.client_directory.join(CUSTOM_SHOP_PAK);
+                let manifest = config
+                    .iff_directory
+                    .clone()
+                    .ok_or(ServerError::Data)?
+                    .join(config.data_manifest.clone().ok_or(ServerError::Data)?);
+                let checked = tokio::task::spawn_blocking(move || {
+                    publish_report::verify(&report, &client_pak, &manifest)
+                })
+                .await
+                .map_err(|_| ServerError::Runtime)?;
+                if let Err(error) = checked {
+                    tracing::error!(%error, "publish cross-check failed");
+                    return Err(ServerError::PublishSkew(error));
+                }
+                tracing::info!("client archive and server catalog agree with the publish report");
+            }
             let prepared = tokio::task::spawn_blocking(move || {
                 let state = client_web::ClientWebState::prepare(&client_web::ClientWebSettings {
                     advertise: settings.advertise,

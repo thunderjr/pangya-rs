@@ -1379,6 +1379,7 @@ dependencies = [
  "pangya-updater",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1425,6 +1426,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "proptest",
+ "sha2",
  "thiserror",
 ]
 

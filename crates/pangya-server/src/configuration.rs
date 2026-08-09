@@ -186,7 +186,10 @@ section_default!(ClientWebSection {
     patch_number: u32 = 9999,
     // Plaintext catalog XML; the service base64-encodes it as the client expects.
     translation_catalog: Option<PathBuf> = None,
-    theme_directory: Option<PathBuf> = None
+    theme_directory: Option<PathBuf> = None,
+    // shop-sync-report.json from scripts/sync-client-shop.sh. When set, startup refuses if the
+    // served client archive and the loaded catalog did not come from one authoring run.
+    publish_report: Option<PathBuf> = None
 });
 section_default!(DatabaseSection {
     url_env: String = "DATABASE_URL".to_owned(),
@@ -473,6 +476,8 @@ pub struct ValidatedClientWeb {
     pub translation_catalog: Option<PathBuf>,
     /// Optional theme image directory.
     pub theme_directory: Option<PathBuf>,
+    /// Optional authoring report cross-checked against the served archive and loaded catalog.
+    pub publish_report: Option<PathBuf>,
 }
 
 /// Validated operator admin API policy.
@@ -1873,6 +1878,7 @@ fn validated_client_web(
         patch_number: raw.patch_number,
         translation_catalog: raw.translation_catalog.clone(),
         theme_directory: raw.theme_directory.clone(),
+        publish_report: raw.publish_report.clone(),
     })
 }
 

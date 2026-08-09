@@ -229,6 +229,7 @@ Newest first. Every claim of real-client acceptance in this repository traces to
 | 2026-08-09 | [`evidence/ADMIN_PANEL_2026-08-09.md`](evidence/ADMIN_PANEL_2026-08-09.md) | operator surface | Admin sessions, per-request authorisation, append-only audit, account/inventory/equipment control, live shop overlay, catalog names, same-origin panel |
 | 2026-08-09 | [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md) | real client | 196-byte inventory rows render; ClubSet + Ball equip commits atomically and survives restart |
 | 2026-08-09 | [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md) | real client | Authored IFF in the mounted PAK; server-authoritative price charged; replay resistance |
+| 2026-08-09 | [`evidence/REAL_CLIENT_HOMELAB_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_HOMELAB_PRACTICE_2026-08-09.md) | real client | First run against the containerised deployment: settled practice hole, then disconnect on the unhandled post-round `0x002f` |
 | 2026-08-09 | [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md) | real client | Two-seat versus hole with durable forfeit settlement |
 | 2026-08-09 | [`evidence/REAL_CLIENT_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_PRACTICE_2026-08-09.md) | real client | Eight physical strokes, one committed hole, +10 Pang/+5 EXP |
 | 2026-08-09 | [`evidence/REAL_CLIENT_ROOM_DIRECTORY_2026-08-09.md`](evidence/REAL_CLIENT_ROOM_DIRECTORY_2026-08-09.md) | real client | Multiplay lists rooms |
