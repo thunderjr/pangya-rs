@@ -46,6 +46,18 @@ pub const CLIENT_TYPE_ID_OFFSET: usize = 4;
 /// a 40-byte icon, then price. Verified against the acquired client by reading known shop rows
 /// back out — "Air Knight Utility Set" at 10000 and "Candy Club Set" at 7500 match what the
 /// client's own shop displays.
+/// Byte offset of a real client record's fixed-width display name.
+///
+/// Every family shares one 0x90-byte record base — `enabled:u32 @0x00`, `iffId:u32 @0x04`,
+/// `name:[40] @0x08`, `minLevel @0x30`, `icon:[40] @0x31`, `price:u32 @0x5c`,
+/// `shopFlag @0x68` — confirmed independently by two references:
+/// `hsreina--pangya-server/src/Iff/IffManager.IffEntry.pas` (`TIffbase`) and
+/// `pangbox--server/pangya/iff/item.go`, the latter already this project's cited source for
+/// the price and shop-flag offsets.
+pub const CLIENT_NAME_OFFSET: usize = 0x08;
+/// Fixed width of that name field.
+pub const CLIENT_NAME_BYTES: usize = 40;
+/// Byte offset of a real client record's Pang price.
 pub const CLIENT_PRICE_OFFSET: usize = 0x5c;
 /// Offset of the shop availability flag, immediately after price/discount/condition.
 pub const CLIENT_SHOP_FLAG_OFFSET: usize = 0x68;
@@ -132,6 +144,7 @@ pub struct CatalogRecord {
     local_one_hole_par: Option<u8>,
     definition: Option<ItemDefinition>,
     character_part_slot: Option<u8>,
+    name: Option<Box<str>>,
 }
 
 impl CatalogRecord {
@@ -139,6 +152,17 @@ impl CatalogRecord {
     #[must_use]
     pub const fn local_one_hole_par(&self) -> Option<u8> {
         self.local_one_hole_par
+    }
+
+    /// Returns the client's own display name, when the record carries one.
+    ///
+    /// Present only for real client tables: the synthetic schemas have no name field, and a
+    /// record narrower than the shared base yields `None` rather than a guess. Nothing on the
+    /// wire is derived from this — it exists so an operator surface can show an item as
+    /// something other than a bare hexadecimal type id.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Returns the exact immutable v2 economy definition, if this is an item family.
@@ -346,6 +370,37 @@ impl Catalog {
             .binary_search_by_key(&type_id, |definition| definition.type_id)
             .ok()
             .map(|index| &self.0.offers[index])
+    }
+
+    /// Looks up one record in any family, sold or not.
+    ///
+    /// The operator catalog browser needs rows the shop does not sell — that is precisely the
+    /// set an overlay might make sellable — so this is deliberately wider than
+    /// [`Self::shop_offer`].
+    #[must_use]
+    pub fn find_record(&self, type_id: ItemTypeId) -> Option<(CatalogKind, &CatalogRecord)> {
+        self.0
+            .records
+            .iter()
+            .find_map(|(kind, table)| table.get(&type_id.get()).map(|record| (*kind, record)))
+    }
+
+    /// Iterates every loaded record, family by family, in deterministic type-ID order.
+    pub fn records(&self) -> impl Iterator<Item = (CatalogKind, &CatalogRecord)> {
+        self.0
+            .records
+            .iter()
+            .flat_map(|(kind, table)| table.values().map(move |record| (*kind, record)))
+    }
+
+    /// Returns how many records each family contributed.
+    #[must_use]
+    pub fn table_counts(&self) -> Vec<(CatalogKind, usize)> {
+        self.0
+            .records
+            .iter()
+            .map(|(kind, table)| (*kind, table.len()))
+            .collect()
     }
 
     /// Looks up any exact v2 item definition, including a not-sold item.
@@ -590,6 +645,8 @@ pub fn parse_iff_bytes(
             local_one_hole_par,
             definition: None,
             character_part_slot: None,
+            // The synthetic schemas carry no name field.
+            name: None,
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
@@ -644,6 +701,21 @@ fn client_definition(
         durability: ItemDurability::Nondurable,
         compatibility: ItemCompatibility::Any,
     }))
+}
+
+/// Reads a real client record's fixed-width display name.
+///
+/// Returns `None` for a record too narrow to carry one, and for a name that is empty after
+/// trimming. Bytes are taken up to the first NUL, and decoded lossily: the U.S. tables are
+/// ASCII, but a byte outside it must not cost the whole catalog its load — the name is
+/// cosmetic, and every gameplay decision is made from the type id.
+fn client_name(record: &[u8]) -> Option<Box<str>> {
+    let end = CLIENT_NAME_OFFSET.checked_add(CLIENT_NAME_BYTES)?;
+    let field = record.get(CLIENT_NAME_OFFSET..end)?;
+    let bytes = field.split(|byte| *byte == 0).next().unwrap_or(field);
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.into())
 }
 
 /// How an operator wants the loaded catalog priced.
@@ -740,6 +812,7 @@ pub fn parse_client_iff_bytes(
             local_one_hole_par: None,
             definition: client_definition(entry.kind, ItemTypeId::new(type_id), record)?,
             character_part_slot: None,
+            name: client_name(record),
         };
         if records.insert(type_id, value).is_some() {
             return Err(CatalogError::DuplicateTypeId);
@@ -801,6 +874,8 @@ fn parse_iff_bytes_for_schema(
             local_one_hole_par: minimal.local_one_hole_par,
             definition,
             character_part_slot: slot,
+            // The synthetic schemas carry no name field.
+            name: None,
         };
         parsed.insert(record.type_id.get(), record);
     }
@@ -1298,6 +1373,7 @@ mod tests {
             local_one_hole_par: None,
             definition: None,
             character_part_slot: None,
+            name: None,
         };
         let part = CatalogRecord {
             type_id: ItemTypeId::new(20),
@@ -1312,6 +1388,7 @@ mod tests {
                 compatibility: ItemCompatibility::Character(ItemTypeId::new(11)),
             }),
             character_part_slot: Some(0),
+            name: None,
         };
         let records = BTreeMap::from([
             (CatalogKind::Character, BTreeMap::from([(10, character)])),
@@ -1446,5 +1523,55 @@ mod tests {
             declaration.version = 2;
             let _ = parse_iff_bytes_for_schema(M7_MANIFEST_VERSION, &declaration, &bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// The shared 0x90-byte record base, with a name at 0x08 and a price at 0x5c.
+    fn priced_record(name: &[u8]) -> Vec<u8> {
+        let mut record = vec![0_u8; 0x90];
+        record[0] = 1; // active
+        record[CLIENT_TYPE_ID_OFFSET..CLIENT_TYPE_ID_OFFSET + 4]
+            .copy_from_slice(&0x1000_0061_u32.to_le_bytes());
+        record[CLIENT_NAME_OFFSET..CLIENT_NAME_OFFSET + name.len()].copy_from_slice(name);
+        record[CLIENT_PRICE_OFFSET..CLIENT_PRICE_OFFSET + 4]
+            .copy_from_slice(&1234_u32.to_le_bytes());
+        record[CLIENT_SHOP_FLAG_OFFSET] = 0x22;
+        record
+    }
+
+    #[test]
+    fn a_name_is_read_up_to_its_first_nul_and_trimmed() {
+        let record = priced_record(b"Papel Training Club Set\0trailing garbage");
+        assert_eq!(
+            client_name(&record).as_deref(),
+            Some("Papel Training Club Set")
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_name_is_absent_rather_than_an_empty_string() {
+        assert_eq!(client_name(&priced_record(b"")), None);
+        assert_eq!(client_name(&priced_record(b"    ")), None);
+    }
+
+    #[test]
+    fn a_record_too_narrow_to_hold_a_name_yields_none_rather_than_panicking() {
+        // Real tables include families narrower than the priced base; they must still load.
+        assert_eq!(client_name(&[0_u8; 8]), None);
+        assert_eq!(client_name(&[]), None);
+    }
+
+    #[test]
+    fn a_non_ascii_byte_is_decoded_lossily_rather_than_failing_the_load() {
+        // A name is cosmetic. Losing the whole catalog over one unexpected byte would take
+        // the server down for something no gameplay decision depends on.
+        let mut name = b"Caf\xE9 Set".to_vec();
+        name.resize(CLIENT_NAME_BYTES, 0);
+        let parsed = client_name(&priced_record(&name)).expect("a lossy name is still a name");
+        assert!(parsed.starts_with("Caf"), "got {parsed:?}");
     }
 }
