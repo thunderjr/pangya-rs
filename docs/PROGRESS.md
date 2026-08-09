@@ -44,8 +44,8 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
 | Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
-| Gameplay | 🟡 | Local synthetic and retail-wire lifecycle tests pass; a real U.S. 852 client now loads and renders Blue Lagoon hole 1, and a timeout settlement commits both players. A completed real-client stroke and direct §19.6 steps 9-12 evidence remain open |
-| Economy | 🟡 | Local synthetic M7 checkpoint complete; not retail-validated |
+| Gameplay | 🟡 | Real U.S. 852 two-seat Blue Lagoon play now includes one rendered host stroke, direct forfeit settlement, restart-retained +10 Pang/+5 EXP, and retail finish-frame replay coverage; normal holed-out standings UI and broader modes remain |
+| Economy | 🟡 | Retail mounted-PAK purchases and owned/catalog-checked ClubSet/Ball equipment persist across restart; consume/repair remain |
 | Social/parity | ⬜ | M8+; no M8 implementation or checkpoint claim |
 
 ---
@@ -399,9 +399,11 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     A real U.S. 852 client then completed the loading ramp and rendered Blue Lagoon hole 1 at the
     playable tee with both player rows. It answered first-shot-ready and received `0x0090`.
-    The host did not finish a stroke in that run; its turn deadline produced a durable two-player
-    forfeit settlement and returned the client to the room. This closes the hole-load crash but
-    not the direct evidence for a completed real-client stroke or §19.6 steps 9-12. Evidence:
+    The host did not finish a stroke in that first run; its turn deadline produced a durable
+    two-player forfeit settlement and returned the client to the room. A later run completed a
+    real rendered stroke, settled the disconnected second seat, and visibly retained the exact
+    +10 Pang balance after server restart. The retail-wire lifecycle test replays both finish
+    frames and proves one immutable settlement. Evidence:
     [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md).
 
     The diagnosis history below is retained because it records the eliminated causes and the
@@ -681,9 +683,9 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
    and it is not a client opcode we have seen. A practice hole is a one-player roster and would
    isolate the hole-load crash from everything the second seat contributes, which is why it is
    worth finding.
-2. **Complete a real-client stroke and capture the results/balance screen** (blocker 28 follow-up). The client now loads and renders the hole, and a timeout settlement returns it to the room. §19.6 still needs a stroke completed from the real client plus direct evidence for steps 9-12; do not substitute the timeout result for those claims.
-3. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
-2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
+2. **Capture the normal holed-out standings UI if it is required beyond direct settlement evidence.** A real-client stroke, committed two-seat result, visible restart-retained balance, and exact finish-frame replay test now pass. The exercised disconnect-forfeit route returns directly to the room rather than drawing the normal `0x0066` standings overlay.
+3. **Broaden beyond the proven one-hole versus path.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23), while the real client now accepts and plays that path. Multi-hole and other modes remain separate scope.
+2. **Finish remaining retail economy commands.** ClubSet/Ball equipment `0x0020` is durable and restart-validated; consume/repair remain.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.
 2. Re-enable live room broadcasts in retail mode by translating membership changes into census add/remove frames; the census is currently sent only on create and join, so a room does not update while you are sitting in it.
 3. Extend the retail match beyond one player and one hole. The retail flow is wired onto the durable solo lifecycle, which is single-player and single-hole by construction; multi-hole plans, turn arbitration across a party, and the stroke/battle modes still need the generalized actor decided in ADR terms.

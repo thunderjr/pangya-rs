@@ -819,7 +819,7 @@ function Invoke-PangyaShotMeter {
 # vertical marker against a baseline image, commits power after it reaches the requested column,
 # then commits impact when it returns to the pink zone. Coordinates are client-area pixels.
 function Invoke-PangyaObservedShotMeter {
-  param([int]$PowerX = 400, [int]$ImpactX = 145, [int]$TimeoutMs = 4000)
+  param([int]$PowerX = 300, [int]$ImpactX = 170, [int]$TimeoutMs = 4000, [switch]$Trace)
   Add-Type -AssemblyName System.Drawing
   $origin = Get-PangyaOrigin
   $left = 105; $top = 534; $width = 410; $height = 22
@@ -833,7 +833,8 @@ function Invoke-PangyaObservedShotMeter {
   function Find-Marker([System.Drawing.Bitmap]$baseline) {
     $frame = Capture-Bar
     $bestX = -1; $best = 0
-    for ($x = 2; $x -lt $width - 2; $x++) {
+    # Exclude the animated Start/Power label at the far left; it otherwise dominates the diff.
+    for ($x = 30; $x -lt $width - 2; $x++) {
       $score = 0
       for ($y = 0; $y -lt $height; $y++) {
         $a = $baseline.GetPixel($x, $y); $b = $frame.GetPixel($x, $y)
@@ -844,7 +845,8 @@ function Invoke-PangyaObservedShotMeter {
       if ($score -gt $best) { $best = $score; $bestX = $x }
     }
     $frame.Dispose()
-    if ($best -lt 3) { return -1 }
+    if ($Trace -and $best -gt 0) { Write-Host "meter marker=$($left + $bestX) score=$best" }
+    if ($best -lt 1) { return -1 }
     return ($left + $bestX)
   }
 
