@@ -126,13 +126,47 @@ Schema 3 is covered in CI by `tests/fixtures/synthetic-client-v3`, a generated f
 the real record format containing no client bytes. It has been exercised against the real
 tables, which load with correct type IDs across all six declared families.
 
+## The shared record header
+
+Every family this server parses opens with the same header. Layout from
+`opensource-references/pangbox--server/pangya/iff/item.go` (`ItemV11_78` / `ItemV11_98`), and
+cross-checked against the acquired U.S. tables. Constants live in `crates/pangya-data/src/lib.rs`.
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| `0x00` | 4 | `Active` | Non-zero means the row exists. Takes 1, 2, 4, 5 or 101; the values beyond 1 are still unexplained |
+| `0x04` | 4 | `ID` | Type id. High byte is the family tag |
+| `0x08` | 40 | `Name` | NUL-terminated |
+| `0x30` | 1 | `Rank` | Minimum level. Unmodelled by the server — see `SPEC_SHOP_COVERAGE.md` SHOP-005 |
+| `0x31` | 40 | `Icon` | Texture stem, resolved against the extracted `ui/shop_myroom/**` tree |
+| `0x5C` | 4 | `Price` | Pang. `10,000,000` marks a row that is not really for sale |
+| `0x60` | 4 | `DiscountPrice` | Not read |
+| `0x64` | 4 | `Condition` | Not read |
+| `0x68` | 1 | `ShopFlag` | Bit `0x20` = listed in the client's shop. Other bits preserved, meaning unidentified |
+| `0x69` | 1 | `MoneyFlag` | Currency. `0` Pang; `1` and `2` occur on retail rows |
+| `0x6A` | 1 | `TimeFlag` | Time-limited item marker. Not read |
+| `0x6B` | 1 | `TimeByte` | Not read |
+
+Two traps worth stating explicitly, because this project fell into the second one:
+
+- **`0x68` carries no currency.** Currency is `MoneyFlag`, a separate byte. Reading a "currency
+  nibble" out of `ShopFlag` decodes a field that does not exist and silently unlists rows —
+  6,624 of 9,235 in the incident recorded in
+  [`../evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md`](../evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md).
+- **Listing and selling are different questions.** A row can be priced and purchasable by the
+  protocol while the client's shop never draws it. Both halves must test bit `0x20`.
+
+Record sizes differ per family (`Part.iff` 544, `Ball.iff` 792, `ClubSet.iff` 236, `Item.iff`
+224, `HairStyle.iff` 172, …) because each appends its own family fields after this header. The
+header itself does not move.
+
 ## Still unestablished
 
-Why the active word takes 2, 4, 5, or 101 rather than 1; the field layout inside each
-record beyond `type_id` and the name string — which is what real prices, stack limits, and
-durability need; the semantics of `binding`; and the relationship between `pangya.iff` and
-`pangya_gb.iff`. **Course par is not in `Course.iff`**, which is only an id-to-name table,
-so one-hole configuration for real courses still has no source.
+Why the active word takes 2, 4, 5, or 101 rather than 1; the meaning of `ShopFlag` bits other
+than `0x20`, and of `MoneyFlag` values `1` and `2`; the per-family fields after `0x6C`, which is
+where stack limits and durability would live; the semantics of `binding`; and the relationship
+between `pangya.iff` and `pangya_gb.iff`. **Course par is not in `Course.iff`**, which is only
+an id-to-name table, so one-hole configuration for real courses still has no source.
 
 Nothing here says anything about packet layouts; catalog structure and wire protocol are
 independent questions, and the wire side remains gated on the retail layout port.

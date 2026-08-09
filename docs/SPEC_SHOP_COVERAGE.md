@@ -9,10 +9,17 @@ Status legend matches [`PROGRESS.md`](PROGRESS.md): ✅ done · 🟡 partial · 
 
 ## Claim boundary
 
-Everything here describes the server's catalog and the authored client tables. Only one property
-has been in front of a real U.S. 852 client: that an authored archive changes what the shop
-displays and what the server charges (2026-08-09, confirmed by the operator at 1 Pang across the
-four original sellable tables). The widened families below are **🔬 unverified against a client**.
+Everything here describes the server's catalog and the authored client tables. Two properties
+have been in front of a real U.S. 852 client:
+
+- an authored archive changes what the shop displays and what the server charges — 2026-08-09,
+  confirmed by the operator at 1 Pang across the four original sellable tables;
+- bit `0x20` of the shop flag is what makes the client list a row — 2026-08-10, confirmed after
+  6,624 priced-but-unlisted offers were corrected and the previously missing sets appeared. See
+  [`evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md`](evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md).
+
+The widened families now **list**, which was checked; no purchase has been completed from their
+tabs, so they remain **🔬** on the purchase path.
 
 ## The two gates
 
@@ -154,8 +161,27 @@ console draws a family glyph instead. The eight widened families have not been m
 ## Verification
 
 1. `python3 -m unittest discover -s scripts/tests` — the authoring rules, including the
-   `invent_shop_metadata` opt-in and the refusals it does not relax.
-2. `cargo test -p pangya-data` — family tags, manifest validation, fingerprint stability.
+   `invent_shop_metadata` opt-in, the refusals it does not relax, and an exhaustive check over
+   all 256 flag values that nothing authors without the listed bit.
+2. `cargo test -p pangya-data` — family tags, manifest validation, fingerprint stability, and
+   that the server's sale test is the client's listed bit.
 3. A real-client run per family: open the tab, confirm rows render, buy one, confirm the charge
-   matches the catalog and an `economy_operations` row exists. **Not yet done for the eight
-   widened families.**
+   matches the catalog and an `economy_operations` row exists. **Rendering confirmed
+   2026-08-10** for the sets that exposed the flag defect; **no purchase has been completed from
+   the eight widened tabs.**
+
+A shortcut that does not need a client, for the listing half:
+
+```bash
+python3 - <<'PY'
+import json, collections
+d = json.load(open('local-data/custom-shop/console/shop-sync-report.json'))
+bad = [o for o in d['offers'] if not o['shop_flag'] & 0x20]
+print('offers:', len(d['offers']), '| unlisted:', len(bad))
+print('non-Pang currencies converted:',
+      sum(1 for o in d['offers'] if o['original_money_flag'] != 0))
+PY
+```
+
+`unlisted` must be zero. Authoring refuses to produce such a row, so a non-zero count means the
+report and the archive disagree — which is its own defect.

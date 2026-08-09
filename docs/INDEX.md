@@ -1,6 +1,6 @@
 # PangYa-RS documentation index
 
-> Last updated: **2026-08-09** — 60 documents across seven directories.
+> Last updated: **2026-08-10** — 66 documents across seven directories.
 
 **This file is navigation plus a status rollup. It is never a source of truth.**
 Every row links out to the document that owns the claim. When this index and a linked
@@ -260,7 +260,7 @@ compatibility report (2026-08-05).
 
 | Document | Covers | Updated |
 |---|---|---|
-| [`data/US_CLIENT_IFF_STRUCTURE.md`](data/US_CLIENT_IFF_STRUCTURE.md) | ZIP-in-PAK packaging, all 39 client tables, header format, family-tag table, per-family record sizes | 2026-08-07 |
+| [`data/US_CLIENT_IFF_STRUCTURE.md`](data/US_CLIENT_IFF_STRUCTURE.md) | ZIP-in-PAK packaging, all 39 client tables, the shared record header field by field, family-tag table, per-family record sizes | 2026-08-10 |
 | [`data/M3_SYNTHETIC_CATALOG.md`](data/M3_SYNTHETIC_CATALOG.md) | Synthetic manifest and mount format; v2 shop-metadata record layout | 2026-08-07 |
 
 **The server parses 6 of the client's 39 declared tables.** Loaded today: `Character`,
@@ -278,6 +278,7 @@ Newest first. Every claim of real-client acceptance in this repository traces to
 
 | Date | Document | Kind | Establishes |
 |---|---|---|---|
+| 2026-08-10 | [`evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md`](evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md) | real client | Bit `0x20` of the shop flag is what lists a row; `MoneyFlag` is a separate byte at `0x69`; the client ignores an archive past its patch level |
 | 2026-08-09 | [`evidence/ADMIN_PANEL_2026-08-09.md`](evidence/ADMIN_PANEL_2026-08-09.md) | operator surface | Admin sessions, per-request authorisation, append-only audit, account/inventory/equipment control, live shop overlay, catalog names, same-origin panel |
 | 2026-08-09 | [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md) | real client | 196-byte inventory rows render; ClubSet + Ball equip commits atomically and survives restart |
 | 2026-08-09 | [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md) | real client | Authored IFF in the mounted PAK; server-authoritative price charged; replay resistance |
