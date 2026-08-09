@@ -112,8 +112,13 @@ class AuthorClientIffTests(unittest.TestCase):
             )
             self.assertEqual(
                 authored[second + author.SHOP_FLAG_OFFSET],
-                0x20,
-                "a Points row is converted to the non-tradeable Pang form",
+                0x21,
+                "an already-listed row keeps every bit it had",
+            )
+            self.assertEqual(
+                authored[second + author.MONEY_FLAG_OFFSET],
+                author.MONEY_FLAG_PANG,
+                "the price is written in Pang, so the currency byte must say Pang",
             )
             self.assertEqual(struct.unpack_from("<I", authored, second + author.PRICE_OFFSET)[0], 1234)
 
@@ -213,48 +218,44 @@ class AuthorClientIffTests(unittest.TestCase):
     def test_a_never_sold_row_stays_refused_unless_explicitly_opted_into(self) -> None:
         """The default must keep refusing; the opt-in must be the only way through.
 
-        Enabling a row the client never listed is inventing metadata no evidence covers, so it
-        is the operator's call and never a silent default.
+        Listing a row the client never listed may mean listing one with no icon and no
+        description, so it is the operator's call and never a silent default.
         """
         with self.assertRaisesRegex(author.AuthorError, "refusing to invent"):
             author.pang_shop_flag(0x00, "Part.iff", 0x08000800)
+        # 0x20 on its own is attested: 104 pristine Skin rows and 9 Part rows carry exactly it.
         self.assertEqual(
-            author.pang_shop_flag(0x00, "Part.iff", 0x08000800, invent=True), 0x02
+            author.pang_shop_flag(0x00, "Part.iff", 0x08000800, invent=True), 0x20
         )
 
-    def test_an_unknown_currency_nibble_converts_only_under_the_opt_in(self) -> None:
-        # 0x60 keeps its display nibble and becomes tradeable Pang; the meaning of 0x6 as a
-        # currency remains unidentified, which is exactly what the opt-in acknowledges.
-        self.assertEqual(
-            author.pang_shop_flag(0x66, "Part.iff", 0x08000800, invent=True), 0x62
-        )
+    def test_authoring_sets_the_listed_bit_and_preserves_every_other(self) -> None:
+        """The regression this whole model exists to prevent.
 
-    def test_a_bare_points_row_authors_to_a_listed_pang_row(self) -> None:
-        """A ``0x01`` row must not clear to ``0x00``.
-
-        ``0x00`` is the disabled encoding, so clearing the nibble unlists the row while the run
-        still reports it as an offer. The U.S. 851 tables carry 956 rows shaped this way — the
-        whole-catalog case loses every one of them without this. ``0x02`` is used because it
-        appears verbatim on 936 pristine rows, so the client is known to render it.
+        Under the previous model these rows authored to 0x02, 0x02 and 0x62 — priced, sold by
+        the server, and never drawn by the client. SSAF, wings and rings were all shaped this
+        way, which is how 6,624 of 9,235 offers became invisible.
         """
-        self.assertEqual(author.pang_shop_flag(0x01, "ClubSet.iff", 0x10000001), 0x02)
+        self.assertEqual(author.pang_shop_flag(0x06, "Part.iff", 0x08006024), 0x26)
+        self.assertEqual(author.pang_shop_flag(0x01, "ClubSet.iff", 0x10000001), 0x21)
+        self.assertEqual(author.pang_shop_flag(0x66, "Part.iff", 0x08000800), 0x66)
 
-    def test_a_points_row_with_a_display_nibble_keeps_its_evidenced_conversion(self) -> None:
-        # 0x21 -> 0x20 is what a real client was proven to render; widening the bare case must
-        # not disturb it. See docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md.
-        self.assertEqual(author.pang_shop_flag(0x21, "Ball.iff", 0x14000000), 0x20)
-        self.assertEqual(author.pang_shop_flag(0x61, "Part.iff", 0x08000800), 0x60)
+    def test_already_listed_rows_are_left_exactly_as_they_are(self) -> None:
+        """The bytes a real client was proven to render must not move.
 
-    def test_pang_rows_are_left_exactly_as_they_are(self) -> None:
-        for flag in (0x02, 0x20, 0x22, 0x60, 0x62):
+        See docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md — 0x21 and 0x22 rows rendered and were
+        purchasable, so setting a bit they already carry must be a no-op.
+        """
+        for flag in (0x20, 0x21, 0x22, 0x60, 0x61, 0x62, 0xA0, 0xE0):
             self.assertEqual(author.pang_shop_flag(flag, "Item.iff", 0x18000000), flag)
 
-    def test_an_unknown_currency_nibble_is_still_refused(self) -> None:
-        # 0x06 and 0x03 both occur in the pristine U.S. tables (297 and 1 rows). Guessing at
-        # them is exactly what this script exists not to do.
-        for flag in (0x06, 0x03):
-            with self.assertRaisesRegex(author.AuthorError, "unsupported shop currency"):
-                author.pang_shop_flag(flag, "Part.iff", 0x08000800)
+    def test_no_shop_flag_is_ever_authored_without_the_listed_bit(self) -> None:
+        """Exhaustive over the byte, because the failure mode is silent on both sides."""
+        for original in range(1, 256):
+            authored = author.pang_shop_flag(original, "Part.iff", 0x08000800, invent=True)
+            self.assertTrue(
+                authored & author.SHOP_LISTED_BIT,
+                f"{original:#04x} authored to unlisted {authored:#04x}",
+            )
 
 
 if __name__ == "__main__":

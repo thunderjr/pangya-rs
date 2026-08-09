@@ -69,12 +69,24 @@ pub const CLIENT_ICON_BYTES: usize = 40;
 /// Byte offset of a real client record's Pang price.
 pub const CLIENT_PRICE_OFFSET: usize = 0x5c;
 /// Offset of the shop availability flag, immediately after price/discount/condition.
+///
+/// Followed by a separate currency byte at `0x69` (`MoneyFlag`) and a time-limit byte at `0x6a`
+/// — see `opensource-references/pangbox--server/pangya/iff/item.go`. This byte is therefore a
+/// set of shop flags on its own; it does **not** carry a currency nibble, and reading one out of
+/// it is the mistake that once made two thirds of the shop invisible.
 pub const CLIENT_SHOP_FLAG_OFFSET: usize = 0x68;
+/// The shop-flag bit that decides whether the client's shop UI lists a row.
+///
+/// Measured across the pristine U.S. 851 tables: a row with this bit set is never priced at
+/// [`CLIENT_UNAVAILABLE_PRICE`], and a row without it almost always is — Part.iff 2,036 set / 0
+/// sentinels against 5,289 clear / 4,365 sentinels, with the same split in Ball, ClubSet and
+/// Item.
+pub const CLIENT_SHOP_LISTED_BIT: u8 = 0x20;
 /// Smallest client record this server can price.
 pub const CLIENT_PRICED_RECORD_BYTES: usize = CLIENT_SHOP_FLAG_OFFSET + 2;
 /// Price the client tables use to mark a row that is not really for sale.
 ///
-/// Rows carrying it always pair it with a zero shop flag, so it is a belt-and-braces check
+/// Rows carrying it never have [`CLIENT_SHOP_LISTED_BIT`] set, so it is a belt-and-braces check
 /// rather than the primary signal.
 pub const CLIENT_UNAVAILABLE_PRICE: u32 = 10_000_000;
 /// Stack ceiling applied to client consumables.
@@ -732,7 +744,12 @@ fn client_definition(
     }
     let price = u64::from(le_u32(record, CLIENT_PRICE_OFFSET)?);
     let shop_flag = record[CLIENT_SHOP_FLAG_OFFSET];
-    let sale = if shop_flag == 0 || price == u64::from(CLIENT_UNAVAILABLE_PRICE) || price == 0 {
+    // The same bit the client's shop UI tests, so the two halves cannot disagree about what is
+    // on sale. Treating any non-zero flag as sellable is what let the server offer 9,235 items
+    // while the client drew 2,402 of them: the missing 6,624 were priced, purchasable by the
+    // protocol, and invisible on screen, with nothing anywhere reporting the gap.
+    let listed = shop_flag & CLIENT_SHOP_LISTED_BIT != 0;
+    let sale = if !listed || price == u64::from(CLIENT_UNAVAILABLE_PRICE) || price == 0 {
         ItemSale::NotSold
     } else {
         ItemSale::Pang(price)

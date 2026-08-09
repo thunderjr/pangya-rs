@@ -46,7 +46,11 @@ HEADER_BYTES = 8
 TYPE_ID_OFFSET = 0x04
 PRICE_OFFSET = 0x5C
 SHOP_FLAG_OFFSET = 0x68
-MIN_PRICED_RECORD_BYTES = SHOP_FLAG_OFFSET + 1
+# The currency lives in its own byte, not in the low nibble of the one above.
+# `opensource-references/pangbox--server/pangya/iff/item.go` lays the header out as
+# `0x68 ShopFlag`, `0x69 MoneyFlag`, `0x6A TimeFlag`, `0x6B TimeByte`.
+MONEY_FLAG_OFFSET = 0x69
+MIN_PRICED_RECORD_BYTES = MONEY_FLAG_OFFSET + 1
 PAK_SIGNATURE = 0x12
 PAK_TRAILER_BYTES = 9
 PAK_ENTRY_TYPE_MASK = 0xE0
@@ -67,10 +71,19 @@ REGION_KEYS = {
 }
 CLIENT_UNAVAILABLE_PRICE = 10_000_000
 MAX_PANG_PRICE = 0xFFFF_FFFE
-SHOP_CURRENCY_MASK = 0x0F
-SHOP_CURRENCY_PANG_NONTRADEABLE = 0x00
-SHOP_CURRENCY_POINTS = 0x01
-SHOP_CURRENCY_PANG_TRADEABLE = 0x02
+# The bit that decides whether the client's shop UI lists a row at all.
+#
+# Measured across the pristine U.S. 851 tables: a row with this bit set is *never* priced at the
+# 10,000,000 unavailable sentinel, and a row without it almost always is — Part.iff 2,036 listed
+# rows / 0 sentinels versus 5,289 unlisted / 4,365 sentinels, and the same split holds in Ball,
+# ClubSet and Item. Enabling a row therefore means setting this bit; a priced row without it is
+# purchasable by the protocol and invisible in the client, which is exactly the state SSAF,
+# wings and rings were left in.
+SHOP_LISTED_BIT = 0x20
+# `MoneyFlag` values seen on listed rows are 0, 1 and 2. Authoring a Pang shop writes 0, which is
+# what the overwhelming majority of listed Pang rows already carry, so a row cannot be listed at
+# a Pang price the client then tries to charge in another currency.
+MONEY_FLAG_PANG = 0x00
 SERVER_TABLE_KINDS = {
     "Character.iff": "character",
     "ClubSet.iff": "club_set",
@@ -189,50 +202,34 @@ def table_shape(data: bytes, table: str) -> tuple[int, int]:
 
 
 def pang_shop_flag(original: int, table: str, type_id: int, invent: bool = False) -> int:
-    """Returns the U.S. retail money byte for a Pang offer.
+    """Returns the ``ShopFlag`` byte that makes a row appear in the client's shop.
 
-    Retail evidence and the archived IFF research agree on the low nibble: ``1`` is Points,
-    while ``0`` and ``2`` are the non-tradeable and tradeable Pang forms. The upper nibble
-    controls sale/display state, so converting an existing Points row clears only its currency
-    nibble. Unknown forms are refused rather than guessed.
+    This replaces an earlier model that read the low nibble of ``0x68`` as a currency selector
+    (``1`` Points, ``0``/``2`` Pang forms) and the upper nibble as display state. That model was
+    wrong in a way that produced a working server and an empty-looking shop:
+    ``pangbox--server/pangya/iff/item.go`` lays the header out as ``0x68 ShopFlag`` followed by
+    a **separate** ``0x69 MoneyFlag``, so the currency was never in this byte at all. Under the
+    old model 6,624 of 9,235 authored rows — SSAF, wings, rings, most of Part.iff — were given
+    flags with :data:`SHOP_LISTED_BIT` clear. The server sold them happily and the client never
+    drew one.
 
-    One degenerate case has to be handled separately. Clearing the nibble of a bare ``0x01``
-    yields ``0x00`` — which is not "Pang, non-tradeable" but the *disabled* encoding this very
-    script writes to unlist a row, and which ``pangya-data`` reads as "not sold". A row authored
-    that way is silently dropped from the shop instead of being repriced, and the run reports it
-    as a successful offer. That is not hypothetical: the U.S. 851 tables carry **956** such rows,
-    so authoring the whole catalog loses every one of them.
-
-    Those rows become ``0x02`` — Pang, tradeable, upper nibble still zero. This is not a guess:
-    ``0x02`` appears verbatim on **936** rows of the pristine U.S. tables, so it is a byte the
-    retail client already renders. Rows whose upper nibble is non-zero keep the previously
-    evidenced behaviour exactly (``0x21`` → ``0x20``, per
-    ``docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md``), so this widens the function without
-    disturbing anything already proven in front of a client.
+    The correct operation is to **set the listed bit and preserve everything else**. The other
+    bits are independent of currency — Part.iff carries ``0x21`` against MoneyFlag 0, 1 and 2
+    alike — so they encode something this project has not identified and has no reason to
+    disturb. ``0x20`` on its own is attested: 104 pristine Skin rows and 9 Part rows carry
+    exactly that, and ``0x21``/``0x22``/``0x60`` all survive untouched, which keeps the
+    conversion proven in ``docs/evidence/REAL_CLIENT_SHOP_2026-08-09.md`` intact.
     """
-    # A row the client never listed has no metadata to preserve. Only an explicit opt-in may
-    # supply one.
+    # A row the client never listed has no metadata to preserve — possibly no icon and no
+    # description either. Listing one anyway is the operator's call, never a silent default.
     if original == 0:
         if invent:
-            return SHOP_CURRENCY_PANG_TRADEABLE
+            return SHOP_LISTED_BIT
         raise AuthorError(
             f"{table} type {type_id:#010x} was not a client shop row; "
             "refusing to invent its metadata"
         )
-    currency = original & SHOP_CURRENCY_MASK
-    if currency in (SHOP_CURRENCY_PANG_NONTRADEABLE, SHOP_CURRENCY_PANG_TRADEABLE):
-        return original
-    if currency == SHOP_CURRENCY_POINTS:
-        cleared = original & ~SHOP_CURRENCY_MASK
-        return cleared if cleared != 0 else SHOP_CURRENCY_PANG_TRADEABLE
-    # 0x3 and 0x6 occur on 298 U.S. rows and mean something this project has never identified.
-    # Rewriting the nibble to a Pang form keeps the row's display state and makes it purchasable;
-    # guessing at what the original nibble meant is what the opt-in is acknowledging.
-    if invent:
-        return (original & ~SHOP_CURRENCY_MASK) | SHOP_CURRENCY_PANG_TRADEABLE
-    raise AuthorError(
-        f"{table} type {type_id:#010x} has unsupported shop currency nibble {currency:#x}"
-    )
+    return original | SHOP_LISTED_BIT
 
 
 def author_table(
@@ -262,17 +259,23 @@ def author_table(
         # The never-a-shop-row refusal now lives in `pang_shop_flag`, so both it and the unknown
         # currency case are governed by the same opt-in rather than by two separate rules.
         authored_flag = pang_shop_flag(original_flag, table, offer.type_id, invent)
-        # A zero flag is the disabled encoding. Reaching it here would mean the run reports a
-        # successful offer for a row the client will not list and the server will not sell —
-        # the exact silent failure that hid 956 lost rows before `pang_shop_flag` handled the
-        # bare-0x01 case. Refuse instead of writing a lie into the report.
-        if authored_flag == 0:
+        # Without the listed bit the client draws nothing while the server sells the row and this
+        # report calls it an offer — a shop that is simultaneously full and empty depending on
+        # which side you ask. That is precisely how 6,624 rows were lost under the previous
+        # model, so it is a refusal rather than a warning.
+        if not authored_flag & SHOP_LISTED_BIT:
             raise AuthorError(
-                f"{table} type {offer.type_id:#010x} would author to a disabled shop flag "
-                f"(original {original_flag:#04x}); refusing to report it as an offer"
+                f"{table} type {offer.type_id:#010x} would author to an unlisted shop flag "
+                f"{authored_flag:#04x} (original {original_flag:#04x}); "
+                "refusing to report it as an offer"
             )
         struct.pack_into("<I", output, start + PRICE_OFFSET, offer.pang)
         output[start + SHOP_FLAG_OFFSET] = authored_flag
+        # The price written above is in Pang, so the currency byte has to say so. Leaving a
+        # row's retail MoneyFlag in place would list a 1-Pang item the client tries to charge as
+        # Points — 329 Part.iff rows and 15 Item.iff rows are shaped that way.
+        original_money = data[start + MONEY_FLAG_OFFSET]
+        output[start + MONEY_FLAG_OFFSET] = MONEY_FLAG_PANG
         report.append(
             {
                 "table": table,
@@ -280,6 +283,8 @@ def author_table(
                 "pang": offer.pang,
                 "original_shop_flag": original_flag,
                 "shop_flag": authored_flag,
+                "original_money_flag": original_money,
+                "money_flag": MONEY_FLAG_PANG,
             }
         )
     return bytes(output), report

@@ -20,8 +20,29 @@ A purchasable item must clear both, and they live in different places:
 
 | Gate | Where | What decides it |
 |---|---|---|
-| **client shows** | the IFF row inside the client's PAK series | shop flag byte at `0x68`, price at `0x5c` |
-| **server allows** | the parsed catalog (`data.iff_directory`) plus the DB shop overlay | `ItemDefinition::sale` |
+| **client shows** | the IFF row inside the client's PAK series | bit `0x20` of the shop flag at `0x68`, price at `0x5c` |
+| **server allows** | the parsed catalog (`data.iff_directory`) plus the DB shop overlay | `ItemDefinition::sale`, which applies the same bit |
+
+### The record header, corrected
+
+`0x68` is `ShopFlag` and nothing else. The currency is a **separate byte** at `0x69`
+(`MoneyFlag`), followed by `0x6a` `TimeFlag` and `0x6b` `TimeByte` — the layout in
+`opensource-references/pangbox--server/pangya/iff/item.go`.
+
+This project previously read `0x68` as a packed byte: low nibble currency, upper nibble display
+state. That model produced a working server and a shop that looked almost empty. Authoring
+cleared what it thought was a currency nibble and left bit `0x20` unset on **6,624 of 9,235**
+offers, so the server sold them, the console reported them, and the client drew none of them —
+SSAF, wings, rings and most of `Part.iff`. Nothing reported the gap, because the server's own
+sale test accepted any non-zero flag.
+
+Bit `0x20` means *listed in the shop*, measured rather than assumed: across the pristine U.S.
+tables a row carrying it is **never** priced at the 10,000,000 unavailable sentinel, and a row
+without it almost always is (Part.iff 2,036 set / 0 sentinels versus 5,289 clear / 4,365).
+Authoring now sets that bit and preserves every other, writes `MoneyFlag = 0` so a Pang price is
+charged in Pang, and **refuses** to report an offer whose authored flag lacks the bit.
+`pangya-data` applies the same test, so the two halves can no longer disagree about what is on
+sale.
 
 `scripts/author-client-iff.py` writes both halves from one authored ZIP, so within a run they
 cannot disagree. Deployment skew is caught at startup by `client_web.publish_report`
@@ -77,22 +98,24 @@ Its 61 rows carry type-id tags `0x04` and `0x08` — the same space `Character` 
 `CharacterPart` occupy. Admitting it would make `Catalog::find_record` ambiguous for the sake of
 **3** shop rows. Revisit only if the client is shown to disambiguate by table rather than by tag.
 
-### SHOP-003 — unknown currency nibbles are force-converted 🟡
+### SHOP-003 — the "unknown currency nibbles" did not exist ✅ resolved
 
-The shop flag's low nibble encodes currency: `0` non-tradeable Pang, `1` Points, `2` tradeable
-Pang. **298** U.S. rows carry `0x3` or `0x6`, which this project has never identified. Under
-`invent_shop_metadata` those rows keep their display nibble and take a Pang currency; without it
-they are refused.
+Previously recorded as: 298 rows carry a low nibble of `0x3` or `0x6` whose currency meaning is
+unidentified. There was nothing to identify — that nibble is not a currency. `0x06` is a shop
+flag with bits 1 and 2 set and the listed bit clear; the currency is `MoneyFlag` at `0x69`, which
+is independent of it (Part.iff pairs flag `0x21` with MoneyFlag 0, 1 and 2 alike).
 
-Exit criteria: identify what `0x3` and `0x6` mean, and either convert them faithfully or keep
-refusing them with a reason.
+Authoring now preserves those bits and sets `MoneyFlag = 0`. The 1,240 rows whose retail currency
+was not Pang are converted explicitly rather than left to be listed at a Pang price the client
+would try to charge in Points.
 
 ### SHOP-004 — inventing metadata for never-sold rows 🟡
 
 **3,554** rows in the four original tables were never client shop rows (`shop flag == 0`). The
-`invent_shop_metadata` opt-in gives them `0x02`, which 936 pristine rows carry verbatim, so the
-byte is known-renderable. What is *not* known is whether such a row looks right: quest and reward
-rows may have no icon, no `Desc.iff` entry, or a `minLevel` that hides them.
+`invent_shop_metadata` opt-in gives them `0x20` — the listed bit alone, attested verbatim on 104
+pristine `Skin.iff` rows and 9 `Part.iff` rows. What is *not* known is whether such a row looks
+right: quest and reward rows may have no icon, no `Desc.iff` entry, or a `minLevel` that hides
+them.
 
 Exit criteria: a real client run reporting how many enabled rows actually render, and what the
 unrenderable ones have in common.

@@ -53,7 +53,7 @@ Two short operational memories are worth reading before debugging anything:
 |---|---|---|
 | [`SPEC.md`](SPEC.md) | Product scope, architecture, requirements by domain (§22), milestones M0–M9 (§23), definition of done (§27) | 2026-08-07 |
 | [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md) | Which player state is persisted, in which table, and whether an operator can set it. Supersedes `SPEC.md` §14.2's `character_parts` sketch | 2026-08-09 |
-| [`SPEC_SHOP_COVERAGE.md`](SPEC_SHOP_COVERAGE.md) | What the shop sells, what refuses and why — catalog families, currency nibbles, the character-purchase block | 2026-08-10 |
+| [`SPEC_SHOP_COVERAGE.md`](SPEC_SHOP_COVERAGE.md) | What the shop sells, what refuses and why — catalog families, the shop-flag layout, the character-purchase block | 2026-08-10 |
 | [`SPEC_CLIENT_PATCH_DELIVERY.md`](SPEC_CLIENT_PATCH_DELIVERY.md) | How an authored shop reaches a player's disk — which archive wins, the launcher manifest, console-driven publishing | 2026-08-10 |
 | [`RETAIL_CONTRACT.md`](RETAIL_CONTRACT.md) | Retail versus synthetic packet surface, and the removal plan for the `0x7f**` placeholders | 2026-08-08 |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every configuration key and its bounds | 2026-08-07 |
@@ -92,8 +92,8 @@ persist across restart, but retail consume and repair are not claimed. See
 |---|---|:--:|---|
 | SHOP-001 | Characters purchasable | ⛔ | An owned character is a `characters` row, not inventory; the economy path has no destination for it |
 | SHOP-002 | `AddonPart.iff` admitted | ⛔ | Type-id tags collide with Character/CharacterPart; excluded for 3 shop rows |
-| SHOP-003 | Currency nibbles `0x3`/`0x6` | 🟡 | 298 rows; force-converted under `invent_shop_metadata`, meaning still unidentified |
-| SHOP-004 | Never-sold rows enabled | 🟡 | 3,554 rows given an invented `0x02`; whether they render is unmeasured |
+| SHOP-003 | Currency nibbles `0x3`/`0x6` | ✅ | Not a currency at all — `MoneyFlag` is a separate byte at `0x69`; the nibble model is retired |
+| SHOP-004 | Never-sold rows enabled | 🟡 | 3,554 rows given an invented `0x20`; whether they render is unmeasured |
 | SHOP-005 | `minLevel` modelled | 🟡 | Bootstrap hardcodes `level: 1`; ~500 rows sit above it |
 | SHOP-006 | Shop controlled on both halves | ✅ | Overlay changes charging live; a console publish re-authors what the client displays |
 | SHOP-007 | Item icons | 🟡 | 7,127/7,918 of the original six families; widened families unmeasured |
