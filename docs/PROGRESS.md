@@ -1,12 +1,12 @@
 # PangYa-RS progress
 
-> Last updated: **2026-08-08**
+> Last updated: **2026-08-09**
 >
 > Current stage: **The real U.S. 852 client reaches the lobby.** It completes the whole LoginService state machine — login, nickname, character setup, server list, selection, handover — then authenticates to GameService, receives the retail bootstrap, enters the channel, and renders its avatar with the lobby menu bar.
 >
 > Current stage: **a real client buys from the shop.** It logs in, reaches the lobby, opens the room directory, creates and enters a room, opens the shop and My Room, and completes a purchase: balance debited, item in inventory, clubs rendered on the character.
 >
-> Next gate: **a two-player retail match against the real client.** The server implements it now: a retail start in a room holding two players runs the stroke lifecycle, with turn arbitration, a relay of the client's own shot frames, and a settlement that pays both participants exactly once. It is proven over TCP against a real database by `game_retail_two_players_play_and_settle_one_versus_hole`. What remains for §19.6 steps 7-12 is the real client's acceptance of it. See blocker 23.
+> Current stage: **the real U.S. 852 client loads and renders a two-player retail hole.** Restoring the roster's missing 16-byte mascot `SYSTEMTIME` moved the second entry onto the client's measured boundary; Blue Lagoon hole 1 now reaches its playable tee instead of crashing. A timeout settlement returned the client to the room and committed both participants. A completed real-client stroke and direct results/balance-screen evidence remain open. See blocker 28 and [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md).
 
 This is the project status ledger. Update it when a deliverable gains evidence or a new blocker appears; do not use estimated completion percentages.
 
@@ -44,7 +44,7 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | LoginService | 🟡 | Local synthetic M2 runtime/config/CLI/health/TCP/PostgreSQL exit passes; real U.S. 852 order, token field/length, name limits, and server-list acceptance remain |
 | GameService/bootstrap | 🟡 | Local synthetic Login-to-Game snapshot/catalog/channel flow passes; real U.S. 852 layouts and acceptance remain external |
 | Lobby/rooms | 🟡 | Local synthetic M4 actor/registry/TCP exit is complete; real U.S. 852 opcodes, layouts, order, and create/enter acceptance remain external |
-| Gameplay | 🟡 | Local synthetic M5 solo and M6 exactly-two-ready-player stroke/turn/standings/settlement checkpoints pass the complete local matrix, and the retail wire now drives the same two-player lifecycle end to end over TCP; real U.S. 852 one-/two-client gates remain open |
+| Gameplay | 🟡 | Local synthetic and retail-wire lifecycle tests pass; a real U.S. 852 client now loads and renders Blue Lagoon hole 1, and a timeout settlement commits both players. A completed real-client stroke and direct §19.6 steps 9-12 evidence remain open |
 | Economy | 🟡 | Local synthetic M7 checkpoint complete; not retail-validated |
 | Social/parity | ⬜ | M8+; no M8 implementation or checkpoint claim |
 
@@ -386,9 +386,27 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     Also settled here: the census character field is the **catalog** id from the client's own `Character.iff` (PacketDoc `0048.ksy` `item_id_character`), not the inventory id. A room member now carries both, because the client resolves models by catalog id and has no inventory but its own.
 
-28. **A real client crashes while loading a versus hole** — **open, and now localized to a
-    specific instruction in the client.** Seven causes found and fixed so far, from the
-    references and from the client's own memory rather than by guessing at the wire:
+28. **A real client crashes while loading a versus hole** — **fixed 2026-08-09.** The final
+    cause was another sixteen-byte width error in the full `0x0076` player record. The roster
+    wrote a 46-byte mascot block, omitting the `SYSTEMTIME` that all three references include:
+    `pangbox/server` `pangya/player.go:181-197`, PacketDoc `0076.ksy:79-85`, and SuperSS-Dev
+    `pangya_game_st.h:1170-1185`. The first entry remained plausible; its start time, card count,
+    and every later entry began sixteen bytes early, so the client never constructed player 1's
+    model. The full mascot is 62 bytes. Player data is now `0x2f82` bytes and the leading seat
+    brings it to the client's measured `0x2f84` boundary before start time.
+
+    A real U.S. 852 client then completed the loading ramp and rendered Blue Lagoon hole 1 at the
+    playable tee with both player rows. It answered first-shot-ready and received `0x0090`.
+    The host did not finish a stroke in that run; its turn deadline produced a durable two-player
+    forfeit settlement and returned the client to the room. This closes the hole-load crash but
+    not the direct evidence for a completed real-client stroke or §19.6 steps 9-12. Evidence:
+    [`evidence/REAL_CLIENT_MATCH_2026-08-09.md`](evidence/REAL_CLIENT_MATCH_2026-08-09.md).
+
+    The diagnosis history below is retained because it records the eliminated causes and the
+    live-memory method that found the field.
+
+    Seven causes found and fixed before the final width correction, from the references and from
+    the client's own memory rather than by guessing at the wire:
 
     - `0x0052` carries a fixed `[18]HoleInfo` array the client reads by width, not by the `hole_count` beside it (`pangbox/server` `game/packet/server.go` `ServerRoomGameData`, filled in `game/room/room.go`). Entries past `hole_count` are zeroed, which is what upstream sends.
     - `0x0076` is `ServerGameInit`, and its subtype picks between two bodies that share no shape: `0x00` is a player count followed by every player whole, `0x04` is a bare timestamp (`pangbox/packetdoc` `gameservice/server/0076.ksy`). We stamped the full subtype onto the timestamp body, so the client read a four-byte field's low byte as "one player" and parsed a multi-kilobyte record out of the nineteen bytes after it. The roster is now 24 KB of real players, and the record is the same `RetailPlayerData` the handover reply carries — upstream reuses one structure for both.
@@ -661,7 +679,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
    and it is not a client opcode we have seen. A practice hole is a one-player roster and would
    isolate the hole-load crash from everything the second seat contributes, which is why it is
    worth finding.
-2. **Stop the real client crashing during hole load** (blocker 28). It is the whole of the §19.6 steps 8-12 gate now: the room, the roster, the master's Start and the match plan are all accepted, and the hole itself is not. Settle the remaining `0x0052`/`0x0076`/`0x005b` fields and the hole-load handshake against `pangbox/server` and PacketDoc **before** changing anything — iterating against the client costs a full sign-in per attempt and its crash dump names nothing.
+2. **Complete a real-client stroke and capture the results/balance screen** (blocker 28 follow-up). The client now loads and renders the hole, and a timeout settlement returns it to the room. §19.6 still needs a stroke completed from the real client plus direct evidence for steps 9-12; do not substitute the timeout result for those claims.
 3. **Old plan, now unnecessary: play a versus hole from two real clients.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23); §19.6 steps 7-12 now need the real client to accept it. Expect unanswered in-match opcodes — the productive loop is in [`RUNNING_THE_CLIENT.md`](RUNNING_THE_CLIENT.md).
 2. **Implement equipment update `0x0020`** (blocker 17). It is the only thing left that drops a real client out of an otherwise working session.
 2. Raise the shipped `security.login_timeout` guidance: 15 seconds closes the connection while the client's own first-time setup screens are open. Interactive setup needs a far larger allowance.

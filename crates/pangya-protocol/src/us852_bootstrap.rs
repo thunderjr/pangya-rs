@@ -606,6 +606,17 @@ mod tests {
     }
 
     #[test]
+    fn player_data_width_matches_the_reference_roster_stride() {
+        let mut writer = PacketWriter::default();
+        sample_player_data()
+            .encode_body(&mut writer)
+            .expect("player data");
+        // The client strides 0x2f84 bytes from the entry's leading seat through PlayerData:
+        // two bytes of seat plus this 0x2f82-byte record. Start time and card count follow.
+        assert_eq!(writer.as_slice().len(), 0x2f82);
+    }
+
+    #[test]
     fn statistics_block_is_exactly_the_reference_width() {
         let mut writer = PacketWriter::default();
         RetailPlayerStatistics::default().encode_body(&mut writer);
@@ -1073,17 +1084,19 @@ impl RetailPlayerData {
         for _ in 0..10 {
             writer.u16_le(0);
         }
-        // `MascotInfo`, forty-six bytes: id, catalog id, level, experience, a thirty-byte
-        // message, a type and a flag. The reference struct carries a `SYSTEMTIME` between the
-        // type and the flag and comes to sixty-two; this client's is the same record without
-        // it, which is what makes the roster entry's start time land on offset `0x2f74` where
-        // the client was measured to hold it.
+        // `MascotInfo`, sixty-two bytes: id, catalog id, level, experience, a thirty-byte
+        // message, a type, `SYSTEMTIME`, and a flag. All three independent references carry
+        // the sixteen-byte time: `pangbox/server`'s `PlayerMascotData`, PacketDoc 0x0076's
+        // 62-byte `user_entry_unknown_e`, and SuperSS-Dev's packed `MascotInfo`. Omitting it
+        // makes the first player look plausible but starts every later roster entry sixteen
+        // bytes early, so the client never constructs the second player's model.
         writer.u32_le(0);
         writer.u32_le(0);
         writer.u8(0);
         writer.u32_le(0);
         writer.bytes(&[0; 30]);
         writer.u16_le(0);
+        writer.bytes(&[0; 16]);
         writer.u8(0);
         Ok(())
     }
