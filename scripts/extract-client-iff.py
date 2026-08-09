@@ -111,10 +111,14 @@ def read_file_table(blob: bytes, key: tuple[int, int, int, int]) -> list[tuple[s
             cursor += path_length
             decipher(key, raw_path)
             path = bytes(raw_path).rstrip(b"\xcd\x00")
+        elif obfuscation == ENTRY_TYPE_BASIC:
+            # Even the unencrypted/debug entry form stores one trailing path byte. The vendored
+            # reference consumes PathLength + 1 and exposes only PathLength bytes.
+            raw_path = blob[cursor : cursor + path_length + 1]
+            cursor += path_length + 1
+            path = bytes(raw_path[:path_length])
         else:
-            raw_path = blob[cursor : cursor + path_length]
-            cursor += path_length
-            path = bytes(raw_path).rstrip(b"\x00")
+            raise ValueError(f"unsupported entry obfuscation {obfuscation:#04x}")
 
         name = path.decode("euc-kr", errors="replace").replace("\\", "/")
         entries.append(
