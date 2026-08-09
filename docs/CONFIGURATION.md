@@ -167,3 +167,76 @@ why it exists.
   the update list checksums the whole client directory — about eight seconds for the U.S.
   series — so a misconfigured directory is a startup error rather than a client-visible 404.
   Startup logs `client patch web service ready` with the generated list's size.
+
+## Operator admin API and panel
+
+`[http.admin_api]` is the authenticated operator console API, nested on the existing `[http]`
+listener at `/admin/v1` rather than getting a listener of its own. That is the opposite of
+`[client_web]`'s decision, for the opposite reason: the patch surface has to be reachable by
+the *client's* machine, whereas the admin surface has exactly the audience health and metrics
+already have. See ADR-0016.
+
+**This listener serves no HTML.** The panel is a separate service — `pangya-admin`, flat on
+port 5173 — that proxies `/admin/v1` and `/health` through to here. The browser therefore sees
+one origin, which is what lets the session cookie stay `HttpOnly; SameSite=Strict` with no CORS
+layer.
+
+It is **disabled by default**, and enabling it logs a warning at startup naming what changed.
+This is the only HTTP surface in the project that can mutate player state.
+
+- `enabled` — off by default. When on, `/admin/v1/*` answers.
+- `session_lifetime` — how long an issued session stays valid. Validation caps it at `24h`;
+  beyond that a forgotten browser tab becomes a standing credential. Default `12h`.
+- `logins_per_window` / `rate_window` — sign-in attempts permitted per masked source prefix
+  per window. `logins_per_window = 0` is refused, because no operator could then sign in.
+The cookie is issued `HttpOnly; SameSite=Strict; Path=/admin`. `Path=/admin` is tighter than
+`/`: the panel is served at the root by its own service, so the cookie travels only with the
+proxied API calls and never with a request for an asset.
+
+Point the panel at this listener with `PANGYA_ADMIN_API` — `http://127.0.0.1:8080` on a
+developer's machine, or the server's service name in a compose stack.
+
+### Bootstrapping the first operator
+
+The API can grant the admin role, but only to an operator who already holds it, so the first
+one is created out of band:
+
+```bash
+pangya-server account create --username <name> --nickname <nick> --secret-stdin
+pangya-server account role --account-id <id> --role admin
+```
+
+Sign-in takes the account's **password**, not the 32-hex transport secret the game client
+sends; the server derives that secret itself and verifies it against the same Argon2id record
+LoginService uses (ADR-0007).
+
+### What it does not promise
+
+The listener has no TLS of its own. It keeps the loopback default, and any non-loopback bind
+still requires `--acknowledge-public-bind`. Reaching it from another machine is expected to go
+over the existing tailnet, not over a public interface.
+
+Authorisation is re-read from the database on every request, so demoting or banning an account
+takes effect on its next request rather than at its session's expiry; `account role` also
+revokes that account's outstanding sessions in the same transaction.
+
+### The shop overlay
+
+`shop_offer_overrides` (migration 0010) is the only way to change what the server sells without
+a restart. The catalog is parsed once at startup from the client's own IFF tables and is
+immutable; `data.price_override_pang` can reprice rows the client already sells, but
+deliberately cannot make an unsold row sellable. The overlay can.
+
+- It changes what the server **charges and permits**, never what the client **displays**. The
+  client renders shop names, prices and listing from its own tables inside the PAK, so an item
+  enabled here that the client does not list is purchasable by the protocol but unreachable
+  through the client's shop UI, and a repriced item shows one figure and charges another. The
+  `/shop` endpoint returns both values and a `drift` flag so the panel can say so.
+- A write reloads the overlay and publishes it over a `tokio::watch` **before answering**, so a
+  success means the change is in force rather than queued.
+- Startup logs a warning whenever any override is active, because the server's prices then
+  differ from the client's.
+- It resolves against the catalog, so it can only reach type ids the client's own tables
+  contain. An override for an unknown id is refused rather than stored inert.
+- A zero price is refused: zero is how the client's tables spell "unavailable", so an override
+  meaning "free" would be indistinguishable from one meaning "not sold". Use `enabled = false`.

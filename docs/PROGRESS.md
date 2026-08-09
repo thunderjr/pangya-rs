@@ -137,6 +137,40 @@ This is the project status ledger. Update it when a deliverable gains evidence o
 | M8 — Social/ranking | ⬜ | Durable friends/messages/mail basics and rebuildable ranking projection |
 | M9 — Broad parity | ⬜ | Each legacy feature group completes its own packet/state/persistence gate |
 
+### Durable player state
+
+Specified by [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md), ordered to match
+[`protocol/US852_SUBSYSTEM_GAPS.md`](protocol/US852_SUBSYSTEM_GAPS.md) §7. The 116-byte
+equipment block and the 513-byte character block carry fourteen slot families; three are
+durable today, so the rest are emitted as truthful zeros rather than invented values.
+
+| Milestone | Status | User-visible exit |
+|---|---:|---|
+| E1 — Caddie and mascot | ⬜ | A real client selects a caddie and a mascot; both survive restart and appear in the room census |
+| E2 — Character parts, aux parts, hair colour, mastery, stats | ⬜ | A real client renders operator-set hair colour, mastery and fitted parts after relog |
+| E3 — Consumable and decoration slots | ⬜ | The ten consumable slots and six decoration slots persist, and a slot cannot outlive the stack it points at |
+| E4 — Cards | ⬜ | Container `0x0138` and twelve per-character card slots render whole, not partially |
+
+### Operator admin surface
+
+Named in *Immediate next actions* item 2. `crates/pangya-admin` plus a separate SPA at
+`../pangya-admin`; boundary recorded in ADR-0016.
+
+| Phase | Status | Scope |
+|---|---:|---|
+| 0 — foundations | ✅ | Migration 0009, admin crate, sessions, `account role` CLI, [`INDEX.md`](INDEX.md), [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md), ADR-0016. Evidence: [`evidence/ADMIN_PANEL_2026-08-09.md`](evidence/ADMIN_PANEL_2026-08-09.md) |
+| 1–2 — accounts | ✅ | List, detail, ledger, and audited status/role/password/balance mutations |
+| 3–4 — items | ✅ | Catalog item names parsed from the client's own tables; inventory and equipment control under the same optimistic version the in-game path uses |
+| 5 — shop | ✅ | Migration 0010, DB-backed overlay resolved live at purchase time — no restart, and it can offer an item the client's tables mark unavailable |
+| 6 — operations | ✅ | Status readouts, audit log, course-record leaderboard |
+
+Server-side only: no real U.S. 852 client has been driven through any of it. That an
+operator-granted item appears in My Room, and that an overlay price is what the client is
+actually charged, are the open gate — the same checks
+[`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md)
+and [`evidence/REAL_CLIENT_SHOP_2026-08-09.md`](evidence/REAL_CLIENT_SHOP_2026-08-09.md)
+already define.
+
 ---
 
 ## M2 — LoginService domain and storage foundation
