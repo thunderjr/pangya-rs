@@ -80,29 +80,30 @@ use pangya_protocol::{
     RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
     RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
     RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
-    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
-    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
-    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
-    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
-    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
-    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
-    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
-    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
-    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
-    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
-    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
-    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
-    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
-    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
+    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
+    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
+    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
+    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
+    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
+    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
+    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
+    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
+    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     packed_system_time, synthetic_game_hello, us852_game_hello,
 };
@@ -3481,12 +3482,11 @@ where
                     let begin = plan.begin();
                     // A solo hole has no turn arbitration, so the client's own timers are the
                     // only ones, and it is told the same defaults it shows for practice.
-                    let (room_number, roster) = self.retail_match_roster(connection_id).await;
+                    let roster = self.retail_match_roster(connection_id).await;
                     match_context.atmosphere = Some(
                         self.send_retail_hole_intro(
                             framed,
                             connection_id,
-                            room_number,
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
@@ -3511,6 +3511,9 @@ where
                         if let Some(atmosphere) = match_context.atmosphere.take() {
                             self.send_retail_hole_atmosphere(framed, atmosphere).await?;
                         }
+                        // `0x0053` already names whose turn the hole opens on, so no
+                        // `0x0063` follows it. See the stroke path for why sending one here
+                        // is fatal.
                         self.send(
                             framed,
                             &RetailPlayerStartHole {
@@ -3518,13 +3521,7 @@ where
                             },
                         )
                         .await?;
-                        self.send(
-                            framed,
-                            &RetailTurnStart {
-                                connection_id: connection,
-                            },
-                        )
-                        .await?;
+                        self.send_retail_hole_rate_tables(framed).await?;
                         return Ok(RoomEventEffect::EnterMatch);
                     }
                     return Ok(RoomEventEffect::Remain);
@@ -3547,12 +3544,11 @@ where
                     // The timers the client counts down with are the ones the room actor will
                     // actually enforce, so a shot that runs out on screen is the shot the
                     // server forfeits.
-                    let (room_number, roster) = self.retail_match_roster(connection_id).await;
+                    let roster = self.retail_match_roster(connection_id).await;
                     let atmosphere = self
                         .send_retail_hole_intro(
                             framed,
                             connection_id,
-                            room_number,
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
@@ -3581,6 +3577,23 @@ where
                     let connection = |id: PlayerConnectionId| u32::try_from(id.get()).unwrap_or(0);
                     match context.active {
                         // The first turn of the hole is introduced rather than handed over.
+                        //
+                        // `0x0053` carries the connection whose turn opens the hole, and that
+                        // is the whole announcement: no reference server sends a `0x0063`
+                        // here. Sending one is fatal rather than merely redundant. The
+                        // client's `0x0063` handler walks its per-player in-game array to
+                        // mark the active player, and while the course loading screen is
+                        // still up that array holds no scene objects yet — so it dereferences
+                        // a null model and the process exits. `0x0063` belongs only to a turn
+                        // *change*, after a full shot cycle.
+                        //
+                        // `pangbox/server` `game/room/room.go`: `startHole` sends `0x009e`,
+                        // `0x005b` and `0x0053` and no `0x0063`; `0x0063` is emitted only by
+                        // `nextTurn`, reached only from `endTurn`. `Acrisio-Filho/SuperSS-Dev`
+                        // `GAME/versus_base.cpp`: `sendReplyFinishLoadHole` sends `0x9e`,
+                        // `0x5b`, `0x53`; `0x63` lives only in `sendPlayerTurn`, called only
+                        // from `changeTurn`. `hsreina/pangya-server` `Game.pas`
+                        // `HandlePlayerLoadOk` likewise sends no `0x63`.
                         None => {
                             if let Some(atmosphere) = match_context.atmosphere.take() {
                                 self.send_retail_hole_atmosphere(framed, atmosphere).await?;
@@ -3592,6 +3605,7 @@ where
                                 },
                             )
                             .await?;
+                            self.send_retail_hole_rate_tables(framed).await?;
                         }
                         Some(previous) if previous != active => {
                             self.send(
@@ -3601,16 +3615,24 @@ where
                                 },
                             )
                             .await?;
+                            self.send(
+                                framed,
+                                &RetailTurnStart {
+                                    connection_id: connection(active),
+                                },
+                            )
+                            .await?;
                         }
-                        Some(_) => {}
+                        Some(_) => {
+                            self.send(
+                                framed,
+                                &RetailTurnStart {
+                                    connection_id: connection(active),
+                                },
+                            )
+                            .await?;
+                        }
                     }
-                    self.send(
-                        framed,
-                        &RetailTurnStart {
-                            connection_id: connection(active),
-                        },
-                    )
-                    .await?;
                     context.active = Some(active);
                     match_context.stroke = Some(context);
                     return Ok(if state == GameState::InStrokeLoading {
@@ -4025,22 +4047,14 @@ where
     /// Read from the room rather than from the match plan: the plan names connections, and the
     /// roster has to describe whole players. An empty answer sends an empty roster, which the
     /// client renders as a match with nobody in it rather than misreading the frame.
-    /// Returns the room's own number alongside the roster, because every seat in the match
-    /// roster carries it; see [`RetailMatchPlayer::room_number`].
-    async fn retail_match_roster(
-        &self,
-        connection_id: PlayerConnectionId,
-    ) -> (u16, Vec<MemberSnapshot>) {
+    async fn retail_match_roster(&self, connection_id: PlayerConnectionId) -> Vec<MemberSnapshot> {
         match self
             .lobby
             .route(connection_id, LobbyRoomCommand::GetState)
             .await
         {
-            Ok(LobbyRouteResult::Snapshot(snapshot)) => (
-                u16::try_from(snapshot.summary().id().get()).unwrap_or(0xffff),
-                snapshot.members().to_vec(),
-            ),
-            _ => (0xffff, Vec::new()),
+            Ok(LobbyRouteResult::Snapshot(snapshot)) => snapshot.members().to_vec(),
+            _ => Vec::new(),
         }
     }
 
@@ -4058,7 +4072,6 @@ where
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         connection_id: PlayerConnectionId,
-        room_number: u16,
         roster: &[MemberSnapshot],
         hole: RetailHoleIntro,
     ) -> Result<RetailHoleAtmosphere, GameRuntimeError> {
@@ -4086,7 +4099,8 @@ where
             &RetailMatchStart::Roster(
                 roster
                     .iter()
-                    .map(|member| retail_match_player(room_number, member))
+                    .enumerate()
+                    .map(|(slot, member)| retail_match_player(slot, member))
                     .collect(),
             ),
         )
@@ -4146,6 +4160,20 @@ where
             .await?;
         }
         Ok(RetailHoleAtmosphere { weather, wind })
+    }
+
+    /// Sends the three voice and effect rate tables that follow `0x0053`.
+    ///
+    /// Every reference server sends exactly these three, in this order, immediately after the
+    /// hole's opening player is announced and before it waits on the clients.
+    async fn send_retail_hole_rate_tables(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+    ) -> Result<(), GameRuntimeError> {
+        for table in RetailRateTable::hole_tables() {
+            self.send(framed, &table).await?;
+        }
+        Ok(())
     }
 
     /// Sends the weather and wind the hole is played under, once its players are all loaded.
@@ -6215,11 +6243,11 @@ fn retail_now() -> [u8; 16] {
     )
 }
 
-fn retail_match_player(room_number: u16, member: &MemberSnapshot) -> RetailMatchPlayer {
+fn retail_match_player(slot: usize, member: &MemberSnapshot) -> RetailMatchPlayer {
     let card = member.card();
     let start_time = retail_now();
     RetailMatchPlayer {
-        room_number,
+        slot: u16::try_from(slot.saturating_add(1)).unwrap_or(u16::MAX),
         player: RetailPlayerData {
             identity: RetailPlayerIdentity {
                 username: card.username.as_bytes().to_vec(),

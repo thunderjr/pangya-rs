@@ -53,21 +53,20 @@ impl RetailHole {
 /// One seat in the match roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailMatchPlayer {
-    /// The number of the room the match is being played in, repeated on every seat.
+    /// One-based seat of this player within the match.
     ///
-    /// This is **not** a seat index. It is the same field `0x0044` writes ahead of the player
-    /// record, where a player outside a room gets `0xffff`; here every seat carries the room
-    /// they are playing in. Sending a seat index leaves the first seat holding zero, which is
-    /// not a room the client knows, and the lookup it does with this value at hole load
-    /// returns nothing.
+    /// The references disagree on this field and only one reading can be right per client.
+    /// `Acrisio-Filho/SuperSS-Dev` (`Server Lib/Game Server/GAME/versus_base.cpp`
+    /// `VersusBase::sendInitialData`) writes `p.addInt16(m_ri.numero)`, the room's own number,
+    /// and `pangbox/packetdoc` (`common/user_name_data.ksy`) calls the field `room_id`, "0xFFFF
+    /// (-1) when not in room". `pangbox/server` (`game/room/room.go`) instead writes the seat,
+    /// numbered from one, and that is the reading verified against real clients.
     ///
-    /// # Provenance
-    ///
-    /// `pangbox/packetdoc` (`common/user_name_data.ksy`, first field `room_id`, "0xFFFF (-1)
-    /// when not in room"), and `Acrisio-Filho/SuperSS-Dev`
-    /// (`Server Lib/Game Server/GAME/versus_base.cpp` `VersusBase::sendInitialData`, which
-    /// writes `p.addInt16(m_ri.numero)` — the room's own number — ahead of each player).
-    pub room_number: u16,
+    /// The seat is what this server sends, because the client files each roster entry into a
+    /// per-player array by it: a room number is the same value for every player in the match,
+    /// so every entry lands in one slot and every other slot stays empty. The client walks
+    /// that array by index when it builds the hole.
+    pub slot: u16,
     /// The whole player, as the lobby describes them.
     pub player: RetailPlayerData,
     /// Packed match start time.
@@ -120,7 +119,7 @@ impl EncodePacket for RetailMatchStart {
                 writer.u8(count);
                 for seat in players {
                     let entry = writer.as_slice().len();
-                    writer.u16_le(seat.room_number);
+                    writer.u16_le(seat.slot);
                     seat.player.encode_body(writer)?;
                     writer.bytes(&seat.start_time);
                     writer.u8(0); // cards in hand
@@ -138,6 +137,99 @@ impl EncodePacket for RetailMatchStart {
         Ok(())
     }
 }
+
+/// Bytes of one rate table's fixed body.
+pub const RATE_TABLE_BYTES: usize = 100;
+
+/// Voice and effect rate table, server opcode `0x0115`.
+///
+/// Three of these follow `0x0053` at the start of every hole. Their contents drive the
+/// client's caddie voice and effect selection; the tables here are the ones a real server was
+/// captured sending, carried verbatim because nothing in them is derivable.
+///
+/// # Provenance
+///
+/// Opcode from `Acrisio-Filho/SuperSS-Dev`
+/// (`Server Lib/Game Server/GAME/versus_base.cpp` `VersusBase::sendRatesOfVersusBase`, which
+/// broadcasts three `0x115` frames, each a `addString(name)` followed by a fixed table) and
+/// from `hsreina/pangya-server` (`Game.pas`, three `0x0115` frames in `HandlePlayerLoadOk`).
+/// The payloads are the captured ones in `pangbox/server` (`game/room/room.go` `startHole`,
+/// commented there as "taken from an old packet dump"); `pangbox` labels the opcode `0x0151`,
+/// which is the byte-swapped reading and collides with the client's own quest-status opcode,
+/// so the two servers that agree on `0x0115` are followed here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRateTable {
+    /// Table name, without its length prefix.
+    pub name: &'static [u8],
+    /// The table itself.
+    pub table: &'static [u8; RATE_TABLE_BYTES],
+}
+
+impl RetailRateTable {
+    /// The three tables a hole opens with, in the order upstream sends them.
+    #[must_use]
+    pub const fn hole_tables() -> [Self; 3] {
+        [
+            Self {
+                name: b"W_BIGBONGDARI",
+                table: &TABLE_W_BIGBONGDARI,
+            },
+            Self {
+                name: b"R_BIGBONGDARI",
+                table: &TABLE_R_BIGBONGDARI,
+            },
+            Self {
+                name: b"CLUBSET_MIRACLE",
+                table: &TABLE_CLUBSET_MIRACLE,
+            },
+        ]
+    }
+}
+
+impl EncodePacket for RetailRateTable {
+    const OPCODE: u16 = 0x0115;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.pstring(self.name, 64)?;
+        writer.bytes(self.table);
+        Ok(())
+    }
+}
+
+static TABLE_W_BIGBONGDARI: [u8; RATE_TABLE_BYTES] = [
+    0x00, 0x03, 0x01, 0x03, 0x02, 0x03, 0x03, 0x02, 0x00, 0x02, 0x02, 0x02, 0x03, 0x01, 0x01, 0x00,
+    0x01, 0x00, 0x03, 0x02, 0x00, 0x00, 0x00, 0x02, 0x03, 0x03, 0x00, 0x01, 0x01, 0x03, 0x00, 0x02,
+    0x03, 0x01, 0x03, 0x03, 0x01, 0x02, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x02, 0x00, 0x03, 0x03,
+    0x03, 0x02, 0x02, 0x02, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00,
+    0x03, 0x00, 0x01, 0x00, 0x03, 0x03, 0x03, 0x02, 0x00, 0x01, 0x01, 0x02, 0x03, 0x03, 0x01, 0x02,
+    0x00, 0x00, 0x02, 0x03, 0x02, 0x00, 0x00, 0x03, 0x02, 0x03, 0x00, 0x03, 0x00, 0x03, 0x02, 0x03,
+    0x02, 0x03, 0x00, 0x03,
+];
+
+static TABLE_R_BIGBONGDARI: [u8; RATE_TABLE_BYTES] = [
+    0x01, 0x02, 0x00, 0x00, 0x01, 0x03, 0x01, 0x00, 0x01, 0x02, 0x02, 0x02, 0x03, 0x03, 0x02, 0x02,
+    0x01, 0x01, 0x03, 0x03, 0x00, 0x02, 0x02, 0x02, 0x03, 0x01, 0x02, 0x02, 0x03, 0x00, 0x00, 0x00,
+    0x02, 0x03, 0x03, 0x01, 0x02, 0x01, 0x03, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+    0x03, 0x01, 0x00, 0x02, 0x02, 0x00, 0x02, 0x03, 0x00, 0x03, 0x03, 0x01, 0x03, 0x02, 0x01, 0x02,
+    0x03, 0x03, 0x03, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x01, 0x03, 0x00, 0x01, 0x02, 0x00,
+    0x00, 0x02, 0x02, 0x03, 0x00, 0x01, 0x02, 0x01, 0x02, 0x01, 0x03, 0x02, 0x01, 0x01, 0x03, 0x01,
+    0x02, 0x00, 0x02, 0x01,
+];
+
+static TABLE_CLUBSET_MIRACLE: [u8; RATE_TABLE_BYTES] = [
+    0x01, 0x01, 0x01, 0x02, 0x02, 0x00, 0x02, 0x01, 0x02, 0x03, 0x01, 0x03, 0x00, 0x02, 0x02, 0x03,
+    0x03, 0x01, 0x01, 0x02, 0x02, 0x00, 0x03, 0x02, 0x01, 0x01, 0x01, 0x03, 0x01, 0x00, 0x02, 0x01,
+    0x03, 0x03, 0x03, 0x02, 0x01, 0x03, 0x03, 0x03, 0x02, 0x03, 0x01, 0x00, 0x00, 0x03, 0x00, 0x01,
+    0x02, 0x00, 0x02, 0x03, 0x02, 0x02, 0x02, 0x00, 0x03, 0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x03, 0x02, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x00, 0x03,
+    0x02, 0x02, 0x02, 0x03, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x03, 0x01,
+    0x00, 0x01, 0x02, 0x00,
+];
 
 /// Match plan, server opcode `0x0052`.
 ///

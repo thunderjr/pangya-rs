@@ -21,7 +21,14 @@ pub const IFF_CONTAINER_CHUNK_ENTRIES: usize = 50;
 /// Equipped item slots carried by the retail equipment block.
 pub const EQUIPPED_ITEM_SLOTS: usize = 10;
 /// Trailing zeroed equipment slots after the equipped item ids.
-const EQUIPMENT_TRAILING_SLOTS: usize = 11;
+///
+/// Fifteen, not eleven, so the block totals 116 bytes and matches `UserEquip`
+/// (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`), whose
+/// `skin_id[6]`, `skin_typeid[6]`, `mascot_id` and `poster[2]` come to sixty bytes after the
+/// four equipped ids and the ten item slots. Getting this width wrong moved every block after
+/// it sixteen bytes early, which left the client reading a player's character block from the
+/// middle of itself and building no model for them.
+const EQUIPMENT_TRAILING_SLOTS: usize = 15;
 /// Maximum channels the retail server channel list may advertise.
 pub const MAX_SERVER_CHANNELS: usize = 255;
 /// Fixed byte width of a retail channel name.
@@ -482,8 +489,14 @@ mod tests {
             item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
         };
         let payload = encode_packet_payload(&equipment, &profile()).expect("encode");
-        // Four ids, ten item slots, eleven cosmetic slots, all u32.
-        assert_eq!(payload.len(), (4 + EQUIPPED_ITEM_SLOTS + 11) * 4);
+        // Four ids, ten item slots, fifteen cosmetic slots, all u32: 116 bytes, the width of
+        // the reference `UserEquip`. Every block after this one in a player record is placed
+        // by it, so the total is worth pinning.
+        assert_eq!(
+            payload.len(),
+            (4 + EQUIPPED_ITEM_SLOTS + EQUIPMENT_TRAILING_SLOTS) * 4
+        );
+        assert_eq!(payload.len(), 116);
         assert_eq!(&payload[12..16], &0x1400_0000_u32.to_le_bytes());
     }
 
@@ -575,14 +588,14 @@ mod tests {
         let reply = encode_packet_payload(&sample_reply(), &profile()).expect("reply");
         let roster = encode_packet_payload(
             &crate::RetailMatchStart::Roster(vec![crate::RetailMatchPlayer {
-                room_number: 1,
+                slot: 1,
                 player: sample_player_data(),
                 start_time: [0; 16],
             }]),
             &profile(),
         )
         .expect("roster");
-        // Subtype and count, then the room number, then the record.
+        // Subtype and count, then the seat, then the record.
         assert_eq!(roster[0], 0x00);
         assert_eq!(roster[1], 1);
         assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
@@ -1048,30 +1061,30 @@ impl RetailPlayerData {
         }
         self.character.encode_body(writer);
         self.caddie.encode_body(writer);
-        // Sixteen bytes the equipment block above is short of `UserEquip`
-        // (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`, whose
-        // `skin_id[6]`, `skin_typeid[6]`, `mascot_id` and `poster[2]` total sixty against the
-        // eleven zeroed words written there). They are carried here rather than in the
-        // equipment block so the roster entry's total width, which matches the client's own
-        // per-player record stride exactly, does not change.
+        // `ClubSetInfo`: inventory id, catalog id, five stat slots, five enchant slots
+        // (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`).
         //
-        // Their effect is to put the club set where the client reads it. The client takes its
-        // hole-load lookup key from entry offset `0x2f2e` — measured, by stamping every zero
-        // word of a roster entry with its own offset and reading back the word the client
-        // keys on — and with these sixteen bytes in front, `0x2f2e` is exactly
-        // `ClubSetInfo::_typeid`, the catalog id the club models are resolved from. A catalog
-        // lookup that misses is the null the client then dereferences.
-        writer.bytes(&[0; 16]);
+        // With the equipment block at its correct 116 bytes this lands the catalog id on entry
+        // offset `0x2f2e`, which is where the client takes its hole-load lookup key from —
+        // measured, by stamping every zero word of a roster entry with its own offset and
+        // reading back the word the client keys on.
         writer.u32_le(self.equipment.club_set_uid);
         writer.u32_le(self.club_set_iff_id);
-        writer.bytes(&[0; 4]);
-        // Active mascot.
+        for _ in 0..10 {
+            writer.u16_le(0);
+        }
+        // `MascotInfo`, forty-six bytes: id, catalog id, level, experience, a thirty-byte
+        // message, a type and a flag. The reference struct carries a `SYSTEMTIME` between the
+        // type and the flag and comes to sixty-two; this client's is the same record without
+        // it, which is what makes the roster entry's start time land on offset `0x2f74` where
+        // the client was measured to hold it.
         writer.u32_le(0);
         writer.u32_le(0);
         writer.u8(0);
         writer.u32_le(0);
-        writer.fixed_nul(b"0", 16)?;
-        writer.bytes(&[0; 33]);
+        writer.bytes(&[0; 30]);
+        writer.u16_le(0);
+        writer.u8(0);
         Ok(())
     }
 }

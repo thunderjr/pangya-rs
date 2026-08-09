@@ -6296,11 +6296,16 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
         0x0053,
         "hole intro"
     );
-    assert_eq!(
-        receive_packet(&mut stream, key).await.0,
-        0x0063,
-        "turn start"
-    );
+    // `0x0053` names the opening player itself, so no `0x0063` follows it — the three rate
+    // tables do. A `0x0063` here reaches a client whose per-player scene objects do not exist
+    // yet, and it dies dereferencing one.
+    for _ in 0..3 {
+        assert_eq!(
+            receive_packet(&mut stream, key).await.0,
+            0x0115,
+            "hole rate table"
+        );
+    }
 
     // A shot is one stroke; the turn is handed back so the next can be played.
     send_packet(&mut stream, key, 6, 0x0012, &[0xaa; 8]).await;
@@ -6597,8 +6602,12 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             "{who} is told the weather and wind once loaded: {frames:04x?}"
         );
         assert!(
-            frames.contains(&0x0053) && frames.contains(&0x0063),
-            "{who} is told the hole started and whose turn it is: {frames:04x?}"
+            frames.contains(&0x0053) && frames.iter().filter(|&&f| f == 0x0115).count() == 3,
+            "{who} is told the hole started, and gets its three rate tables: {frames:04x?}"
+        );
+        assert!(
+            !frames.contains(&0x0063),
+            "{who} is not handed a turn before the hole is entered: {frames:04x?}"
         );
     }
 
