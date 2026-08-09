@@ -526,6 +526,31 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     recursive visibility flag, per scene node `PLAYER_n`. So `[record + 4]` is **that player's 3D
     character model**, and it is null: the client did not build a model for player index 0.
 
+    **Two more causes, both from the references, and the crash has moved twice more.**
+
+    - The server was handing a turn — `0x0063` — as part of starting the hole. No reference
+      does: `0x0053` carries the connection whose turn opens the hole and that is the whole
+      announcement. `pangbox/server` `game/room/room.go` emits `0x0063` only from `nextTurn`,
+      reached only from `endTurn`; `Acrisio-Filho/SuperSS-Dev` `GAME/versus_base.cpp` only from
+      `sendPlayerTurn`, called only from `changeTurn`; `hsreina/pangya-server` `Game.pas`
+      `HandlePlayerLoadOk` sends none. The client's `0x0063` handler walks the same per-player
+      array, and on the loading screen it holds no scene objects yet.
+    - The three `0x0115` voice and effect rate tables that follow `0x0053` were not sent at all.
+    - The roster's per-entry leading `u16` is a **one-based seat**, not the room number. The
+      room number is the same value for every player, so every entry filed into one slot.
+
+    Where it now stands: the client reaches the **course loading screen**, the one carrying the
+    course name, and exits there. The fault is `0x00b65c25`, again `[null + 0x6c]`, and the
+    registers say which player: `EBX = 1`, `EDI = 0x358`. **Player index 0 now has a model and
+    player index 1 does not** — the first roster entry produces a player and the second does
+    not, which is the signature of a per-entry width error rather than a per-field one.
+
+    The next measurement is the one that settles it. With `PANGYA_MARK_ROSTER` set, dump the
+    window around the *second* record and decode the markers there: each names its own offset
+    within its entry, so the difference between what they read and what they should read is
+    exactly how far the second entry is misplaced. Sampling the first record this way has
+    already been done and is what located the club set.
+
     The **mascot** was eliminated by experiment — a real mascot catalog id in the block left the
     key zero and the crash unchanged — as was the **caddie**.
 
