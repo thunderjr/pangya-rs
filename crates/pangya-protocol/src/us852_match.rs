@@ -122,7 +122,6 @@ impl EncodePacket for RetailMatchStart {
                     writer.u16_le(seat.slot);
                     seat.player.encode_body(writer)?;
                     writer.bytes(&seat.start_time);
-                    writer.u8(0); // cards in hand
                     if std::env::var_os("PANGYA_MARK_ROSTER").is_some() {
                         writer.mark_zero_words_from(entry);
                     }

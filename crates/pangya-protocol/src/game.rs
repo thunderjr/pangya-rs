@@ -359,6 +359,64 @@ pub const RETAIL_RECENT_PLAYERS: usize = 5;
 /// Bytes in one recent-player record: `u32`, two 22-byte names, `u32`.
 pub const RETAIL_RECENT_PLAYER_BYTES: usize = 52;
 
+/// Client-reported exception, client opcode `0x0033`.
+///
+/// The client sends this when its own error handler fires, carrying the message it would
+/// otherwise only write to its crash log. It is the one channel through which a closed-source
+/// client explains itself, so the server logs it rather than discarding it.
+///
+/// # Provenance
+///
+/// `pangbox/server` (`game/packet/client.go`, `0x0033: &ClientException{}`, whose body is a
+/// single filler byte followed by a `PString` message) and `Acrisio-Filho/SuperSS-Dev`
+/// (`Server Lib/Game Server/PACKET/packet_func_sv.cpp` `packet_func::packet033`, which routes
+/// it to `requestExceptionClientMessage`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailClientException {
+    /// The message, as the client wrote it.
+    pub message: Vec<u8>,
+}
+
+/// Longest client exception message accepted.
+pub const MAX_CLIENT_EXCEPTION_BYTES: usize = 512;
+
+impl DecodePacket for RetailClientException {
+    const OPCODE: u16 = 0x0033;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let _empty = reader.u8()?;
+        Ok(Self {
+            message: reader.pstring(MAX_CLIENT_EXCEPTION_BYTES)?.to_vec(),
+        })
+    }
+}
+
+impl RetailClientException {
+    /// Renders the message for a log line: printable ASCII only, and bounded.
+    ///
+    /// The client controls every byte here, so it is sanitised rather than trusted. Control
+    /// characters would let it forge log structure, and an unbounded string would let it
+    /// flood the log.
+    #[must_use]
+    pub fn sanitized(&self) -> String {
+        self.message
+            .iter()
+            .take(256)
+            .map(|&byte| {
+                if (0x20..0x7f).contains(&byte) {
+                    char::from(byte)
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    }
+}
+
 /// U.S. 852 retail recent-player history request, client opcode `0x009c`.
 ///
 /// # Provenance

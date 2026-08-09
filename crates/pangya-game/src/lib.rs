@@ -69,22 +69,22 @@ use pangya_protocol::{
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailEquipment, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
-    RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression,
-    RetailHoleWeather, RetailHoleWind, RetailLoadProgress, RetailLockerCombinationAttempt,
-    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
-    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
-    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
-    RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
-    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
-    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
-    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailClientException, RetailEquipment, RetailEquipmentSlot, RetailEquipmentUpdate,
+    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
+    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailLoadProgress,
+    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
+    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
+    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
+    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
+    RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
+    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
+    RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem,
+    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
+    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
+    RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin,
+    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd,
+    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -4749,6 +4749,20 @@ where
         // What matters is that it is answered by an explicit allowlist rather than by the
         // unknown-opcode policy, which under the shipped `disconnect` would end the session
         // mid-hole.
+        // The client's own error handler reporting home. It is the only channel through which
+        // a closed-source client says what went wrong, and it is the last thing it sends
+        // before it exits, so it is logged rather than ignored. The message is client-
+        // controlled, so it is sanitised and bounded before it reaches a log line.
+        if opcode == RetailClientException::OPCODE
+            && let Ok(report) = decode_packet_payload::<RetailClientException>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+        {
+            tracing::warn!(message = %report.sanitized(), "client reported an exception");
+            return Ok(Some(state));
+        }
         if is_retail_accepted_match_opcode(opcode) {
             self.observer.unknown(GameUnknownObservation::Ignored);
             return Ok(Some(state));
