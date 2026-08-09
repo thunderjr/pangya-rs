@@ -6236,13 +6236,23 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
 
-    // Create a room, then start a match from inside it.
+    let (character_id, clubset_id, ball_type_id): (i64, i64, i64) = sqlx::query_as(
+        "SELECT character_id, COALESCE(club_item_id, 0), 0::bigint \
+         FROM equipment_sets WHERE account_id = $1",
+    )
+    .bind(account.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("equipped practice items");
+
+    // Create a one-player Practice room, then start it with the TC_ALL equipment submission the
+    // retail Practice UI sends instead of enabling the ordinary Start button.
     let mut writer = pangya_protocol::PacketWriter::default();
     writer.u8(0);
     writer.u32_le(30_000);
     writer.u32_le(600_000);
-    writer.u8(4);
-    writer.u8(0);
+    writer.u8(1);
+    writer.u8(0x13);
     writer.u8(1);
     writer.u8(1);
     writer.bytes(&[0; 5]);
@@ -6261,7 +6271,13 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     // Start match: the client receives the pre-match framing, then the roster and the plan.
     // Weather and wind are not among them; upstream withholds both until every player has
     // reported its hole loaded, and a retail client crashes mid-load when told early.
-    send_packet(&mut stream, key, 4, 0x000e, &[]).await;
+    let mut practice_start = pangya_protocol::PacketWriter::default();
+    practice_start.u8(7);
+    practice_start.u32_le(u32::try_from(character_id).expect("character id"));
+    practice_start.u32_le(0);
+    practice_start.u32_le(u32::try_from(clubset_id).expect("clubset id"));
+    practice_start.u32_le(u32::try_from(ball_type_id).expect("ball type id"));
+    send_packet(&mut stream, key, 4, 0x000c, &practice_start.into_inner()).await;
     for expected in [0x0230_u16, 0x0231, 0x0077] {
         assert_eq!(
             receive_packet(&mut stream, key).await.0,

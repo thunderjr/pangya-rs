@@ -81,15 +81,15 @@ use pangya_protocol::{
     RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
     RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
     RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPlayerStatisticsReport, RetailPointBalance, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomStatus, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
-    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
-    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeStart, RetailPurchaseItem,
+    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
+    RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList,
+    RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType, RetailSelectChannel,
+    RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
+    RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
+    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
+    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
     SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
     SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
@@ -4628,7 +4628,30 @@ where
             .solo_practice
             .ok_or(GameRuntimeError::Protocol)?;
         match (state, opcode) {
-            (GameState::InRoom, RETAIL_C2S_START_MATCH) => {
+            (GameState::InRoom, RETAIL_C2S_START_MATCH | RetailPracticeStart::OPCODE) => {
+                if opcode == RetailPracticeStart::OPCODE {
+                    let _request = decode_packet_payload::<RetailPracticeStart>(
+                        payload,
+                        &CompatibilityProfile::US_852,
+                        ServiceKind::Game,
+                    )
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                    let Ok(LobbyRouteResult::Snapshot(snapshot)) = self
+                        .lobby
+                        .route(identity.connection_id, LobbyRoomCommand::GetState)
+                        .await
+                    else {
+                        return Ok(GameState::InRoom);
+                    };
+                    if snapshot.members().len() != 1
+                        || snapshot.summary().profile().mode != RetailRoomType::Practice as u8
+                    {
+                        return Ok(GameState::InRoom);
+                    }
+                    // The submission is a UI barrier, not equipment authority. The durable
+                    // equipment aggregate already supplied the roster and remains unchanged even
+                    // when these client-claimed ids are stale.
+                }
                 *strokes = 0;
                 let match_id = MatchId::new(uuid::Uuid::new_v4());
                 let result_key = MatchResultKey::new(uuid::Uuid::new_v4());
@@ -4789,7 +4812,9 @@ where
             tracing::warn!(message = %report.sanitized(), "client reported an exception");
             return Ok(Some(state));
         }
-        if is_retail_accepted_match_opcode(opcode) {
+        if is_retail_accepted_match_opcode(opcode)
+            && !(state == GameState::InRoom && opcode == RetailPracticeStart::OPCODE)
+        {
             self.observer.unknown(GameUnknownObservation::Ignored);
             return Ok(Some(state));
         }
@@ -6718,6 +6743,7 @@ fn retail_room_from_summary(
     request: &RetailRoomCreate,
     course: u8,
 ) -> RetailRoom {
+    let (mode, play_mode) = retail_room_wire_modes(request.room_type);
     RetailRoom {
         name: summary.name().as_str().as_bytes().to_vec(),
         public: !summary.password_protected(),
@@ -6725,8 +6751,8 @@ fn retail_room_from_summary(
         max_players: summary.max_members(),
         player_count: summary.members(),
         hole_count: 1,
-        mode: request.room_type,
-        play_mode: 0,
+        mode,
+        play_mode,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
         course,
@@ -6757,6 +6783,7 @@ fn retail_room_from_snapshot(snapshot: &RoomSnapshot) -> RetailRoom {
 /// sitting in its own practice room told it was somewhere else, with Start disabled.
 fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom {
     let profile = summary.profile();
+    let (mode, play_mode) = retail_room_wire_modes(profile.mode);
     RetailRoom {
         name: summary.name().as_str().as_bytes().to_vec(),
         public: !summary.password_protected(),
@@ -6764,8 +6791,8 @@ fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom
         max_players: summary.max_members(),
         player_count,
         hole_count: profile.hole_count,
-        mode: profile.mode,
-        play_mode: 0,
+        mode,
+        play_mode,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
         course: profile.course,
@@ -6773,6 +6800,21 @@ fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom
         game_timer_ms: profile.game_timer_ms,
         owner_uid: 0,
         natural_wind: profile.natural_wind,
+    }
+}
+
+/// The room record carries a UI-family mode first and the semantic room type later. They are
+/// equal for the minimum versus path, but retail Practice is semantic type 19 in UI family 4.
+/// `alter-pangya` spells this out as `PRACTICE(19, uiType = 4)` and serializes both fields
+/// (`RoomType.kt:8-28`, `Room.kt:145-174`).
+fn retail_room_wire_modes(semantic_mode: u8) -> (u8, u8) {
+    if semantic_mode == RetailRoomType::Practice as u8 {
+        (
+            RetailRoomType::Tournament as u8,
+            RetailRoomType::Practice as u8,
+        )
+    } else {
+        (semantic_mode, 0)
     }
 }
 
@@ -6803,6 +6845,7 @@ fn is_retail_match_opcode(opcode: u16) -> bool {
     matches!(
         opcode,
         RETAIL_C2S_START_MATCH
+            | RetailPracticeStart::OPCODE
             | RETAIL_C2S_HOLE_LOAD_FINISHED
             | RETAIL_C2S_SHOT_COMMIT
             | RETAIL_C2S_SHOT_SYNC

@@ -783,9 +783,37 @@ function Close-PangyaMyRoom {
 # Opens the multiplayer directory, creates the client's default two-seat versus room, and starts
 # it once the second seat reports Ready. The server advertises its configured one-hole course in
 # the created room even though the dialog defaults to three holes.
+# Opens the version-specific Course Practice flow and waits until the playable hole header renders.
+# Practice is not the ordinary room dialog: it is Practice -> Course Practice -> Strategy/Start.
+# The final click sends room create 0x0008 and start 0x000e; the client then follows with its two
+# equipment sync frames. Keeping all three UI steps here prevents future runs from mistaking the
+# intermediate room stage's grey Start button for the actual Practice start control.
+function Start-PangyaCoursePractice {
+  Invoke-PangyaClick -X 169 -Y 577
+  if (-not (Wait-PangyaText -X 130 -Y 150 -Width 170 -Height 24 -TimeoutSeconds 12)) {
+    throw 'single-player practice mode dialog did not render'
+  }
+  Invoke-PangyaClick -X 196 -Y 411
+  if (-not (Wait-PangyaText -X 570 -Y 65 -Width 100 -Height 25 -TimeoutSeconds 12)) {
+    throw 'practice Strategy dialog did not render'
+  }
+  Invoke-PangyaClick -X 606 -Y 479
+  if (-not (Wait-PangyaText -X 10 -Y 7 -Width 100 -Height 25 -TimeoutSeconds 60)) {
+    throw 'practice hole header did not render'
+  }
+}
+
 function Open-PangyaMultiplay {
   Invoke-PangyaClick @script:StartGameButton
   Start-Sleep -Seconds 2
+}
+
+function Join-PangyaFirstListedRoom {
+  # The directory list is pushed when Multiplay opens; the first row is the lowest room id.
+  Invoke-PangyaDoubleClick -X 270 -Y 124
+  if (-not (Wait-PangyaText -X 570 -Y 475 -Width 80 -Height 65 -TimeoutSeconds 15)) {
+    throw 'first listed room did not open'
+  }
 }
 
 function New-PangyaDefaultVersusRoom {

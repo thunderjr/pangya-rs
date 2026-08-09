@@ -117,11 +117,11 @@ pub use us852_room::{
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailMultiplayerJoined, RetailMultiplayerLeft,
     RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
-    RetailPangSpent, RetailPlayerInfo, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomStatus, RetailRoomType, RetailShopJoin, RetailShopJoined, RoomCensusKind,
-    RoomJoinRejection, RoomListKind, RoomPlayerFlags,
+    RetailPangSpent, RetailPlayerInfo, RetailPracticeStart, RetailPurchaseItem,
+    RetailPurchaseRequest, RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
+    RetailRoomState, RetailRoomStatus, RetailRoomType, RetailShopJoin, RetailShopJoined,
+    RoomCensusKind, RoomJoinRejection, RoomListKind, RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 

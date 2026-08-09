@@ -653,19 +653,16 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     real client sitting in its own Single Player Practice Mode room is told it is in a versus room
     of one and leaves Start Game disabled. The settings belong on the room, beside its name.
 
-30. **The room directory never lists rooms** — **open.** A client that opens Multiplay sees an empty list even when rooms exist, so a real client can only ever be the host: it has no way to join one. The room list is served on request but never pushed, and nothing was found that the client sends to refresh it.
+30. **The room directory never lists rooms** — **resolved 2026-08-09.** Opening Multiplay sends client `0x0081`; the server now pushes the current `0x0047` initial list before acknowledging entry with `0x00f5`, matching the transition ordering the retail client accepts. A headless retail-wire account hosted room 1 while a fresh real U.S. 852 client opened Multiplay under `unknown_opcode_policy = "disconnect"`: the row rendered as `001`, `VS`, `Stroke`, `PangYa-RS`, `1/2`, Blue Lagoon. Double-clicking that row sent `0x0009`, joined successfully, and rendered both named players with the real account's **Ready** control. `Join-PangyaFirstListedRoom` preserves the learned UI path. Evidence: [`evidence/REAL_CLIENT_ROOM_DIRECTORY_2026-08-09.md`](evidence/REAL_CLIENT_ROOM_DIRECTORY_2026-08-09.md).
 
 31. **Account creation grants no ball** — **fixed.** `account create` grants a starter character
     and a club set; the equipped comet is left null, so every player enters a hole with no ball.
     Both test accounts were given one by hand to get past it. A starter comet belongs in the same
     grant as the club set.
 
-32. **Nothing starts a single-player practice hole** — **open, and its entry point is now known.** The lobby's own **Practice** button, not Start Game, opens a *Single Player Practice Mode* dialog offering Tutorial, Course Practice, Hole Repeat and Chip In Practice. Course Practice creates a room over the ordinary `0x0008` and shows a course picker whose arrows send `0x000a`; the room's Start Game stays disabled with one player. In `Acrisio-Filho/SuperSS-Dev` a practice room does not start through `0x000e` at all: `room::requestChangePlayerItemRoom` (`GAME/room.cpp`) calls `startGame` from its `TC_ALL` case, so the client's equipment-change opcode `0x000c` with type 7 is the trigger. That is the next thing to answer. The client creates the room and
-    then waits: it sends no `0x000e`, and its Start Game stays disabled in a room of one, both
-    before and after the room learned its own settings. Two mode bytes in the room record were
-    tried against its header — the first names the mode it renders and has no string for
-    practice, the second changed nothing — and neither gates Start. Upstream references do not
-    cover practice, so the next step is capture rather than inference.
+32. **Nothing starts a single-player practice hole** — **resolved 2026-08-09.** The lobby's own **Practice** button opens *Single Player Practice Mode* and Course Practice opens a separate Strategy dialog. The defect was the room record's two mode fields, not the start opcode. The GB.852-targeting `alter-pangya` defines `PRACTICE(19, uiType = 4)` and serializes UI family 4 in the early field plus semantic type 19 later (`RoomType.kt:8-28`, `Room.kt:145-174`). The server had echoed 19 early and zero later; the header showed `(null)`, skipped the Strategy dialog on later attempts, and left the in-room Start grey.
+
+    Practice records now carry UI mode 4 plus semantic mode 19 while the authoritative room profile retains 19. The real client displays the Strategy dialog with an active Start, sends ordinary create `0x0008` followed by start `0x000e`, loads Blue Lagoon, and renders a playable one-player tee. Its immediate loading equipment syncs are explicit too: room `0x000c` is documented by SuperSS-Dev `channel.cpp:9588-9619`, and channel `0x000b` by `packet_func_sv.h:52-55`/`packet_func_sv.cpp:379-395`; neither falls through the shipped disconnect policy. The full retail TCP solo test now creates type-19 Practice and exercises the exact 17-byte `TC_ALL` layout as an alternate start barrier. `Start-PangyaCoursePractice` captures the three-click real UI path and waits for the hole header. Evidence: [`evidence/REAL_CLIENT_PRACTICE_2026-08-09.md`](evidence/REAL_CLIENT_PRACTICE_2026-08-09.md).
 
 33. **Quest status `0x0151` is unanswered and blocks the client modally** — **resolved server-side 2026-08-09.** PacketDoc identifies a payload-free `0x0151` request with companion replies `0x0216` and `0x0225` (`gameservice/client/0151.ksy:4-14`). Its response schemas make an empty result unambiguous: time plus zero deltas for `0x0216`, then success, zero dates, zero quest ids, and zero slots for `0x0225` (`server/0216.ksy:16-25`, `server/0225.ksy:14-38`). SuperSS-Dev sends those two frames in that order (`UTIL/mgr_daily_quest.cpp:57-121`; `PACKET/packet_func_sv.cpp:5914-5939`).
 
@@ -675,16 +672,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 ## Immediate next actions
 
-1. **Find what starts a practice hole** (blocker 33), then use it to probe blocker 28. Step 7 is
-   met — the client creates a room *and* starts practice, and its header reads
-   `[Private] Single Player Practice Mode  1 hole (1/1)  No Time Limit`, with the private flag,
-   hole count and "no time limit" all echoed from what it asked for. But it never sends `0x000e`
-   in a room of one and its Start Game stays disabled, before and after the room learned its own
-   settings. In the two-player room Start lit up only once the second seat readied, so the
-   client appears not to offer Start for a room of one at all: something else starts practice,
-   and it is not a client opcode we have seen. A practice hole is a one-player roster and would
-   isolate the hole-load crash from everything the second seat contributes, which is why it is
-   worth finding.
+1. **Practice follow-ups are optional breadth, not a blocker.** Course Practice now follows Practice -> Course Practice -> Strategy/Start, sends create `0x0008` and start `0x000e`, and renders a playable one-player Blue Lagoon hole under the shipped disconnect policy. Hole Repeat, Tutorial, and Chip In Practice remain broader-mode work.
 2. **Capture the normal holed-out standings UI if it is required beyond direct settlement evidence.** A real-client stroke, committed two-seat result, visible restart-retained balance, and exact finish-frame replay test now pass. The exercised disconnect-forfeit route returns directly to the room rather than drawing the normal `0x0066` standings overlay.
 3. **Broaden beyond the proven one-hole versus path.** The server side is implemented and covered end to end by `game_retail_two_players_play_and_settle_one_versus_hole` (blocker 23), while the real client now accepts and plays that path. Multi-hole and other modes remain separate scope.
 2. **Finish remaining retail economy commands.** ClubSet/Ball equipment `0x0020` is durable and restart-validated; consume/repair remain.

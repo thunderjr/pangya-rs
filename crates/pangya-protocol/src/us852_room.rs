@@ -47,6 +47,8 @@ pub enum RetailRoomType {
     Tournament = 0x04,
     /// Pang battle.
     Battle = 0x0a,
+    /// One-player course practice.
+    Practice = 0x13,
 }
 
 impl RetailRoomType {
@@ -58,6 +60,7 @@ impl RetailRoomType {
             0x02 => Some(Self::Chat),
             0x04 => Some(Self::Tournament),
             0x0a => Some(Self::Battle),
+            0x13 => Some(Self::Practice),
             _ => None,
         }
     }
@@ -129,6 +132,48 @@ impl DecodePacket for RetailRoomCreate {
     }
 }
 
+/// Full room-equipment submission that starts one-player Practice, client opcode `0x000c` type 7.
+///
+/// # Provenance
+///
+/// SuperSS-Dev parses type `TC_ALL = 7` as character inventory id, caddie inventory id, ClubSet
+/// inventory id, and Ball catalog id in that order (`TYPE/pangya_game_st.h:2876-2906`,
+/// `GAME/channel.cpp:9588-9619`). Its `TC_ALL` branch validates/equips those values and calls
+/// `startGame` (`GAME/room.cpp:2601-3239`). Other `0x000c` types are deliberately not accepted by
+/// this model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPracticeStart {
+    /// Equipped character inventory id.
+    pub character_id: u32,
+    /// Equipped caddie inventory id, or zero.
+    pub caddie_id: u32,
+    /// Equipped ClubSet inventory id.
+    pub clubset_id: u32,
+    /// Equipped Ball catalog id.
+    pub ball_type_id: u32,
+}
+
+impl DecodePacket for RetailPracticeStart {
+    const OPCODE: u16 = 0x000c;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let kind = reader.u8()?;
+        if kind != 7 {
+            return Err(reader.invalid("room equipment submission is not TC_ALL (7)"));
+        }
+        Ok(Self {
+            character_id: reader.u32_le()?,
+            caddie_id: reader.u32_le()?,
+            clubset_id: reader.u32_le()?,
+            ball_type_id: reader.u32_le()?,
+        })
+    }
+}
+
 /// Room join request, client opcode `0x0009`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailRoomJoin {
@@ -179,13 +224,9 @@ pub struct RetailRoom {
     pub player_count: u8,
     /// Hole count.
     pub hole_count: u8,
-    /// A second mode byte whose meaning is not established; kept at zero.
+    /// Semantic room type. Practice uses 19 even though its UI-family mode is 4.
     pub play_mode: u8,
-    /// Mode, as the client's own create request spelled it.
-    ///
-    /// Carried verbatim rather than mapped onto [`RetailRoomType`]: the client has modes this
-    /// server does not model — its single-player practice room is one — and it renders its own
-    /// header and gates its Start button on getting the mode it asked for back.
+    /// UI-family mode. Practice and tournament both use 4 here.
     pub mode: u8,
     /// Room number.
     pub id: u16,
@@ -227,9 +268,7 @@ impl RetailRoom {
         writer.u32_le(100);
         writer.u32_le(100);
         writer.u32_le(self.owner_uid);
-        // A second mode byte, held at zero. Echoing the room's own mode into it was tried and
-        // changed nothing on screen, so what it selects is still unestablished; zero is what
-        // every room this server described carried before the room profile existed.
+        // The later semantic type is distinct from the earlier UI-family byte for Practice.
         writer.u8(self.play_mode);
         writer.u32_le(0); // artifact catalog id
         writer.u32_le(u32::from(self.natural_wind));
@@ -1475,6 +1514,26 @@ mod tests {
     }
 
     #[test]
+    fn practice_start_decodes_the_reference_equipment_order() {
+        let mut payload = vec![7];
+        for value in [257_u32, 0, 310, 0x1400_00c9] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let request =
+            decode_packet_payload::<RetailPracticeStart>(&payload, &profile(), ServiceKind::Game)
+                .expect("practice start");
+        assert_eq!(request.character_id, 257);
+        assert_eq!(request.caddie_id, 0);
+        assert_eq!(request.clubset_id, 310);
+        assert_eq!(request.ball_type_id, 0x1400_00c9);
+        payload[0] = 6;
+        assert!(
+            decode_packet_payload::<RetailPracticeStart>(&payload, &profile(), ServiceKind::Game)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn empty_daily_quest_sequence_matches_the_reference_widths() {
         decode_packet_payload::<RetailDailyQuestRequest>(&[], &profile(), ServiceKind::Game)
             .expect("empty request");
@@ -1731,6 +1790,10 @@ mod tests {
         assert_eq!(
             RetailRoomType::from_wire(0x0a),
             Some(RetailRoomType::Battle)
+        );
+        assert_eq!(
+            RetailRoomType::from_wire(0x13),
+            Some(RetailRoomType::Practice)
         );
         assert_eq!(RetailRoomType::from_wire(0x01), None);
         assert_eq!(RetailRoomType::from_wire(0xff), None);
