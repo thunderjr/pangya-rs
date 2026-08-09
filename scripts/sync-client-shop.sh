@@ -7,32 +7,51 @@ set -euo pipefail
 #
 # Two modes, selected by PANGYA_PATCH_MODE:
 #
-#   latest   (default) Emit a NEW one-entry archive that sits after the retail series and wins by
-#            ordering. Every retail archive stays byte-for-byte pristine, so a client never
-#            re-downloads a modified base, and a rolling shop update replaces only this one small
-#            file. ~730 KB rather than a 1.4 MB rebuilt copy of a retail archive.
+#   replace  (default) Rebuild an existing retail archive in place. The only mode that has ever
+#            reached a real client's shop.
 #
-#   replace  Rebuild an existing retail archive in place. What the first custom shop used. Kept
-#            because it is the only mode proven in front of a real client, and because a client
-#            that refuses to mount an unknown archive name would need it.
+#   latest   Emit a NEW one-entry archive numbered past the retail series, hoping to win by
+#            ordering. Cheaper in principle — every retail archive stays pristine and a shop
+#            update ships ~730 KB instead of a rebuilt 1.4 MB base — but see below: it does not
+#            work on the U.S. 852 client.
 #
-# Ordering is what makes `latest` work: the client loads the last archive in the series that
-# provides a file, which is why authoring projectg850gb.pak did nothing while projectg851gb.pak
-# still supplied `data/pangya_gb.iff`. That was measured, not assumed.
+# Two ordering facts, both measured in front of a real client, that read as one rule but are not:
+#
+#   1. Among the archives the client mounts, the LAST one to provide a file wins. Authoring
+#      projectg850gb.pak did nothing because the stock projectg851gb.pak still supplied
+#      `data/pangya_gb.iff`. (2026-08-09)
+#
+#   2. The client does NOT mount an archive numbered past its own patch level. Serving a pristine
+#      projectg851gb.pak alongside an authored projectg852gb.pak put the shop back to retail
+#      prices: 852 was published, hashed and served, and the client ignored it. (2026-08-10)
+#
+# So the mount set is bounded by the patch level, and `latest` can only ever win inside that
+# bound — where, by definition, a retail archive already exists to be replaced. That leaves
+# `replace` as the mode that works, and it is why PANGYA_CLIENT_PAK_NAME defaults per mode:
+# rebuilding must target the LAST archive the client mounts, which is projectg851gb.pak.
+#
+# Raising client_web.patch_number to lift the bound is not an option — the client then
+# re-requests the update list forever and never offers a login dialog. See
+# docs/SPEC_CLIENT_PATCH_DELIVERY.md.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 BASE_IFF=${PANGYA_BASE_IFF:-local-data/us851-data/pak-iff/pangya_gb.iff}
 BASE_PAK=${PANGYA_BASE_PAK:-local-data/custom-shop/projectg851gb-original.pak}
-PATCH_MODE=${PANGYA_PATCH_MODE:-latest}
+PATCH_MODE=${PANGYA_PATCH_MODE:-replace}
 CATALOG=${PANGYA_SHOP_CATALOG:-local-data/custom-shop/catalog.json}
 OUTPUT_DIR=${PANGYA_SHOP_OUTPUT_DIR:-local-data/custom-shop}
 SERVER_IFF_DIR=${PANGYA_SERVER_IFF_DIR:-$OUTPUT_DIR/iff-gb}
 PATCH_DIR=${PANGYA_PATCH_DIR:-local-data/us851}
-# In `latest` mode this names the NEW archive, which must sort after every retail one. The retail
-# U.S. series ends at projectg851gb.pak.
-PAK_NAME=${PANGYA_CLIENT_PAK_NAME:-projectg852gb.pak}
+# The default follows the mode, because the two modes want opposite ends of the series and a
+# single default would be silently wrong for one of them. `replace` must rebuild the LAST archive
+# the client mounts (projectg851gb.pak); `latest` must land past the series end.
+if [[ "${PANGYA_PATCH_MODE:-replace}" == "latest" ]]; then
+  PAK_NAME=${PANGYA_CLIENT_PAK_NAME:-projectg852gb.pak}
+else
+  PAK_NAME=${PANGYA_CLIENT_PAK_NAME:-projectg851gb.pak}
+fi
 
 required_inputs=("$BASE_IFF" "$CATALOG")
 if [[ "$PATCH_MODE" == "replace" ]]; then
