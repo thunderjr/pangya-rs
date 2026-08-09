@@ -20,6 +20,23 @@ impl PacketWriter {
     pub const fn new() -> Self {
         Self { bytes: Vec::new() }
     }
+    /// Diagnostic only: replaces every 4-byte-aligned all-zero word in `start..` with a
+    /// marker encoding that word's offset from `start`.
+    ///
+    /// Used to identify which field of a frame the client reads a value from: the value it
+    /// ends up holding names its own offset. Never enabled on a normal run.
+    #[doc(hidden)]
+    pub fn mark_zero_words_from(&mut self, start: usize) {
+        let mut offset = 0;
+        while start + offset + 4 <= self.bytes.len() {
+            let at = start + offset;
+            if self.bytes[at..at + 4] == [0, 0, 0, 0] {
+                let marker = 0xc000_0000_u32 | (offset as u32 & 0x00ff_ffff);
+                self.bytes[at..at + 4].copy_from_slice(&marker.to_le_bytes());
+            }
+            offset += 4;
+        }
+    }
     /// Writes raw bytes.
     pub fn bytes(&mut self, value: &[u8]) {
         self.bytes.extend_from_slice(value);

@@ -119,10 +119,14 @@ impl EncodePacket for RetailMatchStart {
                 writer.u8(0x00);
                 writer.u8(count);
                 for seat in players {
+                    let entry = writer.as_slice().len();
                     writer.u16_le(seat.room_number);
                     seat.player.encode_body(writer)?;
                     writer.bytes(&seat.start_time);
                     writer.u8(0); // cards in hand
+                    if std::env::var_os("PANGYA_MARK_ROSTER").is_some() {
+                        writer.mark_zero_words_from(entry);
+                    }
                 }
             }
             Self::TimeOnly { start_time } => {

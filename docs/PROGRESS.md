@@ -460,12 +460,48 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     | `+0x38` | the sixteen-byte `SYSTEMTIME` this server stamps on the roster |
     | `+0x48` | the player's nickname |
 
-    So the client is not copying our wire order — the start time precedes the name in its own
-    struct — it is filling named fields one by one, and every one we can see lands correctly.
-    The key is a field the client has nothing to fill from. The **mascot** was eliminated the
-    same way — a real mascot catalog id in the block left the key zero and the crash unchanged.
-    Two of the four candidates are now ruled out by experiment rather than by argument, leaving
-    the equipped-item slots and the title and guild fields in the trailing equipment slots.
+    **That reading was wrong, and the offsets above are measured from the wrong origin.** The
+    instruction folds the array base and the field offset into one displacement, so `0x656e` is
+    `array_base + key_offset` and neither is recoverable from the disassembly alone. Everything
+    tabulated above is relative to the key, not to the record.
+
+    The origin was pinned by measurement rather than argument. `PacketWriter::mark_zero_words_from`
+    — a diagnostic enabled only by the `PANGYA_MARK_ROSTER` environment variable — overwrites every
+    four-byte-aligned all-zero word of a roster entry with `0xc0000000 | its own offset`, so any
+    word the client copies names where it came from. One match start with it on gives:
+
+    | address | contains |
+    |---|---|
+    | `g + 0x6570` | the marker for entry offset `0x2f30`, then `0x2f34`, `0x2f38`, `0x2f3c` contiguously |
+    | `g + 0x6580` | *no* marker — entry `0x2f40` is not all-zero, and reads `00 00 00 30` |
+    | `g + 0x6584` | markers `0x2f44` through `0x2f70`, contiguous |
+    | `g + 0x65b4` | the sixteen-byte `SYSTEMTIME`, so the roster's start time is at entry `0x2f74` |
+
+    Three things follow, and they overturn the paragraph above:
+
+    - The client **does** copy our wire order, verbatim and contiguously. The record is the
+      roster entry.
+    - The entry is `0x2f74 + 16 + 1 = 0x2f85` bytes and the client's record stride is `0x2f84`,
+      the same thing without the trailing card-count byte. Our entry's **total width is right**.
+    - The key is read at `g + 0x656e`, which is entry offset **`0x2f2e`**. That is the number to
+      work from; `+0x00` in the older table is this offset, and the nickname the table put at
+      `+0x48` is really at entry `0x2f2e + 0x5e`.
+
+    `0x2f2e` lands twenty bytes past where this server starts the club-set block, inside
+    `ClubSetInfo`'s enchant slots. Moving the block twenty bytes later, so the club set's
+    inventory id landed exactly on `0x2f2e`, was tried and **the crash did not move** — so the
+    key is not simply a club-set id displaced by a missing twenty bytes, and that change was
+    reverted rather than left in.
+
+    Two size discrepancies against `SuperSS-Dev` are known and may account for the twenty:
+    its `UserEquip` is 116 bytes where this server's equipment block is 100 (its `skin_id[6]`,
+    `skin_typeid[6]`, `mascot_id` and `poster[2]` total 60 against eleven zeroed words here),
+    and its `MS_NUM_MAPS` is 22 where `HISTORY_COURSES` is 21. Neither can simply be corrected
+    in isolation: the entry's total width already matches the client's stride exactly, so any
+    twenty bytes added ahead of the club set have to come out of somewhere behind it.
+
+    The **mascot** was eliminated by experiment — a real mascot catalog id in the block left the
+    key zero and the crash unchanged — as was the **caddie**.
 
     Three further things were checked and are **not** the cause:
 
@@ -518,12 +554,12 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
 30. **The room directory never lists rooms** — **open.** A client that opens Multiplay sees an empty list even when rooms exist, so a real client can only ever be the host: it has no way to join one. The room list is served on request but never pushed, and nothing was found that the client sends to refresh it.
 
-31. **Account creation grants no ball** — **open.** `account create` grants a starter character
+31. **Account creation grants no ball** — **fixed.** `account create` grants a starter character
     and a club set; the equipped comet is left null, so every player enters a hole with no ball.
     Both test accounts were given one by hand to get past it. A starter comet belongs in the same
     grant as the club set.
 
-32. **Nothing starts a single-player practice hole** — **open.** The client creates the room and
+32. **Nothing starts a single-player practice hole** — **open, and its entry point is now known.** The lobby's own **Practice** button, not Start Game, opens a *Single Player Practice Mode* dialog offering Tutorial, Course Practice, Hole Repeat and Chip In Practice. Course Practice creates a room over the ordinary `0x0008` and shows a course picker whose arrows send `0x000a`; the room's Start Game stays disabled with one player. In `Acrisio-Filho/SuperSS-Dev` a practice room does not start through `0x000e` at all: `room::requestChangePlayerItemRoom` (`GAME/room.cpp`) calls `startGame` from its `TC_ALL` case, so the client's equipment-change opcode `0x000c` with type 7 is the trigger. That is the next thing to answer. The client creates the room and
     then waits: it sends no `0x000e`, and its Start Game stays disabled in a room of one, both
     before and after the room learned its own settings. Two mode bytes in the room record were
     tried against its header — the first names the mode it renders and has no string for

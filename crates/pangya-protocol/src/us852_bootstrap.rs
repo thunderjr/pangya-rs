@@ -1049,7 +1049,14 @@ impl RetailPlayerData {
         self.character.encode_body(writer);
         self.caddie.encode_body(writer);
         // Active club set: inventory id then catalog id, the same pair every other item
-        // block uses.
+        // block uses, followed by `ClubSetInfo`'s five stat slots and five enchant slots
+        // (`Acrisio-Filho/SuperSS-Dev`, `Server Lib/Game Server/TYPE/pangya_game_st.h`
+        // `struct ClubSetInfo`).
+        //
+        // The client takes its hole-load lookup key from entry offset `0x2f2e`, twenty bytes
+        // past where this block starts; moving the block there so the inventory id landed on
+        // that offset did not satisfy the lookup, so the twenty bytes are not simply missing
+        // from in front of it. See `docs/PROGRESS.md` blocker 28.
         writer.u32_le(self.equipment.club_set_uid);
         writer.u32_le(self.club_set_iff_id);
         for _ in 0..10 {
