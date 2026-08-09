@@ -940,6 +940,13 @@ SQLx requirements:
 - character ID, slot, inventory item ID, item type snapshot
 - unique `(character_id, slot)`
 
+> **Superseded.** This sketch covers only the 24 character-part slots. The wire also models
+> caddie, mascot, 5 aux parts, cut-in, 12 cards, 10 consumable slots and 6 decoration slots,
+> none of which persist today. [`SPEC_DURABLE_PLAYER_STATE.md`](SPEC_DURABLE_PLAYER_STATE.md)
+> replaces this table with a single `player_equipment_slots` table keyed
+> `(account_id, character_id, slot_family, slot_index)` and specifies the whole set as
+> requirements `DPS-010`–`DPS-062`.
+
 #### Match and progression
 
 `matches`
