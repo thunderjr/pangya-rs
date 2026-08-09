@@ -45,6 +45,7 @@ mod audit;
 mod auth;
 mod catalog;
 mod inventory;
+mod publish;
 mod server_status;
 pub mod session;
 mod shop;
@@ -155,6 +156,12 @@ pub fn router(state: AdminState) -> Router {
         .route("/catalog", get(catalog::list))
         .route("/catalog/meta", get(catalog::meta))
         .route("/shop", get(shop::list))
+        // Registered before `/shop/{type_id}` reads as an ordering dependency but is not one:
+        // axum matches static segments ahead of captures regardless of order.
+        .route("/shop/publish", get(publish::status).post(publish::enqueue))
+        .route("/shop/publish/document", get(publish::document))
+        .route("/shop/publish/claim", post(publish::claim))
+        .route("/shop/publish/{id}/finish", post(publish::finish))
         .route("/shop/{type_id}", put(shop::put).delete(shop::delete))
         .route("/accounts/{id}/inventory", post(inventory::grant))
         .route(
@@ -220,6 +227,7 @@ impl From<RepositoryError> for AdminError {
             RepositoryError::AccountInactive => Self::Conflict("account_inactive"),
             RepositoryError::DuplicateUsername => Self::Conflict("duplicate_username"),
             RepositoryError::DuplicateNickname => Self::Conflict("duplicate_nickname"),
+            RepositoryError::ShopPublishInFlight => Self::Conflict("publish_in_flight"),
             _ => Self::Storage,
         }
     }

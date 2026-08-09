@@ -803,6 +803,38 @@ pub enum CatalogPricing {
     FlatPang(u64),
 }
 
+impl CatalogKind {
+    /// The client table this family is authored from, when the family is authorable at all.
+    ///
+    /// `scripts/author-client-iff.py` names its tables by filename and this server names them
+    /// by kind, so one of the two has to hold the mapping or an operator-driven publish would
+    /// re-encode it a third time. It lives here because the catalog is what both halves agree
+    /// about.
+    ///
+    /// `None` marks a family that is parsed but must never be authored into a shop document:
+    /// [`Character`](Self::Character) because an owned character is a `characters` row rather
+    /// than inventory (see `docs/SPEC_SHOP_COVERAGE.md` SHOP-001), and [`Course`](Self::Course)
+    /// because a course is not an item at all.
+    #[must_use]
+    pub const fn authorable_client_table(self) -> Option<&'static str> {
+        match self {
+            Self::Character | Self::Course => None,
+            Self::ClubSet => Some("ClubSet.iff"),
+            Self::Ball => Some("Ball.iff"),
+            Self::Consumable => Some("Item.iff"),
+            Self::CharacterPart => Some("Part.iff"),
+            Self::Caddie => Some("Caddie.iff"),
+            Self::CaddieItem => Some("CaddieItem.iff"),
+            Self::Mascot => Some("Mascot.iff"),
+            Self::Card => Some("Card.iff"),
+            Self::Furniture => Some("Furniture.iff"),
+            Self::Skin => Some("Skin.iff"),
+            Self::HairStyle => Some("HairStyle.iff"),
+            Self::SetItem => Some("SetItem.iff"),
+        }
+    }
+}
+
 /// Family tags accepted for a real client table, as the high byte of each type ID.
 ///
 /// A single client table may legitimately span more than one tag, so this is a set rather
@@ -1294,6 +1326,39 @@ pub const fn crate_boundary() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// The console renders authoring documents from this mapping and
+    /// `scripts/author-client-iff.py` parses them by filename, so a name that disagrees produces
+    /// a document the script refuses — or worse, one that authors the wrong table.
+    ///
+    /// Pinned by value rather than by count so a rename cannot pass by staying the same size.
+    #[test]
+    fn authorable_tables_match_the_authoring_script() {
+        use super::CatalogKind::*;
+        // Every table in `SERVER_TABLE_KINDS` except Character and Course, which the script
+        // parses for the server manifest but which are never shop rows.
+        let expected = [
+            (ClubSet, Some("ClubSet.iff")),
+            (Ball, Some("Ball.iff")),
+            (Consumable, Some("Item.iff")),
+            (CharacterPart, Some("Part.iff")),
+            (Caddie, Some("Caddie.iff")),
+            (CaddieItem, Some("CaddieItem.iff")),
+            (Mascot, Some("Mascot.iff")),
+            (Card, Some("Card.iff")),
+            (Furniture, Some("Furniture.iff")),
+            (Skin, Some("Skin.iff")),
+            (HairStyle, Some("HairStyle.iff")),
+            (SetItem, Some("SetItem.iff")),
+            // An owned character is a `characters` row, not inventory (SHOP-001), and a course
+            // is not an item at all. Authoring either would produce rows nothing can sell.
+            (Character, None),
+            (Course, None),
+        ];
+        for (kind, table) in expected {
+            assert_eq!(kind.authorable_client_table(), table, "{kind:?}");
+        }
+    }
+
     /// The client tables are the only source of item identity and price, so a regression here
     /// silently empties the shop. This builds a record with the measured header layout and
     /// checks both that a sellable row is priced and that the two "not really for sale" markers

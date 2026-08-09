@@ -16,8 +16,9 @@ use pangya_domain::{
     AdminAuditEvent, AdminAuthenticationRecord, AdminEquipmentUpdate, AdminItemGrant,
     AdminItemUpdate, AdminLeaderboardEntry, AdminLedgerEntry, AdminLedgerSource, AdminMatchEntry,
     AdminMutationError, AdminPage, AdminRepository, AdminSession, AdminSessionId,
-    BalanceAssignment, CourseId, NewAdminAuditEvent, NewAdminSession, ResolveAdminSession,
-    ShopOverlay, ShopOverride,
+    BalanceAssignment, ClaimedShopPublish, CourseId, NewAdminAuditEvent, NewAdminSession,
+    NewShopPublishRequest, ResolveAdminSession, ShopOverlay, ShopOverride, ShopPublishOutcome,
+    ShopPublishSummary,
 };
 
 impl PgRepository {
@@ -1014,6 +1015,145 @@ impl PgRepository {
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(revision)
     }
+
+    async fn enqueue_shop_publish_inner(
+        &self,
+        actor: AccountId,
+        request: NewShopPublishRequest,
+    ) -> Result<i64, RepositoryError> {
+        // `uq_shop_publish_active` is what actually enforces one-at-a-time; this INSERT simply
+        // reports its refusal as the domain error rather than a raw storage fault, so an
+        // operator sees "already in flight" instead of "storage operation failed".
+        sqlx::query_scalar!(
+            "INSERT INTO shop_publish_requests \
+             (requested_by, overlay_revision, document, document_sha256, offer_count) \
+             VALUES ($1, $2, $3, $4, $5) \
+             RETURNING id",
+            actor.get(),
+            request.overlay_revision,
+            request.document,
+            &request.document_sha256[..],
+            request.offer_count
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| match &error {
+            sqlx::Error::Database(database)
+                if database.constraint() == Some("uq_shop_publish_active") =>
+            {
+                RepositoryError::ShopPublishInFlight
+            }
+            _ => repository_db_error(error),
+        })
+    }
+
+    async fn claim_shop_publish_inner(
+        &self,
+    ) -> Result<Option<ClaimedShopPublish>, RepositoryError> {
+        // `SKIP LOCKED` rather than a plain UPDATE: the unique index already caps the queue at
+        // one row, but a second worker polling concurrently should find nothing instead of
+        // blocking on the first worker's row lock for the length of an authoring run.
+        let row = sqlx::query!(
+            "UPDATE shop_publish_requests SET status = 'running', started_at = now() \
+             WHERE id = ( \
+               SELECT id FROM shop_publish_requests WHERE status = 'pending' \
+               ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED \
+             ) \
+             RETURNING id, overlay_revision, document, document_sha256"
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        row.map(|row| {
+            Ok(ClaimedShopPublish {
+                id: row.id,
+                overlay_revision: row.overlay_revision,
+                document: row.document,
+                document_sha256: row
+                    .document_sha256
+                    .try_into()
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn finish_shop_publish_inner(
+        &self,
+        id: i64,
+        outcome: ShopPublishOutcome,
+    ) -> Result<(), RepositoryError> {
+        let (status, detail, pak_name, pak_digest) = match outcome {
+            ShopPublishOutcome::Published {
+                client_pak_name,
+                client_pak_sha256,
+            } => (
+                "published",
+                None,
+                Some(client_pak_name),
+                Some(client_pak_sha256),
+            ),
+            ShopPublishOutcome::Failed { detail } => ("failed", Some(detail), None, None),
+        };
+        // Constrained to a running row so a late report from a worker whose request was already
+        // resolved cannot rewrite history.
+        let outcome = sqlx::query!(
+            "UPDATE shop_publish_requests \
+             SET status = $2, detail = $3, client_pak_name = $4, client_pak_sha256 = $5, \
+                 finished_at = now() \
+             WHERE id = $1 AND status = 'running'",
+            id,
+            status,
+            detail,
+            pak_name,
+            pak_digest.as_ref().map(|digest| &digest[..])
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        if outcome.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_shop_publishes_inner(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ShopPublishSummary>, RepositoryError> {
+        // `document` is deliberately not selected: it is hundreds of kilobytes per row and no
+        // console view needs it, so a listing cannot fetch one by accident.
+        let rows = sqlx::query!(
+            "SELECT id, requested_by, overlay_revision, document_sha256, offer_count, status, \
+                    detail, client_pak_name, requested_at, started_at, finished_at \
+             FROM shop_publish_requests ORDER BY id DESC LIMIT $1",
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ShopPublishSummary {
+                    id: row.id,
+                    requested_by: AccountId::new(row.requested_by)
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                    overlay_revision: row.overlay_revision,
+                    document_sha256: row
+                        .document_sha256
+                        .try_into()
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                    offer_count: row.offer_count,
+                    status: row.status,
+                    detail: row.detail,
+                    client_pak_name: row.client_pak_name,
+                    requested_at: row.requested_at.into(),
+                    started_at: row.started_at.map(Into::into),
+                    finished_at: row.finished_at.map(Into::into),
+                })
+            })
+            .collect()
+    }
 }
 
 impl PgRepository {
@@ -1211,6 +1351,35 @@ impl AdminRepository for PgRepository {
         item_type_id: ItemTypeId,
     ) -> RepositoryFuture<'_, Result<i64, RepositoryError>> {
         Box::pin(self.observed(self.clear_shop_override_inner(item_type_id)))
+    }
+
+    fn enqueue_shop_publish(
+        &self,
+        actor: AccountId,
+        request: NewShopPublishRequest,
+    ) -> RepositoryFuture<'_, Result<i64, RepositoryError>> {
+        Box::pin(self.observed(self.enqueue_shop_publish_inner(actor, request)))
+    }
+
+    fn claim_shop_publish(
+        &self,
+    ) -> RepositoryFuture<'_, Result<Option<ClaimedShopPublish>, RepositoryError>> {
+        Box::pin(self.observed(self.claim_shop_publish_inner()))
+    }
+
+    fn finish_shop_publish(
+        &self,
+        id: i64,
+        outcome: ShopPublishOutcome,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.finish_shop_publish_inner(id, outcome)))
+    }
+
+    fn list_shop_publishes(
+        &self,
+        limit: i64,
+    ) -> RepositoryFuture<'_, Result<Vec<ShopPublishSummary>, RepositoryError>> {
+        Box::pin(self.observed(self.list_shop_publishes_inner(limit)))
     }
 
     fn list_leaderboard(

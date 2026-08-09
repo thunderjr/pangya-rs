@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE shop_publish_requests SET status = $2, detail = $3, client_pak_name = $4, client_pak_sha256 = $5, finished_at = now() WHERE id = $1 AND status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "60c494397473555bb4b1d075a92b7daf15b949649a43aa2ad94173c0abacd4d7"
+}

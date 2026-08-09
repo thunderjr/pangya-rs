@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE shop_publish_requests SET status = 'running', started_at = now() WHERE id = ( SELECT id FROM shop_publish_requests WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED ) RETURNING id, overlay_revision, document, document_sha256",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "overlay_revision",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "document",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "document_sha256",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a0cb684ae1e76612d9f6894ab50931af7e2026a911ebd641883e889b285d5d67"
+}

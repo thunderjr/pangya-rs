@@ -760,6 +760,181 @@ async fn the_shop_overlay_round_trips_and_bumps_its_revision(pool: PgPool) {
         .expect("clearing an absent override is a no-op");
 }
 
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_publish_request_is_claimed_once_and_reports_the_archive_it_shipped(pool: PgPool) {
+    use pangya_domain::{NewShopPublishRequest, ShopPublishOutcome};
+
+    let repository = PgRepository::new(pool);
+    let actor = admin(&repository, "publishadmin").await;
+
+    assert!(
+        repository
+            .claim_shop_publish()
+            .await
+            .expect("claiming an empty queue is not an error")
+            .is_none(),
+        "an empty queue must read as nothing to do, not as a failure"
+    );
+
+    // Deliberately in an order and spacing that `jsonb` would normalise away: keys out of
+    // Postgres's internal order, no spaces after the colons. The worker re-hashes exactly what
+    // it writes to disk, so a column that reorders these bytes fails every publish.
+    let document = r#"{"version":1,"managed_tables":["Ball.iff"],"offers":[]}"#;
+    let digest = [7_u8; 32];
+    let id = repository
+        .enqueue_shop_publish(
+            actor,
+            NewShopPublishRequest {
+                overlay_revision: 12,
+                document: document.to_owned(),
+                document_sha256: digest,
+                offer_count: 3,
+            },
+        )
+        .await
+        .expect("enqueued");
+
+    // One at a time: a second queued request would either race two workers over one client tree
+    // or silently discard the first operator's intent.
+    let second = repository
+        .enqueue_shop_publish(
+            actor,
+            NewShopPublishRequest {
+                overlay_revision: 13,
+                document: document.to_owned(),
+                document_sha256: [9_u8; 32],
+                offer_count: 4,
+            },
+        )
+        .await;
+    assert!(
+        matches!(second, Err(RepositoryError::ShopPublishInFlight)),
+        "a second request must be refused as in-flight, got {second:?}"
+    );
+
+    let claimed = repository
+        .claim_shop_publish()
+        .await
+        .expect("claimed")
+        .expect("a pending request is claimable");
+    assert_eq!(claimed.id, id);
+    assert_eq!(claimed.overlay_revision, 12);
+    assert_eq!(claimed.document_sha256, digest);
+    // Byte-for-byte, not merely equivalent JSON. `scripts/publish-shop.sh` writes this to a file
+    // and refuses to author unless its SHA-256 matches `document_sha256`, so any normalisation
+    // in the storage layer turns every publish into a digest mismatch.
+    assert_eq!(
+        claimed.document, document,
+        "the claimed document must be the exact bytes that were enqueued"
+    );
+
+    // Claiming is what moves pending to running, so a second worker finds nothing rather than
+    // authoring the same document twice.
+    assert!(
+        repository
+            .claim_shop_publish()
+            .await
+            .expect("claimed")
+            .is_none(),
+        "a running request must not be claimable again"
+    );
+
+    repository
+        .finish_shop_publish(
+            id,
+            ShopPublishOutcome::Published {
+                client_pak_name: "projectg851gb.pak".to_owned(),
+                client_pak_sha256: [3_u8; 32],
+            },
+        )
+        .await
+        .expect("reported");
+
+    // A late report from a worker whose request already resolved must not rewrite history.
+    let late = repository
+        .finish_shop_publish(
+            id,
+            ShopPublishOutcome::Failed {
+                detail: "arrived after the fact".to_owned(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(late, Err(RepositoryError::NotFound)),
+        "reporting a resolved request must refuse, got {late:?}"
+    );
+
+    let history = repository.list_shop_publishes(10).await.expect("listed");
+    assert_eq!(history.len(), 1);
+    let row = &history[0];
+    assert_eq!(row.status, "published");
+    assert_eq!(row.client_pak_name.as_deref(), Some("projectg851gb.pak"));
+    assert_eq!(row.document_sha256, digest);
+    assert_eq!(row.offer_count, 3);
+    assert!(row.finished_at.is_some());
+
+    // Resolving the previous request is what releases the queue.
+    repository
+        .enqueue_shop_publish(
+            actor,
+            NewShopPublishRequest {
+                overlay_revision: 13,
+                document: document.to_owned(),
+                document_sha256: [9_u8; 32],
+                offer_count: 4,
+            },
+        )
+        .await
+        .expect("a resolved queue accepts the next request");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn a_failed_publish_keeps_its_reason_and_frees_the_queue(pool: PgPool) {
+    use pangya_domain::{NewShopPublishRequest, ShopPublishOutcome};
+
+    let repository = PgRepository::new(pool);
+    let actor = admin(&repository, "failadmin").await;
+    repository
+        .enqueue_shop_publish(
+            actor,
+            NewShopPublishRequest {
+                overlay_revision: 1,
+                document: "{}".to_owned(),
+                document_sha256: [1_u8; 32],
+                offer_count: 0,
+            },
+        )
+        .await
+        .expect("enqueued");
+    let claimed = repository
+        .claim_shop_publish()
+        .await
+        .expect("claimed")
+        .expect("pending");
+    repository
+        .finish_shop_publish(
+            claimed.id,
+            ShopPublishOutcome::Failed {
+                detail: "authoring refused: type 0x14000000 was not a client shop row".to_owned(),
+            },
+        )
+        .await
+        .expect("reported");
+
+    let history = repository.list_shop_publishes(10).await.expect("listed");
+    assert_eq!(history[0].status, "failed");
+    assert!(
+        history[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("0x14000000")),
+        "a failure must keep the worker's reason: {:?}",
+        history[0].detail
+    );
+    assert!(history[0].client_pak_name.is_none());
+    assert!(history[0].finished_at.is_some());
+}
+
 #[test]
 fn an_empty_overlay_resolves_to_exactly_the_catalog_answer() {
     use pangya_domain::{ItemSale, ShopOverlay};

@@ -3060,6 +3060,12 @@ pub enum RepositoryError {
     /// Refusing is the only safe outcome: wrapping would silently destroy a balance.
     #[error("balance would overflow")]
     BalanceOverflow,
+    /// A shop publish is already queued or running.
+    ///
+    /// Enqueuing a second would either race two workers over one client tree or silently
+    /// discard the first operator's intent, so it refuses instead.
+    #[error("a shop publish is already in flight")]
+    ShopPublishInFlight,
     /// Storage is temporarily or permanently unavailable.
     #[error("storage operation failed: {0}")]
     Storage(StorageFault),
@@ -3315,6 +3321,40 @@ pub trait AdminRepository: Send + Sync {
         &self,
         item_type_id: ItemTypeId,
     ) -> RepositoryFuture<'_, Result<i64, RepositoryError>>;
+
+    /// Enqueues a request to re-author the client's shop tables from `document`.
+    ///
+    /// Refuses with [`RepositoryError::ShopPublishInFlight`] when a request is already
+    /// outstanding: two workers authoring one client tree would race on the staged archive.
+    fn enqueue_shop_publish(
+        &self,
+        actor: AccountId,
+        request: NewShopPublishRequest,
+    ) -> RepositoryFuture<'_, Result<i64, RepositoryError>>;
+
+    /// Claims the outstanding request for a worker, returning it with its document.
+    ///
+    /// Returns `None` when nothing is pending. Claiming is what moves `pending` to `running`,
+    /// so a crashed worker leaves a visibly stuck request rather than a silently lost one.
+    fn claim_shop_publish(
+        &self,
+    ) -> RepositoryFuture<'_, Result<Option<ClaimedShopPublish>, RepositoryError>>;
+
+    /// Records the outcome of a claimed request.
+    fn finish_shop_publish(
+        &self,
+        id: i64,
+        outcome: ShopPublishOutcome,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
+    /// Returns the newest requests, newest first, without their documents.
+    ///
+    /// The documents are hundreds of kilobytes each and no console view needs them, so the
+    /// listing deliberately cannot fetch one by accident.
+    fn list_shop_publishes(
+        &self,
+        limit: i64,
+    ) -> RepositoryFuture<'_, Result<Vec<ShopPublishSummary>, RepositoryError>>;
 
     /// Returns course records, best first.
     fn list_leaderboard(
@@ -3609,6 +3649,86 @@ pub struct ShopOverride {
     pub enabled: Option<bool>,
     /// What the server charges. `None` inherits the client's own price.
     pub pang: Option<u64>,
+}
+
+/// A request to re-author the client's shop tables, as the console renders it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewShopPublishRequest {
+    /// The overlay revision `document` was rendered at.
+    pub overlay_revision: i64,
+    /// The catalog document `scripts/author-client-iff.py` will consume, as JSON text.
+    ///
+    /// Carried as text rather than a parsed value for the same reason
+    /// [`NewAdminAuditEvent::detail`] is: the digest below is over exact bytes, and a parse and
+    /// re-serialize round trip is free to move them.
+    pub document: String,
+    /// SHA-256 over `document`, so the worker can prove it authored the bytes the operator
+    /// approved rather than a re-render of them.
+    pub document_sha256: [u8; 32],
+    /// How many offers the document carries, kept out of the JSON so a listing can show it.
+    pub offer_count: i32,
+}
+
+/// A publish request handed to a worker, with the document it must author.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedShopPublish {
+    /// Row identity, used to report the outcome.
+    pub id: i64,
+    /// The overlay revision this document was rendered at.
+    pub overlay_revision: i64,
+    /// The catalog document to author, as JSON text.
+    pub document: String,
+    /// Expected digest of the document.
+    pub document_sha256: [u8; 32],
+}
+
+/// What a worker reports back about a claimed request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShopPublishOutcome {
+    /// The archive was authored and staged.
+    Published {
+        /// The archive name the client will download it as.
+        client_pak_name: String,
+        /// Its SHA-256, matching what `/launcher/v1/manifest` will serve.
+        client_pak_sha256: [u8; 32],
+    },
+    /// Authoring or staging refused, with the reason an operator needs.
+    Failed {
+        /// Operator-facing explanation. A failure that says nothing is indistinguishable from a
+        /// worker that never ran.
+        detail: String,
+    },
+}
+
+/// One row of the publish history, without its document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShopPublishSummary {
+    /// Row identity.
+    pub id: i64,
+    /// Who asked for it.
+    pub requested_by: AccountId,
+    /// The overlay revision the document was rendered at.
+    pub overlay_revision: i64,
+    /// Digest of the document this attempt carried.
+    ///
+    /// Answering "are players' clients showing the current shop?" compares this against a fresh
+    /// render. Comparing revisions instead would be wrong: an overlay edit that cancels out an
+    /// earlier one leaves the revision higher but the shop identical.
+    pub document_sha256: [u8; 32],
+    /// How many offers it carried.
+    pub offer_count: i32,
+    /// `pending`, `running`, `published` or `failed`.
+    pub status: String,
+    /// The worker's outcome text, when it reported one.
+    pub detail: Option<String>,
+    /// The archive name that reached the client tree, on success.
+    pub client_pak_name: Option<String>,
+    /// When it was enqueued.
+    pub requested_at: SystemTime,
+    /// When a worker claimed it.
+    pub started_at: Option<SystemTime>,
+    /// When it reached a terminal state.
+    pub finished_at: Option<SystemTime>,
 }
 
 /// The complete set of overrides, plus the revision it was read at.
