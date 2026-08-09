@@ -9,8 +9,8 @@
 //! a client. The totals agree either way.
 
 use crate::{
-    CHARACTER_BLOCK_BYTES, CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError,
-    PacketEncodeError, PacketReader, PacketWriter, RetailCharacter,
+    CHARACTER_BLOCK_BYTES, CHARACTER_PARTS, CompatibilityProfile, DecodePacket, EncodePacket,
+    PacketDecodeError, PacketEncodeError, PacketReader, PacketWriter, RetailCharacter,
 };
 
 /// Fixed byte width of a room name on the wire.
@@ -548,8 +548,18 @@ impl RetailEquipmentSlot {
 /// and drops that tail.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailEquipmentRequested {
-    /// Full 513-byte character/part/card body, not yet mutable in this server.
-    CharacterParts,
+    /// The worn part set out of the 513-byte character body.
+    ///
+    /// Only the fields this server can act on are lifted out; the rest of the block — cards,
+    /// stats, cut-in, the two large unknown runs — is still read and dropped by the bounded
+    /// decoder, because nothing persists them and inventing a model for them would be a guess.
+    ///
+    /// Layout from `pangbox/server` `pangya/player.go:141-159` (`PlayerCharacterData`):
+    /// `CharTypeID u32 @0x000`, `ID u32 @0x004`, `HairColor u8 @0x008`, `Shirt u8 @0x009`, two
+    /// unknown bytes, `PartTypeIDs [24]u32 @0x00c`, `PartIDs [24]u32 @0x06c`, then 216 unknown
+    /// bytes before the aux parts. The whole body is 513 bytes, which is the width
+    /// `RetailCharacter` already writes.
+    CharacterParts(RetailCharacterParts),
     /// Owned caddie id.
     Caddie(u32),
     /// Ten consumable catalog ids.
@@ -579,6 +589,63 @@ pub enum RetailEquipmentRequested {
     },
 }
 
+/// The worn part set the client sent inside a character block.
+///
+/// Deliberately not the whole block. This carries what the server can honestly hold: which
+/// character the outfit belongs to, its hair colour, and the 24 part slots as paired
+/// `(type id, owned row id)`. A slot the client leaves at zero is an empty slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailCharacterParts {
+    /// Catalog id of the character wearing these parts.
+    pub character_type_id: u32,
+    /// Owned character row.
+    pub character_id: u32,
+    /// Hair colour index, persisted on `characters` but still sent as zero in the bootstrap.
+    pub hair_color: u8,
+    /// Catalog id per slot, `0` for an empty slot.
+    pub part_type_ids: [u32; CHARACTER_PARTS],
+    /// Owned row per slot, `0` when the client named no owned row.
+    pub part_uids: [u32; CHARACTER_PARTS],
+}
+
+impl RetailCharacterParts {
+    /// Bytes of the character block this reads before the tail it drops.
+    const PREFIX_BYTES: usize = 0x0c + CHARACTER_PARTS * 4 * 2;
+    /// Total width of the block — the same constant `RetailCharacter` writes, so the two cannot
+    /// drift apart.
+    const BODY_BYTES: usize = CHARACTER_BLOCK_BYTES;
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, PacketDecodeError> {
+        let character_type_id = reader.u32_le()?;
+        let character_id = reader.u32_le()?;
+        let hair_color = reader.u8()?;
+        // Shirt, then two bytes this project has never identified.
+        let _shirt = reader.u8()?;
+        let _unknown = reader.array::<2>()?;
+        let mut part_type_ids = [0_u32; CHARACTER_PARTS];
+        for value in &mut part_type_ids {
+            *value = reader.u32_le()?;
+        }
+        let mut part_uids = [0_u32; CHARACTER_PARTS];
+        for value in &mut part_uids {
+            *value = reader.u32_le()?;
+        }
+        // Everything after the part arrays — aux parts, cut-in, stats, mastery, three card
+        // groups — is consumed so the frame is fully accounted for, and dropped because nothing
+        // persists it. Reading it into a model this server cannot honour would be the guess
+        // this decoder exists to avoid.
+        let _tail = reader
+            .array::<{ RetailCharacterParts::BODY_BYTES - RetailCharacterParts::PREFIX_BYTES }>()?;
+        Ok(Self {
+            character_type_id,
+            character_id,
+            hair_color,
+            part_type_ids,
+            part_uids,
+        })
+    }
+}
+
 /// Equipment change, client opcode `0x0020`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetailEquipmentUpdate {
@@ -600,7 +667,9 @@ impl DecodePacket for RetailEquipmentUpdate {
         let slot = RetailEquipmentSlot::from_tag(tag)
             .ok_or_else(|| reader.invalid("unknown equipment slot"))?;
         let requested = match slot {
-            RetailEquipmentSlot::CharacterParts => RetailEquipmentRequested::CharacterParts,
+            RetailEquipmentSlot::CharacterParts => {
+                RetailEquipmentRequested::CharacterParts(RetailCharacterParts::decode(reader)?)
+            }
             RetailEquipmentSlot::Caddie => RetailEquipmentRequested::Caddie(reader.u32_le()?),
             RetailEquipmentSlot::Consumables => {
                 let mut values = [0_u32; RETAIL_CONSUMABLE_SLOTS];
@@ -1797,5 +1866,57 @@ mod tests {
         );
         assert_eq!(RetailRoomType::from_wire(0x01), None);
         assert_eq!(RetailRoomType::from_wire(0xff), None);
+    }
+
+    /// The part arrays sit at fixed offsets inside a 513-byte block, and reading them one field
+    /// early or late still yields plausible-looking u32s. This pins the offsets against the
+    /// reference layout rather than trusting that the decode "looked right".
+    #[test]
+    fn a_character_block_yields_its_part_slots_from_the_documented_offsets() {
+        let mut body = vec![0_u8; 1 + CHARACTER_BLOCK_BYTES];
+        body[0] = 0; // slot tag: character parts
+        let block = &mut body[1..];
+        block[0x000..0x004].copy_from_slice(&0x0400_0002_u32.to_le_bytes()); // CharTypeID
+        block[0x004..0x008].copy_from_slice(&4242_u32.to_le_bytes()); // ID
+        block[0x008] = 7; // HairColor
+        block[0x009] = 3; // Shirt, read and dropped
+        // PartTypeIDs @0x00c, PartIDs @0x06c
+        block[0x00c..0x010].copy_from_slice(&0x0800_0400_u32.to_le_bytes());
+        block[0x00c + 23 * 4..0x00c + 24 * 4].copy_from_slice(&0x0800_04ff_u32.to_le_bytes());
+        block[0x06c..0x070].copy_from_slice(&909_u32.to_le_bytes());
+
+        let update = crate::decode_packet_payload::<RetailEquipmentUpdate>(
+            &body,
+            &CompatibilityProfile::US_852,
+            crate::ServiceKind::Game,
+        )
+        .expect("decode");
+        let RetailEquipmentRequested::CharacterParts(parts) = update.requested else {
+            panic!("expected character parts, got {:?}", update.requested);
+        };
+        assert_eq!(parts.character_type_id, 0x0400_0002);
+        assert_eq!(parts.character_id, 4242);
+        assert_eq!(parts.hair_color, 7);
+        assert_eq!(parts.part_type_ids[0], 0x0800_0400);
+        assert_eq!(
+            parts.part_type_ids[23], 0x0800_04ff,
+            "the last slot must not be clipped"
+        );
+        assert_eq!(parts.part_uids[0], 909);
+        assert_eq!(parts.part_type_ids[1], 0, "an untouched slot stays empty");
+    }
+
+    /// A body one byte short must fail rather than decode a shifted outfit.
+    #[test]
+    fn a_truncated_character_block_is_refused() {
+        let body = vec![0_u8; CHARACTER_BLOCK_BYTES]; // tag + 512, one short
+        assert!(
+            crate::decode_packet_payload::<RetailEquipmentUpdate>(
+                &body,
+                &CompatibilityProfile::US_852,
+                crate::ServiceKind::Game,
+            )
+            .is_err()
+        );
     }
 }
