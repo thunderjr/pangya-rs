@@ -31,7 +31,7 @@ pub use game::{
     RETAIL_ACCEPTED_SESSION_OPCODES, RETAIL_C2S_FIRST_SHOT_READY, RETAIL_EXPLICIT_SOCIAL_REFUSALS,
     RETAIL_RECENT_PLAYER_BYTES, RETAIL_RECENT_PLAYERS, RetailChannelJoinNotice,
     RetailChannelJoined, RetailClientException, RetailFirstShotReady, RetailLoginBonusRequest,
-    RetailLoginBonusStatus, RetailNewSessionKey, RetailNewSessionKeyRequest, RetailPlayerHistory,
+    RetailLoginBonusStatus, RetailMessageServerList, RetailMessageServerListRequest, RetailNewSessionKey, RetailNewSessionKeyRequest, RetailPlayerHistory,
     RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailRecentPlayerSlot,
     RetailSelectChannel, RetailServerEntry, RetailServerList, RetailServerListRequest,
     RetailServerTime, RetailServerTimeRequest, RetailSubServerConnect, RetailSubServerEntry,
@@ -43,11 +43,11 @@ pub use login::{
     LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
     LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN,
     LOGIN_STATUS_SET_CHARACTER, LOGIN_STATUS_SET_NICKNAME, LoginKey, LoginRequest, LoginResult,
-    LoginSuccess, MAX_LOGIN_SERVER_CHANNELS, NICKNAME_CHECK_BAD_WORD,
-    NICKNAME_CHECK_DATABASE_ERROR, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_INVALID,
-    NICKNAME_CHECK_NOT_ENOUGH_COOKIE, NICKNAME_CHECK_SAME_NICKNAME, NICKNAME_CHECK_SUCCESS,
-    NicknameCheckResult, ReconnectRequest, SelectCharacter, SelectServer, ServerChannelEntry,
-    SessionKey, SetNickname, us852_login_hello,
+    LoginSuccess, MAX_LOGIN_SERVER_CHANNELS, MessageServerEntry, MessageServerList,
+    NICKNAME_CHECK_BAD_WORD, NICKNAME_CHECK_DATABASE_ERROR, NICKNAME_CHECK_IN_USE,
+    NICKNAME_CHECK_INVALID, NICKNAME_CHECK_NOT_ENOUGH_COOKIE, NICKNAME_CHECK_SAME_NICKNAME,
+    NICKNAME_CHECK_SUCCESS, NicknameCheckResult, ReconnectRequest, SelectCharacter, SelectServer,
+    ServerChannelEntry, SessionKey, SetNickname, us852_login_hello,
 };
 pub use m4_room::{
     MAX_ROOM_MEMBERS, MAX_ROOM_SUMMARIES, RoomChatEvent, RoomChatRequest, RoomCommand,
@@ -100,8 +100,8 @@ pub use reader::PacketReader;
 pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
 pub use social::{
     GameChat, GameChatResponse, LoungeAction, LoungeActionResponse, LoungeEnterRequest,
-    LoungeEnterResponse, MacroUpdate, MessageServerList, MessageServerListRequest, NoteSend,
-    TypingIndicator, TypingIndicatorResponse, UserCharacterInfoResponse,
+    LoungeEnterResponse, MacroUpdate, MessageServerListRequest, NoteSend, TypingIndicator,
+    TypingIndicatorResponse, UserCharacterInfoResponse,
     UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
     UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
     UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,

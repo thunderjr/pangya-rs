@@ -1327,6 +1327,14 @@ dependencies = [
 [[package]]
 name = "pangya-message"
 version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "pangya-protocol",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
 
 [[package]]
 name = "pangya-observability"

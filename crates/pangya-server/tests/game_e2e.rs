@@ -1642,6 +1642,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 starter: starter(1, 0x1000_0000),
                 allowed_character_types: vec![0x0400_0000],
                 game_server: AdvertisedGameServer {
+                    message_server: None,
                     id: 7,
                     name: "Synthetic M3".to_owned(),
                     ipv4: "127.0.0.1".to_owned(),

@@ -609,6 +609,12 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 starter: config.starter.clone(),
                 allowed_character_types: config.allowed_character_type_ids.clone(),
                 game_server: AdvertisedGameServer {
+                    message_server: Some(pangya_protocol::MessageServerEntry {
+                        name: b"PangYa-RS Message".to_vec(), id: 1, max_users: config.game_capacity,
+                        num_users: 0, ip_address: b"127.0.0.1".to_vec(), port: 30303,
+                        unknown2: pangya_protocol::UnknownBytes([0; 2]), flags: pangya_protocol::UnknownBytes([0; 2]),
+                        unknown3: pangya_protocol::UnknownBytes([0; 14]), char_icon: 0,
+                    }),
                     id: config.game_id,
                     name: config.game_name.clone(),
                     ipv4: game_ipv4,

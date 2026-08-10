@@ -17,9 +17,9 @@ use pangya_domain::{
     ServiceKind as DomainServiceKind, SetupState, SourceAddressPrefix, StarterGrant, Username,
 };
 use pangya_protocol::{
-    ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket,
-    EmptyMessageServerList, EncodePacket, ErrorClass, FrameCodec, GameServerEntry, GameServerList,
-    GhostLogin, InboundFrame, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
+    ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket, EncodePacket,
+    ErrorClass, FrameCodec, GameServerEntry, GameServerList, GhostLogin, InboundFrame,
+    LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
     LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN, LoginKey, LoginResult,
     LoginSuccess, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_SUCCESS, NicknameCheckResult,
     OutboundFrame, PacketEncodeError, PacketReader, ReconnectRequest, SelectCharacter,
@@ -215,6 +215,8 @@ impl LoginObserver for NoopLoginObserver {}
 /// Configured GameService advertisement used only by LoginService.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedGameServer {
+    /// MessageService endpoint advertised alongside this GameService.
+    pub message_server: Option<pangya_protocol::MessageServerEntry>,
     /// Protocol server identifier.
     pub id: u16,
     /// Fixed-width server display name.
@@ -1314,7 +1316,15 @@ where
             .await
             .map_err(|_| LoginRuntimeError::Repository)?;
         self.send(framed, &ChatMacros { values: macros }).await?;
-        self.send(framed, &EmptyMessageServerList).await?;
+        let message_servers = self.config.game_server.message_server.clone().map_or_else(
+            || pangya_protocol::MessageServerList {
+                servers: Vec::new(),
+            },
+            |server| pangya_protocol::MessageServerList {
+                servers: vec![server],
+            },
+        );
+        self.send(framed, &message_servers).await?;
         self.send(framed, &self.server_list()).await?;
         Ok(bearer)
     }

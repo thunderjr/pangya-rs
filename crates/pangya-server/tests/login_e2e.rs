@@ -176,6 +176,7 @@ async fn start_with_executor(
                 starter: starter(),
                 allowed_character_types: vec![0x0400_0000],
                 game_server: AdvertisedGameServer {
+                    message_server: None,
                     id: 7,
                     name: game_name.to_owned(),
                     ipv4: "127.0.0.1".to_owned(),
@@ -1488,6 +1489,7 @@ async fn over_grace_noncancellable_worker_returns_bounded_shutdown_error(pool: P
                 starter: starter(),
                 allowed_character_types: vec![0x0400_0000],
                 game_server: AdvertisedGameServer {
+                    message_server: None,
                     id: 7,
                     name: "Synthetic".to_owned(),
                     ipv4: "127.0.0.1".to_owned(),

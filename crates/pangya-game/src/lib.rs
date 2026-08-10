@@ -83,6 +83,7 @@ use pangya_protocol::{
     RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailMessageServerList, RetailMessageServerListRequest,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
     RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
@@ -1935,6 +1936,27 @@ where
                                 let generated = generate_handover(established.account_id, DomainServiceKind::Game, source.clone(), SystemTime::now()).map_err(|_| GameRuntimeError::Authentication)?;
                                 self.repository.issue(generated.record).await.map_err(|_| GameRuntimeError::Authentication)?;
                                 self.send(&mut framed, &RetailNewSessionKey { unknown: UnknownBytes([0; 4]), session_key: generated.token.expose_secret().as_bytes().to_vec().into() }).await?;
+                            } else if frame.opcode == RetailMessageServerListRequest::OPCODE {
+                                if decode_packet_payload::<RetailMessageServerListRequest>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                ).is_err() {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let response = RetailMessageServerList {
+                                    servers: vec![pangya_protocol::MessageServerEntry {
+                                        name: b"PangYa-RS Message".to_vec(), id: 1,
+                                        max_users: 200, num_users: 0,
+                                        ip_address: b"127.0.0.1".to_vec(), port: 30303,
+                                        unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                                        flags: pangya_protocol::UnknownBytes([0; 2]),
+                                        unknown3: pangya_protocol::UnknownBytes([0; 14]), char_icon: 0,
+                                    }],
+                                };
+                                if let Err(error) = self.send(&mut framed, &response).await {
+                                    break Err(error);
+                                }
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -2171,7 +2193,16 @@ where
                                 }
                             } else if self.config.retail_bootstrap && frame.opcode == <MessageServerListRequest as DecodePacket>::OPCODE {
                                 if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
-                                self.send(&mut framed, &MessageServerList).await?;
+                                self.send(&mut framed, &MessageServerList {
+                                    servers: vec![pangya_protocol::MessageServerEntry {
+                                        name: b"PangYa-RS Message".to_vec(), id: 1,
+                                        max_users: 200, num_users: 0,
+                                        ip_address: b"127.0.0.1".to_vec(), port: 30303,
+                                        unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                                        flags: pangya_protocol::UnknownBytes([0; 2]),
+                                        unknown3: pangya_protocol::UnknownBytes([0; 14]), char_icon: 0,
+                                    }],
+                                }).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == <LoungeAction as DecodePacket>::OPCODE {
                                 let action = decode_packet_payload::<LoungeAction>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
                                 if !lounge_actions.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
