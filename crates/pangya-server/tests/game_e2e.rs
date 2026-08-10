@@ -377,6 +377,9 @@ impl<'a> MakeWriter<'a> for CaptureWriter {
     }
 }
 
+/// Installs the process-wide capture once; callers must filter structured records by their own
+/// match/account correlation key and must never clear the shared buffer while tests run in
+/// parallel.
 fn tracing_capture() -> Arc<Mutex<Vec<u8>>> {
     static CAPTURE: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
     Arc::clone(CAPTURE.get_or_init(|| {
@@ -871,10 +874,18 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
 /// multi-client test; the assertions that matter here are about persisted state.
 /// Reads whatever the server has already sent, as (opcode, body) pairs.
 async fn drain_frames(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<(u16, Vec<u8>)> {
+    drain_frames_with_grace(stream, key, budget.min(Duration::from_millis(400))).await
+}
+
+/// Uses a caller-selected grace period for terminal frames whose persistence commit may lag the
+/// final client packet. Ordinary drains stay short so the full-card test remains bounded.
+async fn drain_frames_with_grace(
+    stream: &mut TcpStream,
+    key: u8,
+    budget: Duration,
+) -> Vec<(u16, Vec<u8>)> {
     let mut seen = Vec::new();
-    // Local encrypted frames arrive well within this bound; cap long drain windows so the full
-    // eighteen-hole regression remains bounded even when a peer has no further frames.
-    let deadline = tokio::time::Instant::now() + budget.min(Duration::from_millis(400));
+    let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
         match tokio::time::timeout(remaining.min(Duration::from_millis(400)), async {
@@ -6160,7 +6171,9 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool) {
     let traces = tracing_capture();
-    traces.lock().expect("trace lock").clear();
+    // The process-wide test subscriber is shared by parallel sqlx tests. Never clear it here:
+    // another test may be writing concurrently; assertions must select their own correlation
+    // identity instead.
     let account = create_account(&pool, "RetailBoot", 1, 0x1000_0000).await;
     let metrics = Arc::new(M2Metrics::default());
     let service = Arc::new(
@@ -7978,13 +7991,14 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 /// A real client cannot start a versus room holding fewer players than its capacity, and the
 /// smallest capacity its Make Room dialog offers is two. So the only match a real client can ever
 /// begin is a two-player one, and this drives exactly that over TCP: two authenticated retail
-/// clients, a full versus room, both ready, then a whole hole played turn by turn and settled.
+/// clients, a full versus room, both ready, then all eighteen holes played turn by turn and
+/// settled.
 ///
 /// This supersedes the pin that the retail start built a `BeginSoloMatch` for whoever pressed
 /// Start. What it asserts instead is the property that pin existed to expose: **both** accounts
-/// are participants and both are paid, so a versus hole can be scored.
+/// are participants and both are paid once for the completed full card.
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
+async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
         .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
@@ -8446,16 +8460,9 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         );
         assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
     }
-    // Keep every frame each client consumes from its own final-hole submission onward. The
-    // terminal room event can arrive in either this first post-guest read or a later read while
-    // the coordinator commits; asserting one contiguous post-guest window loses that history.
-    let mut host_final_history = host_waiting.clone();
-    let mut visitor_final_history = visitor_waiting.clone();
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
     let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
-    host_final_history.extend(first_next.clone());
     let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
-    visitor_final_history.extend(second_next.clone());
     assert_retail_hole_intro_order(&first_next, "hole 2 host");
     assert_retail_hole_intro_order(&second_next, "hole 2 visitor");
     assert!(
@@ -8467,6 +8474,8 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         "hole 2 uses introduction, not turn handover: {second_next:04x?}"
     );
 
+    let mut host_final_history = Vec::new();
+    let mut visitor_final_history = Vec::new();
     for hole in 2..=18 {
         // Every next hole starts with the authoritative opening-player introduction.
         if hole > 2 {
@@ -8531,45 +8540,58 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
         let visitor_waiting =
             drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
-        for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
-            assert_eq!(
-                frames
-                    .iter()
-                    .filter(|(opcode, _)| *opcode == 0x0063)
-                    .count(),
-                1,
-                "hole {hole} {who} receives one current-hole handover: {frames:04x?}"
+        if hole < 18 {
+            for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(|(opcode, _)| *opcode == 0x0063)
+                        .count(),
+                    1,
+                    "hole {hole} {who} receives one current-hole handover: {frames:04x?}"
+                );
+                assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+            }
+            send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
+        } else {
+            // The first final-hole finisher receives only its hole marker. The second completion
+            // drives one retained terminal room event, which emits one marker and standings to
+            // each captured socket; keep this history separate from earlier holes.
+            host_final_history.extend(host_waiting);
+            visitor_final_history.extend(visitor_waiting);
+            send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
+            host_final_history.extend(
+                drain_frames_with_grace(&mut host, host_key, Duration::from_millis(2000)).await,
             );
-            assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+            visitor_final_history.extend(
+                drain_frames_with_grace(&mut visitor, visitor_key, Duration::from_millis(2000))
+                    .await,
+            );
         }
-        send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
         salt = hole_salt;
     }
-    for (stream, key, who, history) in [
-        (&mut host, host_key, "host", &mut host_final_history),
-        (
-            &mut visitor,
-            visitor_key,
-            "visitor",
-            &mut visitor_final_history,
-        ),
+    for (who, history) in [
+        ("host", &host_final_history),
+        ("visitor", &visitor_final_history),
     ] {
-        history.extend(drain_frames(stream, key, Duration::from_millis(2000)).await);
+        // The first final-hole finisher also receives the ordinary nonterminal 0x0065 before the
+        // opponent finishes. Identify the terminal marker by its required adjacent 0x0066 rather
+        // than counting every 0x0065 in the final-hole trace.
         let terminal_pairs = history
             .windows(2)
             .filter(|pair| pair[0].0 == 0x0065 && pair[1].0 == 0x0066)
             .count();
+        let match_finish_count = history
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0066)
+            .count();
         assert_eq!(
             terminal_pairs, 1,
-            "{who} receives exactly one terminal 0065/0066 pair across final-hole history: {history:04x?}"
+            "{who} receives exactly one terminal 0065/0066 pair: {history:04x?}"
         );
         assert_eq!(
-            history
-                .iter()
-                .filter(|(opcode, _)| *opcode == 0x0066)
-                .count(),
-            1,
-            "{who} receives exactly one final standings frame: {history:04x?}"
+            match_finish_count, 1,
+            "{who} receives exactly one terminal 0066 for the final hole: {history:04x?}"
         );
     }
 
@@ -8658,15 +8680,24 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     assert!(player_keys.iter().all(|key| *key != commit_key));
 
     let logged = String::from_utf8_lossy(&traces.lock().expect("traces").clone()).into_owned();
+    // sqlx runs this integration target in parallel and the test subscriber is process-wide. The
+    // match UUID is the structured correlation boundary; never count terminal registrations from
+    // the whole capture, which can include another test's settlement.
+    let match_logged = logged
+        .lines()
+        .filter(|line| line.contains(&format!("match_id={match_id}")))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        logged.contains(&format!("match_id={match_id}"))
-            && logged.contains(&format!("result_key={commit_key}")),
-        "observer records the committed settlement identity"
+        match_logged.contains(&format!("result_key={commit_key}")),
+        "observer records the committed settlement identity for this match: {match_logged}"
     );
     assert_eq!(
-        logged.matches("stroke terminal payload registered").count(),
+        match_logged
+            .matches("stroke terminal payload registered")
+            .count(),
         2,
-        "observer records one registered terminal payload per seat"
+        "observer records one valid registered terminal payload per seat for this match: {match_logged}"
     );
 
     // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.

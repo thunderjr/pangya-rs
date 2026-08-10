@@ -4558,18 +4558,20 @@ where
         // connection has already advanced to another card. Match ID, durable settlement key, and
         // generation are all checked before any wire frame is emitted.
         let identity = (delivery.result.match_id(), delivery.result.result_key());
-        self.observer.stroke_terminal_payload(
-            GameConnectionId(connection_id.get()),
-            identity.0,
-            identity.1,
-            delivery.generation,
-        );
         if context.match_id != delivery.result.match_id()
             || !Self::accepts_terminal_generation(delivery.generation, *terminal_generation)
             || terminal_identity.is_some_and(|current| current == identity)
         {
             return Ok(RoomEventEffect::Remain);
         }
+        // Log only an accepted terminal payload. A retained item from an older generation or
+        // another match is rejected above and must not appear as a valid registration in logs.
+        self.observer.stroke_terminal_payload(
+            GameConnectionId(connection_id.get()),
+            identity.0,
+            identity.1,
+            delivery.generation,
+        );
         let handled = self
             .handle_room_event(
                 framed,

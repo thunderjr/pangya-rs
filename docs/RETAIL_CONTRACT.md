@@ -309,7 +309,7 @@ in `crates/pangya-server/tests/game_e2e.rs`:
 | `game_retail_bootstrap_emits_the_reference_derived_sequence` | 5871 | hello, `0x0002` auth, the `0x0044`×4 / `0x0070` / `0x0071` / `0x0072` / `0x0073` / `0x004d` / `0x0095` / `0x0096` order, and the `"852.00"` version string |
 | `game_retail_room_management_over_tcp` | 5968 | create/join/settings, census, team, resync, paired invites, kick/`0x004c`, malformed rejection, and leave |
 | `game_retail_match_plays_and_settles_one_hole` | 6114 | one-player Practice compatibility path: start, hole intro, turn frames, hole finish, settlement |
-| `game_retail_two_players_play_and_settle_one_versus_hole` | 6273 | two authenticated clients: alternating turns, shot relay, and 18-hole whole-card settlement with per-hole `0x0053` introductions and one Pang/EXP ledger row each |
+| `game_retail_two_players_play_and_settle_full_card` | 7978 | two authenticated clients: alternating turns, shot relay, and 18-hole whole-card settlement with per-hole `0x0053` introductions and one Pang/EXP ledger row each |
 
 **Retail paths with no end-to-end test**: `0x001d` purchase, `0x0020` equipment update,
 `0x0140`/`0x00b5`/`0x00b7`/`0x00d3`/`0x00cc` lobby services, `0x016e` login bonus, `0x009c`
@@ -537,7 +537,7 @@ a mechanical move with no behaviour change and should land as its own commit.
 - Docs: `PROVENANCE.md` row 15, `docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md`, ADR-0013.
 
 **Evidence required first**
-1. `game_retail_two_players_play_and_settle_one_versus_hole` covers the happy path already.
+1. `game_retail_two_players_play_and_settle_full_card` covers the happy path already.
 2. **New**: retail-wire forfeit coverage. Retail has no give-up opcode routed, so a forfeit
    can only be driven by disconnect or turn timeout — both must be proven to produce the same
    truthful `WinnerByForfeit` settlement the synthetic path proves today.

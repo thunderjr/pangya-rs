@@ -7,9 +7,9 @@ channel, reaches the lobby, opens the shop and buys an item, and creates and joi
 protocol it speaks is the real U.S. 852 one, derived from the vendored `pangbox` references and
 corrected against the client itself.
 
-A two-player versus hole plays and settles over that same wire — in the test suite, and between
-two instances of `pangya-test-client` against the release binary. Putting a real client in one
-of those two seats is the open gate.
+A two-player versus full card plays and settles over that same wire — in the test suite, and
+between two instances of `pangya-test-client` against the release binary. Putting a real client
+in one of those two seats is the open gate.
 
 The project also carries a generated `0x7f**` synthetic protocol from before a client was
 available. It is redundant in places and is being removed; see
@@ -49,14 +49,14 @@ Each of these was driven from an unmodified U.S. 852 client. The evidence is in
 | Channel entry and lobby | avatar and menu bar render; login bonus, recent-player history, and ten documented session opcodes answered |
 | Shop and My Room | catalog-priced purchase: balance debited, item in inventory, bought clubs rendered on the character |
 | Rooms | create, join, leave, list, ready, and a 341-byte member census that re-sends whenever the roster changes |
-| A two-player versus hole | **server side only.** Proven over TCP by `game_retail_two_players_play_and_settle_one_versus_hole` and by two `pangya-test-client` seats against the release binary; the real client's acceptance of it is the open gate |
+| A two-player versus full card | **server side only.** Proven over TCP by `game_retail_two_players_play_and_settle_full_card` and by two `pangya-test-client` seats against the release binary; the real client's acceptance of it is the open gate |
 
 ## What is not implemented
 
 - **Room chat, settings changes, and kick.** No handler. The roster itself does stay live: a
   membership or ready change re-sends the census.
-- **Multi-hole and multi-mode matches.** One hole, and versus only. Tournament, battle, and
-  chat rooms are accepted and then run as versus.
+- **Multi-mode matches.** Tournament, battle, and chat rooms are accepted and then run as
+  versus; their mode-specific rules and wire flows are not implemented.
 - **Retail give-up.** A concession has no route; a forfeit can only arrive as a disconnect or
   a turn timeout.
 - **Retail consume, repair, and durable equipment changes.** `0x0020` reports the equipment
