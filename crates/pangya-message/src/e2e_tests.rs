@@ -45,8 +45,8 @@ fn social_store() -> MemoryStore {
         guild_id: None,
         guild_name: vec![],
     });
-    store.add_friend(1, 2).expect("friends");
-    store.confirm_friend(1, 2).expect("friend confirmation");
+    store.add_friend(1, 2).expect("friend request");
+    store.confirm_friend(2, 1).expect("friend confirmation");
     store
 }
 
@@ -206,7 +206,7 @@ async fn failed_response_send_disconnects_and_cleans_up_presence() {
             guild_name: vec![],
         });
         store.add_friend(1, id).expect("friend request");
-        store.confirm_friend(1, id).expect("friend confirmation");
+        store.confirm_friend(id, 1).expect("friend confirmation");
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -275,7 +275,8 @@ async fn two_clients_receive_presence_and_friend_chat() {
         guild_id: None,
         guild_name: vec![],
     });
-    store.confirm_friend(1, 2).expect("friends");
+    store.add_friend(1, 2).expect("friend request");
+    store.confirm_friend(2, 1).expect("friends");
     let mut alice = MessageSession::new(store.clone());
     let mut bob = MessageSession::new(store);
     alice

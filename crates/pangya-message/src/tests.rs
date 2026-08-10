@@ -113,7 +113,7 @@ fn packetdoc_status_friend_entry_round_trips_without_single_hole_assumptions() {
 }
 
 #[test]
-fn super_ss_friend_entry_preserves_channel_status_relationship_and_block_fields() {
+fn packetdoc_friend_entry_tail_stays_opaque_against_super_ss_projection() {
     let entry = FriendEntry {
         nickname: b"Bob".to_vec(),
         alias: b"Friend".to_vec(),
@@ -135,15 +135,51 @@ fn super_ss_friend_entry_preserves_channel_status_relationship_and_block_fields(
             total: 1,
             current: 1,
         },
-        entries: vec![entry.clone()],
+        entries: vec![entry],
     }
     .encode_payload()
     .expect("encode");
-    let decoded = ServerPacket::decode(0x30, &encoded).expect("decode");
-    let ServerPacket::FriendList { entries, .. } = decoded else {
-        panic!("friend page")
-    };
-    assert_eq!(entries[0], entry);
+    // PacketDoc 0x0102 is nickname[22], alias[25], uid:u32, opaque[104].
+    assert_eq!(&encoded[2 + 1 + 2 + 4 + 22 + 25 + 4..], vec![0; 104]);
+}
+
+#[test]
+fn superss_k4t_presence_fixture_uses_only_established_0115_fields() {
+    let packet = status_packet(
+        7,
+        Presence::Online,
+        &ChannelInfo {
+            room_number: -1,
+            room_type: -1,
+            server_id: 9,
+            channel_id: 3,
+            channel_name: b"Lobby".to_vec(),
+        },
+    );
+    let payload = packet.encode_payload().expect("encode");
+    let mut expected = vec![0x15, 0x01, 7, 0, 0, 0];
+    expected.extend(4_u32.to_le_bytes());
+    expected.push(1);
+    expected.extend((-1_i16).to_le_bytes());
+    expected.extend((-1_i32).to_le_bytes());
+    expected.extend(9_u32.to_le_bytes());
+    expected.push(3);
+    expected.extend(b"Lobby");
+    expected.extend([0; 59]);
+    assert_eq!(payload, expected);
+}
+
+#[test]
+fn superss_confirm_result_fixture_is_status_and_user_id() {
+    assert_eq!(
+        ServerPacket::ConfirmResult {
+            status: 0,
+            user_id: 2,
+        }
+        .encode_payload()
+        .expect("SuperSS 0x0109"),
+        [0x09, 0x01, 0, 0, 0, 0, 2, 0, 0, 0]
+    );
 }
 
 #[tokio::test]
@@ -176,11 +212,30 @@ async fn confirm_requires_pending_incoming_request() {
         Err(MessageError::Rejected)
     );
     store.add_friend(2, 1).expect("incoming request");
-    assert!(
+    assert_eq!(
         session
             .handle(ClientPacket::ConfirmFriend { user_id: 2 })
-            .await
-            .is_ok()
+            .await,
+        Ok(vec![ServerPacket::ConfirmResult {
+            status: 0,
+            user_id: 2
+        }])
+    );
+
+    let mut requester = MessageSession::new(store.clone());
+    requester
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 2,
+            user_nickname: b"Bob".to_vec(),
+        })
+        .await
+        .expect("auth requester");
+    assert_eq!(
+        requester
+            .handle(ClientPacket::ConfirmFriend { user_id: 1 })
+            .await,
+        Err(MessageError::Rejected),
+        "the requester cannot confirm its own outgoing request"
     );
 }
 

@@ -128,7 +128,20 @@ async fn postgres_social_state_survives_store_restart_and_claims_once(pool: PgPo
             .expect("inactive rejected")
     );
     store.add_friend(1, 2).await.expect("request");
-    store.confirm_friend(1, 2).await.expect("confirm");
+    assert!(
+        !store
+            .has_pending_friend_request(1, 2)
+            .await
+            .expect("outgoing")
+    );
+    assert!(
+        store
+            .has_pending_friend_request(2, 1)
+            .await
+            .expect("incoming")
+    );
+    assert!(store.confirm_friend(1, 2).await.is_err());
+    store.confirm_friend(2, 1).await.expect("confirm");
     store
         .set_online(2, Presence::Online, ChannelInfo::offline())
         .await
@@ -267,8 +280,9 @@ async fn encrypted_production_multi_client_survives_service_restart(pool: PgPool
     }
     let store = PostgresStore::new(pool.clone());
     store.add_friend(1, 2).await.expect("friend request");
+    assert!(store.confirm_friend(1, 2).await.is_err());
     store
-        .confirm_friend(1, 2)
+        .confirm_friend(2, 1)
         .await
         .expect("friend confirmation");
 

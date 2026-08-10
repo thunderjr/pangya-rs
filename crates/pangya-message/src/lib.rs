@@ -54,6 +54,14 @@ pub const MAX_TEXT_BYTES: usize = 512;
 pub const MAX_NICKNAME_BYTES: usize = 22;
 /// Maximum friend rows emitted in one page.
 pub const FRIEND_PAGE_SIZE: usize = 30;
+/// Maximum friend rows materialized for one hello/list response.
+pub const MAX_FRIEND_ROWS: usize = FRIEND_PAGE_SIZE * 10;
+/// Maximum queued messages claimed or presence events emitted in one pass.
+pub const MAX_DELIVERY_BATCH: usize = 30;
+/// Maximum pending/live/in-flight chat rows retained for one recipient in memory.
+pub const MAX_QUEUED_MESSAGES: usize = 1024;
+/// Maximum replay nonces retained by a session.
+pub const MAX_REPLAY_NONCES: usize = 256;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Page {
@@ -123,29 +131,10 @@ impl FriendEntry {
         // sent separately as subtype 0x0115; do not invent fields here.
         fixed(out, &self.alias, 25);
         out.extend(self.user_id.to_le_bytes());
-        let tail_start = out.len();
-        out.resize(tail_start + 104, 0);
-        // SuperSS emits the channel projection followed by status and the friend/guild
-        // relationship bytes. Keep PacketDoc's opaque tail width, but preserve the
-        // reference-established fields instead of silently zeroing them.
-        out[tail_start..tail_start + 2].copy_from_slice(&self.channel.room_number.to_le_bytes());
-        out[tail_start + 2..tail_start + 6].copy_from_slice(&self.channel.room_type.to_le_bytes());
-        out[tail_start + 6..tail_start + 10].copy_from_slice(&self.channel.server_id.to_le_bytes());
-        out[tail_start + 10] = self.channel.channel_id as u8;
-        fixed_at(out, tail_start + 11, &self.channel.channel_name, 64);
-        out[tail_start + 75] = self.state as u8;
-        out[tail_start + 76] = 0xff; // SuperSS cUnknown_flag.
-        out[tail_start + 77] = match self.relationship {
-            Relationship::Friend => 1,
-            Relationship::GuildMember => 2,
-            Relationship::FriendAndGuild => 3,
-        };
-        out[tail_start + 78] = status_bits(self.state, self.blocked);
-        out[tail_start + 79] = match self.relationship {
-            Relationship::Friend => 1,
-            Relationship::GuildMember => 2,
-            Relationship::FriendAndGuild => 2,
-        };
+        // PacketDoc deliberately leaves the complete 104-byte tail opaque. SuperSS's
+        // ChannelPlayerInfo projection is useful behavioural evidence for 0x0115, but it is
+        // not authority to reinterpret this 0x0102/0x0104 field. Keep it byte-exact and opaque.
+        out.extend([0; 104]);
     }
 }
 
@@ -421,6 +410,11 @@ pub enum ServerPacket {
         status: u32,
         entry: FriendEntry,
     },
+    /// SuperSS/K4T-established confirmation result (0x0109).
+    ConfirmResult {
+        status: u32,
+        user_id: u32,
+    },
     /// Reference-described 0x0115 status packet. Its eleven-byte, one-byte, and 64-byte
     /// regions are intentionally opaque: PacketDoc does not assign them presence semantics.
     Presence {
@@ -495,10 +489,14 @@ impl ServerPacket {
             }
             Self::FriendRequest { status, entry } => {
                 o.extend(0x104_u16.to_le_bytes());
-                // 0x104 starts with one u32 result, followed by the same packed
-                // FriendInfo/CPI projection as 0x102. `status` is that result.
+                // 0x104 starts with one u32 result, followed by the same PacketDoc entry.
                 o.extend(status.to_le_bytes());
                 entry.encode(&mut o);
+            }
+            Self::ConfirmResult { status, user_id } => {
+                o.extend(0x109_u16.to_le_bytes());
+                o.extend(status.to_le_bytes());
+                o.extend(user_id.to_le_bytes());
             }
             Self::Presence {
                 user_id,
@@ -594,6 +592,10 @@ impl ServerPacket {
                 let entry = FriendEntry::decode(&mut r)?;
                 Self::FriendRequest { status, entry }
             }
+            0x109 => Self::ConfirmResult {
+                status: r.u32()?,
+                user_id: r.u32()?,
+            },
             0x115 => Self::Presence {
                 user_id: r.u32()?,
                 unknown_f: r.array()?,
@@ -646,54 +648,17 @@ impl FriendEntry {
         let nickname = r.fixed(22)?;
         let alias = r.fixed(25)?;
         let user_id = r.u32()?;
-        let room_number = i16::from_le_bytes(r.array()?);
-        let room_type = i32::from_le_bytes(r.array()?);
-        let server_id = u32::from_le_bytes(r.array()?);
-        let channel_id = r.u8()? as i8;
-        let channel_name = r.fixed(64)?;
-        let state_wire = r.u8()?;
-        let state = Presence::from_wire(state_wire);
-        let unknown = r.u8()?;
-        let relationship_wire = r.u8()?;
-        let relationship = match relationship_wire {
-            2 => Relationship::GuildMember,
-            3 => Relationship::FriendAndGuild,
-            _ => Relationship::Friend,
-        };
-        let bits = r.u8()?;
-        let _level_or_flag = r.u8()?;
-        r.take(104 - 80)?;
-        let opaque_zero = room_number == 0
-            && room_type == 0
-            && server_id == 0
-            && channel_id == 0
-            && channel_name.is_empty()
-            && state_wire == 0
-            && unknown == 0
-            && relationship_wire == 0
-            && bits == 0;
+        // The 104-byte region is intentionally not decoded: PacketDoc assigns no semantics to
+        // any of it, so do not create a hybrid PacketDoc/SuperSS interpretation.
+        r.take(104)?;
         Ok(Self {
             nickname,
             alias,
             user_id,
-            channel: ChannelInfo {
-                room_number,
-                room_type,
-                server_id,
-                channel_id,
-                channel_name,
-            },
-            state: if opaque_zero {
-                Presence::Offline
-            } else {
-                state
-            },
-            relationship: if opaque_zero {
-                Relationship::Friend
-            } else {
-                relationship
-            },
-            blocked: !opaque_zero && bits & (1 << 4) != 0,
+            channel: ChannelInfo::offline(),
+            state: Presence::Offline,
+            relationship: Relationship::Friend,
+            blocked: false,
         })
     }
 }
@@ -730,17 +695,6 @@ impl TryFrom<u8> for Presence {
 }
 
 impl Presence {
-    fn from_wire(v: u8) -> Self {
-        match v {
-            0 => Self::Playing,
-            1 => Self::Idle,
-            3 => Self::Busy,
-            4 => Self::Online,
-            5 => Self::Offline,
-            _ => Self::Offline,
-        }
-    }
-
     fn from_stored(v: i16) -> Result<Self, MessageError> {
         match v {
             0 => Ok(Self::Playing),
@@ -818,23 +772,6 @@ fn string(out: &mut Vec<u8>, value: &[u8], max: usize) -> Result<(), MessageErro
     out.extend((value.len() as u16).to_le_bytes());
     out.extend(value);
     Ok(())
-}
-fn fixed_at(out: &mut [u8], start: usize, value: &[u8], width: usize) {
-    let n = value.len().min(width);
-    out[start..start + n].copy_from_slice(&value[..n]);
-}
-fn status_bits(status: Presence, blocked: bool) -> u8 {
-    let mut bits = match status {
-        Presence::Playing => 1 << 5,
-        Presence::Idle => 1 << 6,
-        Presence::Busy => 1 << 7,
-        Presence::Online => 1 << 1,
-        Presence::Offline => 0,
-    } | (1 << 2);
-    if blocked {
-        bits |= 1 << 4;
-    }
-    bits
 }
 fn fixed(out: &mut Vec<u8>, value: &[u8], width: usize) {
     let n = value.len().min(width);
@@ -989,7 +926,7 @@ impl MessageStore for MemoryStore {
             .map_err(|_| MessageError::Rejected)?
             .friends
             .get(&(owner, friend))
-            .is_some_and(|f| f.pending))
+            .is_some_and(|f| f.pending && f.requested_by == Some(friend)))
     }
     async fn block_friend(&self, a: u32, b: u32) -> Result<(), MessageError> {
         MemoryStore::block_friend(self, a, b)
@@ -1128,8 +1065,12 @@ impl MessageStore for PostgresStore {
         Ok(true)
     }
     async fn friends(&self, id: u32) -> Result<Vec<FriendEntry>, MessageError> {
-        let rows = sqlx::query("SELECT f.friend_account_id, f.alias, f.blocked, p.nickname_display, pr.status, pr.room_number, pr.room_type, pr.server_id, pr.channel_id, pr.channel_name FROM message_friends f JOIN profiles p ON p.account_id=f.friend_account_id LEFT JOIN message_presence pr ON pr.account_id=f.friend_account_id AND pr.expires_at > now() WHERE f.owner_account_id=$1 ORDER BY f.friend_account_id")
-            .bind(Self::id(id)).fetch_all(&self.pool).await.map_err(|_| MessageError::Rejected)?;
+        let rows = sqlx::query("SELECT f.friend_account_id, f.alias, f.blocked, p.nickname_display, pr.status, pr.room_number, pr.room_type, pr.server_id, pr.channel_id, pr.channel_name FROM message_friends f JOIN profiles p ON p.account_id=f.friend_account_id LEFT JOIN message_presence pr ON pr.account_id=f.friend_account_id AND pr.expires_at > now() WHERE f.owner_account_id=$1 ORDER BY f.friend_account_id LIMIT $2")
+            .bind(Self::id(id))
+            .bind(i64::try_from(MAX_FRIEND_ROWS).map_err(|_| MessageError::Limit)?)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
         rows.into_iter()
             .map(|row| {
                 let status = row
@@ -1189,10 +1130,10 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_friends(owner_account_id,friend_account_id,pending) VALUES($1,$2,true) ON CONFLICT DO NOTHING")
-            .bind(Self::id(a)).bind(Self::id(b)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_friends(owner_account_id,friend_account_id,pending) VALUES($1,$2,true) ON CONFLICT DO NOTHING")
-            .bind(Self::id(b)).bind(Self::id(a)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_friends(owner_account_id,friend_account_id,pending,requested_by_account_id) VALUES($1,$2,true,$3) ON CONFLICT DO NOTHING")
+            .bind(Self::id(a)).bind(Self::id(b)).bind(Self::id(a)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_friends(owner_account_id,friend_account_id,pending,requested_by_account_id) VALUES($1,$2,true,$3) ON CONFLICT DO NOTHING")
+            .bind(Self::id(b)).bind(Self::id(a)).bind(Self::id(a)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn confirm_friend(&self, a: u32, b: u32) -> Result<(), MessageError> {
@@ -1201,10 +1142,10 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        let first = sqlx::query("UPDATE message_friends SET pending=false WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending")
+        let first = sqlx::query("UPDATE message_friends SET pending=false, requested_by_account_id=NULL WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending AND requested_by_account_id=$2")
             .bind(Self::id(a)).bind(Self::id(b)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
-        let second = sqlx::query("UPDATE message_friends SET pending=false WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending")
-            .bind(Self::id(b)).bind(Self::id(a)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        let second = sqlx::query("UPDATE message_friends SET pending=false, requested_by_account_id=NULL WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending AND requested_by_account_id=$3")
+            .bind(Self::id(b)).bind(Self::id(a)).bind(Self::id(b)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         if first.rows_affected() != 1 || second.rows_affected() != 1 {
             return Err(MessageError::Rejected);
         }
@@ -1215,7 +1156,7 @@ impl MessageStore for PostgresStore {
         owner: u32,
         friend: u32,
     ) -> Result<bool, MessageError> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_friends WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_friends WHERE owner_account_id=$1 AND friend_account_id=$2 AND pending AND requested_by_account_id=$2)")
             .bind(Self::id(owner)).bind(Self::id(friend)).fetch_one(&self.pool).await.map_err(|_| MessageError::Rejected)
     }
     async fn block_friend(&self, a: u32, b: u32) -> Result<(), MessageError> {
@@ -1247,7 +1188,7 @@ impl MessageStore for PostgresStore {
             .await
             .map_err(|_| MessageError::Rejected)?;
         sqlx::query("INSERT INTO message_presence(account_id,status,room_number,room_type,server_id,channel_id,channel_name) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET status=excluded.status,room_number=excluded.room_number,room_type=excluded.room_type,server_id=excluded.server_id,channel_id=excluded.channel_id,channel_name=excluded.channel_name").bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(&channel_name).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,$2,$3,$4,$5,$6,$7 FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked").bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(channel.channel_name).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,$2,$3,$4,$5,$6,$7 FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $8").bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(channel.channel_name).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn set_offline(&self, id: u32) -> Result<(), MessageError> {
@@ -1261,7 +1202,7 @@ impl MessageStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,5,-1,-1,-1,-1,''::bytea FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked").bind(Self::id(id)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,5,-1,-1,-1,-1,''::bytea FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $2").bind(Self::id(id)).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn heartbeat(&self, id: u32) -> Result<(), MessageError> {
@@ -1273,7 +1214,18 @@ impl MessageStore for PostgresStore {
         &self,
         id: u32,
     ) -> Result<Vec<(u32, Presence, ChannelInfo)>, MessageError> {
-        let rows=sqlx::query("DELETE FROM message_presence_events WHERE recipient_account_id=$1 RETURNING sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name").bind(Self::id(id)).fetch_all(&self.pool).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("DELETE FROM message_presence_events WHERE id IN (SELECT e.id FROM message_presence_events e WHERE e.recipient_account_id=$1 AND e.status <> 5 AND NOT EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.expires_at > now()) ORDER BY e.id LIMIT $2)")
+            .bind(Self::id(id))
+            .bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        let rows=sqlx::query("DELETE FROM message_presence_events WHERE id IN (SELECT id FROM message_presence_events WHERE recipient_account_id=$1 ORDER BY id LIMIT $2) RETURNING sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name")
+            .bind(Self::id(id))
+            .bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
         rows.into_iter()
             .map(|r| {
                 Ok((
@@ -1304,7 +1256,17 @@ impl MessageStore for PostgresStore {
         if !allowed {
             return Err(MessageError::Rejected);
         }
-        sqlx::query("INSERT INTO message_offline_messages(sender_account_id,recipient_account_id,body) VALUES($1,$2,$3)").bind(Self::id(sender)).bind(Self::id(recipient)).bind(body).execute(&self.pool).await.map_err(|_| MessageError::Rejected)?;
+        let inserted = sqlx::query("INSERT INTO message_offline_messages(sender_account_id,recipient_account_id,body) SELECT $1,$2,$3 WHERE (SELECT count(*) FROM message_offline_messages WHERE recipient_account_id=$2 AND delivered_at IS NULL) < $4")
+            .bind(Self::id(sender))
+            .bind(Self::id(recipient))
+            .bind(body)
+            .bind(i64::try_from(MAX_QUEUED_MESSAGES).map_err(|_| MessageError::Limit)?)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        if inserted.rows_affected() != 1 {
+            return Err(MessageError::Limit);
+        }
         Ok(())
     }
     async fn queue_guild_message(
@@ -1326,8 +1288,10 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        let rows=sqlx::query("SELECT m.id,m.sender_account_id,m.recipient_account_id,m.body,p.nickname_display FROM message_offline_messages m JOIN profiles p ON p.account_id=m.sender_account_id WHERE m.recipient_account_id=$1 AND m.delivered_at IS NULL AND (m.delivery_lease_until IS NULL OR m.delivery_lease_until <= now()) ORDER BY m.id FOR UPDATE OF m SKIP LOCKED")
-            .bind(Self::id(id)).fetch_all(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        let rows=sqlx::query("SELECT m.id,m.sender_account_id,m.recipient_account_id,m.body,p.nickname_display FROM message_offline_messages m JOIN profiles p ON p.account_id=m.sender_account_id WHERE m.recipient_account_id=$1 AND m.delivered_at IS NULL AND (m.delivery_lease_until IS NULL OR m.delivery_lease_until <= now()) ORDER BY m.id LIMIT $2 FOR UPDATE OF m SKIP LOCKED")
+            .bind(Self::id(id))
+            .bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+            .fetch_all(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         for row in &rows {
             let message_id: i64 = row.try_get("id").map_err(|_| MessageError::Rejected)?;
             sqlx::query("UPDATE message_offline_messages SET delivery_lease_until=now() + interval '30 seconds', delivery_lease_token=$2 WHERE id=$1")
@@ -1416,6 +1380,7 @@ struct FriendState {
     alias: Vec<u8>,
     blocked: bool,
     pending: bool,
+    requested_by: Option<u32>,
 }
 impl MemoryStore {
     pub fn register_user(&self, user: User) {
@@ -1457,6 +1422,7 @@ impl MemoryStore {
                             blocked: f.blocked,
                         })
                     })
+                    .take(MAX_FRIEND_ROWS)
                     .collect()
             },
         )
@@ -1466,56 +1432,51 @@ impl MemoryStore {
         if !d.users.contains_key(&a) || !d.users.contains_key(&b) || a == b {
             return Err(MessageError::Rejected);
         };
-        let reciprocal_was_pending = d.friends.get(&(b, a)).is_some_and(|f| f.pending);
+        let reciprocal_was_pending = d
+            .friends
+            .get(&(b, a))
+            .is_some_and(|f| f.pending && f.requested_by == Some(b));
         d.friends.entry((a, b)).or_insert(FriendState {
             alias: b"Friend".to_vec(),
             blocked: false,
             pending: true,
+            requested_by: Some(a),
         });
         d.friends.entry((b, a)).or_insert(FriendState {
             alias: b"Friend".to_vec(),
             blocked: false,
             pending: true,
+            requested_by: Some(a),
         });
         if reciprocal_was_pending {
-            if let Some(f) = d.friends.get_mut(&(a, b)) {
-                f.pending = false;
-            }
-            if let Some(f) = d.friends.get_mut(&(b, a)) {
-                f.pending = false;
+            for key in [(a, b), (b, a)] {
+                if let Some(f) = d.friends.get_mut(&key) {
+                    f.pending = false;
+                    f.requested_by = None;
+                }
             }
         }
         Ok(())
     }
     pub fn confirm_friend(&self, a: u32, b: u32) -> Result<(), MessageError> {
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        if !d.friends.contains_key(&(a, b)) || !d.friends.contains_key(&(b, a)) {
-            if !d.users.contains_key(&a) || !d.users.contains_key(&b) || a == b {
-                return Err(MessageError::Rejected);
+        let Some(incoming) = d.friends.get(&(a, b)) else {
+            return Err(MessageError::Rejected);
+        };
+        if !incoming.pending || incoming.requested_by != Some(b) {
+            return Err(MessageError::Rejected);
+        }
+        let Some(reverse) = d.friends.get(&(b, a)) else {
+            return Err(MessageError::Rejected);
+        };
+        if !reverse.pending || reverse.requested_by != Some(b) {
+            return Err(MessageError::Rejected);
+        }
+        for key in [(a, b), (b, a)] {
+            if let Some(f) = d.friends.get_mut(&key) {
+                f.pending = false;
+                f.requested_by = None;
             }
-            d.friends.insert(
-                (a, b),
-                FriendState {
-                    alias: b"Friend".to_vec(),
-                    blocked: false,
-                    pending: false,
-                },
-            );
-            d.friends.insert(
-                (b, a),
-                FriendState {
-                    alias: b"Friend".to_vec(),
-                    blocked: false,
-                    pending: false,
-                },
-            );
-            return Ok(());
-        }
-        if let Some(f) = d.friends.get_mut(&(a, b)) {
-            f.pending = false;
-        }
-        if let Some(f) = d.friends.get_mut(&(b, a)) {
-            f.pending = false;
         }
         Ok(())
     }
@@ -1546,15 +1507,16 @@ impl MemoryStore {
                 .friends
                 .iter()
                 .filter_map(|(&(owner, friend), state)| {
-                    (friend == id && owner != id && !state.blocked).then_some(owner)
+                    (friend == id && owner != id && !state.blocked && !state.pending)
+                        .then_some(owner)
                 })
                 .collect();
             for recipient in recipients {
-                d.presence_events.entry(recipient).or_default().push_back((
-                    id,
-                    status,
-                    channel.clone(),
-                ));
+                let events = d.presence_events.entry(recipient).or_default();
+                if events.len() >= MAX_DELIVERY_BATCH {
+                    events.pop_front();
+                }
+                events.push_back((id, status, channel.clone()));
             }
         }
     }
@@ -1582,15 +1544,16 @@ impl MemoryStore {
                 .friends
                 .iter()
                 .filter_map(|(&(owner, friend), state)| {
-                    (friend == id && owner != id && !state.blocked).then_some(owner)
+                    (friend == id && owner != id && !state.blocked && !state.pending)
+                        .then_some(owner)
                 })
                 .collect();
             for recipient in recipients {
-                d.presence_events.entry(recipient).or_default().push_back((
-                    id,
-                    Presence::Offline,
-                    ChannelInfo::offline(),
-                ));
+                let events = d.presence_events.entry(recipient).or_default();
+                if events.len() >= MAX_DELIVERY_BATCH {
+                    events.pop_front();
+                }
+                events.push_back((id, Presence::Offline, ChannelInfo::offline()));
             }
         }
     }
@@ -1598,9 +1561,21 @@ impl MemoryStore {
         self.0.lock().map_or_else(
             |_| Vec::new(),
             |mut d| {
+                let now = Instant::now();
                 d.presence_events
                     .remove(&id)
-                    .map_or_else(Vec::new, |events| events.into_iter().collect())
+                    .map_or_else(Vec::new, |events| {
+                        events
+                            .into_iter()
+                            .filter(|(sender, status, _)| {
+                                *status == Presence::Offline
+                                    || d.presence_expiry
+                                        .get(sender)
+                                        .is_some_and(|until| *until > now)
+                            })
+                            .take(MAX_DELIVERY_BATCH)
+                            .collect()
+                    })
             },
         )
     }
@@ -1626,6 +1601,12 @@ impl MemoryStore {
             return Err(MessageError::Rejected);
         };
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
+        let queued = d.messages.get(&recipient).map_or(0, VecDeque::len)
+            + d.live_messages.get(&recipient).map_or(0, VecDeque::len)
+            + d.inflight_messages.get(&recipient).map_or(0, VecDeque::len);
+        if queued >= MAX_QUEUED_MESSAGES {
+            return Err(MessageError::Limit);
+        }
         let nickname = d
             .users
             .get(&sender)
@@ -1667,6 +1648,12 @@ impl MemoryStore {
         if sender_user.guild_id.is_none() || sender_user.guild_id != recipient_user.guild_id {
             return Err(MessageError::Rejected);
         }
+        let queued = d.messages.get(&recipient).map_or(0, VecDeque::len)
+            + d.live_messages.get(&recipient).map_or(0, VecDeque::len)
+            + d.inflight_messages.get(&recipient).map_or(0, VecDeque::len);
+        if queued >= MAX_QUEUED_MESSAGES {
+            return Err(MessageError::Limit);
+        }
         let message = OfflineMessage {
             sender_id: sender,
             recipient_id: recipient,
@@ -1687,10 +1674,12 @@ impl MemoryStore {
     }
     pub fn take_live_messages(&self, id: u32) -> Result<Vec<OfflineMessage>, MessageError> {
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let messages: Vec<_> = d
-            .live_messages
-            .remove(&id)
-            .map_or_else(Vec::new, |q| q.into_iter().collect());
+        let messages: Vec<_> = d.live_messages.get_mut(&id).map_or_else(Vec::new, |q| {
+            q.drain(..q.len().min(MAX_DELIVERY_BATCH)).collect()
+        });
+        if d.live_messages.get(&id).is_some_and(VecDeque::is_empty) {
+            d.live_messages.remove(&id);
+        }
         d.inflight_messages
             .entry(id)
             .or_default()
@@ -1699,10 +1688,12 @@ impl MemoryStore {
     }
     pub fn take_messages(&self, id: u32) -> Result<Vec<OfflineMessage>, MessageError> {
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let messages: Vec<_> = d
-            .messages
-            .remove(&id)
-            .map_or_else(Vec::new, |q| q.into_iter().collect());
+        let messages: Vec<_> = d.messages.get_mut(&id).map_or_else(Vec::new, |q| {
+            q.drain(..q.len().min(MAX_DELIVERY_BATCH)).collect()
+        });
+        if d.messages.get(&id).is_some_and(VecDeque::is_empty) {
+            d.messages.remove(&id);
+        }
         d.inflight_messages
             .entry(id)
             .or_default()
@@ -1734,7 +1725,7 @@ pub struct ReplayGuard {
 impl ReplayGuard {
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity,
+            capacity: capacity.min(MAX_REPLAY_NONCES),
             data: ReplayGuardData::default(),
         }
     }
@@ -1812,7 +1803,11 @@ impl MessageSession {
             .into_iter()
             .map(|(user_id, status, channel)| status_packet(user_id, status, &channel))
             .collect::<Vec<_>>();
-        let live = self.store.take_live_messages(id).await?;
+        let live = if self.pending_messages.is_empty() {
+            self.store.take_live_messages(id).await?
+        } else {
+            Vec::new()
+        };
         self.pending_messages.extend(live.iter().cloned());
         responses.extend(live.into_iter().map(|message| ServerPacket::Chat {
             user_id: message.sender_id,
@@ -1941,7 +1936,11 @@ impl MessageSession {
                 let id = self.user_id.ok_or(MessageError::Unauthorized)?;
                 let mut out = vec![status_packet(id, self.status, &self.channel)];
                 out.extend(self.friend_pages(id).await?);
-                let offline = self.store.take_messages(id).await?;
+                let offline = if self.pending_messages.is_empty() {
+                    self.store.take_messages(id).await?
+                } else {
+                    Vec::new()
+                };
                 self.pending_messages.extend(offline.iter().cloned());
                 out.extend(offline.into_iter().map(|m| ServerPacket::Chat {
                     user_id: m.sender_id,
@@ -1987,7 +1986,8 @@ impl MessageSession {
                     return Err(MessageError::Rejected);
                 }
                 self.store.confirm_friend(me, user_id).await?;
-                Ok(Vec::new())
+                // SuperSS's established acceptor result is 0x0109 (status + user ID).
+                Ok(vec![ServerPacket::ConfirmResult { status: 0, user_id }])
             }
             ClientPacket::BlockFriend { user_id } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
