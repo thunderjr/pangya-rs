@@ -209,8 +209,10 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x0081` | `RETAIL_C2S_MULTIPLAYER_JOIN` | `lib.rs:5100` | client-verified | opens the room directory; answered with the list then the acknowledgement |
 | `0x0082` | `RETAIL_C2S_MULTIPLAYER_LEAVE` | `lib.rs:5116` | client-verified | |
 | `0x009c` | `RetailPlayerHistoryRequest` | `lib.rs:1321` | client-verified (blocker 16) | `game.rs:307`; `pangbox/server` `game/packet/client.go` `ClientRequestPlayerHistory` |
-| `0x00b5` | `RetailMyRoomEnter` | `lib.rs:1380` → `:4817` | client-verified | `us852_room.rs:616`; `ClientEnterMyRoom`. Visiting another player's room is refused rather than faked |
-| `0x00b7` | `RetailMyRoomInventoryRequest` | `lib.rs:1380` → `:4834` | client-verified | `us852_room.rs:672`; `ClientRequestInventory` |
+| `0x00b5` | `RetailMyRoomEnter` | `lib.rs` retail lobby service | reference-derived | `us852_room.rs`; target account is loaded from PostgreSQL, so own and visitor rooms use the target projection |
+| `0x00b7` | `RetailMyRoomInventoryRequest` | `lib.rs` retail lobby service | reference-derived | `us852_room.rs`; serves persisted `0x012d` furniture and the target's complete 513-byte equipped-character block |
+| `0x0073` | `RetailMascotMessageUpdate` | `lib.rs` retail lobby service | reference-derived | authenticated owner update persists the mascot message; success is `0x00e2` status 4, with no unsolicited visitor-room result |
+| `0x00b9` / `0x00c9` | UCC requests | `lib.rs` retail lobby service | explicit refusal | no upload service is configured; both return `0x0153` status 1 with `0x05100100` |
 | `0x00cc` | `RetailLockerCombinationAttempt` | `lib.rs:1380` → `:4814` | reference-derived | `us852_room.rs:796`; `ClientLockerCombinationAttempt` |
 | `0x00d3` | `RetailLockerInventoryRequest` | `lib.rs:1380` → `:4811` | reference-derived | `us852_room.rs:746`; `ClientLockerInventoryRequest` |
 | `0x0140` | `RetailShopJoin` | `lib.rs:1380` → `:4810` | client-verified | `us852_room.rs:568`; `ClientShopJoin` |
@@ -253,7 +255,9 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x010e` | `RetailPlayerHistory` | `game.rs:333` | `lib.rs:1341` | five zeroed 52-byte slots — an empty history, not invented opponents |
 | `0x020e` | `RetailShopJoined` | `us852_room.rs:589` | `lib.rs:4810` | `Server020E` |
 | `0x012b` | `RetailMyRoomEntered` | `us852_room.rs:643` | `lib.rs:4826` | |
-| `0x012d` | `RetailMyRoomLayout` | `us852_room.rs:697` | `lib.rs:4844` | `ServerMyRoomLayout` |
+| `0x012d` | `RetailMyRoomLayout` | `us852_room.rs` | `lib.rs` retail lobby service | PacketDoc exact option/count/27-byte Furniture.iff entries, loaded from PostgreSQL |
+| `0x00e2` | `RetailMascotMessageResult` | `us852_room.rs` | `lib.rs` retail lobby service | result of the established `0x0073` update flow; not emitted as a visitor-room projection |
+| `0x0153` | `RetailUccUploadKeyRefusal` | `us852_room.rs` | `lib.rs` retail lobby service | explicit unsupported-upload response; no URL or key fabricated |
 | `0x0168` | `RetailPlayerInfo` | `us852_room.rs:724` | `lib.rs:4845` | carries the same 341-byte record as the room census |
 | `0x0170` | `RetailLockerInventoryResponse` | `us852_room.rs:771` | `lib.rs:4812` | |
 | `0x016c` | `RetailLockerCombinationResponse` | `us852_room.rs:817` | `lib.rs:4815` | |

@@ -4055,7 +4055,39 @@ pub struct RetailEquipmentState {
     pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
 }
 
-/// One atomically accepted offline note.
+/// Opaque furniture row persisted for a player's My Room.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MyRoomFurniture {
+    /// PacketDoc-defined opaque four-byte prefix.
+    pub unknown_prefix: [u8; 4],
+    /// Furniture.iff catalog id.
+    pub item_type_id: u32,
+    /// PacketDoc-defined opaque nineteen-byte suffix.
+    pub unknown_suffix: [u8; 19],
+}
+
+/// A bounded mascot message update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MascotMessageUpdate {
+    /// Owning mascot inventory row.
+    pub inventory_item_id: InventoryItemId,
+    /// UTF-8 message bytes, at most 30 bytes and never empty.
+    pub message: Vec<u8>,
+}
+
+/// A durable visitor-visible My Room projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MyRoomProjection {
+    /// Persisted furniture in deterministic slot order.
+    pub furniture: Vec<MyRoomFurniture>,
+    /// Message attached to the equipped mascot, if one is set.
+    pub mascot_message: Option<Vec<u8>>,
+}
+
+/// Explicit refusal code for UCC upload infrastructure that is not configured.
+pub const UCC_UPLOAD_UNSUPPORTED_ERROR: u32 = 0x0510_0100;
+
+/// An offline note request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfflineNoteRequest {
     /// Authenticated sender account.
@@ -4106,6 +4138,26 @@ pub trait PlayerRepository: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>>;
+
+    /// Loads bounded visitor-visible My Room state for an account.
+    fn load_my_room(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<MyRoomProjection, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(MyRoomProjection {
+            furniture: Vec::new(),
+            mascot_message: None,
+        })))
+    }
+
+    /// Persists one mascot message after ownership and policy validation.
+    fn save_mascot_message(
+        &self,
+        _account_id: AccountId,
+        _update: MascotMessageUpdate,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
+    }
 
     /// Loads the durable retail equipment projection. Legacy/test repositories return the empty
     /// projection by default so retail equipment remains additive to the minimum contract.

@@ -26,13 +26,14 @@ use pangya_domain::{
     InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind, ItemSale,
     ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS,
     MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
-    NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
-    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
-    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult,
-    RepositoryError, RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances,
-    ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault,
-    StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
+    MatchResultKey, MyRoomFurniture, MyRoomProjection, NewAccount, NewHandover, Nickname,
+    NoopStorageObserver, NormalizedNickname, NormalizedUsername, OfflineNote, OfflineNoteClaim,
+    OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
+    PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult, RepositoryError,
+    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
+    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
     StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
     WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
@@ -2412,6 +2413,91 @@ async fn owned_by_type_any(
     Ok(Some((row.id, row.item_type_id)))
 }
 
+impl PgRepository {
+    async fn load_my_room_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<MyRoomProjection, RepositoryError> {
+        let mut connection = self.pool.acquire().await.map_err(repository_db_error)?;
+        let rows = sqlx::query(
+            "SELECT unknown_prefix, item_type_id, unknown_suffix FROM my_room_furniture \
+             WHERE account_id = $1 ORDER BY slot_index LIMIT 1024",
+        )
+        .bind(account_id.get())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(repository_db_error)?;
+        let mut furniture = Vec::with_capacity(rows.len());
+        for row in rows {
+            let prefix: Vec<u8> = row.try_get("unknown_prefix").map_err(repository_db_error)?;
+            let suffix: Vec<u8> = row.try_get("unknown_suffix").map_err(repository_db_error)?;
+            if prefix.len() != 4 || suffix.len() != 19 {
+                return Err(RepositoryError::CorruptData);
+            }
+            let mut unknown_prefix = [0; 4];
+            unknown_prefix.copy_from_slice(&prefix);
+            let mut unknown_suffix = [0; 19];
+            unknown_suffix.copy_from_slice(&suffix);
+            let item_type_id: i64 = row.try_get("item_type_id").map_err(repository_db_error)?;
+            furniture.push(MyRoomFurniture {
+                unknown_prefix,
+                item_type_id: u32::try_from(item_type_id)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                unknown_suffix,
+            });
+        }
+        let mascot_message = sqlx::query(
+            "SELECT m.message FROM mascot_messages m \
+             JOIN player_equipment_slots s ON s.account_id = m.account_id \
+               AND s.inventory_item_id = m.inventory_item_id \
+             WHERE m.account_id = $1 AND s.slot_family = 'mascot' AND s.slot_index = 0",
+        )
+        .bind(account_id.get())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(repository_db_error)?
+        .map(|row| row.try_get("message").map_err(repository_db_error))
+        .transpose()?;
+        Ok(MyRoomProjection {
+            furniture,
+            mascot_message,
+        })
+    }
+
+    async fn save_mascot_message_inner(
+        &self,
+        account_id: AccountId,
+        update: MascotMessageUpdate,
+    ) -> Result<(), RepositoryError> {
+        if update.message.is_empty() || update.message.len() > 30 || update.message.contains(&0) {
+            return Err(RepositoryError::CorruptData);
+        }
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let owned = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM inventory_items WHERE account_id = $1 AND id = $2 AND inventory_class = 'mascot' FOR UPDATE",
+        )
+        .bind(account_id.get())
+        .bind(update.inventory_item_id.get())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        if owned.is_none() {
+            return Err(RepositoryError::NotFound);
+        }
+        sqlx::query(
+            "INSERT INTO mascot_messages (account_id, inventory_item_id, message) VALUES ($1, $2, $3) \
+             ON CONFLICT (account_id, inventory_item_id) DO UPDATE SET message = EXCLUDED.message, updated_at = now()",
+        )
+        .bind(account_id.get())
+        .bind(update.inventory_item_id.get())
+        .bind(&update.message)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        transaction.commit().await.map_err(repository_db_error)
+    }
+}
+
 impl PlayerRepository for PgRepository {
     fn claim_offline_notes(
         &self,
@@ -2440,6 +2526,21 @@ impl PlayerRepository for PgRepository {
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
         Box::pin(self.observed(self.load_player_snapshot_inner(account_id)))
+    }
+
+    fn load_my_room(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<MyRoomProjection, RepositoryError>> {
+        Box::pin(self.observed(self.load_my_room_inner(account_id)))
+    }
+
+    fn save_mascot_message(
+        &self,
+        account_id: AccountId,
+        update: MascotMessageUpdate,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.save_mascot_message_inner(account_id, update)))
     }
 
     fn load_retail_equipment(
@@ -3617,6 +3718,14 @@ fn parse_inventory_class(value: &str) -> Result<InventoryClass, RepositoryError>
         "ball" => Ok(InventoryClass::Ball),
         "consumable" => Ok(InventoryClass::Consumable),
         "character_part" => Ok(InventoryClass::CharacterPart),
+        "caddie" => Ok(InventoryClass::Caddie),
+        "caddie_item" => Ok(InventoryClass::CaddieItem),
+        "mascot" => Ok(InventoryClass::Mascot),
+        "card" => Ok(InventoryClass::Card),
+        "furniture" => Ok(InventoryClass::Furniture),
+        "skin" => Ok(InventoryClass::Skin),
+        "hair_style" => Ok(InventoryClass::HairStyle),
+        "set_item" => Ok(InventoryClass::SetItem),
         _ => Err(RepositoryError::CorruptData),
     }
 }
