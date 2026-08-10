@@ -2208,16 +2208,7 @@ where
                                 }
                             } else if self.config.retail_bootstrap && frame.opcode == <MessageServerListRequest as DecodePacket>::OPCODE {
                                 if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
-                                self.send(&mut framed, &MessageServerList {
-                                    servers: vec![pangya_protocol::MessageServerEntry {
-                                        name: b"PangYa-RS Message".to_vec(), id: 1,
-                                        max_users: 200, num_users: 0,
-                                        ip_address: b"127.0.0.1".to_vec(), port: 30303,
-                                        unknown2: pangya_protocol::UnknownBytes([0; 2]),
-                                        flags: pangya_protocol::UnknownBytes([0; 2]),
-                                        unknown3: pangya_protocol::UnknownBytes([0; 14]), char_icon: 0,
-                                    }],
-                                }).await?;
+                                self.send(&mut framed, &MessageServerList).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == <LoungeAction as DecodePacket>::OPCODE {
                                 let action = decode_packet_payload::<LoungeAction>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
                                 if !lounge_actions.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
