@@ -2163,15 +2163,9 @@ impl MessageSession {
                         .set_online(me, status, self.channel.clone())
                         .await?;
                 }
-                let mut responses = vec![status_packet(me, status, &self.channel)];
-                responses.extend(
-                    self.store
-                        .take_presence_events(me)
-                        .await?
-                        .into_iter()
-                        .map(|(user_id, status, channel)| status_packet(user_id, status, &channel)),
-                );
-                Ok(responses)
+                // PacketDoc 0x001d is a declaration: 0x0115 is broadcast to confirmed friends,
+                // not echoed to the declaring session. Poll delivers other queued transitions.
+                Ok(Vec::new())
             }
             ClientPacket::Server {
                 server_id,
@@ -2190,7 +2184,9 @@ impl MessageSession {
                 self.store
                     .set_online(me, self.status, self.channel.clone())
                     .await?;
-                self.friend_pages(me).await
+                // PacketDoc 0x0023 updates the server/channel projection and replies with the
+                // declaring session's established 0x0115 status packet, not friend pages.
+                Ok(vec![status_packet(me, self.status, &self.channel)])
             }
             ClientPacket::Chat { user_id, message } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
