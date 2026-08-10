@@ -1018,6 +1018,14 @@ async fn maybe_receive_opcode(stream: &mut TcpStream, key: u8) -> Option<u16> {
     .flatten()
 }
 
+async fn assert_no_synthetic_projection_refresh(stream: &mut TcpStream, key: u8) {
+    assert_eq!(
+        maybe_receive_opcode(stream, key).await,
+        None,
+        "synthetic M5/M6 settlement must not emit a retail projection refresh frame",
+    );
+}
+
 async fn assert_closed(stream: &mut TcpStream) {
     assert_closed_within(stream, Duration::from_secs(1)).await;
 }
@@ -3465,6 +3473,8 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
             ("committed".to_owned(), "success".to_owned(), None),
         ]
     );
+    // Synthetic M5 settlement ends with Finished; no retail room-projection census follows.
+    assert_no_synthetic_projection_refresh(&mut client.stream, client.key).await;
 
     send_typed(&mut client.stream, client.key, 11, &FinishHole::new()).await;
     assert_closed(&mut client.stream).await;
@@ -5156,11 +5166,9 @@ async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPo
     assert_eq!(balances[0], StrokeBalanceUpdate::new(14, 5));
     assert_eq!(balances[1], StrokeBalanceUpdate::new(114, 55));
     assert_ne!(balances[0], balances[1]);
-    assert_eq!(
-        maybe_receive_opcode(&mut owner.stream, owner.key).await,
-        None
-    );
-    assert_eq!(maybe_receive_opcode(&mut peer.stream, peer.key).await, None);
+    // Synthetic M6 settlement ends with Finished; no retail room-projection census follows.
+    assert_no_synthetic_projection_refresh(&mut owner.stream, owner.key).await;
+    assert_no_synthetic_projection_refresh(&mut peer.stream, peer.key).await;
 
     let (matches, players, ledgers, records): (i64, i64, i64, i64) = tokio::try_join!(
         sqlx::query_scalar("SELECT count(*) FROM matches WHERE mode = 'stroke_two' AND status = 'committed'").fetch_one(&pool),

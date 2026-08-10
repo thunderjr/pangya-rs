@@ -4666,7 +4666,11 @@ where
                 }
             }
             RoomEvent::SoloCommitted(result) => {
-                if let Some(account_id) = self.social.account_for_connection(connection_id) {
+                // Projection refreshes are a retail room contract. Synthetic M5 settlement has
+                // its own terminal packet order and must not enqueue a retail census frame.
+                if self.config.retail_bootstrap
+                    && let Some(account_id) = self.social.account_for_connection(connection_id)
+                {
                     self.refresh_social_projection(connection_id, account_id)
                         .await?;
                 }
@@ -4804,7 +4808,11 @@ where
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::StrokeCommitted(result) => {
-                if let Some(account_id) = self.social.account_for_connection(connection_id) {
+                // Projection refreshes are a retail room contract. Synthetic M6 settlement has
+                // its own terminal packet order and must not enqueue a retail census frame.
+                if self.config.retail_bootstrap
+                    && let Some(account_id) = self.social.account_for_connection(connection_id)
+                {
                     self.refresh_social_projection(connection_id, account_id)
                         .await?;
                 }
@@ -7062,25 +7070,30 @@ where
             .iter()
             .find(|value| value.id == snapshot.equipment.character_id);
         self.social.update_card(connection_id, card.clone());
-        // Not being in a room is the normal path for a shop mutation; do not turn that into a
-        // failed purchase. Once admitted, the actor serializes this replacement with room
-        // commands and publishes one coherent snapshot to all members.
-        match self
-            .lobby
-            .route(
-                connection_id,
-                LobbyRoomCommand::UpdateMemberProjection {
-                    card,
-                    character_id: Some(snapshot.equipment.character_id),
-                    character_iff_id: character.map(|value| value.item_type_id.get()),
-                },
-            )
-            .await
-        {
-            Ok(LobbyRouteResult::Snapshot(_))
-            | Err(RoomError::NotMember | RoomError::RoomNotFound) => {}
-            Ok(_) => return Err(GameRuntimeError::Protocol),
-            Err(_) => return Err(GameRuntimeError::Protocol),
+        // Synthetic M5/M6 settlement also reloads this helper's durable snapshot, but its
+        // generated terminal contract has no retail census/projection frame. Keep the social card
+        // coherent for internal state while limiting room events to retail sessions.
+        if self.config.retail_bootstrap {
+            // Not being in a room is the normal path for a shop mutation; do not turn that into a
+            // failed purchase. Once admitted, the actor serializes this replacement with room
+            // commands and publishes one coherent snapshot to all members.
+            match self
+                .lobby
+                .route(
+                    connection_id,
+                    LobbyRoomCommand::UpdateMemberProjection {
+                        card,
+                        character_id: Some(snapshot.equipment.character_id),
+                        character_iff_id: character.map(|value| value.item_type_id.get()),
+                    },
+                )
+                .await
+            {
+                Ok(LobbyRouteResult::Snapshot(_))
+                | Err(RoomError::NotMember | RoomError::RoomNotFound) => {}
+                Ok(_) => return Err(GameRuntimeError::Protocol),
+                Err(_) => return Err(GameRuntimeError::Protocol),
+            }
         }
         Ok(snapshot)
     }
