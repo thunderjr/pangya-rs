@@ -6691,7 +6691,7 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
     let (opcode, census) = receive_packet(&mut host, host_key).await;
     assert_eq!(opcode, 0x0048);
     assert_eq!(census[3], 2);
-    let owner_character_at = 4 + 4 + 22 + 17 + 1 + 4 + 4;
+    let owner_character_at = 4 + 341 + 4;
     assert_eq!(
         u32::from_le_bytes(
             census[owner_character_at..owner_character_at + 4]
@@ -8098,19 +8098,18 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         // clients receive the same fresh post-purchase equipment in 0x0076.
         assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
         assert_eq!(&roster[4..13], b"PartyHost");
-        let player_data_club_set_uid = 0x2f2e;
-        let player_data_club_set_iff_id = 0x2f32;
+        // The packetdoc entry offsets include the two-byte seat prefix.
+        let entry_club_set_uid = 0x2f2a;
+        let entry_club_set_iff_id = 0x2f2e;
         let stride = 0x2f95;
         let host_entry = 4;
         let host_club_uid = u32::from_le_bytes(
-            roster[host_entry + 2 + player_data_club_set_uid
-                ..host_entry + 2 + player_data_club_set_uid + 4]
+            roster[host_entry + entry_club_set_uid..host_entry + entry_club_set_uid + 4]
                 .try_into()
                 .expect("host roster club inventory id"),
         );
         let host_club_iff = u32::from_le_bytes(
-            roster[host_entry + 2 + player_data_club_set_iff_id
-                ..host_entry + 2 + player_data_club_set_iff_id + 4]
+            roster[host_entry + entry_club_set_iff_id..host_entry + entry_club_set_iff_id + 4]
                 .try_into()
                 .expect("host roster club catalog id"),
         );
@@ -8125,8 +8124,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         let peer_entry = host_entry + stride;
         assert_eq!(
             u32::from_le_bytes(
-                roster[peer_entry + 2 + player_data_club_set_uid
-                    ..peer_entry + 2 + player_data_club_set_uid + 4]
+                roster[peer_entry + entry_club_set_uid..peer_entry + entry_club_set_uid + 4]
                     .try_into()
                     .expect("peer roster club inventory id"),
             ),
