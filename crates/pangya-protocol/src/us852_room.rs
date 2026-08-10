@@ -485,7 +485,8 @@ pub const RETAIL_CONSUMABLE_SLOTS: usize = 10;
 /// # Provenance
 ///
 /// Discriminants and bodies from `pangbox/server` (`game/packet/client.go`
-/// `ClientEquipmentUpdate`), ISC licensed. Types `8` and `9` are unclassified there and here.
+/// `ClientEquipmentUpdate`), ISC licensed. Type names `8` (mascot) and `9` (cut-in) follow the
+/// issue's named GB.852 behavioral reference; their client bodies remain the packetdoc words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailEquipmentSlot {
     /// Character parts. The body is the client's character block and is not modelled.
@@ -648,9 +649,10 @@ impl RetailCharacterParts {
 
 /// Equipment changes sent by the lobby/room opcodes `0x000b` and `0x000c`.
 ///
-/// The two packetdoc definitions share the leading byte and little-endian scalar bodies, but
-/// their accepted discriminants differ: `0x000b` admits only character (`4`), while `0x000c`
-/// admits caddie, ball, club set, character, and the four-word `7` form.
+/// Both packets use the leading byte and little-endian scalar bodies. PacketDoc documents only
+/// character (`4`) for `0x000b`, while SuperSS-Dev's `requestChangePlayerItemChannel` handles
+/// caddie, ball, club set, and character (`1`–`4`); `0x000c` additionally has the four-word `7`
+/// form. The channel implementation follows the broader 852-targeting reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailRoomEquipmentUpdate {
     /// Equipped caddie roster slot.
@@ -678,9 +680,9 @@ impl RetailRoomEquipmentUpdate {
     fn decode_body(reader: &mut PacketReader<'_>, lobby: bool) -> Result<Self, PacketDecodeError> {
         let tag = reader.u8()?;
         let value = match tag {
-            1 if !lobby => Self::Caddie(reader.u32_le()?),
-            2 if !lobby => Self::Ball(reader.u32_le()?),
-            3 if !lobby => Self::ClubSet(reader.u32_le()?),
+            1 => Self::Caddie(reader.u32_le()?),
+            2 => Self::Ball(reader.u32_le()?),
+            3 => Self::ClubSet(reader.u32_le()?),
             4 => Self::Character(reader.u32_le()?),
             7 if !lobby => Self::UnknownSeven {
                 character: reader.u32_le()?,
@@ -1743,6 +1745,19 @@ mod tests {
                 RetailEquipmentSlot::Character,
                 2 + 4,
             ),
+            (
+                RetailEquipmentUpdated::Mascot { data: [0; 62] },
+                RetailEquipmentSlot::Mascot,
+                2 + 62,
+            ),
+            (
+                RetailEquipmentUpdated::CutIn {
+                    character_id: 3,
+                    data: [0; 16],
+                },
+                RetailEquipmentSlot::CutIn,
+                2 + 4 + 16,
+            ),
         ];
         for (reply, slot, expected_len) in cases {
             let mut writer = PacketWriter::new();
@@ -1777,13 +1792,22 @@ mod tests {
 
     #[test]
     fn packetdoc_000b_and_000c_equipment_bodies_are_distinct_and_little_endian() {
-        let lobby = decode_packet_payload::<RetailLobbyEquipmentUpdate>(
-            &[4, 0x2a, 0, 0, 0],
-            &profile(),
-            ServiceKind::Game,
-        )
-        .expect("decode lobby equipment");
-        assert_eq!(lobby.0, RetailRoomEquipmentUpdate::Character(42));
+        for (tag, value, expected) in [
+            (1_u8, 11_u32, RetailRoomEquipmentUpdate::Caddie(11)),
+            (2, 22, RetailRoomEquipmentUpdate::Ball(22)),
+            (3, 33, RetailRoomEquipmentUpdate::ClubSet(33)),
+            (4, 44, RetailRoomEquipmentUpdate::Character(44)),
+        ] {
+            let mut payload = vec![tag];
+            payload.extend_from_slice(&value.to_le_bytes());
+            let lobby = decode_packet_payload::<RetailLobbyEquipmentUpdate>(
+                &payload,
+                &profile(),
+                ServiceKind::Game,
+            )
+            .expect("decode lobby equipment");
+            assert_eq!(lobby.0, expected);
+        }
 
         let room = decode_packet_payload::<RetailRoomEquipmentUpdatePacket>(
             &[3, 0x37, 0, 0, 0],

@@ -5630,12 +5630,11 @@ where
         Ok(())
     }
 
-    /// Applies the retail character/ball updates this server can persist and reports stored state.
+    /// Applies a tagged retail `0x0020` update and reports the transaction's stored projection.
     ///
-    /// A real client sends `0x0020` repeatedly in My Room. Character parts, caddies, consumables
-    /// and decoration still have no durable aggregate here, so those requests revert to the stored
-    /// zero/current projection rather than being falsely acknowledged. Character and Ball use the
-    /// same owned/catalog-validated optimistic equipment transaction as synthetic M7.
+    /// A real client sends this repeatedly in My Room. Every modeled family is ownership-checked
+    /// and persisted before the `0x006b` acknowledgement; character and ball continue to use the
+    /// proven minimum equipment transaction.
     async fn handle_retail_equipment_update(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -5659,16 +5658,24 @@ where
             RetailEquipmentRequested::CharacterParts(parts) => {
                 let character_id = CharacterId::new(i64::from(parts.character_id))
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let character = snapshot
+                    .characters
+                    .iter()
+                    .find(|character| character.id == character_id)
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
+                if character.item_type_id.get() != parts.character_type_id {
+                    return Err(GameRuntimeError::EconomyPersistence);
+                }
                 let _state = self
                     .repository
                     .update_retail_equipment(
                         account_id,
-                        self.repository
-                            .load_player_snapshot(account_id)
-                            .await
-                            .map_err(|_| GameRuntimeError::Snapshot)?
-                            .equipment
-                            .version,
+                        snapshot.equipment.version,
                         RetailEquipmentChange::CharacterParts {
                             character_id,
                             type_ids: parts.part_type_ids,
@@ -5775,6 +5782,13 @@ where
                     .map_err(|_| GameRuntimeError::Snapshot)?;
                 let character_id = CharacterId::new(i64::from(character_id))
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                if !snapshot
+                    .characters
+                    .iter()
+                    .any(|character| character.id == character_id)
+                {
+                    return Err(GameRuntimeError::EconomyPersistence);
+                }
                 let _state = self
                     .repository
                     .update_retail_equipment(

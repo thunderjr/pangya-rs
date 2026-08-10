@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
     AccountRepository, AccountStatus, BalanceGrant, BeginSoloMatch, BeginSoloMatchOutcome,
-    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole,
+    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CharacterId, CommitSoloHole,
     CommitStrokeMatch, ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit,
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
@@ -198,6 +198,12 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
          VALUES ($1, $2, 'test.mascot', 1, 'mascot') RETURNING id",
     )
     .bind(account_id.get()).bind(i64::from(mascot_type)).fetch_one(&pool).await.expect("mascot");
+    let part_type = 134_217_729_u32;
+    let part_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.character-part', 1, 'character_part') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(part_type)).fetch_one(&pool).await.expect("character part");
     let state = repository
         .update_retail_equipment(
             account_id,
@@ -241,6 +247,27 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         .expect("cut-in");
     assert_eq!(state.cut_in.map(|(_, values)| values[0]), Some(skin_type));
     let version = version + 1;
+    let mut part_types = [0_u32; 24];
+    let mut part_ids = [0_u32; 24];
+    part_types[23] = part_type;
+    part_ids[23] = u32::try_from(part_id).expect("part id");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::CharacterParts {
+                character_id: aggregate.equipment.character_id,
+                type_ids: part_types,
+                inventory_ids: part_ids,
+            },
+        )
+        .await
+        .expect("character parts");
+    assert_eq!(
+        state.character_parts.map(|(_, types, _)| types[23]),
+        Some(part_type)
+    );
+    let version = version + 1;
     assert!(
         repository
             .update_retail_equipment(
@@ -256,6 +283,21 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     assert_eq!(
         retained, 1,
         "rejected ownership must not clear the prior selection"
+    );
+    let missing_character = CharacterId::new(9_999_999).expect("character id");
+    assert!(
+        repository
+            .update_retail_equipment(
+                account_id,
+                u32::try_from(version).expect("version"),
+                RetailEquipmentChange::CutIn {
+                    character_id: missing_character,
+                    values: [0; 4],
+                },
+            )
+            .await
+            .is_err(),
+        "an empty cut-in still must name an owned character"
     );
 }
 

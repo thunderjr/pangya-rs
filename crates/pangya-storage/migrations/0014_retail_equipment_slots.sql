@@ -51,7 +51,7 @@ BEGIN
         ELSIF NEW.slot_family = 'consumable' AND selected_class <> 'consumable' THEN
             RAISE EXCEPTION 'consumable equipment class mismatch';
         ELSIF NEW.slot_family IN ('decoration', 'cut_in')
-              AND selected_class NOT IN ('skin', 'legacy') THEN
+              AND selected_class <> 'skin' THEN
             RAISE EXCEPTION 'decoration equipment class mismatch';
         ELSIF NEW.slot_family = 'mascot' AND selected_class <> 'mascot' THEN
             RAISE EXCEPTION 'mascot equipment class mismatch';

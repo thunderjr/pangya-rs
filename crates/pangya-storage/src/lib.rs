@@ -1782,8 +1782,7 @@ impl PgRepository {
                 let mut owned_values = Vec::with_capacity(values.len());
                 for value in values {
                     owned_values.push(
-                        owned_by_type_any(&mut transaction, account_id, value, &["skin", "legacy"])
-                            .await?,
+                        owned_by_type_any(&mut transaction, account_id, value, &["skin"]).await?,
                     );
                 }
                 sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'decoration'", account_id.get())
@@ -1799,11 +1798,11 @@ impl PgRepository {
                 character_id,
                 values,
             } => {
+                ensure_owned_character(&mut transaction, account_id, character_id).await?;
                 let mut owned_values = Vec::with_capacity(values.len());
                 for value in values {
                     owned_values.push(
-                        owned_by_type_any(&mut transaction, account_id, value, &["skin", "legacy"])
-                            .await?,
+                        owned_by_type_any(&mut transaction, account_id, value, &["skin"]).await?,
                     );
                 }
                 sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'cut_in'", account_id.get())
@@ -1820,6 +1819,7 @@ impl PgRepository {
                 type_ids,
                 inventory_ids,
             } => {
+                ensure_owned_character(&mut transaction, account_id, character_id).await?;
                 for (type_id, inventory_id) in type_ids.into_iter().zip(inventory_ids) {
                     if (type_id == 0) != (inventory_id == 0) {
                         return Err(RepositoryError::CorruptData);
@@ -1861,6 +1861,23 @@ impl PgRepository {
         transaction.commit().await.map_err(repository_db_error)?;
         self.load_retail_equipment_inner(account_id).await
     }
+}
+
+async fn ensure_owned_character(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+    character_id: CharacterId,
+) -> Result<(), RepositoryError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM characters WHERE account_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(account_id.get())
+    .bind(character_id.get())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(repository_db_error)?
+    .ok_or(RepositoryError::NotFound)?;
+    Ok(())
 }
 
 async fn owned_by_type(
