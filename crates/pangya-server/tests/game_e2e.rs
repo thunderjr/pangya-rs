@@ -13,13 +13,14 @@ use pangya_data::Catalog;
 use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
     CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
-    MemberSnapshot, NewAccount, Nickname, PlayerConnectionId, RoomId, RoomName, RoomPassword,
-    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix, StarterCharacter,
-    StarterGrant, StarterItem, StarterKey, Username, Weather,
+    MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId, RoomId, RoomName,
+    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
-    EconomyRuntimeConfig, GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig,
-    StrokeRuntimeConfig, UnknownOpcodePolicy, deterministic_conditions,
+    EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
+    GameTermination, SoloRuntimeConfig, StrokeRuntimeConfig, UnknownOpcodePolicy,
+    deterministic_conditions,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
@@ -29,10 +30,12 @@ use pangya_observability::M2Metrics;
 use pangya_protocol::{
     BalanceUpdate, CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand,
     EconomyCommandResult, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, FinishHole,
-    HoleResult, InventoryChanged, Lie, LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase,
-    MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket, RepairCommitted,
-    RepairRequest, RetailEquipment, RetailEquipmentAnnounce, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    GameChat, GameChatResponse, HoleResult, InventoryChanged, Lie, LoadingComplete, LoungeAction,
+    LoungeActionResponse, LoungeEnterRequest, LoungeEnterResponse, MacroUpdate, MatchAbortReason,
+    MatchAborted, MatchPhase, MatchStarted, NoteSend, PacketWriter, PurchaseCommitted,
+    PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailEquipment,
+    RetailEquipmentAnnounce, RetailPangBalance, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
     RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
     ServiceKind as ProtocolServiceKind, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay,
@@ -41,7 +44,8 @@ use pangya_protocol::{
     StrokeCommand, StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandings, StrokeTurnStarted,
-    Weather as ProtocolWeather, decode_packet_payload, encode_packet_payload,
+    UserInfoRequest, Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse,
+    decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -66,8 +70,13 @@ struct BlockingStrokeCommitRepository {
     commit_started: Notify,
     commit_calls: AtomicUsize,
     abort_calls: AtomicUsize,
+    offline_claim_started: Notify,
+    offline_claim_release: Notify,
+    offline_ack_completed: Notify,
     /// When set, economy purchases stall past any sane command deadline.
     stall_economy: bool,
+    /// Number of claims to pause so an E2E client can disconnect before the outbound write.
+    stall_offline_claims: AtomicUsize,
 }
 
 impl BlockingStrokeCommitRepository {
@@ -77,13 +86,24 @@ impl BlockingStrokeCommitRepository {
             commit_started: Notify::new(),
             commit_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
+            offline_claim_started: Notify::new(),
+            offline_claim_release: Notify::new(),
+            offline_ack_completed: Notify::new(),
             stall_economy: false,
+            stall_offline_claims: AtomicUsize::new(0),
         }
     }
 
     fn stalling_economy(pool: PgPool) -> Self {
         Self {
             stall_economy: true,
+            ..Self::new(pool)
+        }
+    }
+
+    fn stalling_offline_claim(pool: PgPool) -> Self {
+        Self {
+            stall_offline_claims: AtomicUsize::new(1),
             ..Self::new(pool)
         }
     }
@@ -117,6 +137,66 @@ impl pangya_domain::PlayerRepository for BlockingStrokeCommitRepository {
         Result<pangya_domain::PlayerSnapshot, pangya_domain::RepositoryError>,
     > {
         pangya_domain::PlayerRepository::load_player_snapshot(&self.inner, account_id)
+    }
+
+    fn claim_offline_notes(
+        &self,
+        recipient_id: AccountId,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<Vec<pangya_domain::OfflineNote>, pangya_domain::RepositoryError>,
+    > {
+        Box::pin(async move {
+            let notes =
+                pangya_domain::PlayerRepository::claim_offline_notes(&self.inner, recipient_id)
+                    .await?;
+            if self
+                .stall_offline_claims
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |claims| {
+                    claims.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.offline_claim_started.notify_one();
+                self.offline_claim_release.notified().await;
+            }
+            Ok(notes)
+        })
+    }
+
+    fn ack_offline_note(
+        &self,
+        claim: pangya_domain::OfflineNoteClaim,
+    ) -> pangya_domain::RepositoryFuture<'_, Result<bool, pangya_domain::RepositoryError>> {
+        Box::pin(async move {
+            let acknowledged =
+                pangya_domain::PlayerRepository::ack_offline_note(&self.inner, claim).await?;
+            if acknowledged {
+                self.offline_ack_completed.notify_one();
+            }
+            Ok(acknowledged)
+        })
+    }
+
+    fn accept_offline_note(
+        &self,
+        request: pangya_domain::OfflineNoteRequest,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::OfflineNoteCommit, pangya_domain::RepositoryError>,
+    > {
+        pangya_domain::PlayerRepository::accept_offline_note(&self.inner, request)
+    }
+}
+
+#[derive(Default)]
+struct OfflineNoteDeliveryObservation {
+    closed: Notify,
+}
+
+impl GameObserver for OfflineNoteDeliveryObservation {
+    fn closed(&self, _outcome: GameTermination) {
+        self.closed.notify_one();
     }
 }
 
@@ -703,6 +783,45 @@ async fn connect_game_retail(address: std::net::SocketAddr) -> (TcpStream, u8) {
     (stream, hello[8])
 }
 
+async fn connect_retail_social_client(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    account_id: AccountId,
+    username: &str,
+) -> (TcpStream, u8, u32) {
+    let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: username.as_bytes().to_vec(),
+            user_id: u32::try_from(account_id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    let mut connection_id = 0_u32;
+    for index in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let (_, body) = receive_packet(&mut stream, key).await;
+        if index == 3 {
+            let at = 1 + 2 + 6 + 2 + 9 + 2 + 22 + 22 + 17 + 24;
+            connection_id = u32::from_le_bytes(body[at..at + 4].try_into().expect("connection id"));
+        }
+    }
+    assert_ne!(
+        connection_id, 0,
+        "social connection id is advertised by bootstrap"
+    );
+    send_packet(&mut stream, key, 2, 4, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+    (stream, key, connection_id)
+}
+
 async fn connect_login(address: std::net::SocketAddr) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut hello = [0_u8; 14];
@@ -778,6 +897,12 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
         .into_iter()
         .map(|(opcode, _)| opcode)
         .collect()
+}
+
+fn wire<T: EncodePacket>(packet: &T, profile: &CompatibilityProfile) -> Result<Vec<u8>, String> {
+    encode_packet_payload(packet, profile)
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| error.to_string())
 }
 
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
@@ -6532,6 +6657,663 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
     drop(host);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+#[allow(deprecated)] // SO_LINGER is intentionally used to force the encrypted peer's write failure.
+async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(pool: PgPool) {
+    let sender = create_account(&pool, "LeaseSender", 1, 0x1000_0000).await;
+    let recipient = create_account(&pool, "LeaseRecipient", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 25 WHERE account_id = $1")
+        .bind(sender.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund sender");
+    let repository = Arc::new(BlockingStrokeCommitRepository::stalling_offline_claim(
+        pool.clone(),
+    ));
+    pangya_domain::PlayerRepository::accept_offline_note(
+        &*repository,
+        OfflineNoteRequest {
+            sender_id: sender.account.id,
+            recipient_id: recipient.account.id,
+            operation_id: [0x35; 32],
+            message: b"retry after socket failure".to_vec(),
+        },
+    )
+    .await
+    .expect("queue note");
+    let delivery_observation = Arc::new(OfflineNoteDeliveryObservation::default());
+    let service = Arc::new(
+        GameService::new(
+            Arc::clone(&repository),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits::default(),
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            delivery_observation.clone(),
+        )
+        .expect("lease service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        recipient.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut failed, key) = connect_game_retail(address).await;
+    let claim_started = repository.offline_claim_started.notified();
+    send_typed(
+        &mut failed,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"LeaseRecipient".to_vec(),
+            user_id: u32::try_from(recipient.account.id.get()).expect("recipient id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, claim_started)
+        .await
+        .expect("offline claim began");
+    let leased: (bool, bool) = sqlx::query_as(
+        "SELECT delivered_at IS NULL, delivery_lease_token IS NOT NULL FROM offline_notes",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("lease state");
+    assert_eq!(leased, (true, true));
+    // RST the encrypted peer while claim_offline_notes is paused, then let the server attempt the
+    // queued WhisperResponse. The failed write must not turn the lease into a delivered row.
+    // The connection-close observation is the state transition proving the failed write path has
+    // finished. A fixed sleep here races the handler's write and database work under contention.
+    let failed_closed = delivery_observation.closed.notified();
+    failed
+        .set_linger(Some(Duration::ZERO))
+        .expect("reset linger");
+    drop(failed);
+    repository.offline_claim_release.notify_one();
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, failed_closed)
+        .await
+        .expect("failed delivery connection closed");
+    let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
+        .fetch_one(&pool)
+        .await
+        .expect("failed delivery state");
+    assert!(!delivered, "socket failure acknowledged the note");
+
+    sqlx::query("UPDATE offline_notes SET delivery_lease_until = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .expect("expire failed lease");
+    // The packet becoming readable only proves the socket write reached the kernel. Wait for the
+    // repository acknowledgement event before inspecting durable state.
+    let retry_acknowledged = repository.offline_ack_completed.notified();
+    let (mut retry, retry_key, _) =
+        connect_retail_social_client(&pool, address, recipient.account.id, "LeaseRecipient").await;
+    let (opcode, body) = receive_packet(&mut retry, retry_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            0, 12, 0, 78, 76, 101, 97, 115, 101, 83, 101, 110, 100, 101, 114, 26, 0, 114, 101, 116,
+            114, 121, 32, 97, 102, 116, 101, 114, 32, 115, 111, 99, 107, 101, 116, 32, 102, 97,
+            105, 108, 117, 114, 101,
+        ]
+    );
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, retry_acknowledged)
+        .await
+        .expect("retry acknowledgement completed");
+    let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
+        .fetch_one(&pool)
+        .await
+        .expect("retry delivery state");
+    assert!(delivered, "retry was not acknowledged");
+    drop(retry);
+    shutdown.cancel();
+    task.await.expect("lease join").expect("lease serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool: PgPool) {
+    let alice = create_account(&pool, "SocialAlice", 1, 0x1000_0000).await;
+    let bob = create_account(&pool, "SocialBob", 1, 0x1000_0000).await;
+    let offline = create_account(&pool, "SocialOffline", 1, 0x1000_0000).await;
+    // Give this fixture a real LoginService credential; GameService still authenticates by
+    // handover below, while the restarted login instance proves the persisted macro path.
+    let policy = CredentialPolicy::new().expect("macro credential policy");
+    let secret = pangya_login::CanonicalTransportSecret::parse(SECRET).expect("macro secret");
+    let hash = policy.hash(&secret).expect("macro hash");
+    sqlx::query("UPDATE credentials SET password_hash = $2 WHERE account_id = $1")
+        .bind(alice.account.id.get())
+        .bind(hash.expose_phc())
+        .execute(&pool)
+        .await
+        .expect("macro credential");
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    chat_messages_per_window: 20,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail social service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut first, first_key, first_connection) =
+        connect_retail_social_client(&pool, address, alice.account.id, "SocialAlice").await;
+    let (mut second, second_key, second_connection) =
+        connect_retail_social_client(&pool, address, bob.account.id, "SocialBob").await;
+    sqlx::query("UPDATE profiles SET pang = 100 WHERE account_id = $1")
+        .bind(alice.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund note sender");
+
+    // A note resolves by durable user id, not by live presence. It is charged and acknowledged
+    // only after the offline bridge accepts the row.
+    let offline_id = u32::try_from(offline.account.id.get()).expect("offline id");
+    send_typed(
+        &mut first,
+        first_key,
+        5,
+        &NoteSend {
+            subtype: 0x0111,
+            user_id: offline_id,
+            message: b"queued while away".to_vec(),
+            unknown: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        receive_packet(&mut first, first_key).await.0,
+        RetailPangBalance::OPCODE
+    );
+    let stored: (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT message, (SELECT pang FROM profiles WHERE account_id = $1) \
+         FROM offline_notes WHERE sender_account_id = $2 AND recipient_account_id = $3",
+    )
+    .bind(alice.account.id.get())
+    .bind(alice.account.id.get())
+    .bind(offline.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("offline note persisted");
+    assert_eq!(stored.0, b"queued while away");
+    assert_eq!(stored.1, 90);
+    let (mut offline_stream, offline_key, _) =
+        connect_retail_social_client(&pool, address, offline.account.id, "SocialOffline").await;
+    let (opcode, body) = receive_packet(&mut offline_stream, offline_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    // Literal PacketDoc golden bytes keep the E2E independent from the encoder under test.
+    assert_eq!(
+        body,
+        [
+            0, 12, 0, 78, 83, 111, 99, 105, 97, 108, 65, 108, 105, 99, 101, 17, 0, 113, 117, 101,
+            117, 101, 100, 32, 119, 104, 105, 108, 101, 32, 97, 119, 97, 121
+        ]
+    );
+
+    // Both sockets are independently encrypted, and lobby chat is broadcast to every member.
+    let chat = GameChat::new(b"NSocialAlice".to_vec(), b"hello lobby".to_vec());
+    send_typed(&mut first, first_key, 3, &chat).await;
+    for (stream, key) in [(&mut first, first_key), (&mut second, second_key)] {
+        let (opcode, body) = receive_packet(stream, key).await;
+        assert_eq!(opcode, GameChatResponse::OPCODE);
+        let expected = wire(
+            &GameChatResponse {
+                nickname: chat.nickname.clone(),
+                message: chat.message.clone(),
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("chat response");
+        assert_eq!(body, expected, "encrypted lobby fanout bytes");
+    }
+
+    // Whisper delivery is point-to-point with a sender acknowledgement.
+    let whisper = Whisper::new(b"NSocialBob".to_vec(), b"private".to_vec());
+    send_typed(&mut first, first_key, 4, &whisper).await;
+    let (opcode, body) = receive_packet(&mut second, second_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            0, 12, 0, 78, 83, 111, 99, 105, 97, 108, 65, 108, 105, 99, 101, 7, 0, 112, 114, 105,
+            118, 97, 116, 101
+        ]
+    );
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            1, 10, 0, 78, 83, 111, 99, 105, 97, 108, 66, 111, 98, 7, 0, 112, 114, 105, 118, 97,
+            116, 101
+        ]
+    );
+
+    // Lounge action and the 0x00EB per-occupant query both remain process-wide and multi-client.
+    let action = LoungeAction::emote(b"dance".to_vec());
+    send_typed(&mut first, first_key, 5, &action).await;
+    for (stream, key) in [(&mut first, first_key), (&mut second, second_key)] {
+        let (opcode, body) = receive_packet(stream, key).await;
+        assert_eq!(opcode, <LoungeActionResponse as EncodePacket>::OPCODE);
+        assert_eq!(
+            body,
+            wire(
+                &LoungeActionResponse::new(first_connection, {
+                    let mut value = vec![action.action_type];
+                    value.extend_from_slice(&action.action_payload);
+                    value
+                }),
+                &CompatibilityProfile::US_852,
+            )
+            .expect("lounge action")
+        );
+    }
+    send_packet(
+        &mut first,
+        first_key,
+        6,
+        <LoungeEnterRequest as DecodePacket>::OPCODE,
+        &second_connection.to_le_bytes(),
+    )
+    .await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, LoungeEnterResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &LoungeEnterResponse {
+                connection_id: second_connection
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("lounge enter")
+    );
+
+    // Blocked and offline targets are explicit client-safe refusal packets, not silent drops.
+    send_packet(&mut second, second_key, 7, 0x0055, &[0]).await;
+    send_typed(&mut first, first_key, 8, &whisper).await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperRefusalResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperRefusalResponse {
+                status: 4,
+                nickname: b"NSocialBob".to_vec()
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("blocked refusal")
+    );
+    send_typed(
+        &mut first,
+        first_key,
+        9,
+        &Whisper::new(b"Offline".to_vec(), b"gone".to_vec()),
+    )
+    .await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperRefusalResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperRefusalResponse {
+                status: 5,
+                nickname: b"Offline".to_vec()
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("offline refusal")
+    );
+
+    // Save a literal fixture through 0x0069 before the malformed-packet closure below. The
+    // restarted LoginService assertion builds its expected 576-byte body independently.
+    let macro_values: [Vec<u8>; 9] =
+        std::array::from_fn(|index| format!("literal-macro-{index}").into_bytes());
+    send_typed(
+        &mut first,
+        first_key,
+        12,
+        &MacroUpdate::new(macro_values.clone()),
+    )
+    .await;
+
+    // User-info is a golden 13-packet sequence. Every wire body is canonicalized against its
+    // independently typed PacketDoc contract, so this pins order and exact bytes, not only IDs.
+    send_typed(
+        &mut first,
+        first_key,
+        10,
+        &UserInfoRequest {
+            user_id: u32::try_from(bob.account.id.get()).expect("bob id"),
+            request_type: 5,
+        },
+    )
+    .await;
+    let mut fanout = Vec::new();
+    for _ in 0..13 {
+        fanout.push(receive_packet(&mut first, first_key).await);
+    }
+    assert_eq!(
+        fanout.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
+        vec![
+            0x0157, 0x015e, 0x0156, 0x0158, 0x015d, 0x015c, 0x015c, 0x015b, 0x015a, 0x0159, 0x015c,
+            0x0257, 0x0089,
+        ]
+    );
+    let user_id = u32::try_from(bob.account.id.get()).expect("bob id");
+    let character_uid: i64 =
+        sqlx::query_scalar("SELECT character_id FROM equipment_sets WHERE account_id = $1")
+            .bind(bob.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("bob character");
+    let character_uid = u32::try_from(character_uid).expect("character uid");
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id = $1")
+        .bind(bob.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("bob pang");
+    let pang = u32::try_from(pang).expect("bob pang width");
+
+    // Independent PacketDoc reference fixtures. Keep these literal builders separate from the
+    // protocol encoders so an encoder regression cannot make this E2E self-validate.
+    fn fixed_nul(value: &[u8], width: usize) -> Vec<u8> {
+        let mut bytes = vec![0; width];
+        bytes[..value.len()].copy_from_slice(value);
+        bytes
+    }
+    fn user_name_fixture(user_id: u32) -> Vec<u8> {
+        let mut bytes = vec![5];
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        bytes.extend_from_slice(&[0xff, 0xff]);
+        bytes.extend(fixed_nul(b"SocialBob", 22));
+        bytes.extend(fixed_nul(b"NSocialBob", 22));
+        bytes.extend(fixed_nul(&[], 21));
+        bytes.extend(fixed_nul(&[], 24));
+        bytes.extend_from_slice(&[0; 4 + 12 + 4 + 4 + 2]);
+        bytes.extend_from_slice(&[0xff; 6]);
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend(fixed_nul(&[], 128));
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+    fn character_fixture(user_id: u32, character_uid: u32) -> Vec<u8> {
+        let mut bytes = user_id.to_le_bytes().to_vec();
+        let mut character = vec![0; pangya_protocol::CHARACTER_BLOCK_BYTES];
+        character[0..4].copy_from_slice(&0x0400_0000_u32.to_le_bytes());
+        character[4..8].copy_from_slice(&character_uid.to_le_bytes());
+        bytes.extend(character);
+        bytes
+    }
+    fn statistics_fixture(user_id: u32, pang: u32) -> Vec<u8> {
+        let mut bytes = vec![5];
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        let mut body = vec![0; pangya_protocol::PLAYER_STATISTICS_BYTES];
+        body[74..78].copy_from_slice(&0_u32.to_le_bytes());
+        body[79..83].copy_from_slice(&pang.to_le_bytes());
+        body[91..96].fill(0x7f);
+        bytes.extend(body);
+        bytes
+    }
+    fn counted_course_fixture(request_type: u8, user_id: u32) -> Vec<u8> {
+        [
+            vec![request_type],
+            user_id.to_le_bytes().to_vec(),
+            vec![0; 8],
+        ]
+        .concat()
+    }
+    fn short_info_fixture(request_type: u8, user_id: u32, tail: &[u8]) -> Vec<u8> {
+        [
+            vec![request_type],
+            user_id.to_le_bytes().to_vec(),
+            tail.to_vec(),
+        ]
+        .concat()
+    }
+    let mut equipment = vec![5];
+    equipment.extend_from_slice(&user_id.to_le_bytes());
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&character_uid.to_le_bytes());
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&[0; 25 * 4]);
+    let mut guild = user_id.to_le_bytes().to_vec();
+    guild.extend_from_slice(&[0; 4]); // unknown_a
+    guild.extend(fixed_nul(&[], 21)); // guild_name
+    guild.extend_from_slice(&[0; 12]); // unknown_b, unknown_c, unknown_d
+    guild.extend(fixed_nul(&[], 12)); // guild_emblem_id
+    guild.extend_from_slice(&[0; 206]); // unknown_e
+    guild.extend_from_slice(&u32::MAX.to_le_bytes()); // unknown_f
+    guild.extend_from_slice(&[0; 22]); // unknown_g
+    guild.extend_from_slice(&[
+        0xc3, 0x41, 0x02, 0xf8, 0x28, 0x3a, 0x02, 0x78, 0x23, 0x09, 0x09, 0x60, 0xf1, 0x01, 0x0b,
+        0xd0,
+    ]); // unknown_h
+    assert_eq!(guild.len(), 301, "PacketDoc 0x015d field layout");
+    assert_eq!(&guild[0..4], &user_id.to_le_bytes());
+    assert_eq!(&guild[4..8], &[0; 4]);
+    assert_eq!(&guild[8..29], &[0; 21]);
+    assert_eq!(&guild[29..41], &[0; 12]);
+    assert_eq!(&guild[41..53], &[0; 12]);
+    let mut trophies = vec![5];
+    trophies.extend_from_slice(&user_id.to_le_bytes());
+    trophies.extend_from_slice(&[0; 78]);
+    let expected_packets = [
+        user_name_fixture(user_id),
+        character_fixture(user_id, character_uid),
+        equipment,
+        statistics_fixture(user_id, pang),
+        guild,
+        counted_course_fixture(0x33, user_id),
+        counted_course_fixture(0x34, user_id),
+        short_info_fixture(5, user_id, &[0, 0]),
+        short_info_fixture(5, user_id, &[0, 0]),
+        trophies,
+        counted_course_fixture(5, user_id),
+        short_info_fixture(5, user_id, &[0, 0]),
+        [
+            1_u32.to_le_bytes().to_vec(),
+            vec![5],
+            user_id.to_le_bytes().to_vec(),
+        ]
+        .concat(),
+    ];
+    for (index, expected) in expected_packets.into_iter().enumerate() {
+        let actual = &fanout[index].1;
+        let first_difference = actual
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected)
+            .or_else(|| {
+                (actual.len() != expected.len()).then_some(actual.len().min(expected.len()))
+            });
+        assert!(
+            first_difference.is_none(),
+            "golden fanout body {index}: first differing offset {first_difference:?}, actual len {}, expected len {}",
+            actual.len(),
+            expected.len(),
+        );
+    }
+
+    // Malformed payloads are rejected on the encrypted transport; neither client is left with a
+    // silent parser gap. A fresh pre-auth socket also proves social packets are out-of-state.
+    send_packet(
+        &mut first,
+        first_key,
+        11,
+        <GameChat as EncodePacket>::OPCODE,
+        &[0],
+    )
+    .await;
+    assert_closed(&mut first).await;
+    let (mut pre_auth, pre_auth_key) = connect_game_retail(address).await;
+    send_packet(
+        &mut pre_auth,
+        pre_auth_key,
+        1,
+        <GameChat as EncodePacket>::OPCODE,
+        &[],
+    )
+    .await;
+    assert_closed(&mut pre_auth).await;
+
+    let persisted_macros: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT chat_macros FROM profiles WHERE account_id = $1")
+            .bind(alice.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("macro row");
+    assert_eq!(persisted_macros, macro_values, "macro save before restart");
+    drop(offline_stream);
+    drop(second);
+    shutdown.cancel();
+    assert!(task.await.expect("social join").is_ok());
+
+    let login_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("macro login bind");
+    let login_address = login_listener.local_addr().expect("macro login address");
+    let login = Arc::new(
+        LoginService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            BoundedCredentialExecutor::new(
+                Arc::new(policy),
+                2,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("macro executor"),
+            LoginRuntimeConfig {
+                auto_create_accounts: false,
+                starter: starter(1, 0x1000_0000),
+                allowed_character_types: vec![0x0400_0000],
+                game_server: AdvertisedGameServer {
+                    id: 1,
+                    name: "Macro Fixture".to_owned(),
+                    ipv4: "127.0.0.1".to_owned(),
+                    port: 1,
+                    capacity: 1,
+                },
+                limits: LoginRuntimeLimits::default(),
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("macro login service"),
+    );
+    let login_shutdown = CancellationToken::new();
+    let login_child = login_shutdown.clone();
+    let login_task = tokio::spawn(async move { login.serve(login_listener, login_child).await });
+    let (mut login_stream, login_key) = connect_login(login_address).await;
+    send_packet(
+        &mut login_stream,
+        login_key,
+        20,
+        1,
+        &login_payload("SocialAlice"),
+    )
+    .await;
+    let mut macro_body = None;
+    for expected_opcode in [1, 0x10, 6, 9, 2] {
+        let (opcode, body) = receive_packet(&mut login_stream, login_key).await;
+        assert_eq!(opcode, expected_opcode);
+        if opcode == 6 {
+            macro_body = Some(body);
+        }
+    }
+    let mut expected_macro_body = Vec::with_capacity(9 * 64);
+    for value in &macro_values {
+        expected_macro_body.extend_from_slice(value);
+        expected_macro_body.resize(expected_macro_body.len() + 64 - value.len(), 0);
+    }
+    assert_eq!(
+        macro_body.expect("login macro response"),
+        expected_macro_body
+    );
+    login_shutdown.cancel();
+    assert!(login_task.await.expect("macro login join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgPool) {
+    let account = create_account(&pool, "SocialRate", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    chat_messages_per_window: 1,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail social rate service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut stream, key, _) =
+        connect_retail_social_client(&pool, address, account.account.id, "SocialRate").await;
+    // Exercise the whisper limiter with the actual whisper body/opcode, rather than a chat
+    // packet that bypasses the 0x002a -> 0x0084 path under review.
+    let whisper = Whisper::new(b"NSocialRate".to_vec(), b"one".to_vec());
+    send_typed(&mut stream, key, 4, &whisper).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            0, 11, 0, 78, 83, 111, 99, 105, 97, 108, 82, 97, 116, 101, 3, 0, 111, 110, 101
+        ]
+    );
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            1, 11, 0, 78, 83, 111, 99, 105, 97, 108, 82, 97, 116, 101, 3, 0, 111, 110, 101
+        ]
+    );
+    send_typed(&mut stream, key, 4, &whisper).await;
+    assert_closed(&mut stream).await;
+    shutdown.cancel();
+    assert!(task.await.expect("rate join").is_ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

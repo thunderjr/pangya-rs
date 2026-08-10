@@ -3077,6 +3077,9 @@ pub enum RepositoryError {
     /// Refusing is the only safe outcome: wrapping would silently destroy a balance.
     #[error("balance would overflow")]
     BalanceOverflow,
+    /// A fixed-price operation cannot be covered by the current Pang balance.
+    #[error("balance is insufficient")]
+    BalanceInsufficient,
     /// A shop publish is already queued or running.
     ///
     /// Enqueuing a second would either race two workers over one client tree or silently
@@ -3183,6 +3186,23 @@ pub trait AccountRepository: Send + Sync {
         account_id: AccountId,
         grant: BalanceGrant,
     ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>>;
+
+    /// Loads the nine persisted lobby chat macros for LoginService.
+    fn load_chat_macros(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<[Vec<u8>; 9], RepositoryError>> {
+        Box::pin(std::future::ready(Ok(std::array::from_fn(|_| Vec::new()))))
+    }
+
+    /// Persists the nine bounded lobby chat macros.
+    fn save_chat_macros(
+        &self,
+        _account_id: AccountId,
+        _macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
+    }
 }
 
 /// Technology-neutral operator admin surface repository contract.
@@ -4035,6 +4055,50 @@ pub struct RetailEquipmentState {
     pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
 }
 
+/// One atomically accepted offline note.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineNoteRequest {
+    /// Authenticated sender account.
+    pub sender_id: AccountId,
+    /// Recipient account from the wire's user id.
+    pub recipient_id: AccountId,
+    /// Stable digest of the exact authenticated request payload.
+    pub operation_id: [u8; 32],
+    /// Bounded note text.
+    pub message: Vec<u8>,
+}
+
+/// One leased offline note pending delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineNote {
+    /// Durable note row id.
+    pub id: i64,
+    /// Opaque lease token fencing stale acknowledgements.
+    pub lease_token: [u8; 16],
+    /// Sender's display nickname.
+    pub sender_nickname: Vec<u8>,
+    /// Note text.
+    pub message: Vec<u8>,
+}
+
+/// A successful outbound delivery acknowledgement for one leased note.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineNoteClaim {
+    /// Durable note row id.
+    pub id: i64,
+    /// Lease token returned by the claim operation.
+    pub lease_token: [u8; 16],
+}
+
+/// Durable result of an offline-note submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineNoteCommit {
+    /// Sender's balance after the operation.
+    pub pang: u64,
+    /// Whether this request inserted a new note rather than replaying one.
+    pub accepted: bool,
+}
+
 /// Technology-neutral coherent player-bootstrap repository contract.
 pub trait PlayerRepository: Send + Sync {
     /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
@@ -4063,6 +4127,47 @@ pub trait PlayerRepository: Send + Sync {
         _change: RetailEquipmentChange,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RetailEquipmentState>, RepositoryError>> {
         Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
+    }
+
+    /// Persists the nine bounded lobby chat macros for the authenticated player.
+    fn save_chat_macros(
+        &self,
+        _account_id: AccountId,
+        _macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
+    }
+
+    /// Leases pending notes for delivery after a recipient authenticates.
+    ///
+    /// A lease is recoverable after expiry; implementations must not mark a row delivered here.
+    fn claim_offline_notes(
+        &self,
+        _recipient_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<Vec<OfflineNote>, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+
+    /// Acknowledges one note only after its outbound socket write succeeds.
+    ///
+    /// Returns whether exactly one pending row carried this lease token. The token fences a
+    /// delayed acknowledgement from an expired lease and a later claimant.
+    fn ack_offline_note(
+        &self,
+        _claim: OfflineNoteClaim,
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+
+    /// Stores an offline note and debits its fixed 10-Pang cost in one transaction.
+    ///
+    /// Implementations must resolve the recipient by account id (not presence), insert or replay
+    /// the operation idempotently, and never debit a rejected or failed insert.
+    fn accept_offline_note(
+        &self,
+        _request: OfflineNoteRequest,
+    ) -> RepositoryFuture<'_, Result<OfflineNoteCommit, RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
 }
 

@@ -28,13 +28,13 @@ use pangya_domain::{
     MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
     NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
-    PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem,
-    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
-    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
-    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
-    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
-    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
-    synthetic_stroke_reward_v1,
+    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
+    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult,
+    RepositoryError, RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances,
+    ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault,
+    StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
+    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -430,6 +430,182 @@ impl PgRepository {
         }
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(())
+    }
+
+    async fn load_chat_macros_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<[Vec<u8>; 9], RepositoryError> {
+        let row = sqlx::query("SELECT chat_macros FROM profiles WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        let values: Vec<Vec<u8>> = row.try_get("chat_macros").map_err(repository_db_error)?;
+        if values.len() != 9 || values.iter().any(|value| value.len() >= 64) {
+            return Err(RepositoryError::CorruptData);
+        }
+        values.try_into().map_err(|_| RepositoryError::CorruptData)
+    }
+
+    async fn save_chat_macros_inner(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> Result<(), RepositoryError> {
+        if macros
+            .iter()
+            .any(|value| value.len() >= 64 || value.contains(&0))
+        {
+            return Err(RepositoryError::CorruptData);
+        }
+        sqlx::query(
+            "UPDATE profiles SET chat_macros = $2, updated_at = now() WHERE account_id = $1",
+        )
+        .bind(account_id.get())
+        .bind(macros.to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        Ok(())
+    }
+
+    async fn claim_offline_notes_inner(
+        &self,
+        recipient_id: AccountId,
+    ) -> Result<Vec<OfflineNote>, RepositoryError> {
+        // Claiming is deliberately separate from delivery acknowledgement. A process crash or
+        // socket failure leaves the row leased, not lost; the short lease makes it claimable by a
+        // reconnect without charging the sender again.
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let rows = sqlx::query(
+            "SELECT n.id, p.nickname_display, n.message \
+             FROM offline_notes n \
+             JOIN profiles p ON p.account_id = n.sender_account_id \
+             WHERE n.recipient_account_id = $1 AND n.delivered_at IS NULL \
+               AND (n.delivery_lease_until IS NULL OR n.delivery_lease_until <= now()) \
+             ORDER BY n.id FOR UPDATE OF n SKIP LOCKED",
+        )
+        .bind(recipient_id.get())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        let mut notes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id").map_err(repository_db_error)?;
+            let lease_token = *Uuid::new_v4().as_bytes();
+            sqlx::query(
+                "UPDATE offline_notes SET delivery_lease_until = now() + interval '30 seconds', \
+                 delivery_lease_token = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(lease_token.as_slice())
+            .execute(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?;
+            let nickname: Option<String> = row
+                .try_get("nickname_display")
+                .map_err(repository_db_error)?;
+            let message: Vec<u8> = row.try_get("message").map_err(repository_db_error)?;
+            notes.push(OfflineNote {
+                id,
+                lease_token,
+                sender_nickname: nickname.unwrap_or_default().into_bytes(),
+                message,
+            });
+        }
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(notes)
+    }
+
+    async fn ack_offline_note_inner(
+        &self,
+        claim: OfflineNoteClaim,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE offline_notes SET delivered_at = now(), delivery_lease_until = NULL, \
+             delivery_lease_token = NULL WHERE id = $1 AND delivered_at IS NULL \
+             AND delivery_lease_token = $2",
+        )
+        .bind(claim.id)
+        .bind(claim.lease_token.as_slice())
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn accept_offline_note_inner(
+        &self,
+        request: OfflineNoteRequest,
+    ) -> Result<OfflineNoteCommit, RepositoryError> {
+        if request.message.is_empty() || request.message.len() > 128 || request.message.contains(&0)
+        {
+            return Err(RepositoryError::CorruptData);
+        }
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let recipient = sqlx::query("SELECT status FROM accounts WHERE id = $1 FOR SHARE")
+            .bind(request.recipient_id.get())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        let status: String = recipient.try_get("status").map_err(repository_db_error)?;
+        if status != "active" {
+            return Err(RepositoryError::AccountInactive);
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO offline_notes \
+             (sender_account_id, recipient_account_id, operation_id, message) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (sender_account_id, operation_id) \
+             DO NOTHING RETURNING id",
+        )
+        .bind(request.sender_id.get())
+        .bind(request.recipient_id.get())
+        .bind(request.operation_id.as_slice())
+        .bind(&request.message)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .is_some();
+
+        if inserted {
+            // The note row and this debit commit together. A failed predicate rolls back the
+            // insert, so an unaccepted note can never consume Pang.
+            let row = sqlx::query(
+                "UPDATE profiles SET pang = pang - 10, updated_at = now() \
+                 WHERE account_id = $1 AND pang >= 10 RETURNING pang",
+            )
+            .bind(request.sender_id.get())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::BalanceInsufficient)?;
+            let pang: i64 = row.try_get("pang").map_err(repository_db_error)?;
+            let pang = u64::try_from(pang).map_err(|_| RepositoryError::CorruptData)?;
+            transaction.commit().await.map_err(repository_db_error)?;
+            Ok(OfflineNoteCommit {
+                pang,
+                accepted: true,
+            })
+        } else {
+            // A retry returns the already durable balance without charging again. The unique
+            // operation key is intentionally scoped to the sender account.
+            let row = sqlx::query("SELECT pang FROM profiles WHERE account_id = $1")
+                .bind(request.sender_id.get())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(repository_db_error)?;
+            let pang: i64 = row.try_get("pang").map_err(repository_db_error)?;
+            let pang = u64::try_from(pang).map_err(|_| RepositoryError::CorruptData)?;
+            transaction.commit().await.map_err(repository_db_error)?;
+            Ok(OfflineNoteCommit {
+                pang,
+                accepted: false,
+            })
+        }
     }
 
     async fn load_player_snapshot_inner(
@@ -1546,6 +1722,21 @@ impl PgRepository {
 }
 
 impl AccountRepository for PgRepository {
+    fn load_chat_macros(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<[Vec<u8>; 9], RepositoryError>> {
+        Box::pin(self.observed(self.load_chat_macros_inner(account_id)))
+    }
+
+    fn save_chat_macros(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.save_chat_macros_inner(account_id, macros)))
+    }
+
     fn create_account(
         &self,
         request: NewAccount,
@@ -2222,6 +2413,28 @@ async fn owned_by_type_any(
 }
 
 impl PlayerRepository for PgRepository {
+    fn claim_offline_notes(
+        &self,
+        recipient_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<Vec<OfflineNote>, RepositoryError>> {
+        Box::pin(self.observed(self.claim_offline_notes_inner(recipient_id)))
+    }
+
+    fn ack_offline_note(
+        &self,
+        claim: OfflineNoteClaim,
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(self.observed(self.ack_offline_note_inner(claim)))
+    }
+
+    fn save_chat_macros(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.save_chat_macros_inner(account_id, macros)))
+    }
+
     fn load_player_snapshot(
         &self,
         account_id: AccountId,
@@ -2249,6 +2462,13 @@ impl PlayerRepository for PgRepository {
             expected_version,
             change,
         )))
+    }
+
+    fn accept_offline_note(
+        &self,
+        request: OfflineNoteRequest,
+    ) -> RepositoryFuture<'_, Result<OfflineNoteCommit, RepositoryError>> {
+        Box::pin(self.observed(self.accept_offline_note_inner(request)))
     }
 }
 

@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn statistics_block_is_exactly_the_reference_width() {
         let mut writer = PacketWriter::default();
-        RetailPlayerStatistics::default().encode_body(&mut writer);
+        RetailPlayerStatistics::default().encode_data(&mut writer);
         assert_eq!(writer.as_slice().len(), PLAYER_STATISTICS_BYTES);
     }
 
@@ -839,7 +839,8 @@ pub struct RetailPlayerStatistics {
 }
 
 impl RetailPlayerStatistics {
-    fn encode_body(&self, writer: &mut PacketWriter) {
+    /// Encodes the packetdoc user-statistic body for profile fan-out packets.
+    pub fn encode_data(&self, writer: &mut PacketWriter) {
         let start = writer.as_slice().len();
         writer.u32_le(self.total_shots);
         writer.u32_le(self.total_putts);
@@ -926,7 +927,7 @@ impl EncodePacket for RetailPlayerStatisticsReport {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
-        self.statistics.encode_body(writer);
+        self.statistics.encode_data(writer);
         // The trophy block, written the same way the handover record writes it.
         writer.u16_le(1);
         writer.bytes(&[0; PLAYER_TROPHIES_BYTES - 4]);
@@ -962,7 +963,10 @@ impl EncodePacket for RetailPangBalance {
         check_encode_profile(profile)?;
         writer.u16_le(273);
         writer.u32_le(0);
-        writer.u64_le(self.pang);
+        let pang =
+            u32::try_from(self.pang).map_err(|_| PacketEncodeError::Invalid { field: "pang" })?;
+        writer.u32_le(pang);
+        writer.u32_le(0);
         Ok(())
     }
 }
@@ -1148,7 +1152,7 @@ pub struct RetailPlayerData {
 impl RetailPlayerData {
     pub(crate) fn encode_body(&self, writer: &mut PacketWriter) -> Result<(), PacketEncodeError> {
         self.identity.encode_body(writer)?;
-        self.statistics.encode_body(writer);
+        self.statistics.encode_data(writer);
         // Trophies: amateur 6..1 then pro 1..7, each gold/silver/bronze.
         writer.u16_le(1);
         writer.bytes(&[0; PLAYER_TROPHIES_BYTES - 4]);
