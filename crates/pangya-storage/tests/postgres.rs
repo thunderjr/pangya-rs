@@ -17,12 +17,11 @@ use pangya_domain::{
     ItemTypeId, LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
     MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId,
     MatchPlan, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
-    Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
-    PlayerRepository, PurchaseRequest,
-    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
-    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
-    Weather, WindConditions,
+    Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository,
+    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -640,6 +639,35 @@ async fn upgraded_pre_recent_players_database_keeps_migration_0022_path(pool: Pg
             .map(|migration| migration.description.as_ref()),
         Some("retail recent players"),
         "the released migration remains version 0022",
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_bonus_forward_migration_follows_message_migrations(pool: PgPool) {
+    for migration in MIGRATOR.iter().filter(|migration| migration.version <= 31) {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .expect("previous released migration");
+    }
+    sqlx::raw_sql(include_str!("../migrations/0032_login_bonus.sql"))
+        .execute(&pool)
+        .await
+        .expect("0032 login bonus migration");
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'login_bonus_claims')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("login bonus catalog query");
+    assert!(table_exists);
+    assert_eq!(
+        MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 32)
+            .map(|migration| migration.description.as_ref()),
+        Some("login bonus"),
     );
 }
 
@@ -4849,10 +4877,12 @@ async fn login_bonus_claim_is_exactly_once_and_crosses_server_day(pool: PgPool) 
         .await
         .expect("account");
     let reward = login_bonus_reward();
-    assert!(!repository
-        .login_bonus_claimed(aggregate.account.id, 20_000)
-        .await
-        .expect("unclaimed"));
+    assert!(
+        !repository
+            .login_bonus_claimed(aggregate.account.id, 20_000)
+            .await
+            .expect("unclaimed")
+    );
     let (first, second) = tokio::join!(
         repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
         repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
@@ -4869,12 +4899,11 @@ async fn login_bonus_claim_is_exactly_once_and_crosses_server_day(pool: PgPool) 
         .expect("next day claim");
     assert!(!next.already_claimed);
     assert_eq!(next.quantity_after, 4);
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM login_bonus_claims WHERE account_id = $1",
-    )
-    .bind(aggregate.account.id.get())
-    .fetch_one(&pool)
-    .await
-    .expect("claim rows");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("claim rows");
     assert_eq!(count, 2);
 }

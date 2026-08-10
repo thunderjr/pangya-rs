@@ -24,14 +24,13 @@ use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::{Catalog, CatalogKind, CatalogPricing};
 use pangya_domain::{
     AccountId, AccountRepository, AccountRole, AdminRepository, BalanceGrant, CourseId,
-    EconomyRepository, HandoverRepository, ItemTypeId, LoginBonusReward, MatchPlan, MatchRepository,
-    NewAccount, Nickname, OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver,
+    EconomyRepository, HandoverRepository, ItemTypeId, LoginBonusReward, MatchPlan,
+    MatchRepository, NewAccount, Nickname, PlayerRepository, RepositoryError, StorageObserver,
     Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
-    LoginBonusRuntimeConfig,
-    LobbyLimits, RoomActorLimits, SoloRuntimeConfig, StrokeRuntimeConfig,
+    LobbyLimits, LoginBonusRuntimeConfig, RoomActorLimits, SoloRuntimeConfig, StrokeRuntimeConfig,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
@@ -489,7 +488,10 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                     .find(|offer| offer.kind == pangya_domain::ItemKind::Consumable)
                     .copied()
                     .map(|definition| LoginBonusRuntimeConfig {
-                        reward: LoginBonusReward { definition, quantity: 1 },
+                        reward: LoginBonusReward {
+                            definition,
+                            quantity: 1,
+                        },
                         calendar_days: 30,
                     })
             } else {

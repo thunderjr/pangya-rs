@@ -29,15 +29,15 @@ use pangya_domain::{
     MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate,
     MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey,
     MessageEligibilityRepository, MyRoomFurniture, MyRoomProjection, NewAccount, NewHandover,
-    NewMessageEligibility, Nickname,
-    NoopStorageObserver, NormalizedNickname, NormalizedUsername, OfflineNote, OfflineNoteClaim,
-    OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
-    PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem, RepairItemResult, RepositoryError,
-    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
-    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
-    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
-    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    NewMessageEligibility, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
+    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
+    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem,
+    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
+    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
+    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
+    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
+    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
+    synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -2608,8 +2608,9 @@ impl PgRepository {
         .await
         .map_err(repository_db_error)?;
         tx.commit().await.map_err(repository_db_error)
+    }
 
-async fn login_bonus_claimed_inner(
+    async fn login_bonus_claimed_inner(
         &self,
         account_id: AccountId,
         server_day: i64,
@@ -2653,14 +2654,22 @@ async fn login_bonus_claimed_inner(
         .await
         .map_err(repository_db_error)?
         {
-            let inventory_id = row.try_get::<i64, _>("inventory_item_id").map_err(|_| RepositoryError::CorruptData)?;
-            let quantity = row.try_get::<i32, _>("quantity").map_err(|_| RepositoryError::CorruptData)?;
-            let day = row.try_get::<i32, _>("calendar_day").map_err(|_| RepositoryError::CorruptData)?;
+            let inventory_id = row
+                .try_get::<i64, _>("inventory_item_id")
+                .map_err(|_| RepositoryError::CorruptData)?;
+            let quantity = row
+                .try_get::<i32, _>("quantity")
+                .map_err(|_| RepositoryError::CorruptData)?;
+            let day = row
+                .try_get::<i32, _>("calendar_day")
+                .map_err(|_| RepositoryError::CorruptData)?;
             transaction.commit().await.map_err(repository_db_error)?;
             return Ok(LoginBonusClaim {
                 already_claimed: true,
-                inventory_item_id: InventoryItemId::new(inventory_id).map_err(|_| RepositoryError::CorruptData)?,
-                quantity_after: u32::try_from(quantity).map_err(|_| RepositoryError::CorruptData)?,
+                inventory_item_id: InventoryItemId::new(inventory_id)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                quantity_after: u32::try_from(quantity)
+                    .map_err(|_| RepositoryError::CorruptData)?,
                 calendar_day: u32::try_from(day).map_err(|_| RepositoryError::CorruptData)?,
             });
         }
@@ -2728,10 +2737,12 @@ async fn login_bonus_claimed_inner(
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(LoginBonusClaim {
             already_claimed: false,
-            inventory_item_id: InventoryItemId::new(inventory.0).map_err(|_| RepositoryError::CorruptData)?,
+            inventory_item_id: InventoryItemId::new(inventory.0)
+                .map_err(|_| RepositoryError::CorruptData)?,
             quantity_after: u32::try_from(inventory.1).map_err(|_| RepositoryError::CorruptData)?,
             calendar_day,
-        })    }
+        })
+    }
 }
 
 impl PlayerRepository for PgRepository {
@@ -2748,8 +2759,9 @@ impl PlayerRepository for PgRepository {
         recent: RecentPlayer,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(self.observed(self.record_recent_player_inner(account_id, recent)))
+    }
 
-fn login_bonus_claimed(
+    fn login_bonus_claimed(
         &self,
         account_id: AccountId,
         server_day: i64,
@@ -2764,7 +2776,13 @@ fn login_bonus_claimed(
         calendar_day: u32,
         reward: LoginBonusReward,
     ) -> RepositoryFuture<'_, Result<LoginBonusClaim, RepositoryError>> {
-        Box::pin(self.observed(self.claim_login_bonus_inner(account_id, server_day, calendar_day, reward)))    }
+        Box::pin(self.observed(self.claim_login_bonus_inner(
+            account_id,
+            server_day,
+            calendar_day,
+            reward,
+        )))
+    }
 
     fn claim_offline_notes(
         &self,

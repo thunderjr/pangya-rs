@@ -12,18 +12,16 @@ use std::{
 use pangya_data::Catalog;
 use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
-    LoginBonusReward,
-    CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
-    MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId,
-    PlayerRepository as _, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
-    ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey,
-    Username, Weather,
+    CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId,
+    LoginBonusReward, MatchSeed, MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest,
+    PlayerConnectionId, PlayerRepository as _, RoomId, RoomName, RoomPassword, RoomSettings,
+    RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant,
+    StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
-    LoginBonusRuntimeConfig,
-    GameTermination, SoloRuntimeConfig, StrokeRuntimeConfig, UnknownOpcodePolicy,
-    deterministic_conditions,
+    GameTermination, LoginBonusRuntimeConfig, SoloRuntimeConfig, StrokeRuntimeConfig,
+    UnknownOpcodePolicy, deterministic_conditions,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
@@ -6341,16 +6339,27 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(status_opcode, 0x0248);
     assert_eq!(status.len(), 25);
     assert_eq!(status[4], 0, "the configured reward is initially unclaimed");
-    assert_eq!(u32::from_le_bytes(status[5..9].try_into().expect("item id")), reward_definition.type_id.get());
+    assert_eq!(
+        u32::from_le_bytes(status[5..9].try_into().expect("item id")),
+        reward_definition.type_id.get()
+    );
     send_packet(&mut stream, key, 4, 0x016f, &[]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x0216);
     let (claim_opcode, claim) = receive_packet(&mut stream, key).await;
     assert_eq!(claim_opcode, 0x0249);
     assert_eq!(claim.len(), 25);
     send_packet(&mut stream, key, 5, 0x016f, &[]).await;
-    assert_eq!(receive_packet(&mut stream, key).await.0, 0x0249, "retry is idempotent and has no second grant");
-    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
-        .bind(account.account.id.get()).fetch_one(&pool).await.expect("claim row");
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        0x0249,
+        "retry is idempotent and has no second grant"
+    );
+    let claims: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+            .bind(account.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("claim row");
     assert_eq!(claims, 1);
 
     // Daily quests are Tier D, but the retail button must receive an honest empty response rather
@@ -9085,6 +9094,7 @@ async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgP
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),

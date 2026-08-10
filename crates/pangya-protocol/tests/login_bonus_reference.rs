@@ -1,8 +1,8 @@
 //! PacketDoc literal layouts for the login-bonus protocol pair.
 
 use pangya_protocol::{
-    CompatibilityProfile, DecodePacket, Direction, EncodePacket, PacketReader, ServiceKind,
-    RetailLoginBonusClaimResponse, RetailLoginBonusStatus,
+    CompatibilityProfile, DecodePacket, Direction, EncodePacket, PacketReader,
+    RetailLoginBonusClaimResponse, RetailLoginBonusStatus, ServiceKind,
 };
 
 #[test]
@@ -21,10 +21,19 @@ fn status_uncollected_branch_is_the_reference_25_byte_union() {
     let bytes = writer.into_inner();
     assert_eq!(bytes.len(), 25);
     assert_eq!(bytes[4], 0);
-    assert_eq!(RetailLoginBonusStatus::decode(
-        &mut PacketReader::new(&bytes, Direction::ServerToClient, ServiceKind::Game, Some(0x0248)),
-        &CompatibilityProfile::US_852,
-    ).expect("decode"), packet);
+    assert_eq!(
+        RetailLoginBonusStatus::decode(
+            &mut PacketReader::new(
+                &bytes,
+                Direction::ServerToClient,
+                ServiceKind::Game,
+                Some(0x0248)
+            ),
+            &CompatibilityProfile::US_852,
+        )
+        .expect("decode"),
+        packet
+    );
 }
 
 #[test]
@@ -38,6 +47,8 @@ fn claim_response_has_five_opaque_bytes_and_five_words() {
         current_bonus_day: 5,
     };
     let mut writer = pangya_protocol::PacketWriter::new();
-    packet.encode(&mut writer, &CompatibilityProfile::US_852).expect("encode");
+    packet
+        .encode(&mut writer, &CompatibilityProfile::US_852)
+        .expect("encode");
     assert_eq!(writer.into_inner().len(), 25);
 }

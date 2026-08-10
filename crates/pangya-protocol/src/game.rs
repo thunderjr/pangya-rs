@@ -1268,16 +1268,19 @@ mod tests {
             .expect("encode");
         let bytes = writer.into_inner();
         assert_eq!(bytes[4], 1);
-        assert_eq!(RetailLoginBonusStatus::decode(
-            &mut PacketReader::new(
-                &bytes,
-                crate::Direction::ServerToClient,
-                crate::ServiceKind::Game,
-                Some(0x0248),
-            ),
-            &CompatibilityProfile::US_852,
-        )
-        .expect("decode"), collected);
+        assert_eq!(
+            RetailLoginBonusStatus::decode(
+                &mut PacketReader::new(
+                    &bytes,
+                    crate::Direction::ServerToClient,
+                    crate::ServiceKind::Game,
+                    Some(0x0248),
+                ),
+                &CompatibilityProfile::US_852,
+            )
+            .expect("decode"),
+            collected
+        );
     }
 
     #[test]
@@ -1296,16 +1299,19 @@ mod tests {
             .expect("encode");
         let bytes = writer.into_inner();
         assert_eq!(bytes.len(), 5 + 4 * 5);
-        assert_eq!(RetailLoginBonusClaimResponse::decode(
-            &mut PacketReader::new(
-                &bytes,
-                crate::Direction::ServerToClient,
-                crate::ServiceKind::Game,
-                Some(0x0249),
-            ),
-            &CompatibilityProfile::US_852,
-        )
-        .expect("decode"), response);
+        assert_eq!(
+            RetailLoginBonusClaimResponse::decode(
+                &mut PacketReader::new(
+                    &bytes,
+                    crate::Direction::ServerToClient,
+                    crate::ServiceKind::Game,
+                    Some(0x0249),
+                ),
+                &CompatibilityProfile::US_852,
+            )
+            .expect("decode"),
+            response
+        );
     }
 
     /// An empty history is five zeroed slots, not an empty packet: the client reads a fixed

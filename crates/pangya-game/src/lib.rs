@@ -48,16 +48,15 @@ use pangya_domain::{
     CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, CourseId, EconomyCommit,
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
-    LoginBonusReward,
-    ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan, MatchRepository, MatchResultKey,
-    MatchSeed, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer,
-    RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId,
-    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
-    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
-    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
-    StrokeRosterOrder,
+    ItemTypeId, LoginBonusReward, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
+    MatchRepository, MatchResultKey, MatchSeed, MemberCard, MemberSnapshot, Nickname,
+    OfflineNoteClaim, OfflineNoteRequest, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
+    PurchaseRequest, RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange,
+    RetailEquipmentState, RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings,
+    RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult,
+    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
+    StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -75,21 +74,21 @@ use pangya_protocol::{
     MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
     MessageServerList, MessageServerListRequest, NoteSend, OutboundFrame, PacketEncodeError,
     PacketWriter, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
-    RETAIL_C2S_FIRST_SHOT_READY, RETAIL_RECENT_PLAYERS, RepairCommitted, RepairRequest,
-    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
-    RetailEquipment, RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot,
-    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
-    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
-    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
-    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailLoginBonusClaimResponse, RetailLoginBonusItemGrant,
-    RetailLoginBonusRequest, RetailLoginBonusStatus, RETAIL_LOGIN_BONUS_CLAIM_OPCODE,
-    RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
-    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailMessageServerList, RetailMessageServerListRequest, RetailMultiplayerJoined,
-    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomFurniture,
-    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
+    RETAIL_C2S_FIRST_SHOT_READY, RETAIL_LOGIN_BONUS_CLAIM_OPCODE, RETAIL_RECENT_PLAYERS,
+    RepairCommitted, RepairRequest, RetailCaddie, RetailChannel, RetailChannelJoinNotice,
+    RetailChannelJoined, RetailCharacter, RetailClientException, RetailDailyQuestDelta,
+    RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment, RetailEquipmentAnnounce,
+    RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
+    RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression,
+    RetailHoleWeather, RetailHoleWind, RetailInventoryClass, RetailInventoryItem,
+    RetailLoadProgress, RetailLobbyEquipmentUpdate, RetailLockerCombinationAttempt,
+    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
+    RetailLoginBonusClaimResponse, RetailLoginBonusItemGrant, RetailLoginBonusRequest,
+    RetailLoginBonusStatus, RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed,
+    RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer,
+    RetailMatchStart, RetailMessageServerList, RetailMessageServerListRequest,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
     RetailNewSessionKeyRequest, RetailPangBalance, RetailPangRate, RetailPangSpent,
     RetailPlayerData, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailPlayerIdentity,
     RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
@@ -645,7 +644,9 @@ impl LoginBonusRuntimeConfig {
     fn validate(self, catalog: &Catalog) -> Result<(), GameRuntimeError> {
         if self.calendar_days == 0
             || self.reward.quantity == 0
-            || catalog.find_record(self.reward.definition.type_id).is_none()
+            || catalog
+                .find_record(self.reward.definition.type_id)
+                .is_none()
         {
             return Err(GameRuntimeError::Catalog);
         }
@@ -1287,9 +1288,9 @@ where
                     || solo.shot_packets_per_window == 0
                     || solo.shot_packets_per_window > 1_000_000
             })
-            || config.login_bonus.is_some_and(|bonus| {
-                bonus.calendar_days == 0 || bonus.reward.quantity == 0
-            })
+            || config
+                .login_bonus
+                .is_some_and(|bonus| bonus.calendar_days == 0 || bonus.reward.quantity == 0)
             || config.economy.is_some_and(|economy| {
                 economy.command_timeout.is_zero()
                     || economy.command_timeout > limits.shutdown_grace
@@ -2049,11 +2050,7 @@ where
                                 )
                                 .await?;
                             } else if self.config.retail_bootstrap
-                                && matches!(
-                                    frame.opcode,
-                                    RetailLoginBonusRequest::OPCODE
-                                        | RetailPlayerHistoryRequest::OPCODE
-                                )
+                                && frame.opcode == RetailPlayerHistoryRequest::OPCODE
                             {
                                 if !frame.payload.is_empty() {
                                     break Err(GameRuntimeError::Protocol);
@@ -2062,18 +2059,14 @@ where
                                     biased;
                                     () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
                                     sent = async {
-                                        if frame.opcode == RetailLoginBonusRequest::OPCODE {
-                                            self.send(&mut framed, &RetailLoginBonusStatus).await
-                                        } else {
-                                            let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
-                                            let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
-                                            let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
-                                                let account_id = u32::try_from(player.account_id.get()).ok()?;
-                                                let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
-                                                Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
-                                            }).collect::<Vec<_>>();
-                                            self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
-                                        }
+                                        let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
+                                        let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
+                                        let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
+                                            let account_id = u32::try_from(player.account_id.get()).ok()?;
+                                            let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
+                                            Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
+                                        }).collect::<Vec<_>>();
+                                        self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
                                     } => sent,
                                 };
                                 if let Err(error) = sent {
@@ -6791,7 +6784,9 @@ where
     fn retail_server_day() -> i64 {
         SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX))
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX)
+            })
     }
 
     async fn retail_login_bonus_status(
@@ -6825,7 +6820,11 @@ where
                 current_item_quantity: config.reward.quantity,
                 future_item_id: item_id,
                 future_item_quantity: config.reward.quantity,
-                future_bonus_day: if day == config.calendar_days { 1 } else { day + 1 },
+                future_bonus_day: if day == config.calendar_days {
+                    1
+                } else {
+                    day + 1
+                },
             })
         } else {
             Ok(RetailLoginBonusStatus::Uncollected {
@@ -6852,12 +6851,7 @@ where
             .saturating_add(1);
         let claim = self
             .repository
-            .claim_login_bonus(
-                account_id,
-                server_day,
-                calendar_day,
-                config.reward,
-            )
+            .claim_login_bonus(account_id, server_day, calendar_day, config.reward)
             .await
             .map_err(|_| GameRuntimeError::EconomyPersistence)?;
         let item_id = config.reward.definition.type_id.get();
@@ -6868,7 +6862,9 @@ where
                 .ok_or(GameRuntimeError::Snapshot)?;
             let unix_time = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| u32::try_from(duration.as_secs()).unwrap_or(u32::MAX));
+                .map_or(0, |duration| {
+                    u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
+                });
             self.send(
                 framed,
                 &RetailLoginBonusItemGrant {

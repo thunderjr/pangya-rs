@@ -4251,7 +4251,6 @@ pub trait PlayerRepository: Send + Sync {
             StorageFault::Other,
         ))))
     }
-    }
 
     /// Loads bounded visitor-visible My Room state for an account.
     fn load_my_room(
