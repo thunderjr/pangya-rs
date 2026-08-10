@@ -131,9 +131,9 @@ use pangya_protocol::{
     UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
     UserStatisticsInfoResponse, UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse,
     Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse, Wind,
-    decode_packet_payload, encode_packet_payload, is_retail_accepted_match_opcode,
-    is_retail_accepted_session_opcode, is_retail_explicit_social_refusal, packed_system_time,
-    synthetic_game_hello, us852_game_hello,
+    authorize_gm_request, decode_gm_request, decode_packet_payload, encode_packet_payload,
+    is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
+    is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};

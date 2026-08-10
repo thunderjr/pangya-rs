@@ -1353,12 +1353,27 @@ impl LobbyRegistry {
         let account_id = owner.account_id;
         let (handle, summary) = match terminal_outbox {
             Some(mailbox) => spawn_room_with_terminal_outbox(
-                id, name, password, settings, owner, outbound, mailbox, cancellation.clone(),
-                self.limits.room, Some(self.events.clone()),
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                mailbox,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
             ),
             None => spawn_room_with_events(
-                id, name, password, settings, owner, outbound, cancellation.clone(),
-                self.limits.room, Some(self.events.clone()),
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
             ),
         };
         let summary = match channel {
@@ -1411,14 +1426,22 @@ impl LobbyRegistry {
         let connection_id = identity.connection_id;
         let account_id = identity.account_id;
         match match terminal_outbox {
-            Some(mailbox) => handle
-                .join_with_terminal_outbox(
-                    identity, password, outbound, mailbox, cancellation.clone(),
-                )
-                .await,
-            None => handle
-                .join_with_cancellation(identity, password, outbound, cancellation.clone())
-                .await,
+            Some(mailbox) => {
+                handle
+                    .join_with_terminal_outbox(
+                        identity,
+                        password,
+                        outbound,
+                        mailbox,
+                        cancellation.clone(),
+                    )
+                    .await
+            }
+            None => {
+                handle
+                    .join_with_cancellation(identity, password, outbound, cancellation.clone())
+                    .await
+            }
         } {
             Ok(snapshot) => {
                 self.connections.insert(
