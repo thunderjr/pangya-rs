@@ -3953,7 +3953,7 @@ where
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 self.observer.stroke_commit(GameCommitObservation::Failed);
                 let abort = AbortStrokeMatch::new(
                     commit.match_id(),
@@ -3968,7 +3968,7 @@ where
                     AbortResolution::Aborted => Err(GameRuntimeError::MatchPersistence),
                 };
             }
-            Err(_) => {
+            Err(error) => {
                 self.observer
                     .stroke_commit(GameCommitObservation::Cancelled);
                 let abort = AbortStrokeMatch::new(
@@ -5471,11 +5471,6 @@ where
         context: Option<ConnectionStrokeContext>,
     ) -> Result<(), GameRuntimeError> {
         let context = context.ok_or(GameRuntimeError::Protocol)?;
-        eprintln!(
-            "RETAIL_COMMIT conn={} match={}",
-            context.roster[0].get(),
-            result.match_id().get()
-        );
         if context.match_id != result.match_id() {
             return Err(GameRuntimeError::Protocol);
         }
