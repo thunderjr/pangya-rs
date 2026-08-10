@@ -274,7 +274,6 @@ pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
     0x0007, // online status of another user
     0x0018, // typing indicator
     0x0032, // idle status
-    0x0033, // client-side exception report
     0x004f, // unclassified
     0x0069, // chat macro set
     0x0088, // unclassified
@@ -390,9 +389,12 @@ impl DecodePacket for RetailClientException {
     ) -> Result<Self, PacketDecodeError> {
         check_decode_profile(profile, reader)?;
         let _empty = reader.u8()?;
-        Ok(Self {
-            message: reader.pstring(MAX_CLIENT_EXCEPTION_BYTES)?.to_vec(),
-        })
+        let message = reader.pstring(MAX_CLIENT_EXCEPTION_BYTES)?.to_vec();
+        // Both primary references define only the filler byte and one PString. Their tails are
+        // unspecified, so reject any bytes after the declared message rather than guessing an
+        // extension that could hide a second frame or malformed data.
+        require_end(reader)?;
+        Ok(Self { message })
     }
 }
 

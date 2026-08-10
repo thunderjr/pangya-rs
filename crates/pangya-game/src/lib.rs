@@ -1350,6 +1350,12 @@ where
                                 Err(error) => break Err(error),
                             }
                         }
+                        GameState::AwaitChannel if frame.opcode == RetailClientException::OPCODE => {
+                            // Authenticated clients may report an exception before choosing a
+                            // channel. The report is fire-and-forget and must not become an
+                            // unknown-opcode strike or a response-producing command.
+                            observe_retail_client_exception(&frame.payload);
+                        }
                         GameState::AwaitChannel if frame.opcode == SelectChannel::OPCODE => {
                             // A real client sends the one-byte sub-server ID documented for this
                             // opcode; the synthetic packet carries a `u32` channel ID.
@@ -1400,6 +1406,11 @@ where
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
+                            } else if frame.opcode == RetailClientException::OPCODE {
+                                // This report is fire-and-forget. Decode failures are ignored
+                                // after the bounded frame has been consumed: a client diagnostic
+                                // must never turn into a second disconnect or stall the session.
+                                observe_retail_client_exception(&frame.payload);
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -4921,20 +4932,6 @@ where
         // What matters is that it is answered by an explicit allowlist rather than by the
         // unknown-opcode policy, which under the shipped `disconnect` would end the session
         // mid-hole.
-        // The client's own error handler reporting home. It is the only channel through which
-        // a closed-source client says what went wrong, and it is the last thing it sends
-        // before it exits, so it is logged rather than ignored. The message is client-
-        // controlled, so it is sanitised and bounded before it reaches a log line.
-        if opcode == RetailClientException::OPCODE
-            && let Ok(report) = decode_packet_payload::<RetailClientException>(
-                payload,
-                &CompatibilityProfile::US_852,
-                ServiceKind::Game,
-            )
-        {
-            tracing::warn!(message = %report.sanitized(), "client reported an exception");
-            return Ok(Some(state));
-        }
         if is_retail_accepted_match_opcode(opcode)
             && !(state == GameState::InRoom && opcode == RetailPracticeStart::OPCODE)
         {
@@ -7026,6 +7023,26 @@ fn retail_shot_announce_payload(payload: &[u8]) -> Result<Vec<u8>, GameRuntimeEr
 }
 const RETAIL_C2S_LOAD_PROGRESS: u16 = 0x0048;
 
+/// Observes a fire-and-forget retail client exception without making it fatal.
+///
+/// The frame has already been bounded by the codec. Decode errors are deliberately redacted and
+/// ignored: the client is reporting a failure, and a malformed report must not cause a second
+/// disconnect or prevent it from sending whatever diagnostic follows.
+fn observe_retail_client_exception(payload: &[u8]) {
+    match decode_packet_payload::<RetailClientException>(
+        payload,
+        &CompatibilityProfile::US_852,
+        ServiceKind::Game,
+    ) {
+        Ok(report) => {
+            tracing::warn!(message = %report.sanitized(), "client reported an exception");
+        }
+        Err(error) => {
+            tracing::debug!(%error, "malformed client exception report");
+        }
+    }
+}
+
 fn is_retail_match_opcode(opcode: u16) -> bool {
     matches!(
         opcode,
@@ -7797,6 +7814,54 @@ mod tests {
         assert_eq!(GameState::InRoom, GameState::InRoom);
         assert_eq!(UnknownOpcodePolicy::Capture, UnknownOpcodePolicy::Capture);
         assert_eq!(GameTermination::Cancelled.label(), "cancelled");
+    }
+
+    #[test]
+    fn retail_client_exception_is_not_a_silent_session_or_match_allowlist_entry() {
+        assert!(!is_retail_accepted_session_opcode(
+            RetailClientException::OPCODE
+        ));
+        assert!(!is_retail_match_opcode(RetailClientException::OPCODE));
+    }
+
+    #[test]
+    fn retail_client_exception_log_value_is_bounded_and_redacted() {
+        let report = RetailClientException {
+            message: [b"safe", &[b'\n', 0, 0xff][..], &[b'x'; 300][..]].concat(),
+        };
+        let sanitized = report.sanitized();
+        assert_eq!(sanitized.len(), 256);
+        assert_eq!(&sanitized[..7], "safe...");
+        assert!(
+            sanitized
+                .chars()
+                .all(|character| { character == '.' || (' '..='~').contains(&character) })
+        );
+    }
+
+    #[test]
+    fn retail_client_exception_uses_reference_body_and_rejects_truncation_or_trailing_bytes() {
+        // pangbox's ClientException is exactly one filler byte followed by one PString. The
+        // references do not define an extension tail, so an exact body is the safe policy.
+        let valid = [0, 4, 0, b's', b'a', b'f', b'e'];
+        let report = decode_packet_payload::<RetailClientException>(
+            &valid,
+            &CompatibilityProfile::US_852,
+            ServiceKind::Game,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.message, b"safe");
+
+        for malformed in [[0, 1, 0].as_slice(), &[0, 0, 0, 0][..]] {
+            assert!(
+                decode_packet_payload::<RetailClientException>(
+                    malformed,
+                    &CompatibilityProfile::US_852,
+                    ServiceKind::Game,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

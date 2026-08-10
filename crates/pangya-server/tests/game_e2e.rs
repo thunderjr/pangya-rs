@@ -762,6 +762,47 @@ async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, 
     send_packet(stream, key, salt, T::OPCODE, &payload).await;
 }
 
+/// Sends the reference-derived 0x0033 body over the real encrypted TCP codec.
+async fn send_exception_report(stream: &mut TcpStream, key: u8, salt: u8, body: &[u8]) {
+    send_packet(stream, key, salt, 0x0033, body).await;
+}
+
+/// A client exception report never has a server response. A timeout proves no encrypted frame
+/// leaked while still distinguishing an EOF (which would mean the report disconnected us).
+async fn assert_no_response(stream: &mut TcpStream) {
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(Duration::from_millis(150), stream.read(&mut byte)).await {
+        Err(_) => {}
+        Ok(Ok(0)) => panic!("exception report disconnected the client"),
+        Ok(Ok(bytes)) => panic!("exception report leaked {bytes} response bytes"),
+        Ok(Err(error)) => panic!("exception report read failed: {error}"),
+    }
+}
+
+/// Exercises every report shape that the retail references permit us to classify: a valid report,
+/// truncation, a bounded-message overflow, and a valid PString with an undefined trailing byte.
+/// All are fire-and-forget regardless of whether decoding succeeds.
+async fn exercise_exception_reports(stream: &mut TcpStream, key: u8, salt: u8) -> u8 {
+    let valid = [0, 4, 0, b's', b'a', b'f', b'e'];
+    send_exception_report(stream, key, salt, &valid).await;
+    assert_no_response(stream).await;
+    send_exception_report(stream, key, salt.wrapping_add(1), &[0, 1, 0]).await;
+    assert_no_response(stream).await;
+    let mut oversize = vec![0, 1, 2];
+    oversize.extend(std::iter::repeat_n(b'x', 513));
+    send_exception_report(stream, key, salt.wrapping_add(2), &oversize).await;
+    assert_no_response(stream).await;
+    send_exception_report(
+        stream,
+        key,
+        salt.wrapping_add(3),
+        &[0, 4, 0, b's', b'a', b'f', b'e', 0xff],
+    )
+    .await;
+    assert_no_response(stream).await;
+    salt.wrapping_add(4)
+}
+
 async fn flood_ready(mut stream: TcpStream, key: u8, count: usize) {
     let mut plain = Vec::with_capacity(3);
     plain.extend_from_slice(&pangya_protocol::SYNTHETIC_M4_C2S_READY.to_le_bytes());
@@ -3153,6 +3194,10 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
         f32::from(expected_wind.angle_degrees())
     );
 
+    // StartSolo transitions the authenticated client into InMatchLoading. Reports are still
+    // fire-and-forget while the match intro is buffered.
+    let exception_salt = exercise_exception_reports(&mut client.stream, client.key, 20).await;
+
     let catalog_fingerprint = m5_catalog().fingerprint();
     let persisted_begin: PersistedBeginRow = sqlx::query_as(
         "SELECT course_id, hole, par, catalog_sha256, seed, weather, wind_speed_tenths, \
@@ -3188,6 +3233,8 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
     );
 
     enter_playing(&mut client, &started).await;
+    // The loading-complete event transitions this connection to InMatch.
+    let _ = exercise_exception_reports(&mut client.stream, client.key, exception_salt).await;
     let action_power_canary = f32::from_bits(0x42f6_abcd);
     let result_x_canary = f32::from_bits(0x42ca_dcba);
     let first_action =
@@ -3298,6 +3345,16 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
     ] {
         let (key, value) = parse_expected_metric(expected);
         assert_eq!(metric_sample(&rendered, &key), Some(value), "{expected}");
+    }
+    for action in ["disconnected", "ignored", "captured", "strike_limit"] {
+        assert_eq!(
+            metric_sample(
+                &rendered,
+                &format!("pangya_game_unknown_opcode_actions_total{{action=\"{action}\"}}"),
+            ),
+            Some(0.0),
+            "client reports are not unknown opcodes",
+        );
     }
     let seed_hex = started
         .seed()
@@ -4776,6 +4833,8 @@ async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPo
             StrokePhase::new(owner_started.match_id(), StrokePhaseKind::Loading)
         );
     }
+    // Stroke start transitions both connections into InStrokeLoading.
+    let exception_salt = exercise_exception_reports(&mut owner.stream, owner.key, 20).await;
 
     send_typed(
         &mut peer.stream,
@@ -4811,6 +4870,9 @@ async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPo
                 .expect("first turn")
         );
     }
+    // The playing phase transitions both connections into InStrokeMatch. A report cannot alter
+    // the active turn, produce a reply, or consume a strike in this state.
+    let _ = exercise_exception_reports(&mut owner.stream, owner.key, exception_salt).await;
 
     type PersistenceSnapshot = (String, Vec<(i16, Option<i16>, Option<i16>, Option<String>)>);
     let in_game_snapshot: PersistenceSnapshot = (
@@ -5104,10 +5166,19 @@ async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPo
     assert!(rendered.contains("pangya_game_matches_active{mode=\"stroke_two\"} 0"));
     assert!(rendered.contains("mode=\"stroke_two\",outcome=\"out_of_turn\"} 1"));
     assert!(rendered.contains("mode=\"stroke_two\",outcome=\"duplicate\"} 1"));
+    for action in ["disconnected", "ignored", "captured", "strike_limit"] {
+        assert_eq!(
+            metric_sample(
+                &rendered,
+                &format!("pangya_game_unknown_opcode_actions_total{{action=\"{action}\"}}"),
+            ),
+            Some(0.0),
+            "client reports are not unknown opcodes",
+        );
+    }
     for forbidden in ["match_id=", "result_key=", "seed=", "balance=", "x="] {
         assert!(!rendered.contains(forbidden));
     }
-
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 
@@ -5884,7 +5955,10 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
 
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool) {
+    let traces = tracing_capture();
+    traces.lock().expect("trace lock").clear();
     let account = create_account(&pool, "RetailBoot", 1, 0x1000_0000).await;
+    let metrics = Arc::new(M2Metrics::default());
     let service = Arc::new(
         GameService::new(
             Arc::new(PgRepository::new(pool.clone())),
@@ -5901,7 +5975,7 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
                 economy: None,
                 retail_bootstrap: true,
             },
-            Arc::new(M2Metrics::default()),
+            metrics.clone(),
         )
         .expect("retail service"),
     );
@@ -5974,10 +6048,18 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(&channels[1..10], b"pangya-rs");
     assert_eq!(channels[10], 0);
 
+    // 0x0033 is fire-and-forget in the authenticated AwaitChannel state. Exercise every
+    // reference-derived shape over encrypted TCP; none may disconnect or produce a response.
+    let salt = exercise_exception_reports(&mut stream, key, 20).await;
+
     // Enter the channel before exercising menu services.
     send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // The same four shapes are legal in InChannel too. They have no response and must not
+    // increment the unknown-opcode strike counter.
+    let _ = exercise_exception_reports(&mut stream, key, salt).await;
 
     // Daily quests are Tier D, but the retail button must receive an honest empty response rather
     // than hang modally or disconnect under the shipped unknown-opcode policy.
@@ -5989,6 +6071,30 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     let (state_opcode, state) = receive_packet(&mut stream, key).await;
     assert_eq!(state_opcode, 0x0225);
     assert_eq!(state, vec![0; 20]);
+
+    let rendered = metrics.render();
+    for action in ["disconnected", "ignored", "captured", "strike_limit"] {
+        assert_eq!(
+            metric_sample(
+                &rendered,
+                &format!("pangya_game_unknown_opcode_actions_total{{action=\"{action}\"}}"),
+            ),
+            Some(0.0),
+            "client reports are not unknown opcodes",
+        );
+    }
+    assert!(
+        metric_sample(
+            &rendered,
+            "pangya_packets_total{service=\"game\",direction=\"in\"}"
+        )
+        .is_some_and(|count| count >= 8.0),
+        "each report remains in the frame counter: {rendered}"
+    );
+    let trace_text = String::from_utf8(traces.lock().expect("trace lock").clone()).expect("utf8");
+    assert!(trace_text.contains("client reported an exception"));
+    assert!(!trace_text.contains(&"x".repeat(513)));
+    assert!(!trace_text.contains("safe\\n"));
 
     drop(stream);
     shutdown.cancel();
@@ -6126,6 +6232,10 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     let room_id = u16::from_le_bytes([body[2 + 64 + 5 + 17 + 3], body[2 + 64 + 5 + 17 + 4]]);
     assert_eq!(body[2 + 64 + 3], 4, "capacity");
     assert_eq!(body[2 + 64 + 4], 1, "occupancy");
+
+    // Reports remain fire-and-forget after room admission too. Exercise valid, malformed,
+    // oversize, and trailing bodies without reclassifying any as an unknown room command.
+    let _ = exercise_exception_reports(&mut host, host_key, 30).await;
 
     // A second client joins the same room by number.
     let (mut visitor, visitor_key, _) =
