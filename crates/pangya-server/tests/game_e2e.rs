@@ -12,6 +12,7 @@ use std::{
 use pangya_data::Catalog;
 use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
+    LoginBonusReward,
     CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
     MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId,
     PlayerRepository as _, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
@@ -20,6 +21,7 @@ use pangya_domain::{
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
+    LoginBonusRuntimeConfig,
     GameTermination, SoloRuntimeConfig, StrokeRuntimeConfig, UnknownOpcodePolicy,
     deterministic_conditions,
 };
@@ -465,6 +467,7 @@ fn retail_economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameServ
                 solo_practice: None,
                 stroke_two: None,
                 economy: Some(default_economy()),
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             metrics,
@@ -502,6 +505,7 @@ fn economy_service_with(
                 solo_practice: None,
                 stroke_two: None,
                 economy,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics,
@@ -625,6 +629,7 @@ fn solo_service(
                 }),
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics,
@@ -683,6 +688,7 @@ fn stroke_service_with_deadlines(
                     shot_packets_per_window: 120,
                 }),
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics,
@@ -709,6 +715,7 @@ fn game_service_with_policy(
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics,
@@ -1667,6 +1674,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics.clone(),
@@ -4569,6 +4577,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
                     shot_packets_per_window: 120,
                 }),
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             metrics.clone(),
@@ -6162,6 +6171,7 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
                     command_timeout: Duration::from_millis(100),
                     ..default_economy()
                 }),
+                login_bonus: None,
                 retail_bootstrap: false,
             },
             Arc::new(M2Metrics::default()),
@@ -6207,10 +6217,17 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     // identity instead.
     let account = create_account(&pool, "RetailBoot", 1, 0x1000_0000).await;
     let metrics = Arc::new(M2Metrics::default());
+    let catalog = economy_catalog();
+    let reward_definition = catalog
+        .shop_offers()
+        .iter()
+        .find(|offer| offer.kind == pangya_domain::ItemKind::Consumable)
+        .copied()
+        .expect("consumable reward");
     let service = Arc::new(
         GameService::new(
             Arc::new(PgRepository::new(pool.clone())),
-            economy_catalog(),
+            catalog,
             GameRuntimeConfig {
                 channel_id: 1,
                 advertised_channel_ids: vec![1],
@@ -6222,6 +6239,13 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: Some(LoginBonusRuntimeConfig {
+                    reward: LoginBonusReward {
+                        definition: reward_definition,
+                        quantity: 1,
+                    },
+                    calendar_days: 30,
+                }),
                 retail_bootstrap: true,
             },
             metrics.clone(),
@@ -6310,9 +6334,28 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     // increment the unknown-opcode strike counter.
     let _ = exercise_exception_reports(&mut stream, key, salt).await;
 
+    // Login bonus status is the reference 0x0248 uncollected union, followed by an exactly-once
+    // claim that emits the item status update before 0x0249 over encrypted TCP.
+    send_packet(&mut stream, key, 3, 0x016e, &[]).await;
+    let (status_opcode, status) = receive_packet(&mut stream, key).await;
+    assert_eq!(status_opcode, 0x0248);
+    assert_eq!(status.len(), 25);
+    assert_eq!(status[4], 0, "the configured reward is initially unclaimed");
+    assert_eq!(u32::from_le_bytes(status[5..9].try_into().expect("item id")), reward_definition.type_id.get());
+    send_packet(&mut stream, key, 4, 0x016f, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x0216);
+    let (claim_opcode, claim) = receive_packet(&mut stream, key).await;
+    assert_eq!(claim_opcode, 0x0249);
+    assert_eq!(claim.len(), 25);
+    send_packet(&mut stream, key, 5, 0x016f, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x0249, "retry is idempotent and has no second grant");
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+        .bind(account.account.id.get()).fetch_one(&pool).await.expect("claim row");
+    assert_eq!(claims, 1);
+
     // Daily quests are Tier D, but the retail button must receive an honest empty response rather
     // than hang modally or disconnect under the shipped unknown-opcode policy.
-    send_packet(&mut stream, key, 3, 0x0151, &[]).await;
+    send_packet(&mut stream, key, 6, 0x0151, &[]).await;
     let (delta_opcode, delta) = receive_packet(&mut stream, key).await;
     assert_eq!(delta_opcode, 0x0216);
     assert_eq!(delta.len(), 8);
@@ -6847,6 +6890,7 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             delivery_observation.clone(),
@@ -6969,6 +7013,7 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -7436,6 +7481,7 @@ async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgP
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -7490,6 +7536,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -7799,6 +7846,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
                 }),
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -8078,6 +8126,7 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
                     shot_packets_per_window: 120,
                 }),
                 economy: Some(default_economy()),
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -8875,6 +8924,7 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -8937,6 +8987,7 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
                 solo_practice: None,
                 stroke_two: None,
                 economy: None,
+                login_bonus: None,
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),

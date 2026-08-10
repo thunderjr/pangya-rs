@@ -14,10 +14,11 @@ use pangya_domain::{
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
-    ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
-    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
-    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository, PurchaseRequest,
+    ItemTypeId, LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
+    MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId,
+    MatchPlan, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
+    Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
+    PlayerRepository, PurchaseRequest,
     RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
     StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
     StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
@@ -27,6 +28,20 @@ use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+fn login_bonus_reward() -> LoginBonusReward {
+    LoginBonusReward {
+        definition: ItemDefinition {
+            type_id: ItemTypeId::new(0x1a00_0001),
+            kind: ItemKind::Consumable,
+            sale: ItemSale::NotSold,
+            stacking: ItemStacking::Stackable { max_stack: 100 },
+            durability: ItemDurability::Nondurable,
+            compatibility: ItemCompatibility::Any,
+        },
+        quantity: 2,
+    }
+}
 
 fn source() -> SourceAddressPrefix {
     SourceAddressPrefix::from_ip("198.51.100.77".parse().expect("test source IP"))
@@ -4824,4 +4839,42 @@ async fn operator_balance_grants_accumulate_and_refuse_overflow(pool: PgPool) {
             .await,
         Err(RepositoryError::NotFound)
     );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn login_bonus_claim_is_exactly_once_and_crosses_server_day(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("LoginBonusStorage", Some("LoginBonusNick")))
+        .await
+        .expect("account");
+    let reward = login_bonus_reward();
+    assert!(!repository
+        .login_bonus_claimed(aggregate.account.id, 20_000)
+        .await
+        .expect("unclaimed"));
+    let (first, second) = tokio::join!(
+        repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
+        repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
+    );
+    let first = first.expect("first claim");
+    let second = second.expect("replayed claim");
+    assert_ne!(first.already_claimed, second.already_claimed);
+    assert_eq!(first.inventory_item_id, second.inventory_item_id);
+    assert_eq!(first.quantity_after, 2);
+    assert_eq!(second.quantity_after, 2);
+    let next = repository
+        .claim_login_bonus(aggregate.account.id, 20_001, 2, reward)
+        .await
+        .expect("next day claim");
+    assert!(!next.already_claimed);
+    assert_eq!(next.quantity_after, 4);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM login_bonus_claims WHERE account_id = $1",
+    )
+    .bind(aggregate.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("claim rows");
+    assert_eq!(count, 2);
 }
