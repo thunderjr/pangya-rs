@@ -1,6 +1,10 @@
 //! Runtime-neutral room rules wrapped by one bounded Tokio owner task.
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use pangya_domain::{
     AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, CharacterId,
@@ -202,6 +206,14 @@ pub enum RoomEvent {
     StrokeAbortRequested(AbortStrokeMatch),
     /// Trusted persisted aggregate committed and room returned open.
     StrokeCommitted(StrokeMatchResult),
+    /// Terminal settlement carrying its connection-generation fence. This remains in the same
+    /// ordered outbox as every ordinary event, unlike the removed side mailbox.
+    StrokeCommittedWithGeneration {
+        /// Durable settlement result.
+        result: StrokeMatchResult,
+        /// Connection generation fence used to reject stale replay.
+        generation: u64,
+    },
     /// Exact durable stroke abort was acknowledged.
     StrokeAborted(AbortStrokeMatch),
     /// The room shut down.
@@ -299,14 +311,97 @@ pub(crate) struct TerminalDelivery {
     pub(crate) generation: u64,
 }
 
-pub(crate) type TerminalMailboxSender = mpsc::Sender<TerminalDelivery>;
-pub(crate) type TerminalMailboxReceiver = mpsc::Receiver<TerminalDelivery>;
+/// Per-session bounded outbound queue with one slot reserved for terminal settlement.
+#[derive(Clone)]
+pub enum RoomOutbound {
+    /// Compatibility sender used by runtime-neutral unit tests and non-network callers.
+    Legacy(mpsc::Sender<RoomEvent>),
+    /// Production session outbox. Its underlying queue has one extra slot, while the mutex
+    /// enforces that ordinary events leave that slot available for terminal settlement.
+    Ordered {
+        /// Shared queue sender serialized with ordinary-capacity checks.
+        sender: Arc<Mutex<mpsc::Sender<RoomEvent>>>,
+    },
+}
 
-pub(crate) fn terminal_mailbox() -> (TerminalMailboxSender, TerminalMailboxReceiver) {
-    // A live roster member has at most one pending terminal settlement. The room actor waits for
-    // this reserved slot under ordinary backpressure instead of growing memory or canceling the
-    // connection.
-    mpsc::channel(1)
+impl From<mpsc::Sender<RoomEvent>> for RoomOutbound {
+    fn from(sender: mpsc::Sender<RoomEvent>) -> Self {
+        Self::Legacy(sender)
+    }
+}
+
+pub(crate) type TerminalOutboxSender = RoomOutbound;
+
+impl RoomOutbound {
+    /// Creates an outbox whose ordinary capacity is `capacity` plus one reserved terminal slot.
+    pub fn ordered(capacity: usize) -> (Self, mpsc::Receiver<RoomEvent>) {
+        let (sender, receiver) = mpsc::channel(capacity.saturating_add(1));
+        (
+            Self::Ordered {
+                sender: Arc::new(Mutex::new(sender)),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn try_send(&self, event: RoomEvent) -> bool {
+        match self {
+            Self::Legacy(sender) => sender.try_send(event).is_ok(),
+            Self::Ordered { sender } => {
+                let Ok(sender) = sender.lock() else {
+                    return false;
+                };
+                // The final queue slot is reserved exclusively for 0x0066 settlement. Holding
+                // the lock makes the capacity check and send atomic across invite/room writers.
+                if sender.capacity() <= 1 {
+                    return false;
+                }
+                sender.try_send(event).is_ok()
+            }
+        }
+    }
+
+    async fn send_terminal(
+        &self,
+        cancellation: &CancellationToken,
+        delivery: TerminalDelivery,
+    ) -> bool {
+        let event = match self {
+            Self::Legacy(_) => RoomEvent::StrokeCommitted(delivery.result),
+            Self::Ordered { .. } => RoomEvent::StrokeCommittedWithGeneration {
+                result: delivery.result,
+                generation: delivery.generation,
+            },
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            let sent = match self {
+                Self::Legacy(sender) => match sender.try_send(event.clone()) {
+                    Ok(()) => return true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                    Err(mpsc::error::TrySendError::Full(_)) => false,
+                },
+                Self::Ordered { sender } => {
+                    let Ok(sender) = sender.lock() else {
+                        return false;
+                    };
+                    match sender.try_send(event.clone()) {
+                        Ok(()) => return true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                        Err(mpsc::error::TrySendError::Full(_)) => false,
+                    }
+                }
+            };
+            debug_assert!(!sent);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return false,
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    }
 }
 
 struct Member {
@@ -315,8 +410,7 @@ struct Member {
     ready: bool,
     team: u8,
     joined_order: u64,
-    outbound: mpsc::Sender<RoomEvent>,
-    terminal_mailbox: Option<TerminalMailboxSender>,
+    outbound: RoomOutbound,
     cancellation: CancellationToken,
 }
 
@@ -477,32 +571,10 @@ impl RoomState {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Self {
-        Self::new_with_terminal_mailbox(
-            id,
-            name,
-            password,
-            settings,
-            owner,
-            outbound,
-            None,
-            cancellation,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_terminal_mailbox(
-        id: RoomId,
-        name: RoomName,
-        password: Option<RoomPassword>,
-        settings: RoomSettings,
-        owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
-        cancellation: CancellationToken,
-    ) -> Self {
+        let outbound = outbound.into();
         Self {
             id,
             name,
@@ -515,7 +587,6 @@ impl RoomState {
                 team: 0,
                 joined_order: 0,
                 outbound,
-                terminal_mailbox,
                 cancellation,
             }],
             next_join_order: 1,
@@ -534,78 +605,16 @@ impl RoomState {
         if member.cancellation.is_cancelled() {
             return false;
         }
-        match member.outbound.try_send(event) {
-            Ok(()) => true,
-            // Once terminal persistence is pending, a full queue on any captured member is
-            // ordinary backpressure. Keep that member alive so the retained terminal result can
-            // wait for a permit; the persistence request can fail over without invalidating the
-            // captured socket.
-            Err(mpsc::error::TrySendError::Full(_))
-                if self.pending_stroke_persistence.is_some() =>
-            {
-                // A captured roster member must remain eligible for the terminal event even
-                // when its queue is full before persistence ownership is established. The
-                // settlement may fail over to another member; canceling this sender here would
-                // make the eventual 0x0066 impossible for that socket.
-                false
-            }
-            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                member.cancellation.cancel();
-                false
-            }
+        if member.outbound.try_send(event) {
+            true
+        } else if self.pending_stroke_persistence.is_some() {
+            // Retain captured members while persistence is pending; terminal delivery may still
+            // fail over or wait for the reserved slot.
+            false
+        } else {
+            member.cancellation.cancel();
+            false
         }
-    }
-
-    /// Queues a terminal result without competing with the ordinary room-event backlog.
-    ///
-    /// Terminal delivery is retained in `stroke_terminal`, so it must not be discarded merely
-    /// because a peer has not drained its preceding relays yet. Waiting for one channel permit is
-    /// safe here: the connection consumes its queue concurrently, while its cancellation token
-    /// breaks the wait when the transport has gone away.
-    async fn deliver_terminal_mailbox(
-        mailbox: &TerminalMailboxSender,
-        cancellation: &CancellationToken,
-        delivery: TerminalDelivery,
-    ) -> bool {
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        let permit = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return false,
-            permit = mailbox.reserve() => match permit {
-                Ok(permit) => permit,
-                Err(_) => return false,
-            },
-        };
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        permit.send(delivery);
-        true
-    }
-
-    async fn deliver_terminal(
-        outbound: &mpsc::Sender<RoomEvent>,
-        cancellation: &CancellationToken,
-        event: RoomEvent,
-    ) -> bool {
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        let permit = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return false,
-            permit = outbound.reserve() => match permit {
-                Ok(permit) => permit,
-                Err(_) => return false,
-            },
-        };
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        permit.send(event);
-        true
     }
 
     fn member_index(&self, connection_id: PlayerConnectionId) -> Option<usize> {
@@ -649,7 +658,7 @@ impl RoomState {
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
     ) -> Result<RoomSnapshot, RoomError> {
         self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
     }
@@ -658,35 +667,17 @@ impl RoomState {
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_inner(identity, password, outbound, None, cancellation)
-    }
-
-    fn join_with_terminal_mailbox(
-        &mut self,
-        identity: RoomIdentity,
-        password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
-        cancellation: CancellationToken,
-    ) -> Result<RoomSnapshot, RoomError> {
-        self.join_inner(
-            identity,
-            password,
-            outbound,
-            Some(terminal_mailbox),
-            cancellation,
-        )
+        self.join_inner(identity, password, outbound.into(), cancellation)
     }
 
     fn join_inner(
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.match_active() {
@@ -714,7 +705,6 @@ impl RoomState {
             team: 0,
             joined_order,
             outbound,
-            terminal_mailbox,
             cancellation,
         });
         Ok(self.snapshot())
@@ -1425,16 +1415,7 @@ impl RoomState {
                 result: committed,
                 generation,
             };
-            let accepted = if let Some(mailbox) = member.terminal_mailbox.clone() {
-                Self::deliver_terminal_mailbox(&mailbox, &cancellation, delivery).await
-            } else {
-                Self::deliver_terminal(
-                    &member.outbound,
-                    &cancellation,
-                    RoomEvent::StrokeCommitted(committed),
-                )
-                .await
-            };
+            let accepted = member.outbound.send_terminal(&cancellation, delivery).await;
             if accepted {
                 delivered[index] = true;
             }
@@ -1789,8 +1770,7 @@ enum RoomCommand {
     Join {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -2085,47 +2065,45 @@ impl RoomHandle {
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
-            .await
+        self.join_with_cancellation(
+            identity,
+            password,
+            outbound.into(),
+            CancellationToken::new(),
+        )
+        .await
     }
 
     pub(crate) async fn join_with_cancellation(
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_inner(identity, password, outbound, None, cancellation)
+        self.join_inner(identity, password, outbound.into(), cancellation)
             .await
     }
 
-    pub(crate) async fn join_with_terminal_mailbox(
+    pub(crate) async fn join_with_terminal_outbox(
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        _terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_inner(
-            identity,
-            password,
-            outbound,
-            Some(terminal_mailbox),
-            cancellation,
-        )
-        .await
+        self.join_with_cancellation(identity, password, outbound, cancellation)
+            .await
     }
 
     async fn join_inner(
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -2133,7 +2111,6 @@ impl RoomHandle {
             identity,
             password,
             outbound,
-            terminal_mailbox,
             cancellation,
             reply,
         })?;
@@ -2727,7 +2704,7 @@ pub fn spawn_room(
     password: Option<RoomPassword>,
     settings: RoomSettings,
     owner: RoomIdentity,
-    owner_outbound: mpsc::Sender<RoomEvent>,
+    owner_outbound: impl Into<RoomOutbound>,
     limits: RoomActorLimits,
 ) -> (RoomHandle, RoomSummary) {
     spawn_room_with_events(
@@ -2750,7 +2727,7 @@ pub(crate) fn spawn_room_with_events(
     password: Option<RoomPassword>,
     settings: RoomSettings,
     owner: RoomIdentity,
-    owner_outbound: mpsc::Sender<RoomEvent>,
+    owner_outbound: impl Into<RoomOutbound>,
     owner_cancellation: CancellationToken,
     limits: RoomActorLimits,
     events: Option<mpsc::Sender<RoomActorEvent>>,
@@ -2768,29 +2745,29 @@ pub(crate) fn spawn_room_with_events(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_room_with_terminal_mailbox(
+pub(crate) fn spawn_room_with_terminal_outbox(
     id: RoomId,
     name: RoomName,
     password: Option<RoomPassword>,
     settings: RoomSettings,
     owner: RoomIdentity,
-    owner_outbound: mpsc::Sender<RoomEvent>,
-    owner_terminal_mailbox: TerminalMailboxSender,
+    owner_outbound: impl Into<RoomOutbound>,
+    _owner_terminal_outbox: TerminalOutboxSender,
     owner_cancellation: CancellationToken,
     limits: RoomActorLimits,
     events: Option<mpsc::Sender<RoomActorEvent>>,
 ) -> (RoomHandle, RoomSummary) {
-    let state = RoomState::new_with_terminal_mailbox(
+    spawn_room_with_events(
         id,
         name,
         password,
         settings,
         owner,
         owner_outbound,
-        Some(owner_terminal_mailbox),
         owner_cancellation,
-    );
-    spawn_room_state(state, limits, events)
+        limits,
+        events,
+    )
 }
 
 fn spawn_room_state(
@@ -2911,25 +2888,11 @@ async fn handle_normal(
             identity,
             password,
             outbound,
-            terminal_mailbox,
             cancellation,
             reply,
         } => {
-            let result = match terminal_mailbox {
-                Some(mailbox) => state.join_with_terminal_mailbox(
-                    identity,
-                    password.as_ref(),
-                    outbound,
-                    mailbox,
-                    cancellation,
-                ),
-                None => state.join_with_cancellation(
-                    identity,
-                    password.as_ref(),
-                    outbound,
-                    cancellation,
-                ),
-            };
+            let result =
+                state.join_with_cancellation(identity, password.as_ref(), outbound, cancellation);
             if let Ok(snapshot) = &result {
                 after_mutation(state, Some(snapshot), events);
             }
@@ -3385,6 +3348,68 @@ mod tests {
             StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
         });
         StrokeMatchResult::new(commit.match_id(), commit.result_key(), players)
+    }
+
+    #[tokio::test]
+    async fn ordered_outbox_reserves_terminal_slot_and_keeps_sequence() {
+        let (outbound, mut events) = RoomOutbound::ordered(2);
+        let first = identity(1);
+        let second = identity(2);
+        let mut state = RoomState::new(
+            RoomId::new(60).expect("room"),
+            RoomName::parse("ordered-outbox").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            outbound.clone(),
+            CancellationToken::new(),
+        );
+        let (second_outbound, mut second_events) = RoomOutbound::ordered(2);
+        state
+            .join(second.clone(), None, second_outbound)
+            .expect("join");
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+        while second_events.try_recv().is_ok() {}
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let result = persisted_stroke(commit);
+        let delivery = TerminalDelivery {
+            result,
+            generation: 7,
+        };
+        assert!(outbound.try_send(RoomEvent::Closed));
+        assert!(outbound.try_send(RoomEvent::Closed));
+        assert!(
+            !outbound.try_send(RoomEvent::Closed),
+            "ordinary event consumed terminal reserve"
+        );
+        assert!(
+            outbound
+                .send_terminal(&CancellationToken::new(), delivery)
+                .await
+        );
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 7
+            })
+        );
     }
 
     fn playing_stroke_room(state: &mut RoomState, plan: &StrokeStartPlan) {
@@ -4305,79 +4330,6 @@ mod tests {
                 .expect("second terminal did not arrive"),
             Some(RoomEvent::StrokeCommitted(persisted))
         );
-    }
-
-    #[tokio::test]
-    async fn terminal_mailbox_full_waits_without_cancel_and_replays_exactly_once() {
-        let first = identity(1);
-        let second = identity(2);
-        let (first_tx, mut first_rx) = mpsc::channel(8);
-        let (second_tx, mut second_rx) = mpsc::channel(8);
-        let (first_terminal_tx, mut first_terminal_rx) = terminal_mailbox();
-        let (second_terminal_tx, mut second_terminal_rx) = terminal_mailbox();
-        let first_cancel = CancellationToken::new();
-        let second_cancel = CancellationToken::new();
-        let mut state = RoomState::new_with_terminal_mailbox(
-            RoomId::new(60).expect("room"),
-            RoomName::parse("terminal-mailbox").expect("name"),
-            None,
-            RoomSettings::new(2).expect("settings"),
-            first.clone(),
-            first_tx,
-            Some(first_terminal_tx.clone()),
-            first_cancel.clone(),
-        );
-        state
-            .join_with_terminal_mailbox(
-                second.clone(),
-                None,
-                second_tx,
-                second_terminal_tx.clone(),
-                second_cancel.clone(),
-            )
-            .expect("join");
-        let plan = stroke_plan(
-            &first,
-            &second,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            3,
-        );
-        state.set_ready(first.connection_id, true).expect("ready");
-        state.set_ready(second.connection_id, true).expect("ready");
-        playing_stroke_room(&mut state, &plan);
-        while first_rx.try_recv().is_ok() {}
-        while second_rx.try_recv().is_ok() {}
-        let commit = state
-            .stroke
-            .give_up(first.connection_id)
-            .expect("settlement");
-        let persisted = persisted_stroke(commit);
-        let stale = TerminalDelivery {
-            result: persisted,
-            generation: 0,
-        };
-        first_terminal_tx
-            .try_send(stale)
-            .expect("first mailbox full");
-        second_terminal_tx
-            .try_send(stale)
-            .expect("second mailbox full");
-        let apply = tokio::spawn(async move { state.apply_stroke_commit(persisted).await });
-        assert_eq!(first_terminal_rx.recv().await, Some(stale));
-        assert_eq!(second_terminal_rx.recv().await, Some(stale));
-        assert_eq!(apply.await.expect("apply"), Ok(persisted));
-        assert_eq!(
-            first_terminal_rx.recv().await.unwrap_or(stale).result,
-            persisted
-        );
-        assert_eq!(
-            second_terminal_rx.recv().await.unwrap_or(stale).result,
-            persisted
-        );
-        assert!(!first_cancel.is_cancelled());
-        assert!(!second_cancel.is_cancelled());
     }
 
     #[tokio::test]

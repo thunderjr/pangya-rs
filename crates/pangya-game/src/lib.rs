@@ -10,7 +10,7 @@ pub mod match_state;
 pub mod room;
 pub mod stroke_state;
 
-use crate::room::{TerminalDelivery, TerminalMailboxSender, terminal_mailbox};
+use crate::room::{RoomOutbound, TerminalDelivery, TerminalOutboxSender};
 pub use lobby::{
     LobbyHandle, LobbyLimits, LobbyRoomCommand, LobbyRouteResult, LobbyShutdownError,
     LobbyShutdownOutcome, LobbySoloCommand, LobbySoloRouteResult, LobbyStrokeCommand,
@@ -141,12 +141,15 @@ use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt as _,
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch},
     task::JoinSet,
     time::{sleep_until, timeout},
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
 use tracing::Instrument as _;
+
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 /// Process-local GameService connection ID safe for observability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1087,7 +1090,7 @@ where
     active_accounts: CapacityRegistry<AccountId>,
     social: SocialHub,
     /// Authenticated channel connections eligible for direct room invites.
-    invite_targets: Arc<Mutex<HashMap<AccountId, mpsc::Sender<RoomEvent>>>>,
+    invite_targets: Arc<Mutex<HashMap<AccountId, RoomOutbound>>>,
     pending_invites: Arc<Mutex<HashMap<AccountId, RoomId>>>,
 }
 
@@ -1613,9 +1616,8 @@ where
         let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
-            mpsc::channel(self.config.limits.outbound_room_event_capacity);
-        let (terminal_outbound, mut terminal_mailbox) = terminal_mailbox();
-        let mut terminal_mailbox_open = true;
+            RoomOutbound::ordered(self.config.limits.outbound_room_event_capacity);
+        let terminal_outbound = outbound.clone();
         let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
         let mut match_context = ConnectionMatchContext::default();
@@ -1652,49 +1654,35 @@ where
                     };
                     if let Err(error) = self.handle_social_event(&mut framed, connection_id, event).await { break Err(error); }
                 }
-                terminal = terminal_mailbox.recv(), if identity.is_some() && terminal_mailbox_open => {
-                    let Some(delivery) = terminal else {
-                        terminal_mailbox_open = false;
-                        continue;
-                    };
-                    let handled = tokio::select! {
-                        biased;
-                        () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
-                        handled = self.handle_terminal_delivery(
-                            &mut framed,
-                            state,
-                            delivery,
-                            room_id,
-                            connection_id,
-                            &mut match_context,
-                            &mut terminal_generation,
-                            &mut terminal_identity,
-                        ) => handled,
-                    };
-                    match handled {
-                        Ok(RoomEventEffect::Remain) => {}
-                        Ok(RoomEventEffect::EnterChannel) => { state = GameState::InChannel; room_id = None; }
-                        Ok(RoomEventEffect::EnterRoom) => { state = GameState::InRoom; match_context = ConnectionMatchContext::default(); }
-                        Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
-                        Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
-                        Ok(RoomEventEffect::EnterStrokeLoading) => state = GameState::InStrokeLoading,
-                        Ok(RoomEventEffect::EnterStrokeMatch) => state = GameState::InStrokeMatch,
-                        Err(error) => break Err(error),
-                    }
-                }
                 event = room_events.recv(), if matches!(state, GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
                     let handled = tokio::select! {
                         biased;
                         () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
-                        handled = self.handle_room_event(
-                            &mut framed,
-                            state,
-                            event,
-                            room_id,
-                            connection_id,
-                            &mut match_context,
-                        ) => handled,
+                        handled = async {
+                            match event {
+                                RoomEvent::StrokeCommittedWithGeneration { result, generation } => {
+                                    self.handle_terminal_delivery(
+                                        &mut framed,
+                                        state,
+                                        TerminalDelivery { result, generation },
+                                        room_id,
+                                        connection_id,
+                                        &mut match_context,
+                                        &mut terminal_generation,
+                                        &mut terminal_identity,
+                                    ).await
+                                }
+                                event => self.handle_room_event(
+                                    &mut framed,
+                                    state,
+                                    event,
+                                    room_id,
+                                    connection_id,
+                                    &mut match_context,
+                                ).await,
+                            }
+                        } => handled,
                     };
                     match handled {
                         Ok(RoomEventEffect::Remain) => {}
@@ -3127,8 +3115,8 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         state: GameState,
         identity: &RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_outbound: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbound: TerminalOutboxSender,
         room_cancellation: CancellationToken,
         chats: &mut LocalRateWindow,
         opcode: u16,
@@ -3158,7 +3146,7 @@ where
                         .map_err(|_| GameRuntimeError::Protocol)?;
                 let result = self
                     .lobby
-                    .create_with_terminal_mailbox(
+                    .create_with_terminal_outbox(
                         request.name,
                         request.password,
                         request.settings,
@@ -3215,7 +3203,7 @@ where
                 let requested_room = request.room_id;
                 let result = self
                     .lobby
-                    .join_with_terminal_mailbox(
+                    .join_with_terminal_outbox(
                         requested_room,
                         identity.clone(),
                         request.password,
@@ -4912,13 +4900,14 @@ where
                     }
                     return Ok(RoomEventEffect::Remain);
                 }
-                RoomEvent::StrokeCommitted(result) => {
-                    let context = match_context.stroke;
+                RoomEvent::StrokeCommitted(result)
+                | RoomEvent::StrokeCommittedWithGeneration { result, .. } => {
                     // The actor emitted this only after durable settlement. Recording before the
                     // completion frames keeps a client-visible completed match and its history
                     // atomic from an observer's point of view.
                     self.record_retail_match_history(result).await?;
-                    self.send_retail_stroke_committed(framed, *result, context)
+                    self.send_retail_stroke_committed(framed, *result, match_context.stroke)
+                        .await?
                         .await?;
                     match_context.stroke = None;
                     return Ok(RoomEventEffect::EnterRoom);
@@ -5229,7 +5218,8 @@ where
                 .await?;
                 Ok(RoomEventEffect::Remain)
             }
-            RoomEvent::StrokeCommitted(result) => {
+            RoomEvent::StrokeCommitted(result)
+            | RoomEvent::StrokeCommittedWithGeneration { result, .. } => {
                 // Projection refreshes are a retail room contract. Synthetic M6 settlement has
                 // its own terminal packet order and must not enqueue a retail census frame.
                 if self.config.retail_bootstrap
@@ -7758,8 +7748,8 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         state: GameState,
         identity: &RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_outbound: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbound: TerminalOutboxSender,
         room_cancellation: CancellationToken,
         channel: u8,
         opcode: u16,
@@ -7848,7 +7838,7 @@ where
                 });
                 let created = self
                     .lobby
-                    .create_on_channel_with_terminal_mailbox(
+                    .create_on_channel_with_terminal_outbox(
                         name,
                         password,
                         settings,
@@ -7900,7 +7890,7 @@ where
                 };
                 let joined = self
                     .lobby
-                    .join_on_channel_with_terminal_mailbox(
+                    .join_on_channel_with_terminal_outbox(
                         target,
                         identity.clone(),
                         password,
@@ -8092,7 +8082,7 @@ where
                 };
                 let snapshot = self
                     .lobby
-                    .join_with_terminal_mailbox(
+                    .join_with_terminal_outbox(
                         target,
                         identity.clone(),
                         None,
@@ -11755,7 +11745,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_mailbox_rejects_stale_generation() {
+    fn terminal_outbox_rejects_stale_generation() {
         assert!(!GameService::<FakeRepository>::accepts_terminal_generation(
             0, 0
         ));

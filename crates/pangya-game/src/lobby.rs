@@ -30,9 +30,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     match_state::{RelayDisposition, SoloMatchError, SoloStartPlan},
     room::{
-        RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomEvent, RoomHandle,
-        RoomIdentity, TerminalMailboxSender, spawn_room_with_events,
-        spawn_room_with_terminal_mailbox,
+        RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomHandle,
+        RoomIdentity, RoomOutbound, TerminalOutboxSender, spawn_room_with_events,
+        spawn_room_with_terminal_outbox,
     },
     stroke_state::{
         StrokeHoleOutOutcome, StrokeLoadingOutcome, StrokeMatchError, StrokeRelayOutcome,
@@ -399,8 +399,8 @@ enum LobbyCommand {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -410,8 +410,8 @@ enum LobbyCommand {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -430,8 +430,8 @@ enum LobbyCommand {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -440,8 +440,8 @@ enum LobbyCommand {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -494,7 +494,7 @@ enum LobbyCommand {
         name: RoomName,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
         started: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -593,7 +593,7 @@ impl LobbyHandle {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         self.create_inner(
@@ -601,7 +601,7 @@ impl LobbyHandle {
             password,
             settings,
             owner,
-            outbound,
+            outbound.into(),
             None,
             cancellation,
         )
@@ -609,14 +609,14 @@ impl LobbyHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_with_terminal_mailbox(
+    pub(crate) async fn create_with_terminal_outbox(
         &self,
         name: RoomName,
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         self.create_inner(
@@ -625,7 +625,7 @@ impl LobbyHandle {
             settings,
             owner,
             outbound,
-            Some(terminal_mailbox),
+            Some(terminal_outbox),
             cancellation,
         )
         .await
@@ -638,8 +638,8 @@ impl LobbyHandle {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -651,7 +651,7 @@ impl LobbyHandle {
                 settings,
                 owner,
                 outbound,
-                terminal_mailbox,
+                terminal_outbox,
                 cancellation,
                 reply,
             },
@@ -669,7 +669,7 @@ impl LobbyHandle {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -682,7 +682,7 @@ impl LobbyHandle {
                 owner,
                 channel,
                 outbound,
-                terminal_mailbox: None,
+                terminal_outbox: None,
                 cancellation,
                 reply,
             },
@@ -692,15 +692,15 @@ impl LobbyHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_on_channel_with_terminal_mailbox(
+    pub(crate) async fn create_on_channel_with_terminal_outbox(
         &self,
         name: RoomName,
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -713,7 +713,7 @@ impl LobbyHandle {
                 owner,
                 channel,
                 outbound,
-                terminal_mailbox: Some(terminal_mailbox),
+                terminal_outbox: Some(terminal_outbox),
                 cancellation,
                 reply,
             },
@@ -755,20 +755,27 @@ impl LobbyHandle {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_inner(room_id, identity, password, outbound, None, cancellation)
-            .await
+        self.join_inner(
+            room_id,
+            identity,
+            password,
+            outbound.into(),
+            None,
+            cancellation,
+        )
+        .await
     }
 
-    pub(crate) async fn join_with_terminal_mailbox(
+    pub(crate) async fn join_with_terminal_outbox(
         &self,
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         self.join_inner(
@@ -776,7 +783,7 @@ impl LobbyHandle {
             identity,
             password,
             outbound,
-            Some(terminal_mailbox),
+            Some(terminal_outbox),
             cancellation,
         )
         .await
@@ -787,8 +794,8 @@ impl LobbyHandle {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -799,7 +806,7 @@ impl LobbyHandle {
                 identity,
                 password,
                 outbound,
-                terminal_mailbox,
+                terminal_outbox,
                 cancellation,
                 reply,
             },
@@ -815,7 +822,7 @@ impl LobbyHandle {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -827,7 +834,7 @@ impl LobbyHandle {
                 password,
                 channel,
                 outbound,
-                terminal_mailbox: None,
+                terminal_outbox: None,
                 cancellation,
                 reply,
             },
@@ -837,14 +844,14 @@ impl LobbyHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn join_on_channel_with_terminal_mailbox(
+    pub(crate) async fn join_on_channel_with_terminal_outbox(
         &self,
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: TerminalMailboxSender,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -856,7 +863,7 @@ impl LobbyHandle {
                 password,
                 channel,
                 outbound,
-                terminal_mailbox: Some(terminal_mailbox),
+                terminal_outbox: Some(terminal_outbox),
                 cancellation,
                 reply,
             },
@@ -1289,8 +1296,8 @@ impl LobbyRegistry {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: Option<u8>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         if self.connections.contains_key(&owner.connection_id) {
@@ -1301,8 +1308,8 @@ impl LobbyRegistry {
         }
         let id = self.allocate_room_id()?;
         let connection_id = owner.connection_id;
-        let (handle, summary) = match terminal_mailbox {
-            Some(mailbox) => spawn_room_with_terminal_mailbox(
+        let (handle, summary) = match terminal_outbox {
+            Some(mailbox) => spawn_room_with_terminal_outbox(
                 id,
                 name,
                 password,
@@ -1355,8 +1362,8 @@ impl LobbyRegistry {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: Option<u8>,
-        outbound: mpsc::Sender<RoomEvent>,
-        terminal_mailbox: Option<TerminalMailboxSender>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.connections.contains_key(&identity.connection_id) {
@@ -1372,10 +1379,10 @@ impl LobbyRegistry {
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
         let connection_id = identity.connection_id;
-        match match terminal_mailbox {
+        match match terminal_outbox {
             Some(mailbox) => {
                 handle
-                    .join_with_terminal_mailbox(
+                    .join_with_terminal_outbox(
                         identity,
                         password,
                         outbound,
@@ -2020,12 +2027,14 @@ async fn run_lobby(
                 }
             }
             command = commands.recv() => match command.and_then(begin) {
-                Some(LobbyCommand::Create { name, password, settings, owner, outbound, terminal_mailbox, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, terminal_mailbox, cancellation).await;
+                Some(LobbyCommand::Create { name, password, settings, owner, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, terminal_mailbox, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, terminal_mailbox, cancellation).await;
+                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, terminal_outbox, cancellation).await;
+                    let _ignored = reply.send(result);
+                }
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::List { reply }) => {
@@ -2051,12 +2060,14 @@ async fn run_lobby(
                     };
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::Join { room_id, identity, password, outbound, terminal_mailbox, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, terminal_mailbox, cancellation).await;
+                Some(LobbyCommand::Join { room_id, identity, password, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, terminal_mailbox, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, terminal_mailbox, cancellation).await;
+                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, terminal_outbox, cancellation).await;
+                    let _ignored = reply.send(result);
+                }
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
@@ -2133,7 +2144,7 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use crate::match_state::deterministic_conditions;
+    use crate::{match_state::deterministic_conditions, room::RoomEvent};
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
@@ -2493,7 +2504,7 @@ mod tests {
                         name: RoomName::parse("begun").unwrap_or_else(|_| unreachable!()),
                         settings: RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
                         owner: identity(1),
-                        outbound,
+                        outbound: RoomOutbound::from(outbound),
                         cancellation,
                         started,
                         release: continue_execution,
@@ -2573,7 +2584,7 @@ mod tests {
                         name: RoomName::parse("blocker").unwrap_or_else(|_| unreachable!()),
                         settings: RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
                         owner: identity(2),
-                        outbound,
+                        outbound: RoomOutbound::from(outbound),
                         cancellation: CancellationToken::new(),
                         started,
                         release: continue_execution,
