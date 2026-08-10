@@ -15,13 +15,13 @@ use pangya_domain::{
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MatchSeed, MatchPlan, NewAccount, Nickname,
-    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository,
-    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
-    StrokeRosterOrder, Username, Weather, WindConditions,
+    MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchPlan, MatchRepository,
+    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
+    OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest,
+    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
+    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
+    Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
