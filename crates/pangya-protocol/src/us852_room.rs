@@ -80,6 +80,147 @@ pub enum RetailHoleProgression {
     ShuffleAll = 0x03,
 }
 
+/// One requested room-setting mutation carried by client opcode `0x000a`.
+///
+/// # Provenance
+///
+/// The tagged body shapes and valid value sets come from
+/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Types 11 and 12
+/// are additionally documented by `alter-pangya`
+/// `RoomSettingsUpdatePacketHandler.kt`; their bodies are retained as protocol
+/// facts because this server has no repeat-hole mode to apply yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailRoomSettingChange {
+    /// Change the room name.
+    Name(Vec<u8>),
+    /// Change the room password; an empty value makes the room public.
+    Password(Vec<u8>),
+    /// Change the semantic room type.
+    Mode(RetailRoomType),
+    /// Change the course ordinal.
+    Course(u8),
+    /// Change the configured hole count.
+    HoleCount(u8),
+    /// Change the hole sequence.
+    HoleProgression(RetailHoleProgression),
+    /// Change the per-shot timer, in seconds.
+    ShotTimerSeconds(u16),
+    /// Change the room capacity.
+    PlayerCount(u8),
+    /// Change the whole-game timer, in minutes.
+    GameTimerMinutes(u8),
+    /// Change the repeated-hole selector.
+    RepeatHole(u8),
+    /// Change the fixed repeated-hole selector.
+    FixedRepeatHole(i32),
+    /// Change the selected artifact catalog id.
+    Artifact(u32),
+    /// Enable or disable natural wind.
+    NaturalWind(bool),
+}
+
+/// Bounded maximum number of room-setting entries in one retail frame.
+pub const MAX_RETAIL_ROOM_SETTING_CHANGES: usize = 14;
+
+/// Room-settings update, client opcode `0x000a`.
+///
+/// The leading `u16` is `0xffff` in the documented examples. It is retained as
+/// an unknown field rather than treated as authority: the server only acts on
+/// the checked tagged updates that follow it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomSettingsUpdate {
+    /// Independently validated requested changes, in their wire order.
+    pub changes: Vec<RetailRoomSettingChange>,
+}
+
+impl DecodePacket for RetailRoomSettingsUpdate {
+    const OPCODE: u16 = 0x000a;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let _unknown = reader.u16_le()?;
+        let count = usize::from(reader.u8()?);
+        if count > MAX_RETAIL_ROOM_SETTING_CHANGES {
+            return Err(reader.invalid("room settings carries too many changes"));
+        }
+        let mut changes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let setting = match reader.u8()? {
+                0 => RetailRoomSettingChange::Name(reader.pstring(ROOM_NAME_BYTES)?.to_vec()),
+                1 => RetailRoomSettingChange::Password(reader.pstring(ROOM_NAME_BYTES)?.to_vec()),
+                2 => {
+                    let mode = RetailRoomType::from_wire(reader.u8()?)
+                        .ok_or_else(|| reader.invalid("unknown room type"))?;
+                    RetailRoomSettingChange::Mode(mode)
+                }
+                3 => {
+                    let course = reader.u8()?;
+                    if !is_retail_course(course) {
+                        return Err(reader.invalid("unknown room course"));
+                    }
+                    RetailRoomSettingChange::Course(course)
+                }
+                4 => {
+                    let hole_count = reader.u8()?;
+                    if !matches!(hole_count, 3 | 6 | 9 | 18) {
+                        return Err(reader.invalid("invalid room hole count"));
+                    }
+                    RetailRoomSettingChange::HoleCount(hole_count)
+                }
+                5 => {
+                    let progression = match reader.u8()? {
+                        0 => RetailHoleProgression::FrontStart,
+                        1 => RetailHoleProgression::BackStart,
+                        2 => RetailHoleProgression::RandomStart,
+                        3 => RetailHoleProgression::ShuffleAll,
+                        _ => return Err(reader.invalid("unknown hole progression")),
+                    };
+                    RetailRoomSettingChange::HoleProgression(progression)
+                }
+                6 => {
+                    let seconds = reader.u16_le()?;
+                    if !matches!(seconds, 30 | 60 | 120 | 300) {
+                        return Err(reader.invalid("invalid shot timer"));
+                    }
+                    RetailRoomSettingChange::ShotTimerSeconds(seconds)
+                }
+                7 => {
+                    let player_count = reader.u8()?;
+                    if !matches!(player_count, 2 | 3 | 4 | 10 | 20 | 30) {
+                        return Err(reader.invalid("invalid room capacity"));
+                    }
+                    RetailRoomSettingChange::PlayerCount(player_count)
+                }
+                8 => {
+                    let minutes = reader.u8()?;
+                    if !matches!(minutes, 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50) {
+                        return Err(reader.invalid("invalid game timer"));
+                    }
+                    RetailRoomSettingChange::GameTimerMinutes(minutes)
+                }
+                11 => RetailRoomSettingChange::RepeatHole(reader.u8()?),
+                12 => RetailRoomSettingChange::FixedRepeatHole(reader.i32_le()?),
+                13 => RetailRoomSettingChange::Artifact(reader.u32_le()?),
+                14 => match reader.u32_le()? {
+                    0 => RetailRoomSettingChange::NaturalWind(false),
+                    1 => RetailRoomSettingChange::NaturalWind(true),
+                    _ => return Err(reader.invalid("invalid natural wind flag")),
+                },
+                _ => return Err(reader.invalid("unknown room setting type")),
+            };
+            changes.push(setting);
+        }
+        Ok(Self { changes })
+    }
+}
+
+fn is_retail_course(course: u8) -> bool {
+    matches!(course, 0x00..=0x0b | 0x0d..=0x10 | 0x12..=0x14 | 0x7f)
+}
+
 /// Room creation request, client opcode `0x0008`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailRoomCreate {
@@ -2177,6 +2318,86 @@ mod tests {
         assert_eq!(decoded.course, 1);
         assert_eq!(decoded.name, b"My Room");
         assert!(decoded.password.is_empty());
+    }
+
+    /// `pangbox--packetdoc` `gameservice/client/000a.ksy` defines this tagged sequence;
+    /// natural-wind's little-endian `u4` is intentionally not copied from alter's BE read.
+    #[test]
+    fn room_settings_update_decodes_every_applied_retail_setting() {
+        let mut writer = PacketWriter::default();
+        writer.u16_le(0xffff);
+        writer.u8(8);
+        writer.u8(1);
+        writer
+            .pstring(b"digest", ROOM_NAME_BYTES)
+            .expect("password");
+        writer.u8(3);
+        writer.u8(7);
+        writer.u8(4);
+        writer.u8(9);
+        writer.u8(5);
+        writer.u8(RetailHoleProgression::ShuffleAll as u8);
+        writer.u8(6);
+        writer.u16_le(120);
+        writer.u8(7);
+        writer.u8(4);
+        writer.u8(8);
+        writer.u8(30);
+        writer.u8(14);
+        writer.u32_le(1);
+
+        let update = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &writer.into_inner(),
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("room settings update");
+        assert_eq!(
+            update.changes,
+            vec![
+                RetailRoomSettingChange::Password(b"digest".to_vec()),
+                RetailRoomSettingChange::Course(7),
+                RetailRoomSettingChange::HoleCount(9),
+                RetailRoomSettingChange::HoleProgression(RetailHoleProgression::ShuffleAll),
+                RetailRoomSettingChange::ShotTimerSeconds(120),
+                RetailRoomSettingChange::PlayerCount(4),
+                RetailRoomSettingChange::GameTimerMinutes(30),
+                RetailRoomSettingChange::NaturalWind(true),
+            ]
+        );
+    }
+
+    /// PacketDoc `000a.ksy` has no recovery frame: a partial tagged body must be a decode error.
+    #[test]
+    fn room_settings_update_refuses_a_truncated_tagged_body() {
+        let payload = [0xff, 0xff, 1, 6, 120];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(
+                &payload,
+                &profile(),
+                ServiceKind::Game,
+            )
+            .is_err()
+        );
+    }
+
+    /// PacketDoc `000a.ksy` limits the setting enum and natural-wind to `0` or `1`.
+    #[test]
+    fn room_settings_update_refuses_unknown_or_out_of_range_values() {
+        let unknown = [0xff, 0xff, 1, 10];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(
+                &unknown,
+                &profile(),
+                ServiceKind::Game,
+            )
+            .is_err()
+        );
+        let wind = [0xff, 0xff, 1, 14, 2, 0, 0, 0];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(&wind, &profile(), ServiceKind::Game)
+                .is_err()
+        );
     }
 
     #[test]

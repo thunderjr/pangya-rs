@@ -194,6 +194,7 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x0004` | `RetailSelectChannel` | `lib.rs:1271` | client-verified | `game.rs:147`; PacketDoc `gameservice/client/0004.ksy`, a **one-byte** sub-server ID |
 | `0x0008` | `RetailRoomCreate` | `lib.rs:5123` | client-verified | `us852_room.rs:101` |
 | `0x0009` | `RetailRoomJoin` | `lib.rs:5172` | client-verified | `us852_room.rs:141` |
+| `0x000a` | `RetailRoomSettingsUpdate` | decoder only; application still does not apply the changes | reference-derived | `us852_room.rs`; `pangbox--packetdoc` `gameservice/client/000a.ksy`; types 11/12 additionally `alter-pangya` `RoomSettingsUpdatePacketHandler.kt` |
 | `0x000d` | `RETAIL_C2S_ROOM_READY` | `lib.rs:5218` | client-verified (blocker 21) | one byte, zero meaning ready; the reply is the census, not an acknowledgement |
 | `0x000e` | `RETAIL_C2S_START_MATCH` | `lib.rs:4527` (stroke), `lib.rs:4384` (solo) | client-verified for start; the versus hole is CI-proven only | the room is read first: two members run the stroke aggregate, one runs solo |
 | `0x000f` | `RETAIL_C2S_ROOM_LEAVE` | `lib.rs:5234` | client-verified | |

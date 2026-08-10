@@ -128,21 +128,19 @@ pub use us852_match::{
     RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
-    MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,
-    ROOM_NAME_BYTES, ROOM_PLAYER_IDENTITY_BYTES, ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES,
-    RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipmentAnnounce,
-    RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
-    RetailHoleProgression, RetailLobbyEquipmentUpdate, RetailLockerCombinationAttempt,
+    MAX_RETAIL_PURCHASE_ITEMS, MAX_RETAIL_ROOM_SETTING_CHANGES, MAX_ROOM_PLAYERS,
+    MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS, ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES,
+    ROOM_RECORD_BYTES, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
+    RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
+    RetailEquipmentUpdated, RetailHoleProgression, RetailLockerCombinationAttempt,
     RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
-    RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMultiplayerJoined,
-    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomFurniture,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
     RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangSpent, RetailPlayerInfo,
     RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
-    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomEquipmentUpdate,
-    RetailRoomEquipmentUpdatePacket, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
-    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType,
-    RetailShopJoin, RetailShopJoined, RetailUccUploadKeyRefusal, RoomCensusKind, RoomJoinRejection,
-    RoomListKind, RoomPlayerFlags,
+    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomSettingChange,
+    RetailRoomSettingsUpdate, RetailRoomState, RetailRoomStatus, RetailRoomType, RetailShopJoin,
+    RetailShopJoined, RoomCensusKind, RoomJoinRejection, RoomListKind, RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 
