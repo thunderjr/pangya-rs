@@ -612,8 +612,13 @@ pub struct EconomyRuntimeConfig {
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
-    /// Sole locally configured channel ID.
+    /// Sole locally configured channel ID used by the listener's initial channel.
     pub channel_id: u32,
+    /// Every retail sub-server ID this service advertises and accepts for transitions.
+    ///
+    /// The initial channel must be present. Keeping this topology explicit prevents `0x0083`
+    /// from treating an arbitrary byte (or the current channel) as a successful move.
+    pub advertised_channel_ids: Vec<u8>,
     /// Post-channel handling policy for truly unknown opcodes.
     pub unknown_opcode_policy: UnknownOpcodePolicy,
     /// Resource, rate, actor, and deadline limits.
@@ -635,6 +640,7 @@ impl Default for GameRuntimeConfig {
     fn default() -> Self {
         Self {
             channel_id: 1,
+            advertised_channel_ids: vec![1],
             unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
             limits: GameRuntimeLimits::default(),
             solo_practice: None,
@@ -771,6 +777,8 @@ struct SocialMember {
     nickname: Vec<u8>,
     card: MemberCard,
     room: Option<RoomId>,
+    /// Retail sub-server presence; absent until the initial channel selection succeeds.
+    channel: Option<u8>,
     whisper_accept: bool,
 }
 
@@ -806,6 +814,7 @@ impl SocialHub {
                     nickname,
                     card,
                     room: None,
+                    channel: None,
                     whisper_accept: true,
                 },
             );
@@ -814,6 +823,13 @@ impl SocialHub {
     fn remove(&self, id: PlayerConnectionId) {
         if let Ok(mut members) = self.members.lock() {
             members.remove(&id);
+        }
+    }
+    fn set_channel(&self, id: PlayerConnectionId, channel: Option<u8>) {
+        if let Ok(mut members) = self.members.lock()
+            && let Some(member) = members.get_mut(&id)
+        {
+            member.channel = channel;
         }
     }
     fn set_room(&self, id: PlayerConnectionId, room: Option<RoomId>) {
@@ -844,6 +860,28 @@ impl SocialHub {
             .ok()?
             .get(&id)
             .map(|member| member.account_id)
+    }
+    fn snapshots_for_connections(&self, ids: &[PlayerConnectionId]) -> Vec<MemberSnapshot> {
+        let Ok(members) = self.members.lock() else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter_map(|id| {
+                let member = members.get(id)?;
+                Some(
+                    MemberSnapshot::new(
+                        *id,
+                        member.account_id,
+                        String::from_utf8_lossy(&member.nickname).into_owned(),
+                        false,
+                        false,
+                        None,
+                        None,
+                    )
+                    .with_card(member.card.clone()),
+                )
+            })
+            .collect()
     }
     fn contains_account(&self, id: u32) -> bool {
         let Ok(members) = self.members.lock() else {
@@ -887,10 +925,16 @@ impl SocialHub {
         let Ok(members) = self.members.lock() else {
             return Vec::new();
         };
-        let room = members.get(&id).and_then(|member| member.room);
+        let Some(requester) = members.get(&id) else {
+            return Vec::new();
+        };
+        let room = requester.room;
+        let channel = requester.channel;
         members
             .iter()
-            .filter_map(|(target, member)| (member.room == room).then_some(*target))
+            .filter_map(|(target, member)| {
+                (member.channel == channel && member.room == room).then_some(*target)
+            })
             .collect()
     }
     fn chat(&self, id: PlayerConnectionId, nickname: Vec<u8>, message: Vec<u8>) {
@@ -1116,6 +1160,16 @@ where
     ) -> Result<Self, GameRuntimeError> {
         let limits = &config.limits;
         let invalid = config.channel_id == 0
+            || config.advertised_channel_ids.is_empty()
+            || config.advertised_channel_ids.len() > 255
+            || !config
+                .advertised_channel_ids
+                .contains(&u8::try_from(config.channel_id).unwrap_or(0))
+            || config
+                .advertised_channel_ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| config.advertised_channel_ids[index + 1..].contains(id))
             || limits.global_connections == 0
             || limits.global_connections > 10_000
             || limits.connections_per_source == 0
@@ -1524,6 +1578,9 @@ where
         let mut state = GameState::AwaitHandover;
         let mut presence: Option<RegistryGuard<AccountId>> = None;
         let mut identity: Option<RoomIdentity> = None;
+        // Distinct from the authenticated account lease: this is the current retail sub-server
+        // and is changed only after a valid transition has completed its room cleanup.
+        let mut current_channel: Option<u8> = None;
         // Target account selected by the last 0x00b5 My Room open. It is connection-local and
         // never trusted as authorization for mutable state; every projection is loaded from DB.
         let mut my_room_target: Option<AccountId> = None;
@@ -1706,9 +1763,13 @@ where
                                     Err(_) => break Err(GameRuntimeError::Protocol),
                                 }
                             };
-                            if channel_id != self.config.channel_id
+                            let Some(channel) = u8::try_from(channel_id).ok() else {
+                                break Err(GameRuntimeError::Protocol);
+                            };
+                            if !self.config.advertised_channel_ids.contains(&channel)
                                 || identity.is_none()
                                 || presence.is_none()
+                                || current_channel.is_some()
                             {
                                 break Err(GameRuntimeError::Protocol);
                             }
@@ -1729,6 +1790,8 @@ where
                             if let Err(error) = sent {
                                 break Err(error);
                             }
+                            current_channel = Some(channel);
+                            self.social.set_channel(connection_id, current_channel);
                             state = GameState::InChannel;
                         }
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
@@ -1747,12 +1810,18 @@ where
                                     unknown_c: UnknownBytes([0; 2]), flags: UnknownBytes([0; 2]),
                                     unknown_d: UnknownBytes([0; 14]), icon: 1,
                                 };
-                                let channel = RetailSubServerEntry {
-                                    name: b"Channel 1".to_vec(), unknown_a: UnknownBytes([0; 47]),
-                                    id: u8::try_from(self.config.channel_id).map_err(|_| GameRuntimeError::Protocol)?,
-                                    unknown_b: UnknownBytes([0; 8]),
-                                };
-                                self.send(&mut framed, &RetailServerList { servers: vec![server], sub_servers: vec![channel] }).await?;
+                                let channels = self
+                                    .config
+                                    .advertised_channel_ids
+                                    .iter()
+                                    .map(|&id| RetailSubServerEntry {
+                                        name: format!("Channel {id}").into_bytes(),
+                                        unknown_a: UnknownBytes([0; 47]),
+                                        id,
+                                        unknown_b: UnknownBytes([0; 8]),
+                                    })
+                                    .collect();
+                                self.send(&mut framed, &RetailServerList { servers: vec![server], sub_servers: channels }).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == RetailServerTimeRequest::OPCODE {
                                 if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
                                 let now = chrono::Local::now();
@@ -1768,9 +1837,35 @@ where
                                 }).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == RetailSubServerConnect::OPCODE {
                                 let request = decode_packet_payload::<RetailSubServerConnect>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
-                                if u32::from(request.sub_server_id) != self.config.channel_id { break Err(GameRuntimeError::Protocol); }
+                                let Some(previous) = current_channel else { break Err(GameRuntimeError::Protocol); };
+                                // 0x0083 is a real move, not an idempotent re-join. Validate the
+                                // destination before touching the room actor or presence map so
+                                // malformed/unknown requests cannot strand a player half-moved.
+                                if !matches!(state, GameState::InChannel | GameState::InRoom)
+                                    || request.sub_server_id == previous
+                                    || !self.config.advertised_channel_ids.contains(&request.sub_server_id)
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                if state == GameState::InRoom {
+                                    match self.lobby.disconnect(connection_id).await {
+                                        Ok(_) | Err(RoomError::NotMember | RoomError::RoomNotFound) => {}
+                                        Err(_) => break Err(GameRuntimeError::Protocol),
+                                    }
+                                    room_id = None;
+                                    self.social.set_room(connection_id, None);
+                                    // The room actor may have queued its final census before the
+                                    // leave reply. It must not leak into a later room entered on
+                                    // the destination channel.
+                                    while room_events.try_recv().is_ok() {}
+                                }
+                                // Reference 0x004e/0x01f6 carries no destination ID. Commit the
+                                // session/lobby presence only after both response frames are sent.
                                 self.send(&mut framed, &RetailChannelJoined).await?;
                                 self.send(&mut framed, &RetailChannelJoinNotice).await?;
+                                current_channel = Some(request.sub_server_id);
+                                self.social.set_channel(connection_id, current_channel);
+                                state = GameState::InChannel;
                             } else if self.config.retail_bootstrap && frame.opcode == RetailNewSessionKeyRequest::OPCODE {
                                 let request = decode_packet_payload::<RetailNewSessionKeyRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
                                 let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
@@ -4578,7 +4673,15 @@ where
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::StrokeCommitted(result) => {
-                    self.send_retail_stroke_committed(framed, *result, match_context.stroke)
+                    let context = match_context.stroke;
+                    // The actor emitted this only after durable settlement. Recording before the
+                    // completion frames keeps a client-visible completed match and its history
+                    // atomic from an observer's point of view.
+                    if let Some(context) = context {
+                        let members = self.social.snapshots_for_connections(&context.roster);
+                        self.record_retail_match_history(&members).await?;
+                    }
+                    self.send_retail_stroke_committed(framed, *result, context)
                         .await?;
                     match_context.stroke = None;
                     return Ok(RoomEventEffect::EnterRoom);
@@ -5845,7 +5948,6 @@ where
                 ) {
                     return Ok(Some(GameState::InRoom));
                 }
-                self.record_retail_match_history(snapshot.members()).await?;
                 self.begin_retail_stroke_match(
                     &snapshot,
                     room_id,
@@ -7658,14 +7760,18 @@ where
         self.send(
             framed,
             &ServerChannelList {
-                channels: vec![RetailChannel {
-                    name: b"pangya-rs".to_vec(),
-                    capacity: 200,
-                    player_count: 0,
-                    id: u16::try_from(self.config.channel_id)
-                        .map_err(|_| GameRuntimeError::InvalidConfig)?,
-                    restrictions: 0,
-                }],
+                channels: self
+                    .config
+                    .advertised_channel_ids
+                    .iter()
+                    .map(|&id| RetailChannel {
+                        name: b"pangya-rs".to_vec(),
+                        capacity: 200,
+                        player_count: 0,
+                        id: u16::from(id),
+                        restrictions: 0,
+                    })
+                    .collect(),
             },
         )
         .await?;

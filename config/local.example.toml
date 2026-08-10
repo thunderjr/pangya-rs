@@ -18,6 +18,8 @@ id = 1
 name = "PangYa-RS Local"
 capacity = 200
 channel_id = 1
+# Every retail sub-server ID advertised in 0x009f; 0x0083 only moves among these.
+channels = [1]
 max_rooms = 1024
 lobby_command_capacity = 256
 lobby_event_capacity = 256
