@@ -905,7 +905,9 @@ async fn drain_frames_with_grace(
         {
             Ok(Some(frame)) => seen.push(frame),
             Ok(None) => break,
-            Err(_) => break,
+            // A 400 ms polling slice is not the grace deadline. Keep polling after a quiet
+            // slice so a delayed terminal settlement can still deliver 0x0065/0x0066.
+            Err(_) => continue,
         }
     }
     seen
@@ -917,6 +919,34 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
         .into_iter()
         .map(|(opcode, _)| opcode)
         .collect()
+}
+
+#[tokio::test]
+async fn terminal_grace_keeps_polling_for_delayed_finish_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let key = 3;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        // Deliberately exceed the helper's 400 ms polling slice while remaining inside its
+        // two-second overall grace period.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for opcode in [0x0065_u16, 0x0066] {
+            let plain = opcode.to_le_bytes();
+            let frame =
+                pangya_crypto::server_encrypt(&plain, key, 1, 8 * 1024 * 1024).expect("encrypt");
+            stream.write_all(&frame).await.expect("write");
+        }
+    });
+    let mut client = TcpStream::connect(address).await.expect("connect");
+
+    let frames = drain_frames_with_grace(&mut client, key, Duration::from_secs(2)).await;
+    server.await.expect("server task");
+    assert_eq!(
+        frames.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
+        vec![0x0065, 0x0066],
+        "terminal frames arriving after the first polling slice are retained"
+    );
 }
 
 fn wire<T: EncodePacket>(packet: &T, profile: &CompatibilityProfile) -> Result<Vec<u8>, String> {
