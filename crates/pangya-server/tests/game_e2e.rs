@@ -31,10 +31,10 @@ use pangya_protocol::{
     EconomyCommandResult, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, FinishHole,
     HoleResult, InventoryChanged, Lie, LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket, RepairCommitted,
-    RepairRequest, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest, RoomKickRequest,
-    RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind,
-    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    RepairRequest, RetailEquipment, RetailEquipmentAnnounce, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
+    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
     ServiceKind as ProtocolServiceKind, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay,
     ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase,
     StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate,
@@ -362,6 +362,29 @@ fn economy_catalog() -> Catalog {
 
 fn economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
     economy_service_with(pool, metrics, Some(default_economy()))
+}
+
+fn retail_economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
+    Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool)),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: Some(default_economy()),
+                retail_bootstrap: true,
+            },
+            metrics,
+        )
+        .expect("retail economy service"),
+    )
 }
 
 fn default_economy() -> EconomyRuntimeConfig {
@@ -5991,6 +6014,290 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(state, vec![0; 20]);
 
     drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_bulk_equipment_is_acknowledged_owned_and_restart_safe(pool: PgPool) {
+    let account = create_account(&pool, "RetailBulk", 0, 0x1000_0000).await;
+    let character_id: i64 = sqlx::query_scalar(
+        "INSERT INTO characters (account_id, item_type_id, starter_key) \
+         VALUES ($1, 0x04000000, 'e2e.bulk.alt') RETURNING id",
+    )
+    .bind(account.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("supported alternate character");
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"RetailBulk".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let _ = receive_packet(&mut stream, key).await;
+    }
+    send_packet(&mut stream, key, 2, 4, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // Tag 5 is the supported selected-character bulk update; the alternate row uses the
+    // catalog's real starter character type rather than an invented item id.
+    let mut valid = vec![5];
+    valid.extend_from_slice(
+        &u32::try_from(character_id)
+            .expect("character")
+            .to_le_bytes(),
+    );
+    send_packet(&mut stream, key, 3, 0x0020, &valid).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x006b);
+    assert_eq!(body, [4, 5, valid[1], valid[2], valid[3], valid[4]]);
+
+    // An exact encrypted retry reuses the durable operation and does not bump the projection.
+    send_packet(&mut stream, key, 4, 0x0020, &valid).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await,
+        (0x006b, body.clone())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(account.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("equipment version"),
+        1
+    );
+
+    // Ownership refusal is a status-1 0x006b response, not a protocol disconnect. A later valid
+    // command proves the encrypted connection remains usable.
+    let mut invalid = vec![5];
+    invalid.extend_from_slice(&u32::MAX.to_le_bytes());
+    send_packet(&mut stream, key, 5, 0x0020, &invalid).await;
+    assert_eq!(receive_packet(&mut stream, key).await, (0x006b, vec![1, 5]));
+    send_packet(&mut stream, key, 6, 0x0020, &valid).await;
+    assert_eq!(receive_packet(&mut stream, key).await, (0x006b, body));
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+
+    // A newly constructed service projects the selected character from durable state.
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut restarted, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut restarted,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"RetailBulk".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    let mut projected = None;
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let frame = receive_packet(&mut restarted, key).await;
+        if frame.0 == RetailEquipment::OPCODE {
+            projected = Some(frame.1);
+        }
+    }
+    let projected = projected.expect("retail equipment after restart");
+    assert_eq!(
+        u32::from_le_bytes([projected[4], projected[5], projected[6], projected[7]]),
+        u32::try_from(character_id).expect("character")
+    );
+    drop(restarted);
+    shutdown.cancel();
+    assert!(task.await.expect("restart join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(pool: PgPool) {
+    let owner = create_account(&pool, "REquipOwner", 0, 0x1000_0000).await;
+    let guest = create_account(&pool, "REquipGuest", 0, 0x1000_0000).await;
+    let owner_character: i64 =
+        sqlx::query_scalar("SELECT id FROM characters WHERE account_id = $1")
+            .bind(owner.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("owner character");
+    let owner_alt_character: i64 = sqlx::query_scalar(
+        "INSERT INTO characters (account_id, item_type_id, starter_key) \
+         VALUES ($1, 0x04000000, 'e2e.room.alt') RETURNING id",
+    )
+    .bind(owner.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("supported alternate character");
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+
+    async fn connect_retail(
+        pool: &PgPool,
+        address: std::net::SocketAddr,
+        account_id: pangya_domain::AccountId,
+        username: &str,
+    ) -> (TcpStream, u8, u32) {
+        let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+        let (mut stream, key) = connect_game_retail(address).await;
+        send_typed(
+            &mut stream,
+            key,
+            1,
+            &pangya_protocol::RetailGameAuth {
+                username: username.as_bytes().to_vec(),
+                user_id: u32::try_from(account_id.get()).expect("user id"),
+                login_key: zeroize::Zeroizing::new(token.into_bytes()),
+                client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+                session_key: zeroize::Zeroizing::new(Vec::new()),
+            },
+        )
+        .await;
+        let mut connection_id = 0_u32;
+        for index in 0..RETAIL_BOOTSTRAP_FRAMES {
+            let (_, body) = receive_packet(&mut stream, key).await;
+            if index == 3 {
+                let at = 1 + 2 + 6 + 2 + 9 + 2 + 22 + 22 + 17 + 24;
+                connection_id =
+                    u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+            }
+        }
+        send_packet(&mut stream, key, 2, 4, &[1]).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+        (stream, key, connection_id)
+    }
+
+    let (mut host, host_key, host_connection) =
+        connect_retail(&pool, address, owner.account.id, "REquipOwner").await;
+    let (mut visitor, visitor_key, _) =
+        connect_retail(&pool, address, guest.account.id, "REquipGuest").await;
+
+    // 0x000b is the lobby form. It persists while no room broadcast is possible.
+    let mut lobby_change = vec![4];
+    lobby_change.extend_from_slice(
+        &u32::try_from(owner_alt_character)
+            .expect("alternate character")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 3, 0x000b, &lobby_change).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT character_id FROM equipment_sets WHERE account_id = $1",
+        )
+        .bind(owner.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("lobby projection"),
+        owner_alt_character
+    );
+
+    let mut create = PacketWriter::default();
+    create.u8(0);
+    create.u32_le(30_000);
+    create.u32_le(600_000);
+    create.u8(4);
+    create.u8(0);
+    create.u8(3);
+    create.u8(1);
+    create.bytes(&[0; 5]);
+    create.pstring(b"Equipment Room", 64).expect("name");
+    create.pstring(b"", 64).expect("password");
+    send_packet(&mut host, host_key, 4, 0x0008, &create.into_inner()).await;
+    let (_, room_record) = receive_packet(&mut host, host_key).await;
+    let _ = receive_packet(&mut host, host_key).await;
+    let room_id = u16::from_le_bytes([
+        room_record[2 + 64 + 5 + 17 + 3],
+        room_record[2 + 64 + 5 + 17 + 4],
+    ]);
+    let mut join = PacketWriter::default();
+    join.u16_le(room_id);
+    join.pstring(b"", 64).expect("password");
+    send_packet(&mut visitor, visitor_key, 3, 0x0009, &join.into_inner()).await;
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0049);
+    let _ = receive_packet(&mut visitor, visitor_key).await;
+    let _ = drain_frames(&mut host, host_key, Duration::from_millis(100)).await;
+
+    // 0x000c changes the current room loadout and emits packetdoc's exact 0x004b bytes to both
+    // currently connected members. No rejoin is used to observe the peer notification.
+    let mut room_change = vec![4];
+    room_change.extend_from_slice(
+        &u32::try_from(owner_character)
+            .expect("owner character")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 5, 0x000c, &room_change).await;
+    let expected = encode_packet_payload(
+        &RetailEquipmentAnnounce::Character {
+            connection_id: host_connection,
+            character_type_id: 0x0400_0000,
+            character_uid: u32::try_from(owner_character).expect("owner character"),
+        },
+        &CompatibilityProfile::US_852,
+    )
+    .expect("004b payload")
+    .to_vec();
+    assert_eq!(
+        receive_packet(&mut host, host_key).await,
+        (0x004b, expected.clone())
+    );
+    assert_eq!(
+        receive_packet(&mut visitor, visitor_key).await,
+        (0x004b, expected.clone())
+    );
+
+    // The exact retry is durable replay, not a second room-wide announcement.
+    send_packet(&mut host, host_key, 6, 0x000c, &room_change).await;
+    assert!(
+        drain_frames(&mut host, host_key, Duration::from_millis(150))
+            .await
+            .is_empty()
+    );
+    assert!(
+        drain_frames(&mut visitor, visitor_key, Duration::from_millis(150))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(owner.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("room replay version"),
+        2
+    );
+    drop(visitor);
+    drop(host);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
