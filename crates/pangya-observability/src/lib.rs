@@ -21,7 +21,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use pangya_domain::{AccountId, SourceAddressPrefix, StorageFault, StorageObserver};
+use pangya_domain::{
+    AccountId, MatchId, MatchResultKey, SourceAddressPrefix, StorageFault, StorageObserver,
+};
 use pangya_game::{
     GameChatObservation, GameCommitObservation, GameConnectionId, GameEconomyCommand,
     GameEconomyOutcome, GameMatchObservation, GameObserver, GameQueueObservation, GameRateClass,
@@ -1282,6 +1284,34 @@ impl GameObserver for M2Metrics {
             GameCommitObservation::Cancelled => 5,
         };
         self.game_stroke_commit[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stroke_commit_identity(&self, match_id: MatchId, result_key: MatchResultKey) {
+        tracing::info!(
+            service = "game",
+            mode = "stroke_two",
+            match_id = %match_id.get(),
+            result_key = %result_key.get(),
+            "stroke settlement committed"
+        );
+    }
+
+    fn stroke_terminal_payload(
+        &self,
+        connection_id: GameConnectionId,
+        match_id: MatchId,
+        result_key: MatchResultKey,
+        generation: u64,
+    ) {
+        tracing::info!(
+            service = "game",
+            mode = "stroke_two",
+            connection_id = connection_id.get(),
+            match_id = %match_id.get(),
+            result_key = %result_key.get(),
+            generation,
+            "stroke terminal payload registered"
+        );
     }
 
     fn shot(&self, outcome: GameShotObservation) {

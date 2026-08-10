@@ -392,7 +392,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
 
     The retail start now reads the room before it starts anything: two members run the stroke aggregate, one member still runs the solo one. Three things the versus flow needed did not exist. `StrokeMatchState::hole_out` is a completion rather than a shot, because the client plays the holing stroke through the ordinary action/result pair and only *then* announces the hole is over — counting the announcement as a stroke scored every hole one over. A bounded relay carries the client's own in-match frames (`0x0055` shot announce, `0x0064` ball sync) to the other participant unchanged, since the client owns trajectory and this server's authority is the stroke count and whose turn it is. And `0x0066` carries the final standings, so the results screen shows the durable settlement.
 
-    `game_retail_two_players_play_and_settle_one_versus_hole` replaces the pin and drives two authenticated retail clients through a whole hole over TCP: both receive the hole intro, the turn alternates with `0x00cc`/`0x0063`, each shot reaches the other client as `0x0055`, and the second hole-out settles one durable match with **both** accounts as participants and one Pang and one EXP ledger row each.
+    `game_retail_two_players_play_and_settle_full_card` replaces the pin and drives two authenticated retail clients through all eighteen holes over TCP: each hole gets its authoritative intro and turn sequence, each shot reaches the other client as `0x0055`, and the final hole settles one durable match with **both** accounts as participants and one Pang and one EXP ledger row each.
 
     A process note that matters more than the fix. The pinning test proved less than it claimed: it read the room number from the wrong offset of the join reply, so its guest was refused the room with `RoomNotFound` and could not have been scored whatever the server did. `0x0049` is both the acceptance and the rejection, so asserting the opcode alone asserted nothing. The replacement asserts the status word, and the guest's census frame, before it believes anyone is in a room.
 
@@ -679,7 +679,7 @@ Evidence: [`adr/0014-synthetic-m7-economy.md`](adr/0014-synthetic-m7-economy.md)
     record and the room status report the mode, course, hole count and timers the creator asked
     for. The mode is carried as the client's own byte rather than mapped onto the four modelled
     types: the client's single-player practice room is a mode this server does not model and
-    still has to render. Pinned by `game_retail_two_players_play_and_settle_one_versus_hole`.
+    still has to render. Pinned by `game_retail_two_players_play_and_settle_full_card`.
     Was, before the fix: The room actor stores a name, a password and
     a capacity; the mode, course, hole count and timers a client asked for are echoed once from
     the create request and then lost. `retail_room_from_snapshot` therefore rebuilds the record as

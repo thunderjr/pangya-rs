@@ -80,6 +80,425 @@ pub enum RetailHoleProgression {
     ShuffleAll = 0x03,
 }
 
+/// One requested room-setting mutation carried by client opcode `0x000a`.
+///
+/// # Provenance
+///
+/// The tagged body shapes and valid value sets come from
+/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Types 11 through 13
+/// are additionally documented by `alter-pangya`
+/// `RoomSettingsUpdatePacketHandler.kt`; their bodies are retained as protocol
+/// facts and explicitly refused by the game service until matching authoritative aggregates
+/// exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailRoomSettingChange {
+    /// Change the room name.
+    Name(Vec<u8>),
+    /// Change the room password; an empty value makes the room public.
+    Password(Vec<u8>),
+    /// Change the semantic room type.
+    Mode(RetailRoomType),
+    /// Change the course ordinal.
+    Course(u8),
+    /// Change the configured hole count.
+    HoleCount(u8),
+    /// Change the hole sequence.
+    HoleProgression(RetailHoleProgression),
+    /// Change the per-shot timer, in seconds.
+    ShotTimerSeconds(u16),
+    /// Change the room capacity.
+    PlayerCount(u8),
+    /// Change the whole-game timer, in minutes.
+    GameTimerMinutes(u8),
+    /// Change the repeated-hole selector.
+    RepeatHole(u8),
+    /// Change the fixed repeated-hole selector.
+    FixedRepeatHole(i32),
+    /// Change the selected artifact catalog id.
+    Artifact(u32),
+    /// Enable or disable natural wind.
+    NaturalWind(bool),
+}
+
+/// Bounded maximum number of room-setting entries in one retail frame.
+pub const MAX_RETAIL_ROOM_SETTING_CHANGES: usize = 14;
+
+/// Room-settings update, client opcode `0x000a`.
+///
+/// The leading `u16` is `0xffff` in the documented examples. It is retained as
+/// an unknown field rather than treated as authority: the server only acts on
+/// the checked tagged updates that follow it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomSettingsUpdate {
+    /// Independently validated requested changes, in their wire order.
+    pub changes: Vec<RetailRoomSettingChange>,
+}
+
+impl DecodePacket for RetailRoomSettingsUpdate {
+    const OPCODE: u16 = 0x000a;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let _unknown = reader.u16_le()?;
+        let count = usize::from(reader.u8()?);
+        if count > MAX_RETAIL_ROOM_SETTING_CHANGES {
+            return Err(reader.invalid("room settings carries too many changes"));
+        }
+        let mut changes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let setting = match reader.u8()? {
+                0 => RetailRoomSettingChange::Name(reader.pstring(ROOM_NAME_BYTES)?.to_vec()),
+                1 => RetailRoomSettingChange::Password(reader.pstring(ROOM_NAME_BYTES)?.to_vec()),
+                2 => {
+                    let mode = RetailRoomType::from_wire(reader.u8()?)
+                        .ok_or_else(|| reader.invalid("unknown room type"))?;
+                    RetailRoomSettingChange::Mode(mode)
+                }
+                3 => {
+                    let course = reader.u8()?;
+                    if !is_retail_course(course) {
+                        return Err(reader.invalid("unknown room course"));
+                    }
+                    RetailRoomSettingChange::Course(course)
+                }
+                4 => {
+                    let hole_count = reader.u8()?;
+                    if !matches!(hole_count, 1 | 3 | 6 | 9 | 18) {
+                        return Err(reader.invalid("invalid room hole count"));
+                    }
+                    RetailRoomSettingChange::HoleCount(hole_count)
+                }
+                5 => {
+                    let progression = match reader.u8()? {
+                        0 => RetailHoleProgression::FrontStart,
+                        1 => RetailHoleProgression::BackStart,
+                        2 => RetailHoleProgression::RandomStart,
+                        3 => RetailHoleProgression::ShuffleAll,
+                        _ => return Err(reader.invalid("unknown hole progression")),
+                    };
+                    RetailRoomSettingChange::HoleProgression(progression)
+                }
+                6 => {
+                    let seconds = reader.u16_le()?;
+                    if !matches!(seconds, 30 | 60 | 120 | 300) {
+                        return Err(reader.invalid("invalid shot timer"));
+                    }
+                    RetailRoomSettingChange::ShotTimerSeconds(seconds)
+                }
+                7 => {
+                    let player_count = reader.u8()?;
+                    if !matches!(player_count, 2 | 3 | 4 | 10 | 20 | 30) {
+                        return Err(reader.invalid("invalid room capacity"));
+                    }
+                    RetailRoomSettingChange::PlayerCount(player_count)
+                }
+                8 => {
+                    let minutes = reader.u8()?;
+                    if !matches!(minutes, 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50) {
+                        return Err(reader.invalid("invalid game timer"));
+                    }
+                    RetailRoomSettingChange::GameTimerMinutes(minutes)
+                }
+                11 => RetailRoomSettingChange::RepeatHole(reader.u8()?),
+                12 => RetailRoomSettingChange::FixedRepeatHole(reader.i32_le()?),
+                13 => RetailRoomSettingChange::Artifact(reader.u32_le()?),
+                14 => match reader.u32_le()? {
+                    0 => RetailRoomSettingChange::NaturalWind(false),
+                    1 => RetailRoomSettingChange::NaturalWind(true),
+                    _ => return Err(reader.invalid("invalid natural wind flag")),
+                },
+                _ => return Err(reader.invalid("unknown room setting type")),
+            };
+            changes.push(setting);
+        }
+        Ok(Self { changes })
+    }
+}
+
+fn is_retail_course(course: u8) -> bool {
+    matches!(course, 0x00..=0x0b | 0x0d..=0x10 | 0x12..=0x14 | 0x7f)
+}
+
+/// Team selection, client opcode `0x0010`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RetailTeam {
+    /// Red team.
+    Red = 0,
+    /// Blue team.
+    Blue = 1,
+}
+
+impl RetailTeam {
+    fn from_wire(reader: &PacketReader<'_>, value: u8) -> Result<Self, PacketDecodeError> {
+        match value {
+            0 => Ok(Self::Red),
+            1 => Ok(Self::Blue),
+            _ => Err(reader.invalid("unknown room team")),
+        }
+    }
+}
+
+/// Team change request, client opcode `0x0010`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailTeamChange {
+    /// Requested team.
+    pub team: RetailTeam,
+}
+
+impl DecodePacket for RetailTeamChange {
+    const OPCODE: u16 = 0x0010;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let team = reader.u8()?;
+        Ok(Self {
+            team: RetailTeam::from_wire(reader, team)?,
+        })
+    }
+}
+
+/// Room resync request, client opcode `0x001c`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomResync {
+    /// Reference-defined opaque request marker.
+    pub marker: u8,
+    /// Opaque per-player entries retained for bounded validation.
+    pub entries: Vec<(u8, u32)>,
+}
+
+impl DecodePacket for RetailRoomResync {
+    const OPCODE: u16 = 0x001c;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let marker = reader.u8()?;
+        let count = usize::from(reader.u8()?);
+        if count > MAX_ROOM_PLAYERS as usize {
+            return Err(reader.invalid("room resync carries too many entries"));
+        }
+        let entries = (0..count)
+            .map(|_| Ok((reader.u8()?, reader.u32_le()?)))
+            .collect::<Result<Vec<_>, PacketDecodeError>>()?;
+        Ok(Self { marker, entries })
+    }
+}
+
+/// Room information request, client opcode `0x002d`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRoomInformationRequest {
+    /// Room number from the room directory.
+    pub room_number: u16,
+}
+
+impl DecodePacket for RetailRoomInformationRequest {
+    const OPCODE: u16 = 0x002d;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self {
+            room_number: reader.u16_le()?,
+        })
+    }
+}
+
+/// Master kick request, client opcode `0x0026`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRoomKick {
+    /// Connection ID to remove.
+    pub connection_id: u32,
+}
+
+impl DecodePacket for RetailRoomKick {
+    const OPCODE: u16 = 0x0026;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self {
+            connection_id: reader.u32_le()?,
+        })
+    }
+}
+
+/// Legacy room invite information request, client opcode `0x0029`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRoomInviteInfo {
+    /// Invited account ID.
+    pub account_id: u32,
+}
+
+impl DecodePacket for RetailRoomInviteInfo {
+    const OPCODE: u16 = 0x0029;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self {
+            account_id: reader.u32_le()?,
+        })
+    }
+}
+
+/// Newer room invite request, client opcode `0x00ba`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInvite {
+    /// Invited nickname as sent by the client.
+    pub nickname: Vec<u8>,
+    /// Invited account ID.
+    pub account_id: u32,
+}
+
+impl DecodePacket for RetailRoomInvite {
+    const OPCODE: u16 = 0x00ba;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self {
+            nickname: reader.pstring(ROOM_NAME_BYTES)?.to_vec(),
+            account_id: reader.u32_le()?,
+        })
+    }
+}
+
+/// Server team-change announce, opcode `0x007d`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailTeamChangeAnnounce {
+    /// Member whose team changed.
+    pub connection_id: u32,
+    /// New team.
+    pub team: RetailTeam,
+}
+
+impl EncodePacket for RetailTeamChangeAnnounce {
+    const OPCODE: u16 = 0x007d;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.team as u8);
+        Ok(())
+    }
+}
+
+/// Server acknowledgement for legacy invites, opcode `0x0130`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRoomInviteInfoResponse {
+    /// Invited account ID.
+    pub account_id: u32,
+}
+
+impl EncodePacket for RetailRoomInviteInfoResponse {
+    const OPCODE: u16 = 0x0130;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.account_id);
+        Ok(())
+    }
+}
+
+/// Server acknowledgement for newer invites, opcode `0x012f`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInviteResponse {
+    /// Server identity (one deployment-specific value).
+    pub server_id: u32,
+    /// Channel identity.
+    pub channel_id: u8,
+    /// Room number.
+    pub room_id: u16,
+    /// Inviter account ID.
+    pub inviter_id: u32,
+    /// Inviter nickname.
+    pub inviter_nickname: Vec<u8>,
+    /// Invitee account ID.
+    pub invitee_id: u32,
+}
+
+impl EncodePacket for RetailRoomInviteResponse {
+    const OPCODE: u16 = 0x012f;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u16_le(0xffff);
+        writer.u32_le(self.server_id);
+        writer.u8(self.channel_id);
+        writer.u16_le(self.room_id);
+        writer.u32_le(self.inviter_id);
+        writer.pstring(&self.inviter_nickname, ROOM_NAME_BYTES)?;
+        writer.u32_le(self.invitee_id);
+        Ok(())
+    }
+}
+
+/// Invitation delivered to the invitee, opcode `0x0083`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInviteNotification {
+    /// Server identity (one deployment-specific value).
+    pub server_id: u32,
+    /// Channel identity.
+    pub channel_id: u8,
+    /// Room number.
+    pub room_id: u16,
+    /// Inviter account ID.
+    pub inviter_id: u32,
+    /// Inviter nickname.
+    pub inviter_nickname: Vec<u8>,
+    /// Invitee account ID.
+    pub invitee_id: u32,
+}
+
+impl EncodePacket for RetailRoomInviteNotification {
+    const OPCODE: u16 = 0x0083;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u16_le(0xffff);
+        writer.u32_le(self.server_id);
+        writer.u8(self.channel_id);
+        writer.u16_le(self.room_id);
+        writer.u32_le(self.inviter_id);
+        writer.pstring(&self.inviter_nickname, ROOM_NAME_BYTES)?;
+        writer.u32_le(self.invitee_id);
+        Ok(())
+    }
+}
+
 /// Room creation request, client opcode `0x0008`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailRoomCreate {
@@ -240,6 +659,8 @@ pub struct RetailRoom {
     pub game_timer_ms: u32,
     /// Numeric identity of the room owner.
     pub owner_uid: u32,
+    /// Artifact catalog id selected for the room.
+    pub artifact_id: u32,
     /// Whether wind varies naturally.
     pub natural_wind: bool,
 }
@@ -270,7 +691,7 @@ impl RetailRoom {
         writer.u32_le(self.owner_uid);
         // The later semantic type is distinct from the earlier UI-family byte for Practice.
         writer.u8(self.play_mode);
-        writer.u32_le(0); // artifact catalog id
+        writer.u32_le(self.artifact_id);
         writer.u32_le(u32::from(self.natural_wind));
         for _ in 0..4 {
             writer.u32_le(0); // event info
@@ -284,8 +705,7 @@ impl RetailRoom {
 ///
 /// Sent when a room is joined and whenever its settings change. It is the answer to a client
 /// room edit (`0x000a`): the client asks for a change and learns from this what the room
-/// actually is now, which for this server is what it already was — one hole on the configured
-/// course.
+/// actually is now, including the configured whole-card course shape.
 ///
 /// The two constants are pinned by captures rather than derived: the leading `u16` is `0xffff`
 /// in every recorded example, and the `u16` after the capacity is `30`. `pangbox/server` writes
@@ -1824,6 +2244,77 @@ impl RetailRoomPlayer {
     }
 }
 
+/// One user entry in the room-information response, server opcode `0x0086`.
+///
+/// This is deliberately not [`RetailRoomPlayer`]. PacketDoc `gameservice/server/0086.ksy`
+/// defines a compact 18-byte user record; the 341-byte identity record belongs only to the
+/// room census (`0x0048`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInformationUser {
+    /// Per-connection identifier.
+    pub connection_id: u32,
+    /// User rank byte.
+    pub rank: u8,
+    /// Reference-defined opaque bytes.
+    pub unknown_a: [u8; 5],
+    /// Custom title badge catalog id.
+    pub title_badge: u32,
+    /// Reference-defined opaque bytes.
+    pub unknown_c: [u8; 4],
+}
+
+impl RetailRoomInformationUser {
+    /// Builds the reference-compatible compact record with zero opaque fields.
+    #[must_use]
+    pub const fn new(connection_id: u32, rank: u8, title_badge: u32) -> Self {
+        Self {
+            connection_id,
+            rank,
+            unknown_a: [0; 5],
+            title_badge,
+            unknown_c: [0; 4],
+        }
+    }
+
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u32_le(self.connection_id);
+        writer.u8(self.rank);
+        writer.bytes(&self.unknown_a);
+        writer.u32_le(self.title_badge);
+        writer.bytes(&self.unknown_c);
+    }
+}
+
+/// Room information response, server opcode `0x0086`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInformationResponse {
+    /// Compact public user records for the requested room.
+    pub players: Vec<RetailRoomInformationUser>,
+}
+
+impl EncodePacket for RetailRoomInformationResponse {
+    const OPCODE: u16 = 0x0086;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        let count = u32::try_from(self.players.len()).map_err(|_| PacketEncodeError::Limit {
+            field: "room players",
+            actual: self.players.len(),
+            maximum: u32::MAX as usize,
+        })?;
+        writer.u32_le(count);
+        writer.bytes(&[0; 12]);
+        for player in &self.players {
+            player.encode_body(writer);
+        }
+        Ok(())
+    }
+}
+
 /// Room member census, server opcode `0x0048`.
 ///
 /// This is what populates the room's player list. Note the frame shapes differ per kind:
@@ -2113,6 +2604,7 @@ mod tests {
             shot_timer_ms: 30_000,
             game_timer_ms: 600_000,
             owner_uid: 42,
+            artifact_id: 1234,
             natural_wind: false,
         }
     }
@@ -2130,6 +2622,11 @@ mod tests {
         assert_eq!(payload[1], RoomListKind::Initial as u8);
         assert_eq!(u16::from_le_bytes([payload[2], payload[3]]), 0xffff);
         assert_eq!(&payload[4..13], b"Test Room");
+        assert_eq!(
+            u32::from_le_bytes(payload[4 + 186..4 + 190].try_into().expect("artifact")),
+            1234,
+            "the reference room-list record carries ArtifactID"
+        );
     }
 
     #[test]
@@ -2177,6 +2674,206 @@ mod tests {
         assert_eq!(decoded.course, 1);
         assert_eq!(decoded.name, b"My Room");
         assert!(decoded.password.is_empty());
+    }
+
+    /// `pangbox--packetdoc` `gameservice/client/000a.ksy` defines this tagged sequence;
+    /// natural-wind's little-endian `u4` is intentionally not copied from alter's BE read.
+    #[test]
+    fn room_settings_update_decodes_every_applied_retail_setting() {
+        let mut writer = PacketWriter::default();
+        writer.u16_le(0xffff);
+        writer.u8(9);
+        writer.u8(1);
+        writer
+            .pstring(b"digest", ROOM_NAME_BYTES)
+            .expect("password");
+        writer.u8(3);
+        writer.u8(7);
+        writer.u8(4);
+        writer.u8(9);
+        writer.u8(5);
+        writer.u8(RetailHoleProgression::ShuffleAll as u8);
+        writer.u8(6);
+        writer.u16_le(120);
+        writer.u8(7);
+        writer.u8(4);
+        writer.u8(8);
+        writer.u8(30);
+        writer.u8(14);
+        writer.u32_le(1);
+        writer.u8(13);
+        writer.u32_le(0x1234_5678);
+
+        let update = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &writer.into_inner(),
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("room settings update");
+        assert_eq!(
+            update.changes,
+            vec![
+                RetailRoomSettingChange::Password(b"digest".to_vec()),
+                RetailRoomSettingChange::Course(7),
+                RetailRoomSettingChange::HoleCount(9),
+                RetailRoomSettingChange::HoleProgression(RetailHoleProgression::ShuffleAll),
+                RetailRoomSettingChange::ShotTimerSeconds(120),
+                RetailRoomSettingChange::PlayerCount(4),
+                RetailRoomSettingChange::GameTimerMinutes(30),
+                RetailRoomSettingChange::NaturalWind(true),
+                RetailRoomSettingChange::Artifact(0x1234_5678),
+            ]
+        );
+    }
+
+    /// PacketDoc `000a.ksy` has no recovery frame: a partial tagged body must be a decode error.
+    #[test]
+    fn room_settings_update_refuses_a_truncated_tagged_body() {
+        let payload = [0xff, 0xff, 1, 6, 120];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(
+                &payload,
+                &profile(),
+                ServiceKind::Game,
+            )
+            .is_err()
+        );
+    }
+
+    /// PacketDoc `000a.ksy` limits the setting enum and natural-wind to `0` or `1`.
+    #[test]
+    fn room_settings_update_accepts_generic_one_hole_cards() {
+        let payload = [0xff, 0xff, 1, 4, 1];
+        let decoded = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &payload,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("one-hole setting");
+        assert_eq!(decoded.changes, vec![RetailRoomSettingChange::HoleCount(1)]);
+    }
+
+    #[test]
+    fn room_settings_update_refuses_unknown_or_out_of_range_values() {
+        let unknown = [0xff, 0xff, 1, 10];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(
+                &unknown,
+                &profile(),
+                ServiceKind::Game,
+            )
+            .is_err()
+        );
+        let wind = [0xff, 0xff, 1, 14, 2, 0, 0, 0];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(&wind, &profile(), ServiceKind::Game)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn room_information_uses_packetdoc_18_byte_user_records() {
+        let payload = encode_packet_payload(
+            &RetailRoomInformationResponse {
+                players: vec![RetailRoomInformationUser::new(0x1122_3344, 7, 0x5566_7788)],
+            },
+            &profile(),
+        )
+        .expect("room information");
+        assert_eq!(payload.len(), 16 + 18);
+        assert_eq!(&payload[..4], &1_u32.to_le_bytes());
+        assert_eq!(&payload[4..16], &[0; 12]);
+        assert_eq!(&payload[16..20], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(payload[20], 7);
+        assert_eq!(&payload[26..30], &0x5566_7788_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn room_management_requests_follow_packetdoc_layouts() {
+        let team = decode_packet_payload::<RetailTeamChange>(&[1], &profile(), ServiceKind::Game)
+            .expect("team change");
+        assert_eq!(team.team, RetailTeam::Blue);
+        let resync = decode_packet_payload::<RetailRoomResync>(
+            &[0, 1, 0, 0x78, 0x56, 0x34, 0x12],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("resync");
+        assert_eq!(resync.entries, vec![(0, 0x1234_5678)]);
+        let info = decode_packet_payload::<RetailRoomInformationRequest>(
+            &[9, 0],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("room info");
+        assert_eq!(info.room_number, 9);
+        let kick =
+            decode_packet_payload::<RetailRoomKick>(&[7, 0, 0, 0], &profile(), ServiceKind::Game)
+                .expect("kick");
+        assert_eq!(kick.connection_id, 7);
+        let invite = decode_packet_payload::<RetailRoomInviteInfo>(
+            &[42, 0, 0, 0],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("legacy invite");
+        assert_eq!(invite.account_id, 42);
+        let mut newer = vec![3, 0, b'B', b'o', b'b'];
+        newer.extend_from_slice(&42_u32.to_le_bytes());
+        let invite =
+            decode_packet_payload::<RetailRoomInvite>(&newer, &profile(), ServiceKind::Game)
+                .expect("new invite");
+        assert_eq!(invite.nickname, b"Bob");
+        assert_eq!(invite.account_id, 42);
+    }
+
+    #[test]
+    fn room_management_responses_keep_reference_opcodes_and_widths() {
+        let announce = encode_packet_payload(
+            &RetailTeamChangeAnnounce {
+                connection_id: 7,
+                team: RetailTeam::Blue,
+            },
+            &profile(),
+        )
+        .expect("announce");
+        assert_eq!(announce.as_slice(), [7, 0, 0, 0, 1]);
+        let response =
+            encode_packet_payload(&RetailRoomInviteInfoResponse { account_id: 42 }, &profile())
+                .expect("legacy response");
+        assert_eq!(response.as_slice(), [42, 0, 0, 0]);
+        let notification = encode_packet_payload(
+            &RetailRoomInviteNotification {
+                server_id: 1,
+                channel_id: 2,
+                room_id: 3,
+                inviter_id: 4,
+                inviter_nickname: b"Host".to_vec(),
+                invitee_id: 5,
+            },
+            &profile(),
+        )
+        .expect("target notification");
+        assert_eq!(notification[0..2], [255, 255]);
+        assert_eq!(RetailRoomInviteInfo::OPCODE, 0x0029);
+        assert_eq!(RetailRoomInvite::OPCODE, 0x00ba);
+        assert_eq!(RetailRoomInviteInfoResponse::OPCODE, 0x0130);
+        assert_eq!(RetailRoomInviteResponse::OPCODE, 0x012f);
+        assert_eq!(RetailRoomInviteNotification::OPCODE, 0x0083);
+        let response = encode_packet_payload(
+            &RetailRoomInviteResponse {
+                server_id: 1,
+                channel_id: 2,
+                room_id: 3,
+                inviter_id: 4,
+                inviter_nickname: b"Host".to_vec(),
+                invitee_id: 5,
+            },
+            &profile(),
+        )
+        .expect("new response");
+        assert_eq!(&response[..9], &[255, 255, 1, 0, 0, 0, 2, 3, 0]);
+        assert_eq!(&response[response.len() - 4..], &[5, 0, 0, 0]);
     }
 
     #[test]

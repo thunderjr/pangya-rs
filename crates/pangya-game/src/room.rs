@@ -1,6 +1,13 @@
 //! Runtime-neutral room rules wrapped by one bounded Tokio owner task.
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use pangya_domain::{
     AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, CharacterId,
@@ -96,6 +103,21 @@ pub enum RoomEvent {
     Snapshot(RoomSnapshot),
     /// A validated retail equipment change is broadcast to every room member.
     EquipmentAnnounce(pangya_protocol::RetailEquipmentAnnounce),
+    /// Accepted owner settings edit, including the retail status announcement.
+    SettingsChanged(RoomSnapshot),
+    /// Direct invitation for an authenticated channel connection.
+    Invite {
+        /// Server/channel identity.
+        channel_id: u8,
+        /// Room number.
+        room_id: RoomId,
+        /// Inviter account.
+        inviter_id: AccountId,
+        /// Inviter display name.
+        inviter_nickname: Vec<u8>,
+        /// Invited account.
+        invitee_id: AccountId,
+    },
     /// A validated chat message was broadcast.
     Chat {
         /// Authoritative sender projection.
@@ -107,6 +129,13 @@ pub enum RoomEvent {
     Kicked {
         /// Authoritative owner projection.
         by: MemberSnapshot,
+    },
+    /// A member changed teams in a team-capable room.
+    TeamChanged {
+        /// Member whose team changed.
+        connection_id: PlayerConnectionId,
+        /// New team, reference values 0 red or 1 blue.
+        team: u8,
     },
     /// A persisted checked solo plan was confirmed and loading started.
     SoloStarted(SoloStartPlan),
@@ -180,6 +209,14 @@ pub enum RoomEvent {
     StrokeAbortRequested(AbortStrokeMatch),
     /// Trusted persisted aggregate committed and room returned open.
     StrokeCommitted(StrokeMatchResult),
+    /// Terminal settlement carrying its connection-generation fence. This remains in the same
+    /// ordered outbox as every ordinary event, unlike the removed side mailbox.
+    StrokeCommittedWithGeneration {
+        /// Durable settlement result.
+        result: StrokeMatchResult,
+        /// Connection generation fence used to reject stale replay.
+        generation: u64,
+    },
     /// Exact durable stroke abort was acknowledged.
     StrokeAborted(AbortStrokeMatch),
     /// The room shut down.
@@ -266,12 +303,309 @@ fn digest_password(salt: &[u8; 32], password: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// One committed stroke settlement addressed to exactly one live session.
+///
+/// This is deliberately separate from the ordinary room-event queue: terminal delivery must not
+/// be displaced by relays or room projections. `generation` rejects a late delivery from an older
+/// card, while the match/result pair is the durable settlement idempotency key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalDelivery {
+    pub(crate) result: StrokeMatchResult,
+    pub(crate) generation: u64,
+}
+
+/// Per-session bounded outbound queue with one slot reserved for terminal settlement.
+#[derive(Clone)]
+pub enum RoomOutbound {
+    /// Compatibility sender used by runtime-neutral unit tests and non-network callers.
+    Legacy(mpsc::Sender<RoomEvent>),
+    /// Production session outbox. Its underlying queue has one extra slot, while the mutex
+    /// enforces that ordinary events leave that slot available for terminal settlement.
+    Ordered {
+        /// Shared queue sender serialized with ordinary-capacity checks.
+        sender: Arc<Mutex<mpsc::Sender<RoomEvent>>>,
+        /// Retained terminal payload for this session. It remains available after the queue marker
+        /// is consumed until the socket write acknowledges the exact generation.
+        terminal_payload: Arc<Mutex<Option<(StrokeMatchResult, u64)>>>,
+        /// Generation of the terminal marker currently in the ordered queue, if any.
+        terminal_queued_generation: Arc<AtomicU64>,
+        /// Whether the reserved persistence-control marker is currently queued.
+        persistence_queued: Arc<AtomicBool>,
+        /// Priority control channel used for settlement persistence requests.
+        persistence_sender: mpsc::UnboundedSender<RoomEvent>,
+        /// Receiver moved into the owning game connection's event loop.
+        persistence_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<RoomEvent>>>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrdinarySendResult {
+    Sent,
+    Backpressured { terminal_pending: bool },
+    Closed,
+}
+
+impl From<mpsc::Sender<RoomEvent>> for RoomOutbound {
+    fn from(sender: mpsc::Sender<RoomEvent>) -> Self {
+        Self::Legacy(sender)
+    }
+}
+
+pub(crate) type TerminalOutboxSender = RoomOutbound;
+
+impl RoomOutbound {
+    /// Creates an outbox whose ordinary capacity is `capacity` plus one reserved terminal slot.
+    pub fn ordered(capacity: usize) -> (Self, mpsc::Receiver<RoomEvent>) {
+        // Terminal settlement has one reserved slot; persistence uses a priority control channel
+        // so ordinary room traffic cannot delay the commit request.
+        let (sender, receiver) = mpsc::channel(capacity.saturating_add(1));
+        let (persistence_sender, persistence_receiver) = mpsc::unbounded_channel();
+        (
+            Self::Ordered {
+                sender: Arc::new(Mutex::new(sender)),
+                terminal_payload: Arc::new(Mutex::new(None)),
+                terminal_queued_generation: Arc::new(AtomicU64::new(0)),
+                persistence_queued: Arc::new(AtomicBool::new(false)),
+                persistence_sender,
+                persistence_receiver: Arc::new(Mutex::new(Some(persistence_receiver))),
+            },
+            receiver,
+        )
+    }
+
+    fn try_send_ordinary(&self, event: RoomEvent) -> OrdinarySendResult {
+        match self {
+            Self::Legacy(sender) => match sender.try_send(event) {
+                Ok(()) => OrdinarySendResult::Sent,
+                Err(mpsc::error::TrySendError::Full(_)) => OrdinarySendResult::Backpressured {
+                    terminal_pending: false,
+                },
+                Err(mpsc::error::TrySendError::Closed(_)) => OrdinarySendResult::Closed,
+            },
+            Self::Ordered {
+                sender,
+                terminal_payload,
+                ..
+            } => {
+                let Ok(sender) = sender.lock() else {
+                    return OrdinarySendResult::Closed;
+                };
+                // The final queue slot is reserved exclusively for terminal settlement. Holding
+                // this lock while reading the retained payload makes the backpressure decision
+                // atomic with terminal enqueue.
+                let terminal_pending = terminal_payload
+                    .lock()
+                    .is_ok_and(|payload| payload.is_some());
+                if sender.capacity() <= 1 {
+                    return OrdinarySendResult::Backpressured { terminal_pending };
+                }
+                match sender.try_send(event) {
+                    Ok(()) => OrdinarySendResult::Sent,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        OrdinarySendResult::Backpressured { terminal_pending }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => OrdinarySendResult::Closed,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_send(&self, event: RoomEvent) -> bool {
+        matches!(self.try_send_ordinary(event), OrdinarySendResult::Sent)
+    }
+
+    /// Takes this session's priority persistence receiver for its game connection.
+    pub(crate) fn take_persistence_receiver(&self) -> Option<mpsc::UnboundedReceiver<RoomEvent>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Ordered {
+                persistence_receiver,
+                ..
+            } => persistence_receiver.lock().ok()?.take(),
+        }
+    }
+
+    /// Enqueues the persistence coordinator marker on the priority control channel. This is
+    /// deliberately non-blocking: ordinary room traffic cannot delay the one event that commits
+    /// the match.
+    pub(crate) fn try_send_persistence(&self, event: RoomEvent) -> bool {
+        let Self::Ordered {
+            persistence_sender,
+            persistence_queued,
+            ..
+        } = self
+        else {
+            return self.try_send(event);
+        };
+        if persistence_queued.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        if persistence_sender.send(event).is_err() {
+            persistence_queued.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// Marks the persistence marker consumed without acknowledging the durable operation.
+    pub(crate) fn begin_persistence_delivery(&self) {
+        if let Self::Ordered {
+            persistence_queued, ..
+        } = self
+        {
+            persistence_queued.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn terminal_pending_generation(&self) -> Option<u64> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Ordered {
+                terminal_payload, ..
+            } => terminal_payload
+                .lock()
+                .ok()
+                .and_then(|payload| payload.map(|(_, generation)| generation)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_pending_delivery(&self) -> bool {
+        self.terminal_pending_generation().is_some()
+    }
+
+    /// A successful socket write acknowledges only the generation that produced it. A stale
+    /// connection event can therefore never clear a newer pending terminal delivery.
+    pub(crate) fn acknowledge_terminal_delivery(&self, generation: u64) {
+        if let Self::Ordered {
+            terminal_payload,
+            terminal_queued_generation,
+            ..
+        } = self
+        {
+            let Ok(mut payload) = terminal_payload.lock() else {
+                return;
+            };
+            if payload.is_some_and(|(_, current)| current == generation) {
+                *payload = None;
+                terminal_queued_generation.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// Marks the exact terminal queue marker as consumed by the session writer. The payload stays
+    /// retained until `acknowledge_terminal_delivery` confirms that both socket frames completed.
+    pub(crate) fn begin_terminal_delivery(&self, generation: u64) {
+        if let Self::Ordered {
+            terminal_queued_generation,
+            ..
+        } = self
+        {
+            let _ = terminal_queued_generation.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    async fn send_terminal(
+        &self,
+        cancellation: &CancellationToken,
+        delivery: TerminalDelivery,
+    ) -> bool {
+        let event = match self {
+            Self::Legacy(_) => RoomEvent::StrokeCommitted(delivery.result),
+            Self::Ordered {
+                terminal_payload,
+                terminal_queued_generation,
+                ..
+            } => {
+                let Ok(mut payload) = terminal_payload.lock() else {
+                    return false;
+                };
+                if payload.is_some_and(|(_, current)| current == delivery.generation)
+                    && terminal_queued_generation.load(Ordering::Acquire) == delivery.generation
+                {
+                    return true;
+                }
+                *payload = Some((delivery.result, delivery.generation));
+                terminal_queued_generation.store(delivery.generation, Ordering::Release);
+                drop(payload);
+                RoomEvent::StrokeCommittedWithGeneration {
+                    result: delivery.result,
+                    generation: delivery.generation,
+                }
+            }
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                if let Self::Ordered {
+                    terminal_queued_generation,
+                    ..
+                } = self
+                {
+                    let _ = terminal_queued_generation.compare_exchange(
+                        delivery.generation,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                return false;
+            }
+            let sent = match self {
+                Self::Legacy(sender) => match sender.try_send(event.clone()) {
+                    Ok(()) => return true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                    Err(mpsc::error::TrySendError::Full(_)) => false,
+                },
+                Self::Ordered {
+                    sender,
+                    terminal_payload,
+                    terminal_queued_generation,
+                    ..
+                } => {
+                    let Ok(sender) = sender.lock() else {
+                        return false;
+                    };
+                    match sender.try_send(event.clone()) {
+                        Ok(()) => return true,
+                        Err(mpsc::error::TrySendError::Closed(_))
+                        | Err(mpsc::error::TrySendError::Full(_)) => {
+                            terminal_queued_generation.store(0, Ordering::Release);
+                            if sender.is_closed() {
+                                if let Ok(mut payload) = terminal_payload.lock()
+                                    && payload
+                                        .is_some_and(|(_, current)| current == delivery.generation)
+                                {
+                                    *payload = None;
+                                }
+                                return false;
+                            }
+                            false
+                        }
+                    }
+                }
+            };
+            debug_assert!(!sent);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return false,
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    }
+}
+
 struct Member {
     identity: RoomIdentity,
     owner: bool,
     ready: bool,
+    team: u8,
     joined_order: u64,
-    outbound: mpsc::Sender<RoomEvent>,
+    outbound: RoomOutbound,
     cancellation: CancellationToken,
 }
 
@@ -286,6 +620,7 @@ impl Member {
             self.identity.character_id,
             self.identity.character_iff_id,
         )
+        .with_team(self.team)
         .with_card(self.identity.card.clone())
     }
 }
@@ -404,9 +739,24 @@ struct RoomState {
     solo: SoloMatchState,
     stroke: StrokeMatchState,
     pending_stroke_persistence: Option<PendingStrokePersistence>,
+    /// Connection currently owning the queued persistence event, if any.
+    stroke_persistence_recipient: Option<PlayerConnectionId>,
     stroke_persistence_event_delivered: bool,
     stroke_persistence_control_delivered: bool,
+    /// The durable terminal result retained until every surviving captured member has been
+    /// offered it. A coordinator may disconnect after the repository commit but before the room
+    /// actor applies the result; replaying that idempotent commit must not duplicate the terminal
+    /// wire event for members that already received it.
+    stroke_terminal: Option<StrokeTerminal>,
     deadlines: DeadlineScheduler,
+}
+
+#[derive(Clone, Copy)]
+struct StrokeTerminal {
+    result: StrokeMatchResult,
+    roster: [PlayerConnectionId; 2],
+    generation: u64,
+    delivered: [bool; 2],
 }
 
 impl RoomState {
@@ -416,9 +766,10 @@ impl RoomState {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Self {
+        let outbound = outbound.into();
         Self {
             id,
             name,
@@ -428,6 +779,7 @@ impl RoomState {
                 identity: owner,
                 owner: true,
                 ready: false,
+                team: 0,
                 joined_order: 0,
                 outbound,
                 cancellation,
@@ -436,8 +788,10 @@ impl RoomState {
             solo: SoloMatchState::new(),
             stroke: StrokeMatchState::new(),
             pending_stroke_persistence: None,
+            stroke_persistence_recipient: None,
             stroke_persistence_event_delivered: false,
             stroke_persistence_control_delivered: false,
+            stroke_terminal: None,
             deadlines: DeadlineScheduler::default(),
         }
     }
@@ -446,11 +800,29 @@ impl RoomState {
         if member.cancellation.is_cancelled() {
             return false;
         }
-        if member.outbound.try_send(event).is_ok() {
-            true
-        } else {
-            member.cancellation.cancel();
-            false
+        match member.outbound.try_send_ordinary(event) {
+            OrdinarySendResult::Sent => true,
+            OrdinarySendResult::Backpressured {
+                terminal_pending: true,
+            } => {
+                // A terminal frame already occupies (or is publishing into) the reserved slot.
+                // Keep this session alive until its socket ACK clears that generation.
+                false
+            }
+            OrdinarySendResult::Backpressured {
+                terminal_pending: false,
+            } if self.pending_stroke_persistence.is_some() => {
+                // Retain captured members while persistence is pending; terminal delivery may
+                // still fail over or wait for the reserved slot.
+                false
+            }
+            OrdinarySendResult::Backpressured {
+                terminal_pending: false,
+            }
+            | OrdinarySendResult::Closed => {
+                member.cancellation.cancel();
+                false
+            }
         }
     }
 
@@ -495,7 +867,7 @@ impl RoomState {
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
     ) -> Result<RoomSnapshot, RoomError> {
         self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
     }
@@ -504,7 +876,17 @@ impl RoomState {
         &mut self,
         identity: RoomIdentity,
         password: Option<&RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(identity, password, outbound.into(), cancellation)
+    }
+
+    fn join_inner(
+        &mut self,
+        identity: RoomIdentity,
+        password: Option<&RoomPassword>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.match_active() {
@@ -529,6 +911,7 @@ impl RoomState {
             identity,
             owner: false,
             ready: false,
+            team: 0,
             joined_order,
             outbound,
             cancellation,
@@ -567,6 +950,16 @@ impl RoomState {
         caller: PlayerConnectionId,
         settings: RoomSettings,
     ) -> Result<RoomSnapshot, RoomError> {
+        self.update_room(caller, settings, None, None)
+    }
+
+    fn update_room(
+        &mut self,
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
+    ) -> Result<RoomSnapshot, RoomError> {
         if self.match_active() {
             return Err(RoomError::MatchActive);
         }
@@ -578,6 +971,12 @@ impl RoomState {
             return Err(RoomError::CapacityBelowOccupancy);
         }
         self.settings = settings;
+        if let Some(name) = name {
+            self.name = name;
+        }
+        if let Some(password) = password {
+            self.password = password.as_ref().map(PasswordDigest::new);
+        }
         Ok(self.snapshot())
     }
 
@@ -592,6 +991,31 @@ impl RoomState {
         self.members[member].identity.card = card;
         self.members[member].identity.character_id = character_id;
         self.members[member].identity.character_iff_id = character_iff_id;
+        Ok(self.snapshot())
+    }
+
+    fn change_team(
+        &mut self,
+        caller: PlayerConnectionId,
+        team: u8,
+    ) -> Result<RoomSnapshot, RoomError> {
+        if self.match_active() {
+            return Err(RoomError::MatchActive);
+        }
+        if team > 1 {
+            return Err(RoomError::InvalidTeam);
+        }
+        let index = self.member_index(caller).ok_or(RoomError::NotMember)?;
+        self.members[index].team = team;
+        for member in &self.members {
+            let _delivered = self.deliver(
+                member,
+                RoomEvent::TeamChanged {
+                    connection_id: caller,
+                    team,
+                },
+            );
+        }
         Ok(self.snapshot())
     }
 
@@ -800,14 +1224,18 @@ impl RoomState {
     fn prepare_solo_finish(
         &mut self,
         caller: PlayerConnectionId,
-    ) -> Result<CommitSoloHole, SoloMatchError> {
+    ) -> Result<Option<CommitSoloHole>, SoloMatchError> {
         self.solo_owner(caller)?;
-        let commit = self.solo.prepare_finish()?;
-        self.deliver_solo(RoomEvent::SoloPhase {
-            match_id: commit.match_id(),
-            phase: self.solo.phase(),
-        });
-        Ok(commit)
+        let commit = self.solo.finish_hole()?;
+        if let Some(commit) = commit {
+            self.deliver_solo(RoomEvent::SoloPhase {
+                match_id: commit.match_id(),
+                phase: self.solo.phase(),
+            });
+            Ok(Some(commit))
+        } else {
+            Ok(None)
+        }
     }
 
     fn apply_solo_commit(
@@ -903,8 +1331,10 @@ impl RoomState {
         }
         let begin = self.stroke.prepare_start(plan)?;
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
+        self.stroke_terminal = None;
         Ok(begin)
     }
 
@@ -1019,11 +1449,11 @@ impl RoomState {
             });
             if let Some(commit) = outcome.settlement() {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
             } else {
                 let plan = self
                     .stroke
@@ -1086,20 +1516,36 @@ impl RoomState {
     ) -> Result<StrokeHoleOutOutcome, StrokeMatchError> {
         self.stroke_participant(caller)?;
         let active_before = active_participant(self.stroke.phase());
+        let hole_before = match self.stroke.phase() {
+            StrokeMatchPhase::AwaitAction { hole, .. }
+            | StrokeMatchPhase::AwaitResult { hole, .. } => Some(hole),
+            _ => None,
+        };
         let outcome = self.stroke.hole_out(caller)?;
         match outcome {
             StrokeHoleOutOutcome::Settlement(commit) => {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
             }
-            // Only a changed turn is announced. Finishing out of turn leaves the other
-            // participant mid-shot, and re-announcing their turn would restart it.
+            // A changed turn is announced, as is a changed hole. On a hole transition the
+            // opening player is reset to seat one, so the connection ID can remain unchanged
+            // even though the client must receive a fresh 0x0053 introduction rather than a
+            // stale 0x0063 handover.
             StrokeHoleOutOutcome::Waiting => {
-                if active_participant(self.stroke.phase()) != active_before {
+                let hole_changed = match (hole_before, self.stroke.phase()) {
+                    (Some(before), StrokeMatchPhase::AwaitAction { hole, .. }) => hole != before,
+                    _ => false,
+                };
+                let active_after = active_participant(self.stroke.phase());
+                let turn_changed = active_after != active_before;
+                // A hole reset is an ordered match event even when seat one already held the
+                // previous turn. Keeping this decision explicit prevents callers from collapsing
+                // the reset into a same-player 0x0063 handover.
+                if turn_changed || hole_changed {
                     let plan = self
                         .stroke
                         .start_plan()
@@ -1125,29 +1571,74 @@ impl RoomState {
         self.stroke_participant(caller)?;
         let commit = self.stroke.give_up(caller)?;
         self.deadlines.clear_stroke();
+        let _delivered = self.request_stroke_settlement(commit, None);
         self.broadcast_match(RoomEvent::StrokePhase {
             match_id: commit.match_id(),
             phase: self.stroke.phase(),
         });
-        let _delivered = self.request_stroke_settlement(commit, None);
         Ok(commit)
     }
 
-    fn apply_stroke_commit(
+    async fn apply_stroke_commit(
         &mut self,
         result: StrokeMatchResult,
     ) -> Result<StrokeMatchResult, StrokeMatchError> {
-        let roster = self
-            .stroke
-            .roster()
-            .copied()
-            .ok_or(StrokeMatchError::InvalidPhase)?;
-        let committed = self.stroke.apply_commit(result)?;
+        let (roster, committed, generation, mut delivered) =
+            if let Some(terminal) = self.stroke_terminal {
+                if terminal.result != result {
+                    return Err(StrokeMatchError::IdentityMismatch);
+                }
+                (
+                    terminal.roster,
+                    terminal.result,
+                    terminal.generation,
+                    terminal.delivered,
+                )
+            } else {
+                let roster = self
+                    .stroke
+                    .roster()
+                    .copied()
+                    .ok_or(StrokeMatchError::InvalidPhase)?;
+                let generation = self.stroke.game_generation().unwrap_or(0);
+                let committed = self.stroke.apply_commit(result)?;
+                (roster, committed, generation, [false; 2])
+            };
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         self.deadlines.clear_stroke();
-        self.broadcast_connections(&roster, RoomEvent::StrokeCommitted(committed));
+        for (index, connection_id) in roster.iter().copied().enumerate() {
+            let Some(member_index) = self.member_index(connection_id) else {
+                continue;
+            };
+            let Some(member) = self.members.get(member_index) else {
+                continue;
+            };
+            // `delivered` records that this session was offered the marker, not that the socket
+            // acknowledged the payload. Retry an offered-but-unacknowledged terminal after the
+            // marker has drained; an acknowledged generation has no retained payload and is done.
+            if delivered[index] && member.outbound.terminal_pending_generation() != Some(generation)
+            {
+                continue;
+            }
+            let cancellation = member.cancellation.clone();
+            let delivery = TerminalDelivery {
+                result: committed,
+                generation,
+            };
+            let accepted = member.outbound.send_terminal(&cancellation, delivery).await;
+            if accepted {
+                delivered[index] = true;
+            }
+        }
+        self.stroke_terminal = Some(StrokeTerminal {
+            result: committed,
+            roster,
+            generation,
+            delivered,
+        });
         Ok(committed)
     }
 
@@ -1158,6 +1649,7 @@ impl RoomState {
                 PendingStrokePersistence::Abort(abort) => return Some(abort),
                 PendingStrokePersistence::Settlement(_) => {
                     self.pending_stroke_persistence = None;
+                    self.stroke_persistence_recipient = None;
                     self.stroke_persistence_event_delivered = false;
                     self.stroke_persistence_control_delivered = false;
                 }
@@ -1190,6 +1682,7 @@ impl RoomState {
         }
         self.stroke.acknowledge_abort(abort)?;
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         self.broadcast_connections(&roster, RoomEvent::StrokeAborted(abort));
@@ -1251,7 +1744,11 @@ impl RoomState {
             let Some(member) = self.members.get(index) else {
                 continue;
             };
-            if self.deliver(member, work.event()) {
+            // Persistence has its own reserved outbox slot. Sending it as ordinary traffic lets
+            // a full relay queue strand the commit forever, which in turn leaves retained terminal
+            // payloads with no result to register.
+            if member.outbound.try_send_persistence(work.event()) {
+                self.stroke_persistence_recipient = Some(member.identity.connection_id);
                 self.stroke_persistence_event_delivered = true;
                 return true;
             }
@@ -1264,6 +1761,7 @@ impl RoomState {
             Some(current) => current == work,
             None => {
                 self.pending_stroke_persistence = Some(work);
+                self.stroke_persistence_recipient = None;
                 self.stroke_persistence_event_delivered = false;
                 self.stroke_persistence_control_delivered = false;
                 true
@@ -1309,13 +1807,14 @@ impl RoomState {
                 }
                 Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
                     self.deadlines.clear_stroke();
+                    let _retained = self
+                        .retain_stroke_persistence(PendingStrokePersistence::Settlement(commit));
+                    let _claimed = self.claim_stroke_persistence();
                     self.broadcast_match(RoomEvent::StrokePhase {
                         match_id: commit.match_id(),
                         phase: self.stroke.phase(),
                     });
-                    let _retained = self
-                        .retain_stroke_persistence(PendingStrokePersistence::Settlement(commit));
-                    self.claim_stroke_persistence()
+                    _claimed
                 }
                 Ok(StrokeDeadlineOutcome::Stale) | Err(_) => RoomCloseOutcome::None,
             }
@@ -1337,6 +1836,7 @@ impl RoomState {
             return;
         }
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         if let Some(abort) = self.stroke.prioritize_abort(reason) {
@@ -1354,6 +1854,7 @@ impl RoomState {
         };
         // Replacement transfers the existing event/control claim to this control caller. Keep the
         // claim marked until durable acknowledgement; concurrent cleanup must never retry it.
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = true;
         Some(abort)
@@ -1409,11 +1910,11 @@ impl RoomState {
         match self.stroke.deadline_expired(deadline) {
             Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
                 RoomCloseOutcome::M6Settlement {
                     room_id: self.id,
                     request: commit,
@@ -1473,13 +1974,19 @@ impl RoomState {
             let _delivered = self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
         }
     }
+
+    fn broadcast_settings_changed(&self, snapshot: &RoomSnapshot) {
+        for member in &self.members {
+            let _delivered = self.deliver(member, RoomEvent::SettingsChanged(snapshot.clone()));
+        }
+    }
 }
 
 enum RoomCommand {
     Join {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -1490,6 +1997,13 @@ enum RoomCommand {
     Settings {
         caller: PlayerConnectionId,
         settings: RoomSettings,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
+    RoomUpdate {
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
     Ready {
@@ -1516,6 +2030,11 @@ enum RoomCommand {
     Kick {
         caller: PlayerConnectionId,
         target: PlayerConnectionId,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
+    Team {
+        caller: PlayerConnectionId,
+        team: u8,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
     State {
@@ -1559,7 +2078,7 @@ enum RoomCommand {
     },
     PrepareSoloFinish {
         caller: PlayerConnectionId,
-        reply: oneshot::Sender<Result<CommitSoloHole, SoloMatchError>>,
+        reply: oneshot::Sender<Result<Option<CommitSoloHole>, SoloMatchError>>,
     },
     ApplySoloCommit {
         caller: PlayerConnectionId,
@@ -1762,17 +2281,45 @@ impl RoomHandle {
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
     ) -> Result<RoomSnapshot, RoomError> {
-        self.join_with_cancellation(identity, password, outbound, CancellationToken::new())
-            .await
+        self.join_with_cancellation(
+            identity,
+            password,
+            outbound.into(),
+            CancellationToken::new(),
+        )
+        .await
     }
 
     pub(crate) async fn join_with_cancellation(
         &self,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(identity, password, outbound.into(), cancellation)
+            .await
+    }
+
+    pub(crate) async fn join_with_terminal_outbox(
+        &self,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: RoomOutbound,
+        _terminal_outbox: TerminalOutboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_with_cancellation(identity, password, outbound, cancellation)
+            .await
+    }
+
+    async fn join_inner(
+        &self,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -1806,6 +2353,40 @@ impl RoomHandle {
         self.send_normal(RoomCommand::Settings {
             caller,
             settings,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Applies owner-controlled identity and settings in one actor transaction.
+    pub async fn update_room(
+        &self,
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::RoomUpdate {
+            caller,
+            settings,
+            name,
+            password,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Changes the authoritative caller's team.
+    pub async fn change_team(
+        &self,
+        caller: PlayerConnectionId,
+        team: u8,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::Team {
+            caller,
+            team,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -2000,7 +2581,7 @@ impl RoomHandle {
     pub async fn prepare_solo_finish(
         &self,
         caller: PlayerConnectionId,
-    ) -> Result<CommitSoloHole, SoloMatchError> {
+    ) -> Result<Option<CommitSoloHole>, SoloMatchError> {
         let (reply, receive) = oneshot::channel();
         self.send_solo(RoomCommand::PrepareSoloFinish { caller, reply })?;
         receive.await.map_err(|_| SoloMatchError::Closed)?
@@ -2339,7 +2920,7 @@ pub fn spawn_room(
     password: Option<RoomPassword>,
     settings: RoomSettings,
     owner: RoomIdentity,
-    owner_outbound: mpsc::Sender<RoomEvent>,
+    owner_outbound: impl Into<RoomOutbound>,
     limits: RoomActorLimits,
 ) -> (RoomHandle, RoomSummary) {
     spawn_room_with_events(
@@ -2362,7 +2943,7 @@ pub(crate) fn spawn_room_with_events(
     password: Option<RoomPassword>,
     settings: RoomSettings,
     owner: RoomIdentity,
-    owner_outbound: mpsc::Sender<RoomEvent>,
+    owner_outbound: impl Into<RoomOutbound>,
     owner_cancellation: CancellationToken,
     limits: RoomActorLimits,
     events: Option<mpsc::Sender<RoomActorEvent>>,
@@ -2376,6 +2957,41 @@ pub(crate) fn spawn_room_with_events(
         owner_outbound,
         owner_cancellation,
     );
+    spawn_room_state(state, limits, events)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_room_with_terminal_outbox(
+    id: RoomId,
+    name: RoomName,
+    password: Option<RoomPassword>,
+    settings: RoomSettings,
+    owner: RoomIdentity,
+    owner_outbound: impl Into<RoomOutbound>,
+    _owner_terminal_outbox: TerminalOutboxSender,
+    owner_cancellation: CancellationToken,
+    limits: RoomActorLimits,
+    events: Option<mpsc::Sender<RoomActorEvent>>,
+) -> (RoomHandle, RoomSummary) {
+    spawn_room_with_events(
+        id,
+        name,
+        password,
+        settings,
+        owner,
+        owner_outbound,
+        owner_cancellation,
+        limits,
+        events,
+    )
+}
+
+fn spawn_room_state(
+    state: RoomState,
+    limits: RoomActorLimits,
+    events: Option<mpsc::Sender<RoomActorEvent>>,
+) -> (RoomHandle, RoomSummary) {
+    let id = state.id;
     let summary = state.summary();
     let (normal, normal_rx) = mpsc::channel(limits.normal_capacity.get());
     let (control, control_rx) = mpsc::channel(limits.control_capacity.get());
@@ -2422,11 +3038,24 @@ async fn run_room(
                         Err(RoomError::NotMember)
                     } else {
                         let outcome = state.disconnect_outcome(caller, reason);
+                        // If the disconnected connection owned the queued persistence event,
+                        // transfer that exact work to the surviving participant after removal.
+                        // The repository operation remains single-shot; only its coordinator
+                        // changes.
+                        let coordinator_left =
+                            state.stroke_persistence_recipient == Some(caller);
                         let abort = match outcome {
                             RoomCloseOutcome::M5Abort { request, .. } => Some(request),
                             _ => None,
                         };
                         state.remove(caller).map(|snapshot| {
+                            if coordinator_left
+                                && let Some(work) = state.pending_stroke_persistence
+                            {
+                                state.stroke_persistence_recipient = None;
+                                state.stroke_persistence_event_delivered = false;
+                                let _ = state.request_stroke_persistence(work, None);
+                            }
                             let retain_for_persistence = snapshot.is_none()
                                 && state.pending_stroke_persistence.is_some();
                             RoomDisconnect {
@@ -2456,7 +3085,7 @@ async fn run_room(
                 }
             },
             command = normal.recv() => match command {
-                Some(command) => open = handle_normal(&mut state, command, events.as_ref()),
+                Some(command) => open = handle_normal(&mut state, command, events.as_ref()).await,
                 None => {
                     if control.is_closed() { open = false; }
                 }
@@ -2465,7 +3094,7 @@ async fn run_room(
     }
 }
 
-fn handle_normal(
+async fn handle_normal(
     state: &mut RoomState,
     command: RoomCommand,
     events: Option<&mpsc::Sender<RoomActorEvent>>,
@@ -2506,6 +3135,33 @@ fn handle_normal(
             reply,
         } => {
             let result = state.update_settings(caller, settings);
+            if let Ok(snapshot) = &result {
+                after_mutation(state, Some(snapshot), events);
+            }
+            let _ignored = reply.send(result);
+            true
+        }
+        RoomCommand::RoomUpdate {
+            caller,
+            settings,
+            name,
+            password,
+            reply,
+        } => {
+            let result = state.update_room(caller, settings, name, password);
+            if let Ok(snapshot) = &result {
+                after_mutation(state, Some(snapshot), events);
+                state.broadcast_settings_changed(snapshot);
+            }
+            let _ignored = reply.send(result);
+            true
+        }
+        RoomCommand::Team {
+            caller,
+            team,
+            reply,
+        } => {
+            let result = state.change_team(caller, team);
             if let Ok(snapshot) = &result {
                 after_mutation(state, Some(snapshot), events);
             }
@@ -2729,7 +3385,7 @@ fn handle_normal(
             true
         }
         RoomCommand::ApplyStrokeCommit { result, reply } => {
-            let result = state.apply_stroke_commit(result);
+            let result = state.apply_stroke_commit(result).await;
             let open = result.is_err() || !state.members.is_empty();
             let _ignored = reply.send(result);
             open
@@ -2770,7 +3426,7 @@ mod tests {
     use std::collections::HashSet;
 
     use pangya_domain::{
-        CatalogFingerprint, CourseId, MatchSeed, OneHoleConfig, ServerBalances, SoloReward,
+        CatalogFingerprint, CourseId, MatchPlan, MatchSeed, ServerBalances, SoloReward,
         StrokeCount, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
         synthetic_stroke_reward_v1,
     };
@@ -2805,7 +3461,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(101)),
                 MatchResultKey::new(Uuid::from_u128(102)),
                 account_id,
-                OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -2843,7 +3499,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(204)),
                 ),
             ],
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,
@@ -2862,6 +3518,43 @@ mod tests {
         .unwrap_or_else(|_| unreachable!())
     }
 
+    fn multi_hole_stroke_plan(first: &RoomIdentity, second: &RoomIdentity) -> StrokeStartPlan {
+        let seed = MatchSeed::new([0; 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        let begin = BeginStrokeMatch::new(
+            MatchId::new(Uuid::from_u128(205)),
+            MatchResultKey::new(Uuid::from_u128(206)),
+            [
+                StrokeParticipant::new(
+                    first.account_id,
+                    StrokeRosterOrder::First,
+                    MatchResultKey::new(Uuid::from_u128(207)),
+                ),
+                StrokeParticipant::new(
+                    second.account_id,
+                    StrokeRosterOrder::Second,
+                    MatchResultKey::new(Uuid::from_u128(208)),
+                ),
+            ],
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 2, 0, 4)
+                .unwrap_or_else(|_| unreachable!()),
+            CatalogFingerprint::new([3; 32]),
+            seed,
+            weather,
+            wind,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        StrokeStartPlan::new(
+            begin,
+            [first.connection_id, second.connection_id],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
     fn persisted_stroke(commit: CommitStrokeMatch) -> StrokeMatchResult {
         let players = [0_usize, 1_usize].map(|index| {
             let input = commit.players()[index];
@@ -2871,6 +3564,153 @@ mod tests {
             StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
         });
         StrokeMatchResult::new(commit.match_id(), commit.result_key(), players)
+    }
+
+    #[tokio::test]
+    async fn terminal_pending_delivery_protects_full_queue_until_ack() {
+        let first = identity(1);
+        let second = identity(2);
+        let (outbound, mut events) = RoomOutbound::ordered(1);
+        let cancellation = CancellationToken::new();
+        let (second_tx, mut second_events) = mpsc::channel(8);
+        let mut state = RoomState::new(
+            RoomId::new(61).expect("room"),
+            RoomName::parse("terminal-pending").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            outbound.clone(),
+            cancellation.clone(),
+        );
+        state.join(second.clone(), None, second_tx).expect("join");
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+        while second_events.try_recv().is_ok() {}
+        // Setup broadcasts may have exercised the tiny queue. Start the post-commit assertion
+        // with a live session token, independent of that setup backpressure.
+        state.members[0].cancellation = CancellationToken::new();
+        let cancellation = state.members[0].cancellation.clone();
+
+        // Post-commit, the reserved queue is full in order: one preceding event and 0x0066.
+        assert!(outbound.try_send(RoomEvent::Closed));
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let result = persisted_stroke(commit);
+        state
+            .apply_stroke_commit(result)
+            .await
+            .expect("apply settlement");
+        assert!(outbound.terminal_pending_delivery());
+        assert!(!state.deliver(&state.members[0], RoomEvent::Closed));
+        assert!(
+            !cancellation.is_cancelled(),
+            "ordinary backpressure must not cancel before terminal ACK"
+        );
+
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 1,
+            })
+        );
+        outbound.acknowledge_terminal_delivery(2);
+        assert!(outbound.terminal_pending_delivery());
+        outbound.acknowledge_terminal_delivery(1);
+        assert!(!outbound.terminal_pending_delivery());
+    }
+
+    #[tokio::test]
+    async fn ordered_outbox_reserves_terminal_slot_and_keeps_sequence() {
+        let (outbound, mut events) = RoomOutbound::ordered(2);
+        let first = identity(1);
+        let second = identity(2);
+        let mut state = RoomState::new(
+            RoomId::new(60).expect("room"),
+            RoomName::parse("ordered-outbox").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            outbound.clone(),
+            CancellationToken::new(),
+        );
+        let (second_outbound, mut second_events) = RoomOutbound::ordered(2);
+        state
+            .join(second.clone(), None, second_outbound)
+            .expect("join");
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+        while second_events.try_recv().is_ok() {}
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let result = persisted_stroke(commit);
+        let delivery = TerminalDelivery {
+            result,
+            generation: 7,
+        };
+        assert!(outbound.try_send(RoomEvent::Closed));
+        assert!(outbound.try_send(RoomEvent::Closed));
+        assert!(
+            !outbound.try_send(RoomEvent::Closed),
+            "ordinary event consumed terminal reserve"
+        );
+        assert!(
+            outbound
+                .send_terminal(&CancellationToken::new(), delivery)
+                .await
+        );
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 7
+            })
+        );
+        // Consuming the ordered marker is not an ACK. A failed socket write leaves the retained
+        // payload eligible for an idempotent retry, while a later socket success clears it.
+        outbound.begin_terminal_delivery(7);
+        assert!(
+            outbound
+                .send_terminal(&CancellationToken::new(), delivery)
+                .await
+        );
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 7
+            })
+        );
+        outbound.begin_terminal_delivery(7);
+        outbound.acknowledge_terminal_delivery(7);
+        assert!(!outbound.terminal_pending_delivery());
     }
 
     fn playing_stroke_room(state: &mut RoomState, plan: &StrokeStartPlan) {
@@ -2915,6 +3755,68 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn advancing_to_next_hole_broadcasts_a_turn_event_even_when_the_opening_player_is_unchanged() {
+        let first = identity(1);
+        let second = identity(2);
+        let (mut state, mut events) = state(2, None);
+        let (second_tx, _second_events) = mpsc::channel(64);
+        assert!(state.join(second.clone(), None, second_tx).is_ok());
+        assert!(state.set_ready(first.connection_id, true).is_ok());
+        assert!(state.set_ready(second.connection_id, true).is_ok());
+        let plan = multi_hole_stroke_plan(&first, &second);
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+
+        let action = |sequence| {
+            StrokeShotAction::new(sequence, 1, 10.0, 0.0, 0.0, 0.0)
+                .unwrap_or_else(|_| unreachable!())
+        };
+        let result = |sequence| {
+            StrokeShotResult::new(sequence, 0.0, 0.0, 0.0, Lie::Fairway, false)
+                .unwrap_or_else(|_| unreachable!())
+        };
+        assert_eq!(
+            state.stroke_action(first.connection_id, action(1)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .stroke_result(first.connection_id, result(1))
+                .map(|outcome| (outcome.disposition(), outcome.settlement())),
+            Ok((RelayDisposition::Accepted, None))
+        );
+        assert_eq!(
+            state.stroke_action(second.connection_id, action(1)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .stroke_result(second.connection_id, result(1))
+                .map(|outcome| (outcome.disposition(), outcome.settlement())),
+            Ok((RelayDisposition::Accepted, None))
+        );
+        assert_eq!(
+            state.stroke_hole_out(first.connection_id),
+            Ok(StrokeHoleOutOutcome::Waiting)
+        );
+        assert_eq!(
+            state.stroke_hole_out(second.connection_id),
+            Ok(StrokeHoleOutOutcome::Waiting)
+        );
+
+        let turns: Vec<_> =
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter_map(|event| match event {
+                    RoomEvent::StrokeTurn(StrokeMatchPhase::AwaitAction {
+                        hole, active, ..
+                    }) if hole == 2 => Some((hole, active)),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(turns, vec![(2, first.connection_id)]);
     }
 
     #[test]
@@ -3262,7 +4164,8 @@ mod tests {
         let commit = handle
             .prepare_solo_finish(id(1))
             .await
-            .unwrap_or_else(|_| unreachable!());
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
         let committed = SoloMatchResult::new(
             commit.match_id(),
             commit.result_key(),
@@ -3613,12 +4516,125 @@ mod tests {
             StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
         });
         let persisted = StrokeMatchResult::new(commit.match_id(), commit.result_key(), results);
+        // The event was accepted by the owner's bounded queue, but the coordinator can
+        // disconnect before it performs repository I/O. The room must transfer that exact work
+        // to the surviving participant rather than treating the accepted enqueue as durable.
+        assert!(
+            handle
+                .disconnect_with_abort(first.connection_id, MatchAbortReason::Disconnect)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(RoomEvent::StrokeSettlementRequested(value)) if value == commit
+        ));
         assert_eq!(handle.apply_stroke_commit(persisted).await, Ok(persisted));
+        let terminal_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
+        assert!(
+            terminal_events.iter().any(
+                |event| matches!(event, RoomEvent::StrokeCommitted(value) if *value == persisted)
+            ),
+            "terminal events: {terminal_events:?}"
+        );
+        // A coordinator can also disconnect after the idempotent repository commit and before
+        // the room actor applies its result. Replaying that outcome must not emit a second
+        // terminal frame to a member that already received it.
+        assert_eq!(handle.apply_stroke_commit(persisted).await, Ok(persisted));
+        assert!(second_rx.try_recv().is_err());
         assert!(handle.shutdown().await.is_ok());
     }
 
-    #[test]
-    fn stroke_persistence_falls_back_and_retains_work_when_all_outbounds_are_full() {
+    #[tokio::test]
+    async fn retained_terminal_waits_for_full_output_queues_and_is_emitted_once_per_roster_member()
+    {
+        let first = identity(1);
+        let second = identity(2);
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        let owner_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let mut state = RoomState::new(
+            RoomId::new(40).expect("room"),
+            RoomName::parse("terminal-backpressure").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            owner_tx.clone(),
+            owner_cancel.clone(),
+        );
+        state
+            .join_with_cancellation(
+                second.clone(),
+                None,
+                second_tx.clone(),
+                second_cancel.clone(),
+            )
+            .expect("join");
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        // Earlier setup broadcasts intentionally exercised the bounded normal queue. Reset the
+        // lifecycle tokens so this test isolates terminal backpressure rather than setup overflow.
+        for member in &mut state.members {
+            member.cancellation = CancellationToken::new();
+        }
+
+        // Simulate a peer that has not yet drained the preceding room traffic. The terminal
+        // result must wait for these permits instead of canceling either captured member.
+        owner_tx
+            .try_send(RoomEvent::Closed)
+            .expect("owner queue full");
+        second_tx
+            .try_send(RoomEvent::Closed)
+            .expect("second queue full");
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let persisted = persisted_stroke(commit);
+        let apply = tokio::spawn(async move { state.apply_stroke_commit(persisted).await });
+        // Drain one pre-terminal event from each queue. The retained terminal send either remains
+        // pending until this happens or is already queued behind it; both paths preserve order.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .expect("owner queue did not drain"),
+            Some(RoomEvent::Closed)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+                .await
+                .expect("second queue did not drain"),
+            Some(RoomEvent::Closed)
+        );
+        assert_eq!(apply.await.expect("apply task"), Ok(persisted));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .expect("owner terminal did not arrive"),
+            Some(RoomEvent::StrokeCommitted(persisted))
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+                .await
+                .expect("second terminal did not arrive"),
+            Some(RoomEvent::StrokeCommitted(persisted))
+        );
+    }
+
+    #[tokio::test]
+    async fn stroke_persistence_falls_back_and_retains_work_when_all_outbounds_are_full() {
         let first = identity(1);
         let second = identity(2);
         let plan = stroke_plan(
@@ -3659,7 +4675,10 @@ mod tests {
         let commit = fallback
             .stroke_give_up(first.connection_id)
             .expect("give-up settlement");
-        assert!(owner_cancel.is_cancelled());
+        assert!(
+            !owner_cancel.is_cancelled(),
+            "backpressure must not cancel a captured terminal recipient"
+        );
         assert!(!second_cancel.is_cancelled());
         let second_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
         assert_eq!(
@@ -3706,8 +4725,8 @@ mod tests {
         let commit = retained
             .stroke_give_up(first.connection_id)
             .expect("give-up settlement");
-        assert!(owner_cancel.is_cancelled());
-        assert!(second_cancel.is_cancelled());
+        assert!(!owner_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
         assert!(
             std::iter::from_fn(|| owner_rx.try_recv().ok())
                 .chain(std::iter::from_fn(|| second_rx.try_recv().ok()))
@@ -3726,7 +4745,7 @@ mod tests {
             "room authority hands retained work to priority cancellation exactly once"
         );
         let persisted = persisted_stroke(commit);
-        assert_eq!(retained.apply_stroke_commit(persisted), Ok(persisted));
+        assert_eq!(retained.apply_stroke_commit(persisted).await, Ok(persisted));
     }
 
     #[test]

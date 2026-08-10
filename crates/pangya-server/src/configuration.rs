@@ -11,7 +11,7 @@ use std::{
 
 use config::{Config, Environment, File};
 use pangya_domain::{
-    CourseId, IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, OneHoleConfig,
+    CourseId, IncompleteMatchAbortLimit, ItemTypeId, MAX_STARTER_ITEMS, MatchPlan,
     StarterCharacter, StarterGrant, StarterItem, StarterKey,
 };
 use pangya_game::UnknownOpcodePolicy;
@@ -1785,7 +1785,7 @@ fn declared_course_par(raw: u8, field: &'static str, issues: &mut Vec<ConfigIssu
     if raw == 0 {
         return None;
     }
-    if OneHoleConfig::par_in_range(raw) {
+    if MatchPlan::par_in_range(raw) {
         Some(raw)
     } else {
         issue(issues, field, "must be within 1..=10 when declared");

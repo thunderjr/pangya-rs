@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO matches (id, result_commit_key, mode, course_id, hole, hole_mode, par, catalog_sha256, seed, weather, wind_speed_tenths, wind_angle_degrees, reward_formula) VALUES ($1, $2, 'stroke_two', $3, $4, $5, $6, $7, $8, $9, $10, $11, 'stroke-two-v1') ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int2",
+        "Int2",
+        "Int2",
+        "Bytea",
+        "Bytea",
+        "Text",
+        "Int2",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ce33be09d15e306019094fdf29ab24882a297319e016e4a0c312ff044455e310"
+}

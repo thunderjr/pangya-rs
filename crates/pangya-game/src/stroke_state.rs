@@ -149,6 +149,8 @@ pub enum StrokeMatchPhase {
     AwaitAction {
         /// Active captured connection.
         active: PlayerConnectionId,
+        /// One-based hole currently in progress.
+        hole: u8,
         /// Global one-based turn number.
         turn: u32,
         /// Active player's required sequence.
@@ -158,6 +160,8 @@ pub enum StrokeMatchPhase {
     AwaitResult {
         /// Active captured connection.
         active: PlayerConnectionId,
+        /// One-based hole currently in progress.
+        hole: u8,
         /// Global one-based turn number.
         turn: u32,
         /// Sequence of the pending action.
@@ -322,6 +326,8 @@ enum ActivePhase {
 #[derive(Clone, Debug, PartialEq)]
 struct ActiveMatch {
     plan: StrokeStartPlan,
+    /// One-based hole currently being played.
+    current_hole: u8,
     players: [PlayerState; 2],
     phase: ActivePhase,
     active: usize,
@@ -371,11 +377,13 @@ impl StrokeMatchState {
                     }
                     ActivePhase::AwaitAction => StrokeMatchPhase::AwaitAction {
                         active: player.connection_id,
+                        hole: active.current_hole,
                         turn: active.turn,
                         sequence: player.sequence,
                     },
                     ActivePhase::AwaitResult(action) => StrokeMatchPhase::AwaitResult {
                         active: player.connection_id,
+                        hole: active.current_hole,
                         turn: active.turn,
                         sequence: action.sequence(),
                     },
@@ -462,6 +470,7 @@ impl StrokeMatchState {
                     last_result: None,
                 },
             ],
+            current_hole: 1,
             plan,
             phase: ActivePhase::Starting,
             active: 0,
@@ -650,6 +659,25 @@ impl StrokeMatchState {
             .iter()
             .all(|player| player.completion.is_some())
         {
+            if active.current_hole < active.plan.begin().config().hole_count() {
+                active.current_hole = active
+                    .current_hole
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                for player in &mut active.players {
+                    player.completion = None;
+                    player.sequence = 1;
+                    player.last_action = None;
+                    player.last_result = None;
+                }
+                active.active = 0;
+                active.turn_generation = next_generation;
+                active.phase = ActivePhase::AwaitAction;
+                return Ok(StrokeRelayOutcome {
+                    disposition: RelayDisposition::Accepted,
+                    settlement: None,
+                });
+            }
             let commit = build_commit(active)?;
             active.phase = ActivePhase::ResultsPending(commit);
             return Ok(StrokeRelayOutcome {
@@ -698,6 +726,24 @@ impl StrokeMatchState {
             .iter()
             .all(|player| player.completion.is_some())
         {
+            if active.current_hole < active.plan.begin().config().hole_count() {
+                active.current_hole = active
+                    .current_hole
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                for player in &mut active.players {
+                    player.completion = None;
+                    player.sequence = 1;
+                    player.last_action = None;
+                    player.last_result = None;
+                }
+                active.active = 0;
+                active.turn_generation = active
+                    .turn_generation
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                return Ok(StrokeHoleOutOutcome::Waiting);
+            }
             let commit = build_commit(active)?;
             active.phase = ActivePhase::ResultsPending(commit);
             return Ok(StrokeHoleOutOutcome::Settlement(commit));
@@ -1054,7 +1100,7 @@ fn same_result(left: StrokeShotResult, right: StrokeShotResult) -> bool {
 #[cfg(test)]
 mod tests {
     use pangya_domain::{
-        AccountId, CatalogFingerprint, CourseId, MatchSeed, OneHoleConfig, ServerBalances,
+        AccountId, CatalogFingerprint, CourseId, MatchPlan, MatchSeed, ServerBalances,
         StrokeParticipant, StrokePlayerResult, StrokeRosterOrder, synthetic_stroke_reward_v1,
     };
     use pangya_protocol::Lie;
@@ -1068,6 +1114,10 @@ mod tests {
     }
 
     fn plan(max_strokes: u8) -> StrokeStartPlan {
+        plan_with_holes(max_strokes, 1)
+    }
+
+    fn plan_with_holes(max_strokes: u8, hole_count: u8) -> StrokeStartPlan {
         let seed = MatchSeed::new([0; 32]);
         let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
         let participants = [
@@ -1086,8 +1136,13 @@ mod tests {
             MatchId::new(Uuid::from_u128(1)),
             MatchResultKey::new(Uuid::from_u128(2)),
             participants,
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
-                .unwrap_or_else(|_| unreachable!()),
+            MatchPlan::with_holes(
+                CourseId::new(1).unwrap_or_else(|_| unreachable!()),
+                hole_count,
+                0,
+                4,
+            )
+            .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([7; 32]),
             seed,
             weather,
@@ -1153,6 +1208,48 @@ mod tests {
         assert!(state.confirm_in_game(mark).is_ok());
     }
 
+    #[test]
+    fn full_course_advances_both_players_and_settles_once() {
+        let plan = plan_with_holes(30, 18);
+        let mut state = StrokeMatchState::new();
+        playing(&mut state, &plan, false);
+        for hole in 1..=18 {
+            assert!(matches!(
+                state.phase(),
+                StrokeMatchPhase::AwaitAction { sequence: 1, .. }
+            ));
+            assert_eq!(
+                state.accept_action(connection(1), action(1, 1.0)),
+                Ok(RelayDisposition::Accepted)
+            );
+            let first = state.accept_result(connection(1), result(1, 0.0, true));
+            assert_eq!(first.as_ref().map(|outcome| outcome.settlement()), Ok(None));
+            assert_eq!(
+                state.accept_action(connection(2), action(1, 1.0)),
+                Ok(RelayDisposition::Accepted)
+            );
+            let second = state.accept_result(connection(2), result(1, 0.0, true));
+            if hole < 18 {
+                assert_eq!(
+                    second.as_ref().map(|outcome| outcome.settlement()),
+                    Ok(None)
+                );
+                assert!(
+                    matches!(state.phase(), StrokeMatchPhase::AwaitAction { active, sequence: 1, .. } if active == connection(1))
+                );
+            } else {
+                let commit = second
+                    .unwrap_or_else(|_| unreachable!())
+                    .settlement()
+                    .unwrap_or_else(|| unreachable!());
+                assert_eq!(commit.players()[0].strokes(), 18);
+                assert_eq!(commit.players()[1].strokes(), 18);
+                assert_eq!(state.phase(), StrokeMatchPhase::ResultsPending);
+                assert_eq!(state.prepare_settlement(), Ok(commit));
+            }
+        }
+    }
+
     /// A retail client plays the holing shot through the ordinary action/result pair and only
     /// then announces the hole is over. Charging that announcement as a stroke would score every
     /// hole one over, so it is a completion and nothing else.
@@ -1177,6 +1274,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 2,
                 sequence: 1,
             }
@@ -1202,6 +1300,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -1272,6 +1371,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[0],
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -1281,6 +1381,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 4,
                 sequence: 2,
             }
@@ -1300,6 +1401,7 @@ mod tests {
             left.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(1),
+                hole: 1,
                 turn: 1,
                 sequence: 1,
             }
@@ -1389,6 +1491,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(2),
+                hole: 1,
                 turn: 2,
                 sequence: 1,
             }
@@ -1415,6 +1518,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(2),
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -1939,14 +2043,14 @@ mod tests {
                 prop_assert_eq!(&left, &right);
                 prop_assert_eq!(left.roster(), Some(plan.roster()));
                 match left.phase() {
-                    StrokeMatchPhase::AwaitAction { turn, sequence, active } => {
+                    StrokeMatchPhase::AwaitAction { turn, sequence, active, .. } => {
                         prop_assert!(turn > 0);
                         prop_assert!(sequence > 0);
                         prop_assert!(plan.roster().contains(&active));
                         prop_assert!(left.turn_generation().is_some());
                         prop_assert_eq!(left.game_generation(), Some(1));
                     }
-                    StrokeMatchPhase::AwaitResult { turn, sequence, active } => {
+                    StrokeMatchPhase::AwaitResult { turn, sequence, active, .. } => {
                         prop_assert!(turn > 0);
                         prop_assert!(sequence > 0);
                         prop_assert!(plan.roster().contains(&active));

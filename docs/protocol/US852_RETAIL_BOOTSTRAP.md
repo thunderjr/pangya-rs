@@ -283,7 +283,9 @@ Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
 | `0x0065` | Hole finished | empty |
 | `0x0090` | Finish-preview acknowledgement | empty |
 
-One hole record is `u32` random id, `u8` pin, `u8` course, `u8` number.
+Each hole record is `u32` random id, `u8` pin, `u8` course, `u8` number. The room-driven
+retail plan carries the selected 3/6/9/18-hole count and progression; the synthetic M5/M6
+one-hole flows are separate compatibility modes.
 
 Four details that are easy to get wrong and were pinned by tests:
 
@@ -298,20 +300,15 @@ Four details that are easy to get wrong and were pinned by tests:
   `Acrisio-Filho/SuperSS-Dev` `versus_base.cpp` `checkAllLoadHole`, and
   `hsreina/pangya-server` `Game.pas` `HandlePlayerLoadOk`.
 - A wind strength of `0` is never sent; upstream picks `1..8`, so a still hole is reported
-  as the weakest breeze.
+  as the weakest breeze. With the room's natural-wind option enabled, the server derives a
+  deterministic per-hole strength in that same range while retaining the seed-derived bearing.
 - Shots are relayed, not recomputed. The client owns trajectory; the server owns turn
   order, scoring, and persistence. The relay body is deliberately opaque.
 
-## What remains to make a hole playable
+## Current retail match scope
 
-The packets are implemented and unit-tested. They are **not routed**, and routing them is
-not merely a wire translation the way rooms were: the existing match actors
-(`stroke_state.rs`, the solo path) encode the synthetic protocol's own semantics — exactly
-one hole, exactly two ready players, a fixed reward formula. The retail flow is
-multi-hole, variable-party, and drives loading and turn order from different client
-signals.
-
-So this step needs a design decision rather than a translation: either generalize the
-existing match actor to the retail lifecycle, or introduce a retail match actor beside it
-and share the settlement layer, which is already protocol-agnostic. That decision should be
-made deliberately, not folded into a packet-porting commit.
+The retail room and match packets are routed. Versus rooms require exactly two ready players;
+the room-driven plan retains 3/6/9/18-hole cards and the selected front/back/random/shuffle
+ordering. The stroke aggregate advances each hole and settles the whole card once, while each
+hole emits its required `0x0053` opening-player introduction. Synthetic M5/M6 remain separate
+one-hole compatibility checkpoints; that limitation does not describe the retail path.

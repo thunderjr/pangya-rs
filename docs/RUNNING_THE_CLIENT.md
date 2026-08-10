@@ -367,13 +367,10 @@ real client did and did not answer.
 Then:
 
 1. Enable `[game.stroke_two]`. `config/retail-local.example.toml` ships it enabled, with the
-   course and par matching `[game.solo_practice]`. Both describe the one hole this server
-   settles.
-2. **Create the room with one hole, and with the course that matches `game.stroke_two.course_id`.**
-   The room record the client renders is echoed from its own Make Room request, but the match
-   plan is built from the configuration: the server settles exactly one hole on the configured
-   course whatever the room says. A room asking for three holes on another course will load that
-   course and then be told the hole is over after one.
+   course and par matching `[game.solo_practice]` for the local catalog fallback.
+2. **Create a two-player room with the desired 3/6/9/18-hole card and course.** The room
+   profile is authoritative: the retail match plan retains the selected course, hole count,
+   progression mode, and deterministic full-card ordering, then settles the whole card once.
 3. Set `protocol.unknown_opcode_policy = "capture"` for the run. The client sends in-match
    opcodes this server does not handle; `RETAIL_ACCEPTED_MATCH_OPCODES` covers the ones known
    from upstream, and capture turns anything else into a bounded metadata record instead of a

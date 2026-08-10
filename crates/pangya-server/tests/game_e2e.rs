@@ -57,6 +57,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::MakeWriter;
+use uuid::Uuid;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 /// Generous packet deadline for ordinary E2E assertions. Timeout-path tests use their own short
@@ -376,6 +377,9 @@ impl<'a> MakeWriter<'a> for CaptureWriter {
     }
 }
 
+/// Installs the process-wide capture once; callers must filter structured records by their own
+/// match/account correlation key and must never clear the shared buffer while tests run in
+/// parallel.
 fn tracing_capture() -> Arc<Mutex<Vec<u8>>> {
     static CAPTURE: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
     Arc::clone(CAPTURE.get_or_init(|| {
@@ -598,7 +602,7 @@ fn solo_service(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -654,7 +658,7 @@ fn stroke_service_with_deadlines(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -870,6 +874,16 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
 /// multi-client test; the assertions that matter here are about persisted state.
 /// Reads whatever the server has already sent, as (opcode, body) pairs.
 async fn drain_frames(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<(u16, Vec<u8>)> {
+    drain_frames_with_grace(stream, key, budget.min(Duration::from_millis(400))).await
+}
+
+/// Uses a caller-selected grace period for terminal frames whose persistence commit may lag the
+/// final client packet. Ordinary drains stay short so the full-card test remains bounded.
+async fn drain_frames_with_grace(
+    stream: &mut TcpStream,
+    key: u8,
+    budget: Duration,
+) -> Vec<(u16, Vec<u8>)> {
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
@@ -891,7 +905,9 @@ async fn drain_frames(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<
         {
             Ok(Some(frame)) => seen.push(frame),
             Ok(None) => break,
-            Err(_) => break,
+            // A 400 ms polling slice is not the grace deadline. Keep polling after a quiet
+            // slice so a delayed terminal settlement can still deliver 0x0065/0x0066.
+            Err(_) => continue,
         }
     }
     seen
@@ -905,10 +921,71 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
         .collect()
 }
 
+#[tokio::test]
+async fn terminal_grace_keeps_polling_for_delayed_finish_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let key = 3;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        // Deliberately exceed the helper's 400 ms polling slice while remaining inside its
+        // two-second overall grace period.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for opcode in [0x0065_u16, 0x0066] {
+            let plain = opcode.to_le_bytes();
+            let frame =
+                pangya_crypto::server_encrypt(&plain, key, 1, 8 * 1024 * 1024).expect("encrypt");
+            stream.write_all(&frame).await.expect("write");
+        }
+    });
+    let mut client = TcpStream::connect(address).await.expect("connect");
+
+    let frames = drain_frames_with_grace(&mut client, key, Duration::from_secs(2)).await;
+    server.await.expect("server task");
+    assert_eq!(
+        frames.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
+        vec![0x0065, 0x0066],
+        "terminal frames arriving after the first polling slice are retained"
+    );
+}
+
 fn wire<T: EncodePacket>(packet: &T, profile: &CompatibilityProfile) -> Result<Vec<u8>, String> {
     encode_packet_payload(packet, profile)
         .map(|bytes| bytes.to_vec())
         .map_err(|error| error.to_string())
+}
+
+/// A hole transition is a new introduction, not a continuation of the previous turn. Keep this
+/// assertion on the ordered wire trace so a stale 0x0063 cannot be hidden by a set-membership
+/// check.
+fn assert_retail_hole_intro_order(frames: &[(u16, Vec<u8>)], label: &str) {
+    let intro_positions: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (opcode, _))| (*opcode == 0x0053).then_some(index))
+        .collect();
+    assert_eq!(
+        intro_positions.len(),
+        1,
+        "{label} has one hole introduction"
+    );
+    if let Some(finish) = frames.iter().position(|(opcode, _)| *opcode == 0x0065) {
+        assert!(
+            finish < intro_positions[0],
+            "{label} finishes before introduction: {frames:04x?}"
+        );
+        assert!(
+            !frames[finish + 1..intro_positions[0]]
+                .iter()
+                .any(|(opcode, _)| *opcode == 0x0063),
+            "{label} has no stale handover after finish: {frames:04x?}"
+        );
+    } else if let Some(turn) = frames.iter().position(|(opcode, _)| *opcode == 0x0063) {
+        assert!(
+            intro_positions[0] < turn,
+            "{label} introduces before handover: {frames:04x?}"
+        );
+    }
 }
 
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
@@ -4458,7 +4535,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
     let repository = Arc::new(BlockingStrokeCommitRepository::new(pool.clone()));
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let service = Arc::new(
         GameService::new(
@@ -4770,10 +4847,13 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
         receive_typed::<StrokeCommandResult>(&mut give_peer.stream, give_peer.key).await,
         StrokeCommandResult::new(StrokeCommand::GiveUp, StrokeCommandOutcome::Success)
     );
-    for (client, own_balance) in [
-        (&mut give_owner, StrokeBalanceUpdate::new(10, 5)),
-        (&mut give_peer, StrokeBalanceUpdate::new(0, 0)),
-    ] {
+    // The owner is the deterministic persistence coordinator. Dropping it immediately after the
+    // terminal command response exercises transfer of an already-enqueued settlement event to
+    // the surviving encrypted TCP connection; the peer must still receive the terminal result.
+    let give_owner_account = give_owner.account_id;
+    drop(give_owner);
+    for client in [&mut give_peer] {
+        let own_balance = StrokeBalanceUpdate::new(0, 0);
         assert_eq!(
             receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
             StrokePhase::new(give_started.match_id(), StrokePhaseKind::ResultsPending)
@@ -4813,7 +4893,7 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
         give_players,
         vec![
             (
-                give_owner.account_id.get(),
+                give_owner_account.get(),
                 1,
                 "winner_by_forfeit".to_owned(),
                 10,
@@ -4836,8 +4916,8 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
     .fetch_all(&pool)
     .await
     .expect("give-up progression ledger");
-    assert_eq!(give_currency, vec![(give_owner.account_id.get(), 10)]);
-    assert_eq!(give_progression, vec![(give_owner.account_id.get(), 5)]);
+    assert_eq!(give_currency, vec![(give_owner_account.get(), 10)]);
+    assert_eq!(give_progression, vec![(give_owner_account.get(), 5)]);
 
     let rendered = metrics.render();
     assert!(rendered.contains(
@@ -6121,7 +6201,9 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool) {
     let traces = tracing_capture();
-    traces.lock().expect("trace lock").clear();
+    // The process-wide test subscriber is shared by parallel sqlx tests. Never clear it here:
+    // another test may be writing concurrently; assertions must select their own correlation
+    // identity instead.
     let account = create_account(&pool, "RetailBoot", 1, 0x1000_0000).await;
     let metrics = Arc::new(M2Metrics::default());
     let service = Arc::new(
@@ -7525,7 +7607,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     let _ = exercise_exception_reports(&mut host, host_key, 30).await;
 
     // A second client joins the same room by number.
-    let (mut visitor, visitor_key, _) =
+    let (mut visitor, visitor_key, visitor_connection) =
         connect_retail(&pool, address, guest.account.id, "RetailGuest").await;
     let mut join = pangya_protocol::PacketWriter::default();
     join.u16_le(room_id);
@@ -7542,27 +7624,144 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         census.len(),
         4 + 2 * pangya_protocol::ROOM_PLAYER_RECORD_BYTES + 1
     );
+    // Joining broadcasts the new roster to the existing member. Drain that delivery before the
+    // next mutation so the team-change assertion cannot mistake a stale join census for a second
+    // team census.
+    let host_join_frames = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        host_join_frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "host receives one census for the visitor join"
+    );
 
-    // Leaving returns the client to the lobby and re-lists rooms.
-    send_packet(&mut visitor, visitor_key, 4, 0x000f, &[]).await;
+    // Team changes are broadcast once as 0x007d plus one authoritative census; the requester
+    // must not receive a direct duplicate of either frame.
+    send_packet(&mut host, host_key, 4, 0x0010, &[1]).await;
+    for (stream, key, who) in [
+        (&mut host, host_key, "host"),
+        (&mut visitor, visitor_key, "visitor"),
+    ] {
+        let frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+        let announces: Vec<_> = frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x007d)
+            .collect();
+        assert_eq!(announces.len(), 1, "{who} team announce");
+        assert_eq!(announces[0].1.len(), 5, "{who} team announce width");
+        assert_eq!(
+            u32::from_le_bytes(announces[0].1[..4].try_into().expect("team connection")),
+            host_connection,
+            "{who} team announce names the requester"
+        );
+        assert_eq!(announces[0].1[4], 1, "{who} team announce selects blue");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(opcode, _)| *opcode == 0x0048)
+                .count(),
+            1,
+            "{who} team census"
+        );
+    }
+
+    // 0x001c is a room resync while in the room, not the in-match shot-end opcode. It answers
+    // with exactly one census and keeps the connection usable.
+    send_packet(&mut host, host_key, 5, 0x001c, &[0, 0]).await;
+    let resync = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        resync
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1
+    );
+
+    // The two invite requests are paired: 0x0029 is the lookup leg and receives 0x0130;
+    // 0x00ba performs the invitation, receives 0x012f, and delivers 0x0083 to the invitee.
+    send_packet(&mut visitor, visitor_key, 6, 0x000f, &[]).await;
     let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
     assert_eq!(opcode, 0x004c);
     assert_eq!(body, vec![0xff, 0xff]);
     let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
     assert_eq!(opcode, 0x0047);
     assert_eq!(body[0], 1, "the host's room is still listed");
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(500)).await;
 
-    // Joining a room number that does not exist is refused, not fatal.
-    let mut bad = pangya_protocol::PacketWriter::default();
-    bad.u16_le(4242);
-    bad.pstring(b"", 64).expect("password");
-    send_packet(&mut visitor, visitor_key, 5, 0x0009, &bad.into_inner()).await;
-    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
-    assert_eq!(opcode, 0x0049);
-    assert_eq!(body, vec![18]);
+    send_packet(
+        &mut host,
+        host_key,
+        7,
+        0x0029,
+        &u32::try_from(guest.account.id.get())
+            .expect("guest id")
+            .to_le_bytes(),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0130);
+    assert!(
+        drain_available(&mut visitor, visitor_key, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "lookup does not deliver an invitation"
+    );
+    let mut invite = pangya_protocol::PacketWriter::default();
+    invite.pstring(b"RetailGuest", 64).expect("nickname");
+    invite.u32_le(u32::try_from(guest.account.id.get()).expect("guest id"));
+    send_packet(&mut host, host_key, 8, 0x00ba, &invite.into_inner()).await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x012f);
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0083);
+
+    // Rejoin consumes the pending invitation, then the owner kick removes the guest and sends
+    // the retail 0x004c leave acknowledgement only to the removed connection.
+    send_packet(&mut visitor, visitor_key, 9, 0x00b4, &[]).await;
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0049);
+    let rejoin_frames = drain_frames(&mut visitor, visitor_key, Duration::from_millis(700)).await;
+    assert_eq!(
+        rejoin_frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "rejoin census is drained before the kick acknowledgement"
+    );
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(700)).await;
+    send_packet(
+        &mut host,
+        host_key,
+        10,
+        0x0026,
+        &visitor_connection.to_le_bytes(),
+    )
+    .await;
+    let kicked_host = drain_available(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        kicked_host
+            .iter()
+            .filter(|&&opcode| opcode == 0x0048)
+            .count(),
+        1
+    );
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x004c);
+
+    // Repeat-hole has no authoritative semantics in the vendored references. It is a safe
+    // deterministic refusal, not a disconnect or a partial room mutation.
+    send_packet(&mut host, host_key, 11, 0x000a, &[0xff, 0xff, 1, 11, 1]).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(250))
+            .await
+            .is_empty(),
+        "unsupported repeat-hole edit has no misleading acknowledgement"
+    );
+
+    // A truncated settings frame is malformed and closes the stream rather than being treated
+    // as an empty edit or allowing a partial mutation.
+    send_packet(&mut host, host_key, 12, 0x000a, &[0xff]).await;
+    assert_closed(&mut host).await;
 
     drop(visitor);
-    drop(host);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
@@ -7571,7 +7770,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
 async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let account = create_account(&pool, "RetailGolfer", 1, 0x1000_0000).await;
     let service = Arc::new(
@@ -7822,16 +8021,17 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 /// A real client cannot start a versus room holding fewer players than its capacity, and the
 /// smallest capacity its Make Room dialog offers is two. So the only match a real client can ever
 /// begin is a two-player one, and this drives exactly that over TCP: two authenticated retail
-/// clients, a full versus room, both ready, then a whole hole played turn by turn and settled.
+/// clients, a full versus room, both ready, then all eighteen holes played turn by turn and
+/// settled.
 ///
 /// This supersedes the pin that the retail start built a `BeginSoloMatch` for whoever pressed
 /// Start. What it asserts instead is the property that pin existed to expose: **both** accounts
-/// are participants and both are paid, so a versus hole can be scored.
+/// are participants and both are paid once for the completed full card.
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
+async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
@@ -7850,14 +8050,15 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 400,
+                    outbound_room_event_capacity: 256,
                     ..GameRuntimeLimits::default()
                 },
                 solo_practice: Some(SoloRuntimeConfig {
                     course,
                     catalog_fingerprint: catalog.fingerprint(),
                     loading_timeout: Duration::from_secs(30),
-                    commit_timeout: Duration::from_secs(2),
-                    max_strokes: 10,
+                    commit_timeout: Duration::from_secs(10),
+                    max_strokes: 30,
                     startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
                         .expect("recovery limit"),
                     shot_packets_per_window: 80,
@@ -7868,8 +8069,8 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                     loading_timeout: Duration::from_secs(30),
                     turn_timeout: Duration::from_secs(60),
                     game_timeout: Duration::from_secs(300),
-                    commit_timeout: Duration::from_secs(2),
-                    max_strokes: 10,
+                    commit_timeout: Duration::from_secs(10),
+                    max_strokes: 30,
                     startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
                         .expect("recovery limit"),
                     shot_packets_per_window: 120,
@@ -7984,7 +8185,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     create.u32_le(600_000);
     create.u8(2); // capacity: the smallest a versus room offers
     create.u8(0);
-    create.u8(1);
+    create.u8(18);
     create.u8(0);
     create.bytes(&[0; 5]);
     create.pstring(b"Party", 64).expect("room name");
@@ -7997,14 +8198,13 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         0,
         "the room was created"
     );
-    // The record reports the hole this server will actually settle rather than the request: one
-    // hole, on the configured course. A room promising more would be contradicted by the match
-    // plan a moment later.
-    assert_eq!(joined[2 + 64 + 5 + 17 + 1], 1, "the room runs one hole");
+    // The room record preserves the client's requested card shape and course.
+    // The fixed room record includes the maximum-player byte before the card shape.
+    assert_eq!(joined[2 + 64 + 5 + 17 + 1], 18, "the room runs a full card");
     assert_eq!(
         joined[2 + 64 + 5 + 17 + 6],
-        7,
-        "on the course the server settles, not the one the request asked for"
+        0,
+        "the room reports the requested course"
     );
     // The room number sits after the status, the name, the settings block and the identity
     // fields; the same offset the room create/join test reads it from.
@@ -8040,7 +8240,16 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     // The room describes itself the way its creator asked for, not as a default versus room.
     // A client told its own room is something else renders the wrong header and gates Start on
     // the wrong rules — a practice room of one reported as versus never starts at all.
-    send_packet(&mut host, host_key, 3, 0x000a, &[0xff, 0xff, 0]).await;
+    // Exercise a non-empty encrypted PacketDoc 000A edit: natural wind is persisted in the
+    // room profile and reflected by the authoritative 004A response.
+    send_packet(
+        &mut host,
+        host_key,
+        3,
+        0x000a,
+        &[0xff, 0xff, 1, 14, 1, 0, 0, 0],
+    )
+    .await;
     let described = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
     let status = described
         .iter()
@@ -8048,7 +8257,8 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         .map(|(_, body)| body.clone())
         .unwrap_or_default();
     assert_eq!(status.get(2).copied(), Some(0), "the mode it was made with");
-    assert_eq!(status.get(4).copied(), Some(1), "one hole");
+    assert_eq!(status.get(4).copied(), Some(18), "eighteen holes");
+    assert_eq!(status.get(6).copied(), Some(1), "natural wind is enabled");
     assert_eq!(
         status.get(10).copied(),
         Some(2),
@@ -8158,7 +8368,9 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (&mut host, host_key, "host"),
         (&mut visitor, visitor_key, "visitor"),
     ] {
-        let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        let loaded_frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+        assert_retail_hole_intro_order(&loaded_frames, who);
+        let frames: Vec<u16> = loaded_frames.iter().map(|(opcode, _)| *opcode).collect();
         assert!(
             frames.contains(&0x009e) && frames.contains(&0x005b),
             "{who} is told the weather and wind once loaded: {frames:04x?}"
@@ -8259,22 +8471,157 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         seen.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>()
     );
 
-    // Both hole out. The second completion settles the match for both accounts at once.
+    // Both hole out. The second completion advances the card and emits a fresh 0x0053;
+    // only hole 18 settles the two-player match.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
-    let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
-    send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
-    for (stream, key, who) in [
-        (&mut host, host_key, "host"),
-        (&mut visitor, visitor_key, "visitor"),
-    ] {
-        let frames = drain_available(stream, key, Duration::from_millis(2000)).await;
-        assert!(
-            frames.contains(&0x0065),
-            "{who} is told the hole finished: {frames:04x?}"
+    // Drain the first finisher's valid current-hole handover from both sockets before asking the
+    // second player to finish; otherwise it remains queued ahead of hole 2's introduction.
+    let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+    let visitor_waiting =
+        drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(opcode, _)| *opcode == 0x0063)
+                .count(),
+            1,
+            "{who} receives one current-hole handover: {frames:04x?}"
         );
-        assert!(
-            frames.contains(&0x0066),
-            "{who} receives the final standings: {frames:04x?}"
+        assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+    }
+    send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
+    let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+    let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    assert_retail_hole_intro_order(&first_next, "hole 2 host");
+    assert_retail_hole_intro_order(&second_next, "hole 2 visitor");
+    assert!(
+        !first_next.iter().any(|(opcode, _)| *opcode == 0x0063),
+        "hole 2 uses introduction, not turn handover: {first_next:04x?}"
+    );
+    assert!(
+        !second_next.iter().any(|(opcode, _)| *opcode == 0x0063),
+        "hole 2 uses introduction, not turn handover: {second_next:04x?}"
+    );
+
+    let mut host_final_history = Vec::new();
+    let mut visitor_final_history = Vec::new();
+    for hole in 2..=18 {
+        // Every next hole starts with the authoritative opening-player introduction.
+        if hole > 2 {
+            for (stream, key, who) in [
+                (&mut host, host_key, "host"),
+                (&mut visitor, visitor_key, "visitor"),
+            ] {
+                let frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+                assert_retail_hole_intro_order(&frames, &format!("hole {hole} {who}"));
+                assert!(
+                    !frames.iter().any(|(opcode, _)| *opcode == 0x0063),
+                    "hole {hole} has no stale turn for {who}: {frames:04x?}"
+                );
+            }
+        }
+        let mut hole_salt = salt.wrapping_add(hole as u8);
+        for host_shoots in [true, false] {
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            let mut committed_shot = vec![0, 0];
+            committed_shot.extend_from_slice(&[0xab; 62]);
+            send_packet(from, from_key, hole_salt, 0x0012, &committed_shot).await;
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            assert!(
+                drain_available(other, other_key, Duration::from_millis(900))
+                    .await
+                    .contains(&0x0055),
+                "hole {hole} shot relay"
+            );
+            hole_salt = hole_salt.wrapping_add(1);
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            send_packet(from, from_key, hole_salt, 0x001c, &[]).await;
+            let handover = drain_frames(from, from_key, Duration::from_millis(1200)).await;
+            assert!(
+                handover.iter().any(|(opcode, _)| *opcode == 0x00cc)
+                    || handover.iter().any(|(opcode, _)| *opcode == 0x0053),
+                "hole {hole} end-shot boundary or queued intro: {handover:04x?}"
+            );
+            if handover.iter().any(|(opcode, _)| *opcode == 0x0053) {
+                assert_retail_hole_intro_order(&handover, &format!("hole {hole} queued intro"));
+            }
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            let _ = drain_available(other, other_key, Duration::from_millis(1200)).await;
+            hole_salt = hole_salt.wrapping_add(1);
+        }
+        send_packet(&mut host, host_key, hole_salt, 0x0031, &[]).await;
+        let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+        let visitor_waiting =
+            drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+        if hole < 18 {
+            for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(|(opcode, _)| *opcode == 0x0063)
+                        .count(),
+                    1,
+                    "hole {hole} {who} receives one current-hole handover: {frames:04x?}"
+                );
+                assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+            }
+            send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
+        } else {
+            // The first final-hole finisher receives only its hole marker. The second completion
+            // drives one retained terminal room event, which emits one marker and standings to
+            // each captured socket; keep this history separate from earlier holes.
+            host_final_history.extend(host_waiting);
+            visitor_final_history.extend(visitor_waiting);
+            send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
+            host_final_history.extend(
+                drain_frames_with_grace(&mut host, host_key, Duration::from_millis(2000)).await,
+            );
+            visitor_final_history.extend(
+                drain_frames_with_grace(&mut visitor, visitor_key, Duration::from_millis(2000))
+                    .await,
+            );
+        }
+        salt = hole_salt;
+    }
+    for (who, history) in [
+        ("host", &host_final_history),
+        ("visitor", &visitor_final_history),
+    ] {
+        // The first final-hole finisher also receives the ordinary nonterminal 0x0065 before the
+        // opponent finishes. Identify the terminal marker by its required adjacent 0x0066 rather
+        // than counting every 0x0065 in the final-hole trace.
+        let terminal_pairs = history
+            .windows(2)
+            .filter(|pair| pair[0].0 == 0x0065 && pair[1].0 == 0x0066)
+            .count();
+        let match_finish_count = history
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0066)
+            .count();
+        assert_eq!(
+            terminal_pairs, 1,
+            "{who} receives exactly one terminal 0065/0066 pair: {history:04x?}"
+        );
+        assert_eq!(
+            match_finish_count, 1,
+            "{who} receives exactly one terminal 0066 for the final hole: {history:04x?}"
         );
     }
 
@@ -8345,7 +8692,45 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
+    // The database commit key and both player payload keys prove that the settlement identity
+    // reaching the terminal outbox is the same durable match, not a retained stale payload.
+    let (match_id, commit_key): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, result_commit_key FROM matches")
+            .fetch_one(&pool)
+            .await
+            .expect("settlement identity");
+    let player_keys: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT player_result_key FROM match_players WHERE match_id = $1 ORDER BY participant_order",
+    )
+    .bind(match_id)
+    .fetch_all(&pool)
+    .await
+    .expect("player settlement identities");
+    assert_eq!(player_keys.len(), 2);
+    assert!(player_keys.iter().all(|key| *key != commit_key));
+
     let logged = String::from_utf8_lossy(&traces.lock().expect("traces").clone()).into_owned();
+    // sqlx runs this integration target in parallel and the test subscriber is process-wide. The
+    // match UUID is the structured correlation boundary; never count terminal registrations from
+    // the whole capture, which can include another test's settlement.
+    let match_logged = logged
+        .lines()
+        .filter(|line| line.contains(&format!("match_id={match_id}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        match_logged.contains(&format!("result_key={commit_key}")),
+        "observer records the committed settlement identity for this match: {match_logged}"
+    );
+    assert_eq!(
+        match_logged
+            .matches("stroke terminal payload registered")
+            .count(),
+        2,
+        "observer records one valid registered terminal payload per seat for this match: {match_logged}"
+    );
+
+    // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
     for token in &tokens {
         assert!(
             !logged.contains(token.as_str()),

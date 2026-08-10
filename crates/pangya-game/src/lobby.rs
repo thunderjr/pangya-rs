@@ -30,8 +30,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     match_state::{RelayDisposition, SoloMatchError, SoloStartPlan},
     room::{
-        RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomEvent, RoomHandle,
-        RoomIdentity, spawn_room_with_events,
+        RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomHandle,
+        RoomIdentity, RoomOutbound, TerminalOutboxSender, spawn_room_with_events,
+        spawn_room_with_terminal_outbox,
     },
     stroke_state::{
         StrokeHoleOutOutcome, StrokeLoadingOutcome, StrokeMatchError, StrokeRelayOutcome,
@@ -150,8 +151,17 @@ pub(crate) struct MatchLifecycle {
 /// A room operation routed by the registry using the caller's registered connection identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LobbyRoomCommand {
-    /// Owner-only capacity update.
+    /// Owner-only room settings update.
     UpdateSettings(RoomSettings),
+    /// Atomically updates owner-controlled room identity and settings.
+    UpdateRoom {
+        /// New settings.
+        settings: RoomSettings,
+        /// New name, when requested.
+        name: Option<RoomName>,
+        /// `Some(None)` clears the password; `None` leaves it unchanged.
+        password: Option<Option<RoomPassword>>,
+    },
     /// Set the caller's ready state.
     SetReady(bool),
     /// Broadcast validated chat.
@@ -169,6 +179,8 @@ pub enum LobbyRoomCommand {
     },
     /// Owner-only removal of another authoritative connection ID.
     Kick(PlayerConnectionId),
+    /// Change the caller's red/blue team.
+    ChangeTeam(u8),
     /// Fetch the caller's current authoritative room state.
     GetState,
 }
@@ -387,7 +399,8 @@ enum LobbyCommand {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -397,7 +410,8 @@ enum LobbyCommand {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -408,11 +422,16 @@ enum LobbyCommand {
         channel: u8,
         reply: oneshot::Sender<Vec<RoomSummary>>,
     },
+    RoomInfo {
+        room_id: RoomId,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
     Join {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -421,7 +440,8 @@ enum LobbyCommand {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -474,7 +494,7 @@ enum LobbyCommand {
         name: RoomName,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
         cancellation: CancellationToken,
         started: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -573,7 +593,53 @@ impl LobbyHandle {
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        self.create_inner(
+            name,
+            password,
+            settings,
+            owner,
+            outbound.into(),
+            None,
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_with_terminal_outbox(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        self.create_inner(
+            name,
+            password,
+            settings,
+            owner,
+            outbound,
+            Some(terminal_outbox),
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -585,6 +651,7 @@ impl LobbyHandle {
                 settings,
                 owner,
                 outbound,
+                terminal_outbox,
                 cancellation,
                 reply,
             },
@@ -602,7 +669,38 @@ impl LobbyHandle {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::CreateOnChannel {
+                name,
+                password,
+                settings,
+                owner,
+                channel,
+                outbound: outbound.into(),
+                terminal_outbox: None,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_on_channel_with_terminal_outbox(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        channel: u8,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -615,6 +713,7 @@ impl LobbyHandle {
                 owner,
                 channel,
                 outbound,
+                terminal_outbox: Some(terminal_outbox),
                 cancellation,
                 reply,
             },
@@ -642,13 +741,61 @@ impl LobbyHandle {
         Self::await_reply(&gate, receive, self.command_timeout).await
     }
 
+    /// Returns the public member projection for a room directory request.
+    pub async fn room_info(&self, room_id: RoomId) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(LobbyCommand::RoomInfo { room_id, reply }, Arc::clone(&gate))?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
     /// Atomically admits a connection to one room only.
     pub async fn join(
         &self,
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(
+            room_id,
+            identity,
+            password,
+            outbound.into(),
+            None,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn join_with_terminal_outbox(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(
+            room_id,
+            identity,
+            password,
+            outbound,
+            Some(terminal_outbox),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn join_inner(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -659,6 +806,7 @@ impl LobbyHandle {
                 identity,
                 password,
                 outbound,
+                terminal_outbox,
                 cancellation,
                 reply,
             },
@@ -674,7 +822,36 @@ impl LobbyHandle {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: impl Into<RoomOutbound>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::JoinOnChannel {
+                room_id,
+                identity,
+                password,
+                channel,
+                outbound: outbound.into(),
+                terminal_outbox: None,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn join_on_channel_with_terminal_outbox(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        channel: u8,
+        outbound: RoomOutbound,
+        terminal_outbox: TerminalOutboxSender,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -686,6 +863,7 @@ impl LobbyHandle {
                 password,
                 channel,
                 outbound,
+                terminal_outbox: Some(terminal_outbox),
                 cancellation,
                 reply,
             },
@@ -1118,7 +1296,8 @@ impl LobbyRegistry {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: Option<u8>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         if self.connections.contains_key(&owner.connection_id) {
@@ -1129,17 +1308,31 @@ impl LobbyRegistry {
         }
         let id = self.allocate_room_id()?;
         let connection_id = owner.connection_id;
-        let (handle, summary) = spawn_room_with_events(
-            id,
-            name,
-            password,
-            settings,
-            owner,
-            outbound,
-            cancellation.clone(),
-            self.limits.room,
-            Some(self.events.clone()),
-        );
+        let (handle, summary) = match terminal_outbox {
+            Some(mailbox) => spawn_room_with_terminal_outbox(
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                mailbox,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
+            ),
+            None => spawn_room_with_events(
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
+            ),
+        };
         let summary = match channel {
             Some(channel) => summary.with_channel(channel),
             None => summary,
@@ -1163,13 +1356,15 @@ impl LobbyRegistry {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn join_with_channel(
         &mut self,
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: Option<u8>,
-        outbound: mpsc::Sender<RoomEvent>,
+        outbound: RoomOutbound,
+        terminal_outbox: Option<TerminalOutboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.connections.contains_key(&identity.connection_id) {
@@ -1185,10 +1380,24 @@ impl LobbyRegistry {
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
         let connection_id = identity.connection_id;
-        match handle
-            .join_with_cancellation(identity, password, outbound, cancellation.clone())
-            .await
-        {
+        match match terminal_outbox {
+            Some(mailbox) => {
+                handle
+                    .join_with_terminal_outbox(
+                        identity,
+                        password,
+                        outbound,
+                        mailbox,
+                        cancellation.clone(),
+                    )
+                    .await
+            }
+            None => {
+                handle
+                    .join_with_cancellation(identity, password, outbound, cancellation.clone())
+                    .await
+            }
+        } {
             Ok(snapshot) => {
                 self.connections.insert(
                     connection_id,
@@ -1301,6 +1510,14 @@ impl LobbyRegistry {
                 .update_settings(connection_id, settings)
                 .await
                 .map(LobbyRouteResult::Snapshot),
+            LobbyRoomCommand::UpdateRoom {
+                settings,
+                name,
+                password,
+            } => handle
+                .update_room(connection_id, settings, name, password)
+                .await
+                .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::SetReady(ready) => handle
                 .set_ready(connection_id, ready)
                 .await
@@ -1328,6 +1545,10 @@ impl LobbyRegistry {
                 }
                 result.map(LobbyRouteResult::Snapshot)
             }
+            LobbyRoomCommand::ChangeTeam(team) => handle
+                .change_team(connection_id, team)
+                .await
+                .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::GetState => handle.state().await.map(LobbyRouteResult::Snapshot),
         };
         match result {
@@ -1405,10 +1626,12 @@ impl LobbyRegistry {
                 .solo_hole_out(connection_id)
                 .await
                 .map(LobbySoloRouteResult::Relay),
-            LobbySoloCommand::PrepareFinish => handle
-                .prepare_solo_finish(connection_id)
-                .await
-                .map(LobbySoloRouteResult::Commit),
+            LobbySoloCommand::PrepareFinish => {
+                match handle.prepare_solo_finish(connection_id).await? {
+                    Some(commit) => Ok(LobbySoloRouteResult::Commit(commit)),
+                    None => Ok(LobbySoloRouteResult::Applied),
+                }
+            }
             LobbySoloCommand::ApplyCommit(result) => {
                 let applied = handle.apply_solo_commit(connection_id, result).await;
                 if let Ok(committed) = applied {
@@ -1805,12 +2028,12 @@ async fn run_lobby(
                 }
             }
             command = commands.recv() => match command.and_then(begin) {
-                Some(LobbyCommand::Create { name, password, settings, owner, outbound, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, cancellation).await;
+                Some(LobbyCommand::Create { name, password, settings, owner, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, cancellation).await;
+                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::List { reply }) => {
@@ -1828,12 +2051,20 @@ async fn run_lobby(
                         .collect();
                     let _ignored = reply.send(summaries);
                 }
-                Some(LobbyCommand::Join { room_id, identity, password, outbound, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, cancellation).await;
+                Some(LobbyCommand::RoomInfo { room_id, reply }) => {
+                    let handle = registry.rooms.get(&room_id).map(|record| record.handle.clone());
+                    let result = match handle {
+                        Some(handle) => handle.state().await,
+                        None => Err(RoomError::RoomNotFound),
+                    };
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, cancellation).await;
+                Some(LobbyCommand::Join { room_id, identity, password, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, terminal_outbox, cancellation).await;
+                    let _ignored = reply.send(result);
+                }
+                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, terminal_outbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
@@ -1880,7 +2111,9 @@ async fn run_lobby(
                 Some(LobbyCommand::CreateAfterRelease { name, settings, owner, outbound, cancellation, started, release, reply }) => {
                     let _ignored = started.send(());
                     let result = if release.await.is_ok() {
-                        registry.create_with_channel(name, None, settings, owner, None, outbound, cancellation).await
+                        registry
+                            .create_with_channel(name, None, settings, owner, None, outbound, None, cancellation)
+                            .await
                     } else {
                         Err(RoomError::Closed)
                     };
@@ -1902,13 +2135,13 @@ mod tests {
 
     use super::*;
     use pangya_domain::{
-        AccountId, CatalogFingerprint, CourseId, MatchSeed, MemberSnapshot, Nickname,
-        OneHoleConfig, ServerBalances, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
+        AccountId, CatalogFingerprint, CourseId, MatchPlan, MatchSeed, MemberSnapshot, Nickname,
+        ServerBalances, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
         synthetic_stroke_reward_v1,
     };
     use uuid::Uuid;
 
-    use crate::match_state::deterministic_conditions;
+    use crate::{match_state::deterministic_conditions, room::RoomEvent};
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
@@ -1938,7 +2171,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(201)),
                 MatchResultKey::new(Uuid::from_u128(202)),
                 account_id,
-                OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -1969,7 +2202,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(304)),
                 ),
             ],
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,
@@ -2268,7 +2501,7 @@ mod tests {
                         name: RoomName::parse("begun").unwrap_or_else(|_| unreachable!()),
                         settings: RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
                         owner: identity(1),
-                        outbound,
+                        outbound: RoomOutbound::from(outbound),
                         cancellation,
                         started,
                         release: continue_execution,
@@ -2348,7 +2581,7 @@ mod tests {
                         name: RoomName::parse("blocker").unwrap_or_else(|_| unreachable!()),
                         settings: RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
                         owner: identity(2),
-                        outbound,
+                        outbound: RoomOutbound::from(outbound),
                         cancellation: CancellationToken::new(),
                         started,
                         release: continue_execution,

@@ -15,9 +15,9 @@ use pangya_domain::{
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
-    OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
+    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
+    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository, PurchaseRequest,
     RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
     StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
     StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
@@ -1560,7 +1560,7 @@ fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
         MatchId::new(Uuid::new_v4()),
         MatchResultKey::new(Uuid::new_v4()),
         account_id,
-        OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+        MatchPlan::with_holes(CourseId::new(7).expect("course"), 1, 0, 3).expect("configuration"),
         CatalogFingerprint::new([0x42; 32]),
         MatchSeed::new([0x24; 32]),
         Weather::Clear,
@@ -1585,7 +1585,7 @@ fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
 fn stroke_begin_with_config(
     first: AccountId,
     second: AccountId,
-    config: OneHoleConfig,
+    config: MatchPlan,
 ) -> BeginStrokeMatch {
     BeginStrokeMatch::new(
         MatchId::new(Uuid::new_v4()),
@@ -1615,7 +1615,7 @@ fn stroke_begin(first: AccountId, second: AccountId) -> BeginStrokeMatch {
     stroke_begin_with_config(
         first,
         second,
-        OneHoleConfig::new(CourseId::new(17).expect("course"), 3).expect("configuration"),
+        MatchPlan::with_holes(CourseId::new(17).expect("course"), 1, 0, 3).expect("configuration"),
     )
 }
 
@@ -2085,11 +2085,63 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
         begin.match_id(),
         begin.result_key(),
         begin.account_id(),
-        OneHoleConfig::new(CourseId::new(8).expect("course"), 3).expect("config"),
+        MatchPlan::with_holes(CourseId::new(8).expect("course"), 1, 0, 3).expect("config"),
         StrokeCount::new(3).expect("strokes"),
     );
     assert_eq!(
         repository.commit_solo_hole(wrong_config).await,
+        Err(MatchRepositoryError::WrongConfig)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_commit_rejects_hole_mode_drift(pool: PgPool) {
+    let repository = PgRepository::new(pool);
+    let first = repository
+        .create_account(account("StrokeModeA", Some("StrokeModeA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeModeB", Some("StrokeModeB")))
+        .await
+        .expect("second account");
+    let plan = MatchPlan::with_holes(CourseId::new(17).expect("course"), 18, 1, 3)
+        .expect("full-card plan");
+    let begin = stroke_begin_with_config(first.account.id, second.account.id, plan);
+    assert_eq!(
+        repository.begin_stroke(begin.clone()).await,
+        Ok(BeginStrokeMatchOutcome::Begun)
+    );
+    repository
+        .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+        .await
+        .expect("mark in game");
+    let wrong_plan =
+        MatchPlan::with_holes(begin.config().course_id(), 18, 2, 3).expect("different progression");
+    let wrong_commit = CommitStrokeMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        wrong_plan,
+        [
+            StrokePlayerCommit::new(
+                begin.participants()[0],
+                2,
+                StrokePlace::First,
+                StrokeCompletion::Holed,
+            )
+            .expect("first commit"),
+            StrokePlayerCommit::new(
+                begin.participants()[1],
+                4,
+                StrokePlace::Second,
+                StrokeCompletion::StrokeCap,
+            )
+            .expect("second commit"),
+        ],
+    )
+    .expect("wrong mode commit shape");
+    assert_eq!(
+        repository.commit_stroke_match(wrong_commit).await,
         Err(MatchRepositoryError::WrongConfig)
     );
 }
@@ -3275,7 +3327,7 @@ async fn stroke_course_records_keep_deterministic_best_and_count_only_holed(pool
         let begin = stroke_begin_with_config(
             first.account.id,
             second.account.id,
-            OneHoleConfig::new(course, par).expect("configuration"),
+            MatchPlan::with_holes(course, 1, 0, par).expect("configuration"),
         );
         repository.begin_stroke(begin.clone()).await.expect("begin");
         repository

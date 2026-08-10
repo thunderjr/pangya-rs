@@ -194,6 +194,7 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x0004` | `RetailSelectChannel` | `lib.rs:1271` | client-verified | `game.rs:147`; PacketDoc `gameservice/client/0004.ksy`, a **one-byte** sub-server ID |
 | `0x0008` | `RetailRoomCreate` | `lib.rs:5123` | client-verified | `us852_room.rs:101` |
 | `0x0009` | `RetailRoomJoin` | `lib.rs:5172` | client-verified | `us852_room.rs:141` |
+| `0x000a` | `RetailRoomSettingsUpdate` | applies validated identity, course/card shape, progression, timers, capacity, artifact id, and natural-wind edits atomically; unsupported repeat selectors (types 11/12) are refused without disconnecting | reference-derived | `us852_room.rs`; `pangbox--packetdoc` `gameservice/client/000a.ksy`; `pangbox/server` `RoomSettingsChange`/`RoomListRoom`; the checked corpus has no authoritative type-11/12 semantics |
 | `0x000d` | `RETAIL_C2S_ROOM_READY` | `lib.rs:5218` | client-verified (blocker 21) | one byte, zero meaning ready; the reply is the census, not an acknowledgement |
 | `0x000e` | `RETAIL_C2S_START_MATCH` | `lib.rs:4527` (stroke), `lib.rs:4384` (solo) | client-verified for start; the versus hole is CI-proven only | the room is read first: two members run the stroke aggregate, one runs solo |
 | `0x000f` | `RETAIL_C2S_ROOM_LEAVE` | `lib.rs:5234` | client-verified | |
@@ -267,9 +268,13 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x00f5` | `RetailMultiplayerJoined` | `us852_room.rs:841` | `lib.rs:5113` | empty body; `ServerMultiplayerJoined`, PacketDoc `00f5.ksy` |
 | `0x00f6` | `RetailMultiplayerLeft` | `us852_room.rs:862` | `lib.rs:5120` | empty body |
 | `0x0047` | `RetailRoomList` | `us852_room.rs:883` | `lib.rs:5105`, `:5297` | 210-byte room records |
-| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:1110` | `lib.rs:5211`, `:5279`, and every room snapshot while in the room | 341-byte player records. **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent. A snapshot re-sends the whole roster rather than a delta |
-| `0x0049` | `RetailRoomJoinResult` | `us852_room.rs:926` | `lib.rs:5163`, `:5206`, `:5259` | success writes a `u16` status then the room record; rejection writes one byte. The widths genuinely differ |
-| `0x004c` | `RetailRoomLeave` | `us852_room.rs:967` | `lib.rs:5241` | `0xffff` means the lobby |
+| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:2115` | `lib.rs:4520`, `:7908`, and every room snapshot while in the room | 854-byte player records (341-byte identity plus 513-byte character block). **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent. A snapshot re-sends the whole roster rather than a delta |
+| `0x0049` | `RetailRoomJoinResult` | `us852_room.rs:914` | `lib.rs:6720`, `:6950` | success writes a `u16` status then the room record; rejection writes one byte. The widths genuinely differ |
+| `0x004c` | `RetailRoomLeave` | `us852_room.rs:1008` | `lib.rs:6830` | `0xffff` means the lobby; also sent to a kicked member |
+| `0x0086` | `RetailRoomInformationResponse` | `us852_room.rs:2110` | `lib.rs:6934`, `:6960` | PacketDoc exact 18-byte user records: connection id, rank, five opaque bytes, title badge, four opaque bytes; do not reuse the 341-byte census identity |
+| `0x007d` | `RetailTeamChangeAnnounce` | `us852_room.rs:385` | room event fanout | one announce plus one census per team mutation |
+| `0x0083` | `RetailRoomInviteNotification` | `us852_room.rs:466` | room event fanout | invitee notification; do not reuse request opcode `0x00ba` |
+| `0x012f` / `0x0130` | `RetailRoomInviteResponse` / `RetailRoomInviteInfoResponse` | `us852_room.rs:429` / `:408` | `lib.rs` invite handlers | `0x00ba` / `0x0029` request pairing respectively |
 | `0x0076` | `RetailMatchStart` | `us852_match.rs:60` | `lib.rs:3948` | |
 | `0x0052` | `RetailMatchInfo` | `us852_match.rs:100` | `lib.rs:3956` | must always write **eighteen** collectible count bytes regardless of hole count |
 | `0x009e` | `RetailHoleWeather` | `us852_match.rs:143` | `lib.rs:3973` | |
@@ -279,9 +284,9 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x00cc` | `RetailTurnEnd` | `us852_match.rs:234` | `lib.rs:3532`, `:4465` | |
 | `0x0055` | `RetailShotCommitRelay` | `us852_match.rs:285` | `lib.rs:3565` | the client's own shot payload, relayed unchanged |
 | `0x0064` | `RetailShotSync` | `us852_match.rs:316` | `lib.rs:3573` | `ServerRoomShotSync`, `game/room/room.go` `handleRoomGameShotSync` |
-| `0x0065` | `RetailFinishHole` | `us852_match.rs:419` | `lib.rs:4015`, `:4499` | empty body |
+| `0x0065` | `RetailFinishHole` | `us852_match.rs:846` | `lib.rs:4608`, `:5440` | empty body; nonterminal holes reply to the caller, while the terminal room event sends exactly one to every captured player |
 | `0x0090` | `RetailFirstShotReady` | `game.rs` | `handle_retail_stroke_command` | empty body; `ServerPlayerFirstShotReady`. Its arrival is the whole message |
-| `0x0066` | `RetailMatchFinish` | `us852_match.rs:386` | `lib.rs:4016` | the durable server-side settlement, never anything the client claimed. `ServerRoomFinishGame` |
+| `0x0066` | `RetailMatchFinish` | `us852_match.rs:802` | `lib.rs:4612` | the durable server-side settlement, never anything the client claimed. Every captured player receives one terminal `0x0065` immediately before this frame. `ServerRoomFinishGame` |
 
 ### 2.6 Retail types defined but not routed
 
@@ -289,9 +294,10 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 |---|---|---|
 | `RetailAimRotate` (`0x0056`) | `us852_match.rs:258` | aim rotation is never relayed; no handler decodes `0x0013` |
 | `RetailRoomCensus::Add` / `Remove` / `Update` | `us852_room.rs:1110` | lobby broadcasts are dropped in retail mode (`lib.rs:3425`), so a room does not update live |
+| `RetailRoomSettingChange::Artifact` | `us852_room.rs:118` | parsed but refused without mutating the room: PacketDoc carries the id, while the checked references provide no authoritative gameplay/reward effect |
 | `HandoverRejection` (all eight codes) | `us852_bootstrap.rs:36` | a failed handover closes the connection instead of naming a client-visible reason |
 | `RetailRoomType::Chat` / `Tournament` / `Battle` | `us852_room.rs:41` | decoded from the create request, then discarded; every room runs the versus lifecycle |
-| `RetailHoleProgression` variants beyond `FrontStart` | `us852_room.rs:69` | rooms are one hole |
+| `RetailRoomSettingChange::RepeatHole` / `FixedRepeatHole` | `us852_room.rs:112-117` | decoded for compatibility but deterministically refused without a disconnect; the checked references define no semantics for types 11/12, so the room remains unchanged |
 
 ### 2.7 Retail coverage in CI
 
@@ -301,9 +307,9 @@ in `crates/pangya-server/tests/game_e2e.rs`:
 | Test | Line | Covers |
 |---|---|---|
 | `game_retail_bootstrap_emits_the_reference_derived_sequence` | 5871 | hello, `0x0002` auth, the `0x0044`×4 / `0x0070` / `0x0071` / `0x0072` / `0x0073` / `0x004d` / `0x0095` / `0x0096` order, and the `"852.00"` version string |
-| `game_retail_rooms_create_join_and_leave_over_tcp` | 5968 | `0x0004`/`0x004e`/`0x01f6`, create, census, join, capacity accounting, leave, list, and a refused join |
-| `game_retail_match_plays_and_settles_one_hole` | 6114 | one client: start, match plan, weather, wind, hole intro, turn frames, hole finish, settlement |
-| `game_retail_two_players_play_and_settle_one_versus_hole` | 6273 | two authenticated clients: alternating turns, shot relay, and one durable match with both accounts and one Pang and one EXP ledger row each |
+| `game_retail_room_management_over_tcp` | 5968 | create/join/settings, census, team, resync, paired invites, kick/`0x004c`, malformed rejection, and leave |
+| `game_retail_match_plays_and_settles_one_hole` | 6114 | one-player Practice compatibility path: start, hole intro, turn frames, hole finish, settlement |
+| `game_retail_two_players_play_and_settle_full_card` | 7978 | two authenticated clients: alternating turns, shot relay, and 18-hole whole-card settlement with per-hole `0x0053` introductions and one Pang/EXP ledger row each |
 
 **Retail paths with no end-to-end test**: `0x001d` purchase, `0x0020` equipment update,
 `0x0140`/`0x00b5`/`0x00b7`/`0x00d3`/`0x00cc` lobby services, `0x016e` login bonus, `0x009c`
@@ -509,7 +515,7 @@ a mechanical move with no behaviour change and should land as its own commit.
   `docs/evidence/M5_SYNTHETIC_SOLO_2026-08-05.md` (mark historical, do not delete).
 
 **Evidence required first**
-1. `game_retail_match_plays_and_settles_one_hole` covers the happy path already.
+1. The retail Practice and two-player paths cover their respective happy paths; the two-player path now carries a full-card plan and per-hole progression.
 2. **New**: retail-wire equivalents of the abort matrix — loading timeout, disconnect
    mid-hole, malformed shot payload, shutdown during commit, restart recovery — asserting
    that nothing is awarded. This is the largest gap in the step; the retail path has no abort
@@ -531,7 +537,7 @@ a mechanical move with no behaviour change and should land as its own commit.
 - Docs: `PROVENANCE.md` row 15, `docs/protocol/M6_SYNTHETIC_STROKE_FLOW.md`, ADR-0013.
 
 **Evidence required first**
-1. `game_retail_two_players_play_and_settle_one_versus_hole` covers the happy path already.
+1. `game_retail_two_players_play_and_settle_full_card` covers the happy path already.
 2. **New**: retail-wire forfeit coverage. Retail has no give-up opcode routed, so a forfeit
    can only be driven by disconnect or turn timeout — both must be proven to produce the same
    truthful `WinnerByForfeit` settlement the synthetic path proves today.

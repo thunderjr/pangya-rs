@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                  m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.par AS \"par!\",\n                  m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                  m.weather AS \"weather!\",\n                  m.wind_speed_tenths AS \"wind_speed_tenths!\",\n                  m.wind_angle_degrees AS \"wind_angle_degrees!\",\n                  m.mode AS \"mode!\", m.reward_formula AS \"reward_formula!\",\n                  m.status AS \"status!\", mp.account_id AS \"account_id!\",\n                  mp.participant_order AS \"participant_order!\",\n                  mp.player_result_key AS \"player_result_key!\",\n                  mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                  mp.pang_reward AS \"pang_reward?\",\n                  mp.experience_reward AS \"experience_reward?\",\n                  mp.pang_balance_after AS \"pang_balance_after?\",\n                  mp.experience_balance_after AS \"experience_balance_after?\"\n           FROM matches m JOIN match_players mp ON mp.match_id = m.id\n           WHERE m.id = $1 FOR UPDATE OF m, mp",
+  "query": "SELECT m.id AS \"id!\", m.result_commit_key AS \"result_commit_key!\",\n                  m.course_id AS \"course_id!\", m.hole AS \"hole!\", m.hole_mode AS \"hole_mode!\", m.par AS \"par!\",\n                  m.catalog_sha256 AS \"catalog_sha256!\", m.seed AS \"seed!\",\n                  m.weather AS \"weather!\",\n                  m.wind_speed_tenths AS \"wind_speed_tenths!\",\n                  m.wind_angle_degrees AS \"wind_angle_degrees!\",\n                  m.mode AS \"mode!\", m.reward_formula AS \"reward_formula!\",\n                  m.status AS \"status!\", mp.account_id AS \"account_id!\",\n                  mp.participant_order AS \"participant_order!\",\n                  mp.player_result_key AS \"player_result_key!\",\n                  mp.strokes AS \"strokes?\", mp.score AS \"score?\",\n                  mp.pang_reward AS \"pang_reward?\",\n                  mp.experience_reward AS \"experience_reward?\",\n                  mp.pang_balance_after AS \"pang_balance_after?\",\n                  mp.experience_balance_after AS \"experience_balance_after?\"\n           FROM matches m JOIN match_players mp ON mp.match_id = m.id\n           WHERE m.id = $1 FOR UPDATE OF m, mp",
   "describe": {
     "columns": [
       {
@@ -25,91 +25,96 @@
       },
       {
         "ordinal": 4,
-        "name": "par!",
+        "name": "hole_mode!",
         "type_info": "Int2"
       },
       {
         "ordinal": 5,
+        "name": "par!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
         "name": "catalog_sha256!",
         "type_info": "Bytea"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "seed!",
         "type_info": "Bytea"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "weather!",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "wind_speed_tenths!",
         "type_info": "Int2"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "wind_angle_degrees!",
         "type_info": "Int2"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "mode!",
         "type_info": "Text"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "reward_formula!",
         "type_info": "Text"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "status!",
         "type_info": "Text"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "account_id!",
         "type_info": "Int8"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "participant_order!",
         "type_info": "Int2"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "player_result_key!",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "strokes?",
         "type_info": "Int2"
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "score?",
         "type_info": "Int2"
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "pang_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "experience_reward?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 20,
+        "ordinal": 21,
         "name": "pang_balance_after?",
         "type_info": "Int8"
       },
       {
-        "ordinal": 21,
+        "ordinal": 22,
         "name": "experience_balance_after?",
         "type_info": "Int8"
       }
@@ -136,6 +141,7 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       true,
@@ -144,5 +150,5 @@
       true
     ]
   },
-  "hash": "840fb596696107b745438237aa0e9da90a9f109becf4826e9dfd4618c4b3752e"
+  "hash": "ea6003a6c67609fcd658e442eb5335151ac81cd40f67bff6b321b6523228990f"
 }

@@ -399,7 +399,7 @@ pangbox--server/game/room/room.go:638-646
 
 with par taken from the client's own hole-info packet (`room.go:687-698`, whose comment
 concedes "It'd probably be better to not rely on the client for this if possible"). **This
-project must not adopt that**: par is server-owned here (`OneHoleConfig::par`,
+project must not adopt that**: par is server-owned here (`MatchPlan::par`,
 `crates/pangya-domain/src/lib.rs:1149-1199`) and configured, per the note in
 [`../PROGRESS.md`](../PROGRESS.md) that course par is operator-declared.
 
@@ -637,9 +637,9 @@ sourced from the PacketDoc `.ksy` definitions with their TH-capture provenance r
 
 Crate: `pangya-domain`.
 
-- `TournamentCourseConfig` — replaces `OneHoleConfig` for this mode: course id plus an
+- `TournamentCourseConfig` — replaces `MatchPlan` for this mode: course id plus an
   ordered `Vec<TournamentHole { number, par, pin }>` of 1..=18 entries, with par validated by
-  the existing `OneHoleConfig::par_in_range` (`crates/pangya-domain/src/lib.rs:1160-1167`) so
+  the existing `MatchPlan::par_in_range` (`crates/pangya-domain/src/lib.rs:1160-1167`) so
   the bound has one definition.
 - `TournamentParticipant` — account id, roster order (`0..=29`), per-player result key;
   modelled on `StrokeParticipant` (`lib.rs:1750-1790`), with roster validation generalised

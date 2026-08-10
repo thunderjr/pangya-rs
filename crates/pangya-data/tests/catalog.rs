@@ -47,12 +47,21 @@ fn generated_golden_catalog_loads_and_cross_checks_starter() {
         b"CLUB"
     );
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
         .expect("generated course");
     assert_eq!(
-        (course.course_id().get(), course.hole(), course.par()),
-        (7, 1, 3)
+        (
+            course.course_id().get(),
+            course.hole_count(),
+            course.hole_mode(),
+            course.par()
+        ),
+        (7, 1, 0, 3)
     );
+    let full_card = catalog
+        .course_plan(CourseId::new(7).expect("course ID"), 18, 3)
+        .expect("full-card course");
+    assert_eq!((full_card.hole_count(), full_card.hole_mode()), (18, 3));
     assert_eq!(
         catalog.fingerprint().as_bytes(),
         &[
