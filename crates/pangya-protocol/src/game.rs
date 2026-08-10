@@ -289,22 +289,15 @@ pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {
     RETAIL_ACCEPTED_SESSION_OPCODES.contains(&opcode)
 }
 
-/// In-match client opcodes a real U.S. 852 client sends that this server accepts and answers
-/// with nothing.
+/// In-match client opcodes a real U.S. 852 client sends that have explicit compatibility paths.
 ///
-/// These are the cosmetic half of a hole: where a player is aiming, how far the power meter has
-/// travelled, which club is in hand, where a relief drop went, and what the client believes the
-/// hole's par and pin are. Upstream relays each to the other participants
-/// (`pangbox/server`, `game/room/room.go` `handleRoomGameShotRotate` and its neighbours, ISC),
-/// and this server does not yet, so an opponent's aim does not animate. None of them changes a
-/// stroke, a turn, or a score, which is why not answering is safe — and why they are listed
-/// here rather than left to the unknown-opcode policy, which would drop the connection
-/// mid-hole.
-///
-/// The authoritative half — start, load, shot commit, shot sync, turn end, hole finish — is
-/// deliberately absent: those have real handlers.
+/// The decoded cosmetic inputs are validated before they are consumed or projected to the
+/// captured room roster. The opaque arrow and game-end inputs remain allowlisted because the
+/// available references do not establish a stable body/projection. The authoritative half —
+/// start, load, shot commit, shot sync, turn end, and hole finish — has real handlers outside
+/// this compatibility list.
 pub const RETAIL_ACCEPTED_MATCH_OPCODES: &[u16] = &[
-    0x0006, // game end
+    0x0006, // full-match statistics submit
     0x000b, // channel equipment sync sent immediately after a Practice start
     0x000c, // the equipment this player is taking into the hole
     0x0013, // aim rotation
@@ -316,7 +309,7 @@ pub const RETAIL_ACCEPTED_MATCH_OPCODES: &[u16] = &[
     0x001a, // the client's own hole info: par, tee and pin
     0x0022, // acknowledgement of the active-player announcement
     0x0030, // pause
-    0x0037, // last player leaving the room
+    0x0037, // last player leaving a finished room
     0x0042, // aiming arrow
 ];
 

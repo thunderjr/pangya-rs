@@ -6611,9 +6611,19 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         "a room edit is answered with the room and its roster: {edited:04x?}"
     );
 
+    // Lounge/avatar actions are projected to every current room occupant as 0x00c4.
+    let mut lounge = pangya_protocol::PacketWriter::default();
+    lounge.u8(7);
+    lounge.pstring(b"wave", 128).expect("lounge emote");
+    send_packet(&mut host, host_key, 4, 0x0063, &lounge.into_inner()).await;
+    let lounge_frames = drain_frames(&mut visitor, visitor_key, Duration::from_millis(600)).await;
+    assert!(lounge_frames.iter().any(|(opcode, body)| {
+        *opcode == 0x00c4 && body.get(4) == Some(&7) && body.ends_with(b"wave")
+    }));
+
     // Only the visitor marks ready. The client's button says Start for the room master and
     // Ready for everyone else, so a master never sends this — pressing Start is what says it.
-    send_packet(&mut visitor, visitor_key, 4, 0x000d, &[0]).await;
+    send_packet(&mut visitor, visitor_key, 5, 0x000d, &[0]).await;
     let _ = drain_available(&mut visitor, visitor_key, Duration::from_millis(600)).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(600)).await;
 
@@ -6801,15 +6811,35 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         ready.contains(&0x0090),
         "the client is told it may take its first shot: {ready:04x?}"
     );
-    for opcode in [0x001a_u16, 0x0022] {
-        salt = salt.wrapping_add(1);
-        send_packet(&mut host, host_key, salt, opcode, &[0; 4]).await;
-        let noise = drain_available(&mut host, host_key, Duration::from_millis(300)).await;
-        assert!(
-            noise.is_empty(),
-            "{opcode:#06x} is accepted in silence, not answered: {noise:04x?}"
-        );
+    // Hole information is consumed after exact-width validation; active-user acknowledgement
+    // is the documented empty response to the server's turn announcement.
+    salt = salt.wrapping_add(1);
+    let mut hole_info = pangya_protocol::PacketWriter::default();
+    hole_info.u8(1);
+    hole_info.u32_le(0);
+    hole_info.u32_le(0);
+    hole_info.u8(3);
+    for value in [1.0_f32, 2.0, 3.0, 4.0] {
+        hole_info.f32_le(value);
     }
+    send_packet(&mut host, host_key, salt, 0x001a, &hole_info.into_inner()).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    salt = salt.wrapping_add(1);
+    send_packet(&mut host, host_key, salt, 0x0022, &[]).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(300))
+            .await
+            .is_empty()
+    );
+    // Pause is projected as 0x008b to the captured stroke roster.
+    salt = salt.wrapping_add(1);
+    send_packet(&mut host, host_key, salt, 0x0030, &[1]).await;
+    let paused = drain_frames(&mut visitor, visitor_key, Duration::from_millis(500)).await;
+    assert!(paused.iter().any(|(opcode, _)| *opcode == 0x008b));
     // Loading progress is the exception: the client draws a bar per player and waits on all of
     // them, so its own progress is republished to the whole match rather than swallowed.
     salt = salt.wrapping_add(1);
@@ -6846,10 +6876,15 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         );
     }
 
+    // The client submits its fixed-width match report after the server-owned settlement. The
+    // report is consumed, and the response is sourced from persisted account statistics.
+    send_packet(&mut host, host_key, salt.wrapping_add(1), 0x0006, &[0; 239]).await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0045);
+
     // SPEC 19.6 step 11: replaying the finish packet must not pay twice. Both clients resend
     // theirs, which is what a client does when it is unsure the server heard it.
-    send_packet(&mut host, host_key, salt.wrapping_add(1), 0x0031, &[]).await;
-    send_packet(&mut visitor, visitor_key, salt.wrapping_add(1), 0x0031, &[]).await;
+    send_packet(&mut host, host_key, salt.wrapping_add(2), 0x0031, &[]).await;
+    send_packet(&mut visitor, visitor_key, salt.wrapping_add(2), 0x0031, &[]).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Both accounts are participants of the same match, and both were paid exactly once.

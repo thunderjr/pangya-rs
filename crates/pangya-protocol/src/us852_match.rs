@@ -12,6 +12,15 @@ use crate::{
 /// Holes a match may carry.
 pub const MAX_MATCH_HOLES: usize = 18;
 
+fn check_decode_profile(
+    profile: &CompatibilityProfile,
+    reader: &PacketReader<'_>,
+) -> Result<(), PacketDecodeError> {
+    profile
+        .require_us852()
+        .map_err(|error| reader.invalid(error.to_string()))
+}
+
 fn check_encode_profile(profile: &CompatibilityProfile) -> Result<(), PacketEncodeError> {
     profile.require_us852().map_err(Into::into)
 }
@@ -941,6 +950,271 @@ impl EncodePacket for RetailCometRelief {
     }
 }
 
+/// Shot-meter input, opcode `0x0014`.
+///
+/// PacketDoc documents three inputs per shot and explicitly says that this packet has no
+/// response. It is still decoded so malformed meter values cannot pass through the retail
+/// dispatcher as an unbounded silent frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailShotMeterInputRequest {
+    /// Meter phase (`0` cancel, `1` started, `2` strength, `3` accuracy).
+    pub sequence: u8,
+    /// Current meter position.
+    pub value: f32,
+}
+
+impl DecodePacket for RetailShotMeterInputRequest {
+    const OPCODE: u16 = 0x0014;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let sequence = reader.u8()?;
+        let value = reader.f32_le()?;
+        if sequence > 3 || !value.is_finite() || !(0.0..=500.0).contains(&value) {
+            return Err(reader.invalid("shot meter input is outside the documented range"));
+        }
+        Ok(Self { sequence, value })
+    }
+}
+
+/// Client-provided hole metadata, opcode `0x001a`.
+///
+/// References describe this as consumed by the server's current-hole state and do not define a
+/// response. Unknown fields are retained for exact-width validation but are never trusted for
+/// scoring or rewards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailHoleInfoRequest {
+    /// One-based hole number.
+    pub number: u8,
+    /// Client-provided par.
+    pub par: u8,
+    /// Tee X coordinate.
+    pub tee_x: f32,
+    /// Tee Z coordinate.
+    pub tee_z: f32,
+    /// Pin X coordinate.
+    pub pin_x: f32,
+    /// Pin Z coordinate.
+    pub pin_z: f32,
+}
+
+impl DecodePacket for RetailHoleInfoRequest {
+    const OPCODE: u16 = 0x001a;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let number = reader.u8()?;
+        let _unknown_a = reader.u32_le()?;
+        let _unknown_b = reader.u32_le()?;
+        let par = reader.u8()?;
+        let tee_x = reader.f32_le()?;
+        let tee_z = reader.f32_le()?;
+        let pin_x = reader.f32_le()?;
+        let pin_z = reader.f32_le()?;
+        if !(1..=MAX_MATCH_HOLES as u8).contains(&number)
+            || par == 0
+            || par > 10
+            || [tee_x, tee_z, pin_x, pin_z]
+                .iter()
+                .any(|value| !value.is_finite())
+            || reader.remaining() != 0
+        {
+            return Err(reader.invalid("hole info is outside the documented shape"));
+        }
+        Ok(Self {
+            number,
+            par,
+            tee_x,
+            tee_z,
+            pin_x,
+            pin_z,
+        })
+    }
+}
+
+/// Empty acknowledgement to server `0x0063`, opcode `0x0022`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailActiveUserAcknowledge;
+
+impl DecodePacket for RetailActiveUserAcknowledge {
+    const OPCODE: u16 = 0x0022;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("active-user acknowledgement must be empty"));
+        }
+        Ok(Self)
+    }
+}
+
+/// Pause/unpause request, opcode `0x0030`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPauseRequest {
+    /// `0` resumes and `1` pauses.
+    pub paused: bool,
+}
+
+impl DecodePacket for RetailPauseRequest {
+    const OPCODE: u16 = 0x0030;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let value = reader.u8()?;
+        if value > 1 || reader.remaining() != 0 {
+            return Err(reader.invalid("pause state must be exactly one boolean byte"));
+        }
+        Ok(Self { paused: value != 0 })
+    }
+}
+
+/// Pause/unpause announcement, server opcode `0x008b`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailPause {
+    /// Authoritative connection ID of the player changing pause state.
+    pub connection_id: u32,
+    /// New pause state.
+    pub paused: bool,
+}
+
+impl EncodePacket for RetailPause {
+    const OPCODE: u16 = 0x008b;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(u8::from(self.paused));
+        Ok(())
+    }
+}
+
+/// Full-match statistics submit, opcode `0x0006`.
+///
+/// The reference layout is a fixed 239-byte `user_course_result_data` block. The server consumes
+/// it after its own result commit; none of the client-claimed values are used as reward input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMatchStatisticsSubmit {
+    /// Opaque, reference-sized client report.
+    pub data: [u8; 239],
+}
+
+impl DecodePacket for RetailMatchStatisticsSubmit {
+    const OPCODE: u16 = 0x0006;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let data = reader.array::<239>()?;
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("match statistics must be exactly 239 bytes"));
+        }
+        Ok(Self { data })
+    }
+}
+
+/// User lounge action, opcode `0x0063`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailLoungeActionRequest {
+    /// Action discriminator from PacketDoc.
+    pub action_type: u8,
+    /// Action body without the discriminator.
+    pub payload: Vec<u8>,
+}
+
+impl DecodePacket for RetailLoungeActionRequest {
+    const OPCODE: u16 = 0x0063;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let action_type = reader.u8()?;
+        let payload = match action_type {
+            0 => {
+                let value = reader.f32_le()?;
+                if !value.is_finite() {
+                    return Err(reader.invalid("lounge rotation must be finite"));
+                }
+                value.to_le_bytes().to_vec()
+            }
+            4 | 6 => {
+                let values = [reader.f32_le()?, reader.f32_le()?, reader.f32_le()?];
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(reader.invalid("lounge position must be finite"));
+                }
+                values
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>()
+            }
+            7 => reader.pstring(128)?.to_vec(),
+            8 => Vec::new(),
+            _ => return Err(reader.invalid("unknown lounge action type")),
+        };
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("lounge action has trailing bytes"));
+        }
+        Ok(Self {
+            action_type,
+            payload,
+        })
+    }
+}
+
+/// Lounge action announcement, server opcode `0x00c4`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailLoungeAction {
+    /// Authoritative actor connection ID.
+    pub connection_id: u32,
+    /// Validated client action.
+    pub action: RetailLoungeActionRequest,
+}
+
+impl EncodePacket for RetailLoungeAction {
+    const OPCODE: u16 = 0x00c4;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.action.action_type);
+        match self.action.action_type {
+            0 => writer.bytes(&self.action.payload),
+            4 | 6 => writer.bytes(&self.action.payload),
+            7 => writer.pstring(&self.action.payload, 128)?,
+            8 => writer.bytes(&[0; 4]),
+            _ => {
+                return Err(PacketEncodeError::Invalid {
+                    field: "lounge action",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Shot relayed to the other players, server opcode `0x0055`.
 ///
 /// The client computes trajectory, so the server relays the committed shot rather than
@@ -1322,19 +1596,21 @@ mod tests {
     #[test]
     fn uncovered_retail_match_requests_follow_reference_layouts() {
         let meter = decode_packet_payload::<RetailShotMeterInputRequest>(
-            &[0x02, 0, 0, 250, 0x43],
+            &[0x02, 0, 0, 0x0c, 0x43],
             &profile(),
             ServiceKind::Game,
         )
         .expect("meter input");
         assert_eq!(meter.sequence, 2);
         assert_eq!(meter.value, 140.0);
-        assert!(decode_packet_payload::<RetailShotMeterInputRequest>(
-            &[0x04, 0, 0, 0, 0],
-            &profile(),
-            ServiceKind::Game
-        )
-        .is_err());
+        assert!(
+            decode_packet_payload::<RetailShotMeterInputRequest>(
+                &[0x04, 0, 0, 0, 0],
+                &profile(),
+                ServiceKind::Game
+            )
+            .is_err()
+        );
 
         let mut hole = vec![3];
         hole.extend_from_slice(&0_u32.to_le_bytes());
@@ -1344,32 +1620,31 @@ mod tests {
         hole.extend_from_slice(&2.0_f32.to_le_bytes());
         hole.extend_from_slice(&3.0_f32.to_le_bytes());
         hole.extend_from_slice(&4.0_f32.to_le_bytes());
-        let info = decode_packet_payload::<RetailHoleInfoRequest>(
-            &hole,
-            &profile(),
-            ServiceKind::Game,
-        )
-        .expect("hole info");
+        let info =
+            decode_packet_payload::<RetailHoleInfoRequest>(&hole, &profile(), ServiceKind::Game)
+                .expect("hole info");
         assert_eq!(info.number, 3);
         assert_eq!(info.par, 3);
-        assert!(decode_packet_payload::<RetailActiveUserAcknowledge>(
-            &[],
-            &profile(),
-            ServiceKind::Game
-        )
-        .is_ok());
-        assert!(decode_packet_payload::<RetailPauseRequest>(
-            &[1],
-            &profile(),
-            ServiceKind::Game
-        )
-        .is_ok());
-        assert!(decode_packet_payload::<RetailMatchStatisticsSubmit>(
-            &[0; 239],
-            &profile(),
-            ServiceKind::Game
-        )
-        .is_ok());
+        assert!(
+            decode_packet_payload::<RetailActiveUserAcknowledge>(
+                &[],
+                &profile(),
+                ServiceKind::Game
+            )
+            .is_ok()
+        );
+        assert!(
+            decode_packet_payload::<RetailPauseRequest>(&[1], &profile(), ServiceKind::Game)
+                .is_ok()
+        );
+        assert!(
+            decode_packet_payload::<RetailMatchStatisticsSubmit>(
+                &[0; 239],
+                &profile(),
+                ServiceKind::Game
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1393,12 +1668,14 @@ mod tests {
         .expect("announcement");
         assert_eq!(&announcement[..5], &[77, 0, 0, 0, 7]);
         assert_eq!(&announcement[5..], &payload[1..]);
-        assert!(decode_packet_payload::<RetailLoungeActionRequest>(
-            &[0x07, 1, 0, b'x'],
-            &profile(),
-            ServiceKind::Game
-        )
-        .is_err());
+        assert!(
+            decode_packet_payload::<RetailLoungeActionRequest>(
+                &[0x07, 1, 0, b'x', 0],
+                &profile(),
+                ServiceKind::Game
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -102,14 +102,17 @@ pub use us852_bootstrap::{
     STATISTICS_COURSE_SLOTS, ServerChannelList, US852_SERVER_VERSION, packed_system_time,
 };
 pub use us852_match::{
-    MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RATE_TABLE_BYTES, RETAIL_STANDING_BYTES, RetailAimRotate,
-    RetailAimRotateRequest, RetailClubChange, RetailClubChangeRequest, RetailCometRelief,
-    RetailCometReliefRequest, RetailFinishHole, RetailHole, RetailHoleWeather, RetailHoleWind,
-    RetailItemUse, RetailItemUseRequest, RetailLoadProgress, RetailMascotSeed, RetailMatchFinish,
-    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailPangRate, RetailPlayerStartHole, RetailPracticeShotSync, RetailPracticeShotSyncRequest,
-    RetailRateTable, RetailShotCommitRelay, RetailShotPower, RetailShotPowerRequest,
-    RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather,
+    MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RATE_TABLE_BYTES, RETAIL_STANDING_BYTES,
+    RetailActiveUserAcknowledge, RetailAimRotate, RetailAimRotateRequest, RetailClubChange,
+    RetailClubChangeRequest, RetailCometRelief, RetailCometReliefRequest, RetailFinishHole,
+    RetailHole, RetailHoleInfoRequest, RetailHoleWeather, RetailHoleWind, RetailItemUse,
+    RetailItemUseRequest, RetailLoadProgress, RetailLoungeAction, RetailLoungeActionRequest,
+    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
+    RetailMatchPlayer, RetailMatchStart, RetailMatchStatisticsSubmit, RetailPangRate, RetailPause,
+    RetailPauseRequest, RetailPlayerStartHole, RetailPracticeShotSync,
+    RetailPracticeShotSyncRequest, RetailRateTable, RetailShotCommitRelay,
+    RetailShotMeterInputRequest, RetailShotPower, RetailShotPowerRequest, RetailShotSync,
+    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,

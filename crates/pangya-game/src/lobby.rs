@@ -156,6 +156,8 @@ pub enum LobbyRoomCommand {
     SetReady(bool),
     /// Broadcast validated chat.
     Chat(ChatText),
+    /// Broadcast a validated retail lounge/avatar action.
+    RetailLoungeAction(pangya_protocol::RetailLoungeActionRequest),
     /// Owner-only removal of another authoritative connection ID.
     Kick(PlayerConnectionId),
     /// Fetch the caller's current authoritative room state.
@@ -1191,6 +1193,10 @@ impl LobbyRegistry {
                 .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::Chat(text) => handle
                 .chat(connection_id, text)
+                .await
+                .map(|()| LobbyRouteResult::ChatAccepted),
+            LobbyRoomCommand::RetailLoungeAction(action) => handle
+                .retail_lounge_action(connection_id, action)
                 .await
                 .map(|()| LobbyRouteResult::ChatAccepted),
             LobbyRoomCommand::Kick(target) => {

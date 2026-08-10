@@ -198,19 +198,28 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x000e` | `RETAIL_C2S_START_MATCH` | `lib.rs:4527` (stroke), `lib.rs:4384` (solo) | client-verified for start; the versus hole is CI-proven only | the room is read first: two members run the stroke aggregate, one runs solo |
 | `0x000f` | `RETAIL_C2S_ROOM_LEAVE` | `lib.rs:5234` | client-verified | |
 | `0x0011` | `RETAIL_C2S_HOLE_LOAD_FINISHED` | `lib.rs:4558` / `:4424` | reference-derived | |
+| `0x0006` | `RetailMatchStatisticsSubmit` | `handle_retail_stroke_command` | reference-derived | consumes exactly the 239-byte report and replies with the authenticated persisted statistics; client-claimed rewards are never trusted; PacketDoc `gameservice/client/0006.ksy`, `common/user_course_result_data.ksy` |
 | `0x0012` | `RETAIL_C2S_SHOT_COMMIT` | `lib.rs:4591` / `:4451` | reference-derived | payload relayed unchanged; nothing in it is decoded |
 | `0x0013` | `RetailAimRotateRequest` | `handle_retail_stroke_command` | reference-derived, TCP E2E pinned | decoded and relayed as `0x0056` with the server-owned connection ID; PacketDoc `gameservice/client/0013.ksy`, `server/0056.ksy`; `pangbox/server` `game/room/room.go:580-584` |
 | `0x0015` | `RetailShotPowerRequest` | `handle_retail_stroke_command` | reference-derived, TCP E2E pinned | closed `0..=2` level, relayed as `0x0058`; PacketDoc `gameservice/client/0015.ksy`, `server/0058.ksy`; `pangbox/server` `game/room/room.go:587-592` |
 | `0x0016` | `RetailClubChangeRequest` | `handle_retail_stroke_command` | reference-derived, TCP E2E pinned | closed `0..=13` club, relayed as `0x0059`; PacketDoc `gameservice/client/0016.ksy`, `server/0059.ksy`; `pangbox/server` `game/room/room.go:594-599` |
 | `0x0017` | `RetailItemUseRequest` | `handle_retail_stroke_command` | reference-derived, TCP E2E pinned | item type ID is relayed as `0x005a`; the middle server field is zero. This is visual relay only, not retail consumption; PacketDoc `gameservice/client/0017.ksy`, `server/005a.ksy`; `pangbox/server` `game/room/room.go:601-606` |
 | `0x0019` | `RetailCometReliefRequest` | `handle_retail_stroke_command` | reference-derived, TCP E2E pinned | three finite coordinates relayed as `0x0060` with connection ID; `pangbox/server` `game/room/room.go:615-621` |
+| `0x0014` | `RetailShotMeterInputRequest` | `handle_retail_stroke_command` | reference-derived | exact finite meter input is consumed with no response, matching PacketDoc `gameservice/client/0014.ksy` |
+| `0x001a` | `RetailHoleInfoRequest` | `handle_retail_stroke_command` | reference-derived | exact hole metadata is consumed server-side; coordinates are finite and hole/par fields bounded |
+| `0x0022` | `RetailActiveUserAcknowledge` | `handle_retail_stroke_command` | reference-derived | exact empty acknowledgement is consumed only during an active stroke match |
+| `0x0030` | `RetailPauseRequest` | `handle_retail_stroke_command` | reference-derived | validated boolean is relayed to the captured stroke roster as `0x008b`, per `hsreina/pangya-server` `Game.pas:1355-1375` |
+| `0x0037` | `RETAIL_C2S_LAST_PLAYER_LEAVE` | `handle_retail_room_command` | reference-derived | exact empty request tears down room membership and sends retail room leave/list frames |
 | `0x001b` | `RETAIL_C2S_SHOT_SYNC` | `lib.rs:4618` / `:4447` | reference-derived | relayed in a versus hole, accepted without reply in solo |
 | `0x001c` | `RETAIL_C2S_SHOT_END` | `lib.rs:4629` / `:4451` | reference-derived | both clients send this barrier; the aggregate decides who owns the turn |
 | `0x001d` | `RetailPurchaseRequest` | `lib.rs:1365` → `handle_retail_purchase` `:4934` | client-verified (blocker 20) | `us852_room.rs:281`; `pangbox/server` `game/packet/client.go` `ClientBuyItem` |
 | `0x0020` | `RetailEquipmentUpdate` | `lib.rs:1349` → `handle_retail_equipment_update` `:4872` | client-verified (blocker 17) | `us852_room.rs:454`; tagged union over eight equipment kinds |
 | `0x0031` | `RETAIL_C2S_HOLE_FINISH` | `lib.rs:4653` / `:4479` | reference-derived | a completion, not a shot — counting it as a stroke scored every hole one over |
 | `0x0034` | `RETAIL_C2S_FIRST_SHOT_READY` | `handle_retail_stroke_command`, answered with `0x0090` | reference-derived | `pangbox/server` `game/server/conn.go` `ClientFirstShotReady`; the client waits for the reply before the first shot |
-| remaining in-match compatibility opcodes | `RETAIL_ACCEPTED_MATCH_OPCODES` (`game.rs`) | accepted without a reply | reference-derived | `0x0014` meter input remains silent because PacketDoc `gameservice/client/0014.ksy` says it has no response; hole info, active-player ack, pause, arrow, game end, and last-player-leave remain unimplemented, not silently claimed as relays |
+| `0x0042` shot arrow | `RETAIL_ACCEPTED_MATCH_OPCODES` (`game.rs`) | consumed without a reply | reference-derived | available references provide no stable body or server projection; it remains bounded compatibility input rather than a guessed relay |
+| `0x0063` lounge action | `handle_retail_room_command` | reference-derived, TCP E2E pinned | exact action body is relayed as `0x00c4` to current room occupants; PacketDoc `gameservice/client/0063.ksy`, `server/00c4.ksy`; match-state inputs remain rejected |
+| `0x0006` / `0x0014` / `0x001a` / `0x0022` / `0x0030` | `handle_retail_stroke_command` | reference-derived | decoded and consumed or relayed as documented above; `0x0006` returns server-owned persisted statistics |
+| remaining in-match compatibility opcodes | `RETAIL_ACCEPTED_MATCH_OPCODES` (`game.rs`) | accepted without a reply | reference-derived | game-end and arrow remain deliberately opaque/unsupported where references do not establish a client-safe S2C projection |
 | `0x0081` | `RETAIL_C2S_MULTIPLAYER_JOIN` | `lib.rs:5100` | client-verified | opens the room directory; answered with the list then the acknowledgement |
 | `0x0082` | `RETAIL_C2S_MULTIPLAYER_LEAVE` | `lib.rs:5116` | client-verified | |
 | `0x009c` | `RetailPlayerHistoryRequest` | `lib.rs:1321` | client-verified (blocker 16) | `game.rs:307`; `pangbox/server` `game/packet/client.go` `ClientRequestPlayerHistory` |
@@ -279,11 +288,14 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x0063` | `RetailTurnStart` | `us852_match.rs:213` | `lib.rs:3467`, `:3542`, `:4472` | |
 | `0x00cc` | `RetailTurnEnd` | `us852_match.rs:234` | `lib.rs:3532`, `:4465` | |
 | `0x0055` | `RetailShotCommitRelay` | `us852_match.rs:285` | `lib.rs:3565` | the client's own shot payload, relayed unchanged |
+| `0x0045` | `RetailPlayerStatisticsReport` | `us852_bootstrap.rs` | `handle_retail_stroke_command` | authoritative response to `0x0006` |
 | `0x0056` | `RetailAimRotate` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0013` aim projection to the captured stroke roster |
 | `0x0058` | `RetailShotPower` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0015` power-selection projection |
 | `0x0059` | `RetailClubChange` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0016` active-club projection |
 | `0x005a` | `RetailItemUse` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0017` visual item-use projection; not an inventory debit |
 | `0x0060` | `RetailCometRelief` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0019` relief-location projection |
+| `0x008b` | `RetailPause` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailRelay` | `0x0030` pause projection |
+| `0x00c4` | `RetailLoungeAction` | `us852_match.rs` | `lib.rs` `RoomEvent::RetailLoungeAction` | `0x0063` room-occupant action projection |
 | `0x0064` | `RetailShotSync` | `us852_match.rs:316` | `lib.rs:3573` | `ServerRoomShotSync`, `game/room/room.go` `handleRoomGameShotSync` |
 | `0x0065` | `RetailFinishHole` | `us852_match.rs:419` | `lib.rs:4015`, `:4499` | empty body |
 | `0x0090` | `RetailFirstShotReady` | `game.rs` | `handle_retail_stroke_command` | empty body; `ServerPlayerFirstShotReady`. Its arrival is the whole message |

@@ -81,6 +81,8 @@ pub enum RetailMatchRelay {
     Item(u32),
     /// Comet-relief coordinates, represented as their original IEEE-754 wire bits.
     CometRelief([u32; 3]),
+    /// Pause/unpause state.
+    Pause(bool),
 }
 
 impl RetailMatchRelay {
@@ -93,7 +95,8 @@ impl RetailMatchRelay {
             | Self::Power(_)
             | Self::Club(_)
             | Self::Item(_)
-            | Self::CometRelief(_) => &[],
+            | Self::CometRelief(_)
+            | Self::Pause(_) => &[],
         }
     }
 
@@ -106,7 +109,8 @@ impl RetailMatchRelay {
             | Self::Power(_)
             | Self::Club(_)
             | Self::Item(_)
-            | Self::CometRelief(_) => true,
+            | Self::CometRelief(_)
+            | Self::Pause(_) => true,
         }
     }
 }
@@ -193,6 +197,13 @@ pub enum RoomEvent {
         from: PlayerConnectionId,
         /// The client's payload and what it is.
         relay: RetailMatchRelay,
+    },
+    /// A validated lounge/avatar action, sent to every current room member.
+    RetailLoungeAction {
+        /// Captured sender connection.
+        from: PlayerConnectionId,
+        /// Validated action payload.
+        action: pangya_protocol::RetailLoungeActionRequest,
     },
     /// Exactly one connected coordinator must persist this aggregate settlement.
     StrokeSettlementRequested(CommitStrokeMatch),
@@ -1047,6 +1058,25 @@ impl RoomState {
         Ok(outcome)
     }
 
+    fn retail_lounge_action(
+        &self,
+        caller: PlayerConnectionId,
+        action: pangya_protocol::RetailLoungeActionRequest,
+    ) -> Result<(), RoomError> {
+        if self.match_active() {
+            return Err(RoomError::MatchActive);
+        }
+        let _member = self.member_index(caller).ok_or(RoomError::NotMember)?;
+        let event = RoomEvent::RetailLoungeAction {
+            from: caller,
+            action,
+        };
+        for member in &self.members {
+            let _delivered = self.deliver(member, event.clone());
+        }
+        Ok(())
+    }
+
     fn retail_relay(
         &mut self,
         caller: PlayerConnectionId,
@@ -1502,6 +1532,11 @@ enum RoomCommand {
         text: ChatText,
         reply: oneshot::Sender<Result<(), RoomError>>,
     },
+    RetailLoungeAction {
+        caller: PlayerConnectionId,
+        action: pangya_protocol::RetailLoungeActionRequest,
+        reply: oneshot::Sender<Result<(), RoomError>>,
+    },
     Kick {
         caller: PlayerConnectionId,
         target: PlayerConnectionId,
@@ -1821,6 +1856,21 @@ impl RoomHandle {
         self.send_normal(RoomCommand::Chat {
             caller,
             text,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Relays one validated lounge action to current room members while no match is active.
+    pub async fn retail_lounge_action(
+        &self,
+        caller: PlayerConnectionId,
+        action: pangya_protocol::RetailLoungeActionRequest,
+    ) -> Result<(), RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::RetailLoungeAction {
+            caller,
+            action,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -2490,6 +2540,15 @@ fn handle_normal(
             reply,
         } => {
             let _ignored = reply.send(state.chat(caller, text));
+            true
+        }
+        RoomCommand::RetailLoungeAction {
+            caller,
+            action,
+            reply,
+        } => {
+            let result = state.retail_lounge_action(caller, action);
+            let _ignored = reply.send(result);
             true
         }
         RoomCommand::Kick {

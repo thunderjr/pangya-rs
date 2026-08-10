@@ -68,47 +68,49 @@ use pangya_protocol::{
     Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
-    RetailAimRotate, RetailAimRotateRequest, RetailCaddie, RetailChannel, RetailChannelJoinNotice,
-    RetailChannelJoined, RetailCharacter, RetailClientException, RetailClubChange,
-    RetailClubChangeRequest, RetailCometRelief, RetailCometReliefRequest, RetailDailyQuestDelta,
-    RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment, RetailEquipmentRequested,
-    RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole,
-    RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
+    RetailActiveUserAcknowledge, RetailAimRotate, RetailAimRotateRequest, RetailCaddie,
+    RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
+    RetailClientException, RetailClubChange, RetailClubChangeRequest, RetailCometRelief,
+    RetailCometReliefRequest, RetailDailyQuestDelta, RetailDailyQuestRequest,
+    RetailDailyQuestState, RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
+    RetailGameAuth, RetailHole, RetailHoleInfoRequest, RetailHoleProgression, RetailHoleWeather,
     RetailHoleWind, RetailInventoryClass, RetailInventoryItem, RetailItemUse, RetailItemUseRequest,
     RetailLoadProgress, RetailLockerCombinationAttempt, RetailLockerCombinationResponse,
     RetailLockerInventoryRequest, RetailLockerInventoryResponse, RetailLoginBonusRequest,
-    RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen,
-    RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined,
-    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
-    RetailMyRoomLayout, RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData,
-    RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo,
-    RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
+    RetailLoginBonusStatus, RetailLoungeAction, RetailLoungeActionRequest, RetailMascotSeed,
+    RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer,
+    RetailMatchStart, RetailMatchStatisticsSubmit, RetailMultiplayerJoined, RetailMultiplayerLeft,
+    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
+    RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPause, RetailPauseRequest,
+    RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
     RetailPointBalance, RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart,
     RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom,
     RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
     RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType,
-    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotPower,
-    RetailShotPowerRequest, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
-    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
-    RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
-    SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
-    SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
-    SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE, SYNTHETIC_M5_C2S_LOADING_COMPLETE,
-    SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT, SYNTHETIC_M5_C2S_START_SOLO,
-    SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE, SYNTHETIC_M6_C2S_SHOT_ACTION,
-    SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO, SYNTHETIC_M7_C2S_CONSUME,
-    SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE, SYNTHETIC_M7_C2S_REPAIR,
-    SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList, ServiceKind, ShopOffer, ShopPage,
-    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
-    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
-    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
+    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay,
+    RetailShotMeterInputRequest, RetailShotPower, RetailShotPowerRequest, RetailShotSync,
+    RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRejection, RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind,
+    RoomListRequest, RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags,
+    RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    SYNTHETIC_M4_C2S_CHAT, SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK,
+    SYNTHETIC_M4_C2S_LEAVE, SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY,
+    SYNTHETIC_M4_C2S_SETTINGS, SYNTHETIC_M4_C2S_STATE, SYNTHETIC_M5_C2S_FINISH_HOLE,
+    SYNTHETIC_M5_C2S_LOADING_COMPLETE, SYNTHETIC_M5_C2S_SHOT_ACTION, SYNTHETIC_M5_C2S_SHOT_RESULT,
+    SYNTHETIC_M5_C2S_START_SOLO, SYNTHETIC_M6_C2S_GIVE_UP, SYNTHETIC_M6_C2S_LOADING_COMPLETE,
+    SYNTHETIC_M6_C2S_SHOT_ACTION, SYNTHETIC_M6_C2S_SHOT_RESULT, SYNTHETIC_M6_C2S_START_STROKE_TWO,
+    SYNTHETIC_M7_C2S_CONSUME, SYNTHETIC_M7_C2S_EQUIP, SYNTHETIC_M7_C2S_PURCHASE,
+    SYNTHETIC_M7_C2S_REPAIR, SYNTHETIC_M7_C2S_SHOP_PAGE, SelectChannel, ServerChannelList,
+    ServiceKind, ShopOffer, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay, ShotResult,
+    ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo,
+    StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand,
+    StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
+    StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
+    StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
+    StrokeStandings, StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
     encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     packed_system_time, synthetic_game_hello, us852_game_hello,
 };
@@ -3523,6 +3525,7 @@ where
             &event,
             RoomEvent::RetailRelay { .. }
                 | RoomEvent::RetailLoadProgress { .. }
+                | RoomEvent::RetailLoungeAction { .. }
                 | RoomEvent::StrokeStarted(_)
                 | RoomEvent::StrokePhase { .. }
                 | RoomEvent::StrokeTurn(_)
@@ -3558,6 +3561,20 @@ where
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::Chat { .. } => {
+                    return Ok(RoomEventEffect::Remain);
+                }
+                RoomEvent::RetailLoungeAction { from, action } => {
+                    if state != GameState::InRoom {
+                        return Err(GameRuntimeError::Protocol);
+                    }
+                    self.send(
+                        framed,
+                        &RetailLoungeAction {
+                            connection_id: u32::try_from(from.get()).unwrap_or(0),
+                            action: action.clone(),
+                        },
+                    )
+                    .await?;
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::SoloStarted(plan) => {
@@ -3805,6 +3822,16 @@ where
                                 &RetailCometRelief {
                                     connection_id: from,
                                     position: position.map(f32::from_bits),
+                                },
+                            )
+                            .await?;
+                        }
+                        RetailMatchRelay::Pause(paused) => {
+                            self.send(
+                                framed,
+                                &RetailPause {
+                                    connection_id: from,
+                                    paused: *paused,
                                 },
                             )
                             .await?;
@@ -4064,9 +4091,9 @@ where
             }
             // Only a retail connection produces one of these, and only a retail connection can
             // read one. Reaching a synthetic stream means the room mixed the two families.
-            RoomEvent::RetailRelay { .. } | RoomEvent::RetailLoadProgress { .. } => {
-                Err(GameRuntimeError::Protocol)
-            }
+            RoomEvent::RetailRelay { .. }
+            | RoomEvent::RetailLoadProgress { .. }
+            | RoomEvent::RetailLoungeAction { .. } => Err(GameRuntimeError::Protocol),
             RoomEvent::StrokeSettlementRequested(commit) => {
                 self.persist_stroke_commit_by_room(
                     room_id.ok_or(GameRuntimeError::Protocol)?,
@@ -4987,10 +5014,73 @@ where
             tracing::warn!(message = %report.sanitized(), "client reported an exception");
             return Ok(Some(state));
         }
+        if opcode == RetailShotMeterInputRequest::OPCODE {
+            if state != GameState::InStrokeMatch {
+                return Err(GameRuntimeError::Protocol);
+            }
+            let _meter = decode_packet_payload::<RetailShotMeterInputRequest>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            return Ok(Some(state));
+        }
+        if opcode == RetailHoleInfoRequest::OPCODE {
+            if state != GameState::InStrokeMatch {
+                return Err(GameRuntimeError::Protocol);
+            }
+            let _hole = decode_packet_payload::<RetailHoleInfoRequest>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            return Ok(Some(state));
+        }
+        if opcode == RetailActiveUserAcknowledge::OPCODE {
+            if state != GameState::InStrokeMatch {
+                return Err(GameRuntimeError::Protocol);
+            }
+            let _ack = decode_packet_payload::<RetailActiveUserAcknowledge>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            return Ok(Some(state));
+        }
+        if opcode == RetailMatchStatisticsSubmit::OPCODE {
+            if !matches!(state, GameState::InRoom | GameState::InStrokeMatch) {
+                return Err(GameRuntimeError::Protocol);
+            }
+            let _reported = decode_packet_payload::<RetailMatchStatisticsSubmit>(
+                payload,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            // Results and balances are server-owned. Reply from the authenticated persisted
+            // snapshot rather than accepting client-claimed reward/statistic values.
+            self.send(
+                framed,
+                &RetailPlayerStatisticsReport {
+                    statistics: RetailPlayerStatistics {
+                        experience: identity.card.experience,
+                        pang: identity.card.pang,
+                        ..RetailPlayerStatistics::default()
+                    },
+                },
+            )
+            .await?;
+            return Ok(Some(state));
+        }
         if let Some(relay) = retail_preview_relay(opcode, payload)? {
             if state == GameState::InStrokeMatch {
                 self.relay_retail_match_frame(identity.connection_id, relay)
                     .await;
+            } else {
+                return Err(GameRuntimeError::Protocol);
             }
             return Ok(Some(state));
         }
@@ -6028,14 +6118,25 @@ where
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_LOUNGE_ACTION) => {
-                // The room UI emits this for avatar-stage clicks. Pangbox relays rotations as
-                // `0x00c4`; ignoring the cosmetic action is honest until that projection exists,
-                // and prevents one missed Start-button click from becoming a protocol disconnect
-                // (`pangbox/server`, `game/server/conn.go:224-231`).
-                self.observer.unknown(GameUnknownObservation::Ignored);
+                let action = decode_packet_payload::<RetailLoungeActionRequest>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                self.lobby
+                    .route(
+                        identity.connection_id,
+                        LobbyRoomCommand::RetailLoungeAction(action),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
                 Ok(state)
             }
-            (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE) => {
+            (GameState::InRoom, RETAIL_C2S_ROOM_LEAVE | RETAIL_C2S_LAST_PLAYER_LEAVE) => {
+                if !payload.is_empty() {
+                    return Err(GameRuntimeError::Protocol);
+                }
                 self.lobby
                     .leave(identity.connection_id)
                     .await
@@ -7042,6 +7143,8 @@ const RETAIL_C2S_ROOM_READY: u16 = 0x000d;
 /// Retail room-edit client opcode. The client sends it whenever the room master touches the
 /// room's settings, and it sends one on the way into a match.
 const RETAIL_C2S_ROOM_EDIT: u16 = 0x000a;
+/// Final participant leaves a completed game; upstream tears down its room membership.
+const RETAIL_C2S_LAST_PLAYER_LEAVE: u16 = 0x0037;
 /// Cosmetic lounge/avatar action sent by clicks in the room's character stage.
 const RETAIL_C2S_LOUNGE_ACTION: u16 = 0x0063;
 const RETAIL_C2S_START_MATCH: u16 = 0x000e;
@@ -7112,6 +7215,12 @@ fn retail_preview_relay(
                 request.position.map(f32::to_bits),
             )))
         }
+        RetailPauseRequest::OPCODE => {
+            let request =
+                decode_packet_payload::<RetailPauseRequest>(payload, profile, ServiceKind::Game)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::Pause(request.paused)))
+        }
         _ => Ok(None),
     }
 }
@@ -7171,6 +7280,7 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
             | RETAIL_C2S_ROOM_LEAVE
             | RETAIL_C2S_ROOM_READY
             | RETAIL_C2S_ROOM_EDIT
+            | RETAIL_C2S_LAST_PLAYER_LEAVE
             | RETAIL_C2S_LOUNGE_ACTION
             | RETAIL_C2S_MULTIPLAYER_JOIN
             | RETAIL_C2S_MULTIPLAYER_LEAVE
