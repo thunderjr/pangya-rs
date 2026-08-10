@@ -14,15 +14,15 @@ use pangya_domain::{
     ConsumeItem, CourseId, CredentialHash, EconomyCommit, EconomyError, EconomyItemSelector,
     EconomyOperationId, EconomyRepository, EquipmentChange, HandoverDigest, HandoverError,
     HandoverRepository, IncompleteMatchAbortLimit, InventoryClass, ItemCompatibility,
-    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId,
-    LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
-    MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId,
-    MatchPlan, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
-    Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository,
-    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
-    StrokeRosterOrder, Username, Weather, WindConditions,
+    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId, LoginBonusReward,
+    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
+    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
+    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository, PurchaseRequest,
+    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
+    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
+    Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -669,6 +669,13 @@ async fn login_bonus_forward_migration_follows_message_migrations(pool: PgPool) 
             .find(|migration| migration.version == 32)
             .map(|migration| migration.description.as_ref()),
         Some("login bonus"),
+    );
+    assert_eq!(
+        MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 33)
+            .map(|migration| migration.description.as_ref()),
+        Some("game master capability"),
     );
 }
 
