@@ -47,13 +47,14 @@ use pangya_domain::{
     EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
-    MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
+    MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
+    MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
     PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
-    RepositoryError, RetailEquipmentChange, RoomError, RoomId, RoomName, RoomPassword, RoomProfile,
-    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay,
-    SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
-    StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
+    RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId, RoomName,
+    RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
+    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
+    StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -80,10 +81,11 @@ use pangya_protocol::{
     RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
-    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
-    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
-    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
-    RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
+    RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
+    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance,
+    RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
     RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
     RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
     RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem,
@@ -92,10 +94,10 @@ use pangya_protocol::{
     RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
     RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
     RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
-    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
-    RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
+    RetailUccUploadKeyRefusal, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
+    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
+    RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
     SYNTHETIC_M4_C2S_CREATE, SYNTHETIC_M4_C2S_JOIN, SYNTHETIC_M4_C2S_KICK, SYNTHETIC_M4_C2S_LEAVE,
     SYNTHETIC_M4_C2S_LIST, SYNTHETIC_M4_C2S_READY, SYNTHETIC_M4_C2S_SETTINGS,
@@ -1517,6 +1519,9 @@ where
         let mut state = GameState::AwaitHandover;
         let mut presence: Option<RegistryGuard<AccountId>> = None;
         let mut identity: Option<RoomIdentity> = None;
+        // Target account selected by the last 0x00b5 My Room open. It is connection-local and
+        // never trusted as authorization for mutable state; every projection is loaded from DB.
+        let mut my_room_target: Option<AccountId> = None;
         let mut local = LocalRateWindow::new(self.config.limits.rate_window);
         let mut commands = LocalRateWindow::new(self.config.limits.rate_window);
         let mut chats = LocalRateWindow::new(self.config.limits.rate_window);
@@ -1973,7 +1978,10 @@ where
                                         | RetailDailyQuestRequest::OPCODE
                                         | RetailMyRoomEnter::OPCODE
                                         | RetailMyRoomInventoryRequest::OPCODE
+                                        | <RetailMascotMessageUpdate as DecodePacket>::OPCODE
                                         | RetailLockerInventoryRequest::OPCODE
+                                        | 0x00b9
+                                        | 0x00c9
                                         | RetailLockerCombinationAttempt::OPCODE
                                 )
                             {
@@ -1984,6 +1992,7 @@ where
                                     .handle_retail_lobby_service(
                                         &mut framed,
                                         established,
+                                        &mut my_room_target,
                                         frame.opcode,
                                         &frame.payload,
                                     )
@@ -5969,6 +5978,7 @@ where
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         identity: &RoomIdentity,
+        my_room_target: &mut Option<AccountId>,
         opcode: u16,
         payload: &[u8],
     ) -> Result<(), GameRuntimeError> {
@@ -6002,18 +6012,85 @@ where
                 let request =
                     decode_packet_payload::<RetailMyRoomEnter>(payload, profile, ServiceKind::Game)
                         .map_err(|_| GameRuntimeError::Protocol)?;
-                // Visiting another player's room is not implemented, and answering as though it
-                // were would show this player their own room under someone else's name.
-                if request.user_id != account_id || request.room_user_id != account_id {
+                if request.user_id != account_id {
                     return Err(GameRuntimeError::Protocol);
                 }
+                let target = AccountId::new(i64::from(request.room_user_id))
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                // Loading the target snapshot is the authorization/existence check. Do not echo
+                // the visitor's own state under the target's name.
+                self.repository
+                    .load_player_snapshot(target)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                *my_room_target = Some(target);
                 self.send(
                     framed,
                     &RetailMyRoomEntered {
-                        user_id: account_id,
+                        user_id: request.room_user_id,
                     },
                 )
                 .await
+            }
+            <RetailMascotMessageUpdate as DecodePacket>::OPCODE => {
+                let update = decode_packet_payload::<RetailMascotMessageUpdate>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                let mascot_id = InventoryItemId::new(i64::from(update.mascot_id))
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let result = self
+                    .repository
+                    .save_mascot_message(
+                        identity.account_id,
+                        MascotMessageUpdate {
+                            inventory_item_id: mascot_id,
+                            message: update.message.clone(),
+                        },
+                    )
+                    .await;
+                let (status, mascot_id, message) = if result.is_ok() {
+                    (4, update.mascot_id, update.message)
+                } else {
+                    // SuperSS sends -1 for both the error status and mascot id.
+                    (255, u32::MAX, Vec::new())
+                };
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(identity.account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                self.send(
+                    framed,
+                    &RetailMascotMessageResult {
+                        status,
+                        mascot_id,
+                        message,
+                        pang: snapshot.profile.pang,
+                    },
+                )
+                .await
+            }
+            0x00b9 => {
+                // PacketDoc defines option + inventory slot + trailing option. The upload
+                // service/HTTP endpoint is intentionally absent, so answer explicitly rather
+                // than inventing an URL or silently dropping the client's request.
+                if payload.len() != 6 {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.send(framed, &RetailUccUploadKeyRefusal::unsupported())
+                    .await
+            }
+            0x00c9 => {
+                // SuperSS's packed request is opt/u32 owner/u8 sequence/i32 item id (10 bytes).
+                // We do not issue upload keys without a configured authenticated upload service.
+                if payload.len() != 10 {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.send(framed, &RetailUccUploadKeyRefusal::unsupported())
+                    .await
             }
             _ => {
                 let request = decode_packet_payload::<RetailMyRoomInventoryRequest>(
@@ -6025,31 +6102,60 @@ where
                 if request.user_id != account_id {
                     return Err(GameRuntimeError::Protocol);
                 }
-                self.send(framed, &RetailMyRoomLayout).await?;
+                let target = my_room_target.unwrap_or(identity.account_id);
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(target)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let state = self
+                    .repository
+                    .load_retail_equipment(target)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let room = self
+                    .repository
+                    .load_my_room(target)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let furniture = room
+                    .furniture
+                    .into_iter()
+                    .map(|entry| RetailMyRoomFurniture {
+                        unknown_prefix: entry.unknown_prefix,
+                        item_type_id: entry.item_type_id,
+                        unknown_suffix: entry.unknown_suffix,
+                    })
+                    .collect();
+                self.send(framed, &RetailMyRoomLayout::new(furniture))
+                    .await?;
+                let character = retail_character_from_snapshot(&snapshot, &state)?;
                 self.send(
                     framed,
                     &RetailPlayerInfo {
                         player: RetailRoomPlayer {
-                            connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
-                            nickname: identity.nickname.display().as_bytes().to_vec(),
+                            connection_id: 0,
+                            nickname: snapshot
+                                .profile
+                                .nickname
+                                .clone()
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec(),
                             slot: 0,
-                            character_iff_id: 0,
+                            character_iff_id: character.iff_id,
                             flags: RoomPlayerFlags::new(false, false),
                             level: 1,
-                            user_id: account_id,
-                            character: RetailCharacter {
-                                iff_id: 0,
-                                uid: 0,
-                                hair_color: 0,
-                                part_iff_ids: [0; CHARACTER_PARTS],
-                                part_uids: [0; CHARACTER_PARTS],
-                                stats: [0; CHARACTER_STATS],
-                                mastery: 0,
-                            },
+                            user_id: u32::try_from(target.get()).unwrap_or(0),
+                            character,
                         },
                     },
                 )
-                .await
+                .await?;
+                // PacketDoc defines the room visit response through 0x012d and 0x0168 only.
+                // Mascot 0x00e2 is emitted by the established 0x0073 update flow below, not as
+                // an unsolicited visitor-room projection.
+                Ok(())
             }
         }
     }
@@ -7912,6 +8018,31 @@ fn retail_now() -> [u8; 16] {
         i64::try_from(since_epoch.as_secs()).unwrap_or(0),
         u16::try_from(since_epoch.subsec_millis()).unwrap_or(0),
     )
+}
+
+fn retail_character_from_snapshot(
+    snapshot: &PlayerSnapshot,
+    state: &RetailEquipmentState,
+) -> Result<RetailCharacter, GameRuntimeError> {
+    let character = snapshot
+        .characters
+        .iter()
+        .find(|character| character.id == snapshot.equipment.character_id)
+        .ok_or(GameRuntimeError::Snapshot)?;
+    let (part_iff_ids, part_uids) = state
+        .character_parts
+        .filter(|(id, _, _)| *id == character.id)
+        .map(|(_, types, ids)| (types, ids))
+        .unwrap_or(([0; CHARACTER_PARTS], [0; CHARACTER_PARTS]));
+    Ok(RetailCharacter {
+        iff_id: character.item_type_id.get(),
+        uid: u32::try_from(character.id.get()).map_err(|_| GameRuntimeError::Snapshot)?,
+        hair_color: u32::from(state.character_hair_color),
+        part_iff_ids,
+        part_uids,
+        stats: [0; CHARACTER_STATS],
+        mastery: 0,
+    })
 }
 
 fn retail_match_player(slot: usize, member: &MemberSnapshot) -> RetailMatchPlayer {

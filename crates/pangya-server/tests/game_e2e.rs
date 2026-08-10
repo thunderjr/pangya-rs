@@ -13,9 +13,10 @@ use pangya_data::Catalog;
 use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
     CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
-    MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId, RoomId, RoomName,
-    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, Username, Weather,
+    MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId,
+    PlayerRepository as _, RoomId, RoomName, RoomPassword, RoomSettings, RoomSnapshot, RoomSummary,
+    ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+    Username, Weather,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -8168,4 +8169,205 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     drop(visitor);
     shutdown.cancel();
     task.await.expect("party join").expect("party serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: PgPool) {
+    let owner = create_account(&pool, "RoomOwner", 1, 0x1000_0000).await;
+    let visitor = create_account(&pool, "RoomVisitor", 1, 0x1000_0000).await;
+    let repository = PgRepository::new(pool.clone());
+    sqlx::query(
+        "INSERT INTO my_room_furniture (account_id, slot_index, item_type_id, unknown_prefix, unknown_suffix) VALUES ($1, 0, 134217780, $2, $3)",
+    )
+    .bind(owner.account.id.get())
+    .bind([1_u8, 2, 3, 4].as_slice())
+    .bind([5_u8; 19].as_slice())
+    .execute(&pool)
+    .await
+    .expect("furniture");
+    async fn connect(
+        pool: &PgPool,
+        address: std::net::SocketAddr,
+        account: &pangya_domain::AccountAggregate,
+        username: &str,
+    ) -> (TcpStream, u8) {
+        let token = issue_token(
+            pool,
+            account.account.id,
+            SystemTime::now(),
+            ServiceKind::Game,
+        )
+        .await;
+        let (mut stream, key) = connect_game_retail(address).await;
+        send_typed(
+            &mut stream,
+            key,
+            1,
+            &pangya_protocol::RetailGameAuth {
+                username: username.as_bytes().to_vec(),
+                user_id: u32::try_from(account.account.id.get()).expect("user id"),
+                login_key: zeroize::Zeroizing::new(token.into_bytes()),
+                client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+                session_key: zeroize::Zeroizing::new(Vec::new()),
+            },
+        )
+        .await;
+        for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+            let _ = receive_packet(&mut stream, key).await;
+        }
+        send_packet(&mut stream, key, 2, 4, &[1]).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+        (stream, key)
+    }
+
+    async fn visit(
+        pool: &PgPool,
+        address: std::net::SocketAddr,
+        visitor: &pangya_domain::AccountAggregate,
+        owner: &pangya_domain::AccountAggregate,
+    ) {
+        let (mut stream, key) = connect(pool, address, visitor, "RoomVisitor").await;
+        let mut open = pangya_protocol::PacketWriter::default();
+        open.u32_le(u32::try_from(visitor.account.id.get()).expect("visitor"));
+        open.u32_le(u32::try_from(owner.account.id.get()).expect("owner"));
+        send_packet(&mut stream, key, 3, 0x00b5, &open.into_inner()).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x012b);
+        let mut info = pangya_protocol::PacketWriter::default();
+        info.u32_le(u32::try_from(visitor.account.id.get()).expect("visitor"));
+        info.u8(1);
+        send_packet(&mut stream, key, 4, 0x00b7, &info.into_inner()).await;
+        let (opcode, layout) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x012d);
+        assert_eq!(layout.len(), 6 + 27);
+        assert_eq!(u16::from_le_bytes([layout[4], layout[5]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([layout[10], layout[11], layout[12], layout[13]]),
+            134217780
+        );
+        let (opcode, player) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x0168);
+        assert_eq!(
+            player.len(),
+            pangya_protocol::ROOM_PLAYER_IDENTITY_BYTES + pangya_protocol::CHARACTER_BLOCK_BYTES
+        );
+        let character = pangya_protocol::ROOM_PLAYER_IDENTITY_BYTES;
+        assert_eq!(
+            u32::from_le_bytes([
+                player[character],
+                player[character + 1],
+                player[character + 2],
+                player[character + 3]
+            ]),
+            0x0400_0000
+        );
+        // The visitor's own id/nickname must not be echoed into the owner's projection.
+        assert_eq!(
+            u32::from_le_bytes([player[101], player[102], player[103], player[104]]),
+            u32::try_from(owner.account.id.get()).expect("owner id")
+        );
+        assert_eq!(&player[4..14], b"NRoomOwner");
+        assert_ne!(&player[4..15], b"NRoomVisitor\0");
+        // The reference only establishes 0x00e2 as the result of a mascot-message update. A
+        // visitor receives the room layout/player projection, not an unsolicited mascot result.
+        let unsolicited = drain_available(&mut stream, key, Duration::from_millis(150)).await;
+        assert!(!unsolicited.contains(&0x00e2));
+        // Both UCC requests are validly framed but unsupported: the encrypted wire receives the
+        // explicit 0x0153 refusal, never a fabricated URL/key and never a silent disconnect.
+        send_packet(&mut stream, key, 5, 0x00b9, &[1, 0, 0, 0, 0, 0]).await;
+        let (opcode, refusal) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x0153);
+        assert_eq!(refusal, [1, 1, 0, 0x01, 0x10, 0x05]);
+        send_packet(&mut stream, key, 6, 0x00c9, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).await;
+        let (opcode, refusal) = receive_packet(&mut stream, key).await;
+        assert_eq!(opcode, 0x0153);
+        assert_eq!(refusal, [1, 1, 0, 0x01, 0x10, 0x05]);
+        drop(stream);
+    }
+
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    // Authenticate the owner before adding the mascot row so the bootstrap remains independent
+    // of the later My Room mutation. The successful 0x0073 update then travels over this
+    // encrypted socket while the visitor uses a second encrypted socket below.
+    let (mut owner_stream, owner_key) = connect(&pool, address, &owner, "RoomOwner").await;
+    let mascot_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) VALUES ($1, 1073741825, 'issue11.mascot', 1, 'mascot') RETURNING id",
+    )
+    .bind(owner.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("mascot");
+    repository
+        .update_retail_equipment(
+            owner.account.id,
+            pangya_domain::EconomyOperationId::new(uuid::Uuid::new_v4()),
+            owner.equipment.version,
+            pangya_domain::RetailEquipmentChange::Mascot(
+                u32::try_from(mascot_id).expect("mascot id"),
+            ),
+        )
+        .await
+        .expect("equip mascot");
+    send_typed(
+        &mut owner_stream,
+        owner_key,
+        3,
+        &pangya_protocol::RetailMascotMessageUpdate {
+            mascot_id: u32::try_from(mascot_id).expect("mascot id"),
+            message: b"hello visitor".to_vec(),
+        },
+    )
+    .await;
+    let (opcode, mascot) = receive_packet(&mut owner_stream, owner_key).await;
+    assert_eq!(opcode, 0x00e2);
+    assert_eq!(mascot[0], 4);
+    visit(&pool, address, &visitor, &owner).await;
+    drop(owner_stream);
+    shutdown.cancel();
+    task.await.expect("first service").expect("serve");
+
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("restarted retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    visit(&pool, address, &visitor, &owner).await;
+    shutdown.cancel();
+    task.await.expect("restarted service").expect("serve");
 }

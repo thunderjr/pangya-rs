@@ -10,7 +10,7 @@
 
 use crate::{
     CHARACTER_BLOCK_BYTES, CHARACTER_PARTS, CompatibilityProfile, DecodePacket, EncodePacket,
-    PacketDecodeError, PacketEncodeError, PacketReader, PacketWriter, RetailCharacter,
+    PacketDecodeError, PacketEncodeError, PacketReader, PacketWriter, RetailCharacter, ServiceKind,
 };
 
 /// Fixed byte width of a room name on the wire.
@@ -1215,16 +1215,136 @@ impl DecodePacket for RetailMyRoomInventoryRequest {
     }
 }
 
-/// My Room furniture layout, server opcode `0x012d`.
+/// Client request to persist a mascot message, client opcode `0x0073`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMascotMessageUpdate {
+    /// Owned mascot inventory row.
+    pub mascot_id: u32,
+    /// New message bytes.
+    pub message: Vec<u8>,
+}
+
+impl DecodePacket for RetailMascotMessageUpdate {
+    const OPCODE: u16 = 0x0073;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let mascot_id = reader.u32_le()?;
+        let message = reader.pstring(30)?.to_vec();
+        if message.is_empty() || message.contains(&0) {
+            return Err(reader.invalid("mascot message must be non-empty and NUL-free"));
+        }
+        Ok(Self { mascot_id, message })
+    }
+}
+
+impl EncodePacket for RetailMascotMessageUpdate {
+    const OPCODE: u16 = 0x0073;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        if self.message.is_empty() || self.message.len() > 30 || self.message.contains(&0) {
+            return Err(PacketEncodeError::Invalid {
+                field: "mascot message",
+            });
+        }
+        writer.u32_le(self.mascot_id);
+        writer.pstring(&self.message, 30)
+    }
+}
+
+/// Mascot message result, server opcode `0x00e2`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMascotMessageResult {
+    /// Result status (`4` is success, `255` is refusal).
+    pub status: u8,
+    /// Mascot inventory row addressed by the request.
+    pub mascot_id: u32,
+    /// Message returned on success.
+    pub message: Vec<u8>,
+    /// Authoritative Pang balance.
+    pub pang: u64,
+}
+
+impl EncodePacket for RetailMascotMessageResult {
+    const OPCODE: u16 = 0x00e2;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(self.status);
+        writer.u32_le(self.mascot_id);
+        writer.pstring(&self.message, 30)?;
+        writer.u64_le(self.pang);
+        Ok(())
+    }
+}
+
+/// One furniture entry in the retail `0x012d` My Room layout.
 ///
-/// This server has no furniture, so the layout is empty. Upstream sends the same empty layout.
+/// PacketDoc defines a fixed 27-byte entry: four opaque bytes, a Furniture.iff catalog id,
+/// and nineteen opaque bytes. The opaque bytes are retained rather than being reinterpreted as
+/// coordinates because the checked-out GB/US references do not establish those fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomFurniture {
+    /// Opaque entry prefix.
+    pub unknown_prefix: [u8; 4],
+    /// Furniture.iff catalog id.
+    pub item_type_id: u32,
+    /// Opaque entry suffix.
+    pub unknown_suffix: [u8; 19],
+}
+
+impl RetailMyRoomFurniture {
+    /// Constructs an entry using the reference's zero-filled opaque fields.
+    #[must_use]
+    pub const fn new(item_type_id: u32) -> Self {
+        Self {
+            unknown_prefix: [0; 4],
+            item_type_id,
+            unknown_suffix: [0; 19],
+        }
+    }
+
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.bytes(&self.unknown_prefix);
+        writer.u32_le(self.item_type_id);
+        writer.bytes(&self.unknown_suffix);
+    }
+}
+
+/// My Room furniture layout, server opcode `0x012d`.
 ///
 /// # Provenance
 ///
-/// A `u4` then a `u2` count, from `pangbox/server` (`game/packet/server.go` `ServerMyRoomLayout`),
-/// ISC licensed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetailMyRoomLayout;
+/// PacketDoc `gameservice/server/012d.ksy` defines a `u4` option (`1`), a `u2` count, then
+/// repeated fixed 27-byte entries. The count is bounded here before it reaches the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMyRoomLayout {
+    /// Persisted furniture entries in deterministic database order.
+    pub furniture: Vec<RetailMyRoomFurniture>,
+}
+
+impl RetailMyRoomLayout {
+    /// Maximum entries accepted in one client-visible layout.
+    pub const MAX_FURNITURE: usize = 1024;
+
+    /// Creates a layout; encoding enforces the bounded entry count.
+    #[must_use]
+    pub fn new(furniture: Vec<RetailMyRoomFurniture>) -> Self {
+        Self { furniture }
+    }
+}
 
 impl EncodePacket for RetailMyRoomLayout {
     const OPCODE: u16 = 0x012d;
@@ -1235,8 +1355,66 @@ impl EncodePacket for RetailMyRoomLayout {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
+        let count = u16::try_from(self.furniture.len()).map_err(|_| PacketEncodeError::Limit {
+            field: "furniture count",
+            actual: self.furniture.len(),
+            maximum: usize::from(u16::MAX),
+        })?;
+        if self.furniture.len() > Self::MAX_FURNITURE {
+            return Err(PacketEncodeError::Limit {
+                field: "furniture count",
+                actual: self.furniture.len(),
+                maximum: Self::MAX_FURNITURE,
+            });
+        }
         writer.u32_le(1);
-        writer.u16_le(0);
+        writer.u16_le(count);
+        for furniture in &self.furniture {
+            furniture.encode_body(writer);
+        }
+        Ok(())
+    }
+}
+
+/// Explicitly safe refusal for the unsupported UCC upload-key flow, server opcode `0x0153`.
+///
+/// SuperSS-Dev's error response is two success/status bytes followed by the bounded system
+/// error `0x05100100`. Returning that packet is preferable to silently dropping `0x00c9`, while
+/// no upload URL, bearer, or proprietary asset is fabricated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailUccUploadKeyRefusal;
+
+impl RetailUccUploadKeyRefusal {
+    /// Stable server-side refusal used when UCC upload infrastructure is disabled.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self
+    }
+
+    /// Encodes the refusal while retaining the service argument at the call boundary used by
+    /// protocol compliance tests and future multi-service routing.
+    pub fn encode_for(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+        _service: ServiceKind,
+    ) -> Result<(), PacketEncodeError> {
+        self.encode(writer, profile)
+    }
+}
+
+impl EncodePacket for RetailUccUploadKeyRefusal {
+    const OPCODE: u16 = 0x0153;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u8(1);
+        writer.u8(1);
+        writer.u32_le(0x0510_0100);
         Ok(())
     }
 }

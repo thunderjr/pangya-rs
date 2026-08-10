@@ -15,13 +15,13 @@ use pangya_domain::{
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OfflineNoteClaim,
-    OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest, RepairItem,
-    RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix, StarterCharacter,
-    StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver, StrokeCompletion,
-    StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
-    WindConditions,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
+    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
+    OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest,
+    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
+    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
+    Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -332,6 +332,64 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
             .await
             .is_err(),
         "an empty cut-in still must name an owned character"
+    );
+}
+
+#[sqlx::test]
+async fn issue11_my_room_and_mascot_message_survive_projection_reload(pool: PgPool) {
+    migrate(&pool).await.expect("migration");
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_operator_account(account("myroom", Some("MyRoom")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let mascot_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 1073741825, 'test.myroom.mascot', 1, 'mascot') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("mascot");
+    repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(Uuid::new_v4()),
+            aggregate.equipment.version,
+            RetailEquipmentChange::Mascot(u32::try_from(mascot_id).expect("mascot id")),
+        )
+        .await
+        .expect("equip mascot");
+    sqlx::query(
+        "INSERT INTO my_room_furniture (account_id, slot_index, item_type_id, unknown_prefix, unknown_suffix) \
+         VALUES ($1, 0, 134217780, $2, $3)",
+    )
+    .bind(account_id.get())
+    .bind([1_u8, 2, 3, 4].as_slice())
+    .bind([5_u8; 19].as_slice())
+    .execute(&pool)
+    .await
+    .expect("furniture");
+    repository
+        .save_mascot_message(
+            account_id,
+            MascotMessageUpdate {
+                inventory_item_id: pangya_domain::InventoryItemId::new(mascot_id).expect("id"),
+                message: b"hello visitor".to_vec(),
+            },
+        )
+        .await
+        .expect("mascot message");
+    let projection = repository
+        .load_my_room(account_id)
+        .await
+        .expect("projection");
+    assert_eq!(projection.furniture.len(), 1);
+    assert_eq!(projection.furniture[0].item_type_id, 134217780);
+    assert_eq!(
+        projection.mascot_message.as_deref(),
+        Some(&b"hello visitor"[..])
     );
 }
 
