@@ -22,7 +22,7 @@ use pangya_domain::{
     RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
     StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
     StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
-    Weather, WindConditions,
+    Weather, WindConditions, TutorialKind, TutorialProgress, tutorial_completion_rewards,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
