@@ -3077,6 +3077,9 @@ pub enum RepositoryError {
     /// Refusing is the only safe outcome: wrapping would silently destroy a balance.
     #[error("balance would overflow")]
     BalanceOverflow,
+    /// A fixed-price operation cannot be covered by the current Pang balance.
+    #[error("balance is insufficient")]
+    BalanceInsufficient,
     /// A shop publish is already queued or running.
     ///
     /// Enqueuing a second would either race two workers over one client tree or silently
@@ -4090,6 +4093,16 @@ pub trait PlayerRepository: Send + Sync {
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
+
+    /// Debits the fixed 10-Pang cost of a retail offline note atomically.
+    ///
+    /// The default refuses, so a repository without a durable balance mutation cannot claim that
+    /// a note succeeded.
+    fn spend_note_pang(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<u64, RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
 }
 

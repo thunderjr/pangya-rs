@@ -28,12 +28,12 @@ pub use game::{
     ChannelJoined, CharacterBootstrap, CharacterInfo, EquipmentInfo, GAME_INVENTORY_SEGMENT_ITEMS,
     GameAuth, InventoryBootstrap, InventorySegment, MAX_CLIENT_EXCEPTION_BYTES,
     MAX_GAME_HANDOVER_BYTES, PlayerInfo, RETAIL_ACCEPTED_MATCH_OPCODES,
-    RETAIL_ACCEPTED_SESSION_OPCODES, RETAIL_C2S_FIRST_SHOT_READY, RETAIL_RECENT_PLAYER_BYTES,
-    RETAIL_RECENT_PLAYERS, RetailChannelJoinNotice, RetailChannelJoined, RetailClientException,
-    RetailFirstShotReady, RetailLoginBonusRequest, RetailLoginBonusStatus, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailSelectChannel, SelectChannel,
-    is_retail_accepted_match_opcode, is_retail_accepted_session_opcode, synthetic_game_hello,
-    us852_game_hello,
+    RETAIL_ACCEPTED_SESSION_OPCODES, RETAIL_C2S_FIRST_SHOT_READY, RETAIL_EXPLICIT_SOCIAL_REFUSALS,
+    RETAIL_RECENT_PLAYER_BYTES, RETAIL_RECENT_PLAYERS, RetailChannelJoinNotice,
+    RetailChannelJoined, RetailClientException, RetailFirstShotReady, RetailLoginBonusRequest,
+    RetailLoginBonusStatus, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailSelectChannel,
+    SelectChannel, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
+    is_retail_explicit_social_refusal, synthetic_game_hello, us852_game_hello,
 };
 pub use login::{
     ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList, GhostLogin,
@@ -97,12 +97,13 @@ pub use reader::PacketReader;
 pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
 pub use social::{
     GameChat, GameChatResponse, LoungeAction, LoungeActionResponse, LoungeEnterRequest,
-    LoungeEnterResponse, MacroUpdate, TypingIndicator, TypingIndicatorResponse,
-    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
-    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
-    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
-    UserStatisticsInfoResponse, UserTrophiesInfoResponse, Whisper, WhisperRefusalResponse,
-    WhisperResponse,
+    LoungeEnterResponse, MacroUpdate, MessageServerList, MessageServerListRequest, NoteSend,
+    TypingIndicator, TypingIndicatorResponse, UserCharacterInfoResponse,
+    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
+    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
+    UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Whisper,
+    WhisperRefusalResponse, WhisperResponse,
 };
 pub use us852_bootstrap::{
     CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_BLOCK_BYTES, CHARACTER_CARDS,

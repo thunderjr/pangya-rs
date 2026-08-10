@@ -400,6 +400,125 @@ impl EncodePacket for MacroUpdate {
         Ok(())
     }
 }
+/// Retail user-status request, client opcode `0x0007`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserStatusRequest {
+    pub unknown: u8,
+    pub username: Vec<u8>,
+}
+impl DecodePacket for UserStatusRequest {
+    const OPCODE: u16 = 0x0007;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let unknown = reader.u8()?;
+        let username = pstring(reader, MAX_NAME, "username")?;
+        end(reader)?;
+        if unknown != 1 {
+            return Err(reader.invalid("user status discriminator"));
+        }
+        Ok(Self { unknown, username })
+    }
+}
+
+/// Retail user-status refusal/empty response, server opcode `0x00A1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserStatusResponse;
+impl EncodePacket for UserStatusResponse {
+    const OPCODE: u16 = 0x00a1;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u8(2);
+        Ok(())
+    }
+}
+
+/// Retail offline-note request, client opcode `0x003C`.
+///
+/// PacketDoc identifies this as a 10-Pang operation. The final byte is retained because its
+/// meaning is not established; it is nevertheless part of the exact request layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteSend {
+    pub subtype: u16,
+    pub user_id: u32,
+    pub message: Vec<u8>,
+    pub unknown: u8,
+}
+impl DecodePacket for NoteSend {
+    const OPCODE: u16 = 0x003c;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let subtype = reader.u16_le()?;
+        let user_id = reader.u32_le()?;
+        let message = pstring(reader, MAX_TEXT, "note message")?;
+        let unknown = reader.u8()?;
+        end(reader)?;
+        Ok(Self {
+            subtype,
+            user_id,
+            message,
+            unknown,
+        })
+    }
+}
+impl EncodePacket for NoteSend {
+    const OPCODE: u16 = 0x003c;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u16_le(self.subtype);
+        writer.u32_le(self.user_id);
+        write_string(writer, &self.message, MAX_TEXT, "note message")?;
+        writer.u8(self.unknown);
+        Ok(())
+    }
+}
+
+/// Retail request for the message-server list, client opcode `0x008B`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MessageServerListRequest;
+impl DecodePacket for MessageServerListRequest {
+    const OPCODE: u16 = 0x008b;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// Retail message-server list response, server opcode `0x00FC`.
+///
+/// The deployment has no message server, so the truthful response is the exact zero-count form.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MessageServerList;
+impl EncodePacket for MessageServerList {
+    const OPCODE: u16 = 0x00fc;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u8(0);
+        Ok(())
+    }
+}
+
 /// Retail lounge-enter request, client opcode `0x00EB`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoungeEnterRequest {
@@ -522,6 +641,10 @@ impl EncodePacket for UserNameInfoResponse {
     }
 }
 /// Retail statistics fan-out response, server opcode `0x0158`.
+///
+/// PacketDoc is authoritative for this response: `u8 request_type`, `u32 user_id`, then the
+/// common 239-byte `user_statistic_data` body, including its five literal `0x7f` bytes. SuperSS's
+/// conflicting projection uses a different Pang width and is not used here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserStatisticsInfoResponse {
     pub request_type: u8,
@@ -544,12 +667,16 @@ impl EncodePacket for UserStatisticsInfoResponse {
         }
         writer.u8(self.request_type);
         writer.u32_le(self.user_id);
-        crate::RetailPlayerStatistics {
-            experience: self.experience,
-            pang: self.pang,
-            ..crate::RetailPlayerStatistics::default()
-        }
-        .encode_data(writer);
+        // PacketDoc `common/user_statistic_data.ksy` puts XP at offset 74 and Pang at 79.
+        // Its five-byte `unknown_user_statistic_data_y` field is literally 0x7f, unlike the
+        // broader SuperSS projection. Pang is a u32 on this response.
+        let mut body = [0_u8; crate::PLAYER_STATISTICS_BYTES];
+        body[74..78].copy_from_slice(&self.experience.to_le_bytes());
+        let pang =
+            u32::try_from(self.pang).map_err(|_| PacketEncodeError::Invalid { field: "pang" })?;
+        body[79..83].copy_from_slice(&pang.to_le_bytes());
+        body[91..96].fill(0x7f);
+        writer.bytes(&body);
         Ok(())
     }
 }

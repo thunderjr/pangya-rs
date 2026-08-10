@@ -29,19 +29,25 @@ use pangya_observability::M2Metrics;
 use pangya_protocol::{
     BalanceUpdate, CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand,
     EconomyCommandResult, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, FinishHole,
-    HoleResult, InventoryChanged, Lie, LoadingComplete, MatchAbortReason, MatchAborted, MatchPhase,
-    MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket, RepairCommitted,
-    RepairRequest, RetailEquipment, RetailEquipmentAnnounce, RoomChatEvent, RoomChatRequest,
-    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
-    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
-    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
-    ServiceKind as ProtocolServiceKind, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay,
-    ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase,
-    StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate,
-    StrokeCommand, StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
-    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
-    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandings, StrokeTurnStarted,
-    Weather as ProtocolWeather, decode_packet_payload, encode_packet_payload,
+    GameChat, GameChatResponse, HoleResult, InventoryChanged, Lie, LoadingComplete, LoungeAction,
+    LoungeActionResponse, LoungeEnterRequest, LoungeEnterResponse, MatchAbortReason, MatchAborted,
+    MatchPhase, MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket,
+    RepairCommitted, RepairRequest, RetailEquipment, RetailEquipmentAnnounce, RoomChatEvent,
+    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
+    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse,
+    RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest,
+    RoomStateRequest, RoomStateResponse, ServiceKind as ProtocolServiceKind, ShopPage,
+    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
+    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
+    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
+    StrokeCommandResult, StrokeCompletion, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted,
+    StrokeMatchStarted, StrokePhase, StrokePhaseKind, StrokeResultRelay, StrokeShotAction,
+    StrokeShotResult, StrokeStandings, StrokeTurnStarted, UserCharacterInfoResponse,
+    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
+    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
+    UserTrophiesInfoResponse, Weather as ProtocolWeather, Whisper, WhisperRefusalResponse,
+    WhisperResponse, decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -703,6 +709,45 @@ async fn connect_game_retail(address: std::net::SocketAddr) -> (TcpStream, u8) {
     (stream, hello[8])
 }
 
+async fn connect_retail_social_client(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    account_id: AccountId,
+    username: &str,
+) -> (TcpStream, u8, u32) {
+    let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: username.as_bytes().to_vec(),
+            user_id: u32::try_from(account_id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    let mut connection_id = 0_u32;
+    for index in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let (_, body) = receive_packet(&mut stream, key).await;
+        if index == 3 {
+            let at = 1 + 2 + 6 + 2 + 9 + 2 + 22 + 22 + 17 + 24;
+            connection_id = u32::from_le_bytes(body[at..at + 4].try_into().expect("connection id"));
+        }
+    }
+    assert_ne!(
+        connection_id, 0,
+        "social connection id is advertised by bootstrap"
+    );
+    send_packet(&mut stream, key, 2, 4, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+    (stream, key, connection_id)
+}
+
 async fn connect_login(address: std::net::SocketAddr) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut hello = [0_u8; 14];
@@ -778,6 +823,12 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
         .into_iter()
         .map(|(opcode, _)| opcode)
         .collect()
+}
+
+fn wire<T: EncodePacket>(packet: &T, profile: &CompatibilityProfile) -> Result<Vec<u8>, String> {
+    encode_packet_payload(packet, profile)
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| error.to_string())
 }
 
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
@@ -6532,6 +6583,382 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
     drop(host);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool: PgPool) {
+    let alice = create_account(&pool, "SocialAlice", 1, 0x1000_0000).await;
+    let bob = create_account(&pool, "SocialBob", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    chat_messages_per_window: 20,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail social service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut first, first_key, first_connection) =
+        connect_retail_social_client(&pool, address, alice.account.id, "SocialAlice").await;
+    let (mut second, second_key, second_connection) =
+        connect_retail_social_client(&pool, address, bob.account.id, "SocialBob").await;
+
+    // Both sockets are independently encrypted, and lobby chat is broadcast to every member.
+    let chat = GameChat::new(b"NSocialAlice".to_vec(), b"hello lobby".to_vec());
+    send_typed(&mut first, first_key, 3, &chat).await;
+    for (stream, key) in [(&mut first, first_key), (&mut second, second_key)] {
+        let (opcode, body) = receive_packet(stream, key).await;
+        assert_eq!(opcode, GameChatResponse::OPCODE);
+        let expected = wire(
+            &GameChatResponse {
+                nickname: chat.nickname.clone(),
+                message: chat.message.clone(),
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("chat response");
+        assert_eq!(body, expected, "encrypted lobby fanout bytes");
+    }
+
+    // Whisper delivery is point-to-point with a sender acknowledgement.
+    let whisper = Whisper::new(b"NSocialBob".to_vec(), b"private".to_vec());
+    send_typed(&mut first, first_key, 4, &whisper).await;
+    let (opcode, body) = receive_packet(&mut second, second_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperResponse {
+                status: 0,
+                nickname: b"NSocialAlice".to_vec(),
+                message: b"private".to_vec(),
+            },
+            &CompatibilityProfile::US_852
+        )
+        .expect("whisper delivery")
+    );
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperResponse {
+                status: 1,
+                nickname: b"NSocialBob".to_vec(),
+                message: b"private".to_vec(),
+            },
+            &CompatibilityProfile::US_852
+        )
+        .expect("whisper acknowledgement")
+    );
+
+    // Lounge action and the 0x00EB per-occupant query both remain process-wide and multi-client.
+    let action = LoungeAction::emote(b"dance".to_vec());
+    send_typed(&mut first, first_key, 5, &action).await;
+    for (stream, key) in [(&mut first, first_key), (&mut second, second_key)] {
+        let (opcode, body) = receive_packet(stream, key).await;
+        assert_eq!(opcode, <LoungeActionResponse as EncodePacket>::OPCODE);
+        assert_eq!(
+            body,
+            wire(
+                &LoungeActionResponse::new(first_connection, {
+                    let mut value = vec![action.action_type];
+                    value.extend_from_slice(&action.action_payload);
+                    value
+                }),
+                &CompatibilityProfile::US_852,
+            )
+            .expect("lounge action")
+        );
+    }
+    send_packet(
+        &mut first,
+        first_key,
+        6,
+        <LoungeEnterRequest as DecodePacket>::OPCODE,
+        &second_connection.to_le_bytes(),
+    )
+    .await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, LoungeEnterResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &LoungeEnterResponse {
+                connection_id: second_connection
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("lounge enter")
+    );
+
+    // Blocked and offline targets are explicit client-safe refusal packets, not silent drops.
+    send_packet(&mut second, second_key, 7, 0x0055, &[0]).await;
+    send_typed(&mut first, first_key, 8, &whisper).await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperRefusalResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperRefusalResponse {
+                status: 4,
+                nickname: b"NSocialBob".to_vec()
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("blocked refusal")
+    );
+    send_typed(
+        &mut first,
+        first_key,
+        9,
+        &Whisper::new(b"Offline".to_vec(), b"gone".to_vec()),
+    )
+    .await;
+    let (opcode, body) = receive_packet(&mut first, first_key).await;
+    assert_eq!(opcode, WhisperRefusalResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperRefusalResponse {
+                status: 5,
+                nickname: b"Offline".to_vec()
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("offline refusal")
+    );
+
+    // User-info is a golden 13-packet sequence. Every wire body is canonicalized against its
+    // independently typed PacketDoc contract, so this pins order and exact bytes, not only IDs.
+    send_typed(
+        &mut first,
+        first_key,
+        10,
+        &UserInfoRequest {
+            user_id: u32::try_from(bob.account.id.get()).expect("bob id"),
+            request_type: 5,
+        },
+    )
+    .await;
+    let mut fanout = Vec::new();
+    for _ in 0..13 {
+        fanout.push(receive_packet(&mut first, first_key).await);
+    }
+    assert_eq!(
+        fanout.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
+        vec![
+            0x0157, 0x015e, 0x0156, 0x0158, 0x015d, 0x015c, 0x015c, 0x015c, 0x015b, 0x015a, 0x0159,
+            0x0257, 0x0089,
+        ]
+    );
+    let expected_name = UserNameInfoResponse {
+        request_type: 5,
+        user_id: u32::try_from(bob.account.id.get()).expect("bob id"),
+        username: b"SocialBob".to_vec(),
+        nickname: b"NSocialBob".to_vec(),
+    };
+    assert_eq!(
+        fanout[0].1,
+        wire(&expected_name, &CompatibilityProfile::US_852).expect("name bytes")
+    );
+    let user_id = u32::try_from(bob.account.id.get()).expect("bob id");
+    let character_uid: i64 =
+        sqlx::query_scalar("SELECT character_id FROM equipment_sets WHERE account_id = $1")
+            .bind(bob.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("bob character");
+    let character_uid = u32::try_from(character_uid).expect("character uid");
+    let pang: i64 = sqlx::query_scalar("SELECT pang FROM profiles WHERE account_id = $1")
+        .bind(bob.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("bob pang");
+    let pang = u64::try_from(pang).expect("bob pang width");
+    let expected_packets = [
+        wire(&expected_name, &CompatibilityProfile::US_852).expect("name bytes"),
+        wire(
+            &UserCharacterInfoResponse {
+                user_id,
+                character_iff_id: 0x0400_0000,
+                character_uid,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("character bytes"),
+        wire(
+            &UserEquipmentInfoResponse {
+                request_type: 5,
+                user_id,
+                character_uid,
+                comet_iff_id: 0,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("equipment bytes"),
+        wire(
+            &UserStatisticsInfoResponse {
+                request_type: 5,
+                user_id,
+                experience: 0,
+                pang,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("statistics bytes"),
+        wire(
+            &UserGuildInfoResponse { user_id },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("guild bytes"),
+        wire(
+            &UserCourseRecordsInfoResponse {
+                request_type: 0x33,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("natural course bytes"),
+        wire(
+            &UserCourseRecordsInfoResponse {
+                request_type: 0x34,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("grand prix course bytes"),
+        wire(
+            &UserCourseRecordsInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("season course bytes"),
+        wire(
+            &UserRelatedInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("related bytes"),
+        wire(
+            &UserSpecialTrophiesInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("special bytes"),
+        wire(
+            &UserTrophiesInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("trophies bytes"),
+        wire(
+            &UserGrandPrixTrophiesInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("grand prix bytes"),
+        wire(
+            &UserInfoResponse {
+                status: 1,
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("acknowledgement bytes"),
+    ];
+    for (index, expected) in expected_packets.into_iter().enumerate() {
+        assert_eq!(fanout[index].1, expected, "golden fanout body {index}");
+    }
+
+    // Malformed payloads are rejected on the encrypted transport; neither client is left with a
+    // silent parser gap. A fresh pre-auth socket also proves social packets are out-of-state.
+    send_packet(
+        &mut first,
+        first_key,
+        11,
+        <GameChat as EncodePacket>::OPCODE,
+        &[0],
+    )
+    .await;
+    assert_closed(&mut first).await;
+    let (mut pre_auth, pre_auth_key) = connect_game_retail(address).await;
+    send_packet(
+        &mut pre_auth,
+        pre_auth_key,
+        1,
+        <GameChat as EncodePacket>::OPCODE,
+        &[],
+    )
+    .await;
+    assert_closed(&mut pre_auth).await;
+
+    drop(second);
+    shutdown.cancel();
+    assert!(task.await.expect("social join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgPool) {
+    let account = create_account(&pool, "SocialRate", 1, 0x1000_0000).await;
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    chat_messages_per_window: 1,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail social rate service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut stream, key, _) =
+        connect_retail_social_client(&pool, address, account.account.id, "SocialRate").await;
+    let chat = GameChat::new(b"NSocialRate".to_vec(), b"one".to_vec());
+    send_typed(&mut stream, key, 3, &chat).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await.0,
+        GameChatResponse::OPCODE
+    );
+    send_typed(&mut stream, key, 4, &chat).await;
+    assert_closed(&mut stream).await;
+    shutdown.cancel();
+    assert!(task.await.expect("rate join").is_ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

@@ -297,6 +297,26 @@ pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {
     RETAIL_ACCEPTED_SESSION_OPCODES.contains(&opcode)
 }
 
+/// Session opcodes for which this implementation deliberately keeps the authenticated client
+/// alive but performs no state mutation. They are explicit refusals, not an accidental dispatch
+/// fall-through, because the available references do not establish a safe response layout.
+pub const RETAIL_EXPLICIT_SOCIAL_REFUSALS: &[u16] = &[
+    0x0032, // AFK/idle state
+    0x0038, // nickname change
+    0x003a, // player report
+    0x0054, // team chat
+    0x0066, // ticker notice
+    0x0067, // ticker cookie
+    0x00c1, // conflicting web-cookie/my-room request
+    0x00fe, // unclassified
+];
+
+/// Returns whether an opcode is handled as a client-safe, explicit social refusal.
+#[must_use]
+pub fn is_retail_explicit_social_refusal(opcode: u16) -> bool {
+    RETAIL_EXPLICIT_SOCIAL_REFUSALS.contains(&opcode)
+}
+
 /// In-match client opcodes a real U.S. 852 client sends that this server accepts and answers
 /// with nothing.
 ///
@@ -699,6 +719,14 @@ mod tests {
     /// number of fixed-width records.
     /// The allowlist exists so the unknown-opcode policy still means something. If a room or
     /// match opcode ever lands in it, a genuine gap in those handlers would be silently accepted.
+    #[test]
+    fn explicit_social_refusals_are_not_unknown_opcodes() {
+        for opcode in RETAIL_EXPLICIT_SOCIAL_REFUSALS {
+            assert!(is_retail_explicit_social_refusal(*opcode));
+            assert!(is_retail_accepted_session_opcode(*opcode));
+        }
+    }
+
     #[test]
     fn accepted_session_opcodes_exclude_room_and_match_opcodes() {
         for opcode in RETAIL_ACCEPTED_SESSION_OPCODES {

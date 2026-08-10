@@ -471,6 +471,22 @@ impl PgRepository {
         Ok(())
     }
 
+    async fn spend_note_pang_inner(&self, account_id: AccountId) -> Result<u64, RepositoryError> {
+        // PacketDoc fixes the note price at ten Pang. The predicate makes concurrent notes
+        // serialize at the row without ever allowing a negative balance.
+        let row = sqlx::query(
+            "UPDATE profiles SET pang = pang - 10, updated_at = now() \
+             WHERE account_id = $1 AND pang >= 10 RETURNING pang",
+        )
+        .bind(account_id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::BalanceInsufficient)?;
+        let pang: i64 = row.try_get("pang").map_err(repository_db_error)?;
+        u64::try_from(pang).map_err(|_| RepositoryError::CorruptData)
+    }
+
     async fn load_player_snapshot_inner(
         &self,
         account_id: AccountId,
@@ -2311,6 +2327,13 @@ impl PlayerRepository for PgRepository {
             expected_version,
             change,
         )))
+    }
+
+    fn spend_note_pang(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<u64, RepositoryError>> {
+        Box::pin(self.observed(self.spend_note_pang_inner(account_id)))
     }
 }
 

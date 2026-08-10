@@ -963,7 +963,10 @@ impl EncodePacket for RetailPangBalance {
         check_encode_profile(profile)?;
         writer.u16_le(273);
         writer.u32_le(0);
-        writer.u64_le(self.pang);
+        let pang =
+            u32::try_from(self.pang).map_err(|_| PacketEncodeError::Invalid { field: "pang" })?;
+        writer.u32_le(pang);
+        writer.u32_le(0);
         Ok(())
     }
 }

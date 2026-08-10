@@ -69,14 +69,15 @@ use pangya_protocol::{
     InventoryChanged, InventorySegment, Lie, LoadingComplete, LoungeAction, LoungeActionResponse,
     LoungeEnterRequest, LoungeEnterResponse, MacroUpdate,
     MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
-    OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
-    PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
-    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
-    RetailEquipment, RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot,
-    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
-    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
-    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
+    MessageServerList, MessageServerListRequest, NoteSend, OutboundFrame, PacketEncodeError,
+    PacketWriter, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
+    RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
+    RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailClientException,
+    RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment,
+    RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
+    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
+    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
+    RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
     RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
@@ -114,10 +115,10 @@ use pangya_protocol::{
     UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
     UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
     UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
-    UserTrophiesInfoResponse, Weather as ProtocolWeather, Whisper, WhisperRefusalResponse,
-    WhisperResponse, Wind, decode_packet_payload, encode_packet_payload,
-    is_retail_accepted_match_opcode, is_retail_accepted_session_opcode, packed_system_time,
-    synthetic_game_hello, us852_game_hello,
+    UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather,
+    Whisper, WhisperRefusalResponse, WhisperResponse, Wind, decode_packet_payload,
+    encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
+    is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -816,6 +817,29 @@ impl SocialHub {
             member.whisper_accept = accept;
         }
     }
+    fn contains_connection(&self, id: u32) -> bool {
+        let Ok(members) = self.members.lock() else {
+            return false;
+        };
+        members
+            .keys()
+            .any(|member| u32::try_from(member.get()).ok() == Some(id))
+    }
+    fn contains_account(&self, id: u32) -> bool {
+        let Ok(members) = self.members.lock() else {
+            return false;
+        };
+        members
+            .values()
+            .any(|member| u32::try_from(member.account_id.get()).ok() == Some(id))
+    }
+    fn account_for_connection(&self, id: PlayerConnectionId) -> Option<AccountId> {
+        self.members
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|member| member.account_id)
+    }
     fn update_card(&self, id: PlayerConnectionId, card: MemberCard) {
         if let Ok(mut members) = self.members.lock()
             && let Some(member) = members.get_mut(&id)
@@ -1482,8 +1506,6 @@ where
         // replay reuses its commit, while a later intentional purchase (new salt) is a new command.
         let retail_purchase_scope = uuid::Uuid::new_v4();
         let mut retail_purchase_replays = RetailWireReplayWindow::new();
-        let retail_equipment_scope = uuid::Uuid::new_v4();
-        let mut retail_equipment_replays = RetailWireReplayWindow::new();
         // Social state updates are also replay-keyed by the frame salt and digest. This keeps a
         // transport retry from repeating a durable write while the bounded windows still allow
         // intentional later updates.
@@ -1738,9 +1760,10 @@ where
                                             Some(card.character_iff_id).filter(|value| *value != 0);
                                         established.card = card.clone();
                                         // User-info fan-out reads the social projection, not the
-                                        // connection's private identity. Keep it current after
-                                        // every durable equipment mutation.
-                                        self.social.update_card(connection_id, card);
+                                        // connection's private identity. Rebuild it from the
+                                        // coherent snapshot after every durable equipment mutation.
+                                        self.refresh_social_projection(connection_id, established.account_id)
+                                            .await?;
                                     }
                                     Ok(None) => {}
                                     Err(GameRuntimeError::EconomyPersistence) => {
@@ -1797,11 +1820,47 @@ where
                                 self.social.set_whisper_accept(connection_id, frame.payload[0] == 1);
                             } else if self.config.retail_bootstrap && frame.opcode == <LoungeEnterRequest as DecodePacket>::OPCODE {
                                 let request = decode_packet_payload::<LoungeEnterRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
-                                if request.connection_id != u32::try_from(connection_id.get()).unwrap_or(u32::MAX) {
+                                // 0x00EB queries the selected occupant, not necessarily the sender.
+                                // The target must be an authenticated member of this process-wide
+                                // lounge projection; accepting arbitrary IDs would expose a fake
+                                // presence response and self-only validation breaks multi-client UI.
+                                if !self.social.contains_connection(request.connection_id) {
                                     break Err(GameRuntimeError::Protocol);
                                 }
                                 if !lounge_enters.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
                                 self.send(&mut framed, &LoungeEnterResponse { connection_id: request.connection_id }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == <UserStatusRequest as DecodePacket>::OPCODE {
+                                let _request = decode_packet_payload::<UserStatusRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                self.send(&mut framed, &UserStatusResponse).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == <NoteSend as DecodePacket>::OPCODE {
+                                let request = decode_packet_payload::<NoteSend>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                if request.subtype != 0x0111 || !self.social.contains_account(request.user_id) {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
+                                if !chats.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
+                                let digest: [u8; 32] = Sha256::digest(&frame.payload).into();
+                                if !social_replays.is_replay(frame.metadata.salt, &digest) {
+                                    let _ = social_replays.sequence(frame.metadata.salt, digest);
+                                    match self.repository.spend_note_pang(established.account_id).await {
+                                        Ok(pang) => {
+                                            self.refresh_social_projection(connection_id, established.account_id).await?;
+                                            self.send(&mut framed, &RetailPangBalance { pang }).await?
+                                        }
+                                        Err(_) => {
+                                            let (pang, _) = self.retail_balances(established.account_id).await?;
+                                            self.send(&mut framed, &RetailPangBalance { pang }).await?;
+                                        }
+                                    }
+                                } else {
+                                    // A transport retry must still receive the money update, but
+                                    // must never debit the account a second time.
+                                    let (pang, _) = self.retail_balances(established.account_id).await?;
+                                    self.send(&mut framed, &RetailPangBalance { pang }).await?;
+                                }
+                            } else if self.config.retail_bootstrap && frame.opcode == <MessageServerListRequest as DecodePacket>::OPCODE {
+                                if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
+                                self.send(&mut framed, &MessageServerList).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == <LoungeAction as DecodePacket>::OPCODE {
                                 let action = decode_packet_payload::<LoungeAction>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
                                 if !lounge_actions.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
@@ -1829,6 +1888,9 @@ where
                                 {
                                     break Err(error);
                                 }
+                                self.refresh_social_projection(connection_id, established.account_id)
+                                    .await
+                                    .map_err(|_| GameRuntimeError::Snapshot)?;
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -1854,6 +1916,13 @@ where
                                 if let Err(error) = handled {
                                     break Err(error);
                                 }
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailClientException::OPCODE {
+                                let report = decode_packet_payload::<RetailClientException>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                ).map_err(|_| GameRuntimeError::Protocol)?;
+                                tracing::warn!(message = %report.sanitized(), "client reported an exception");
                             } else if self.config.retail_bootstrap && frame.opcode == 0x004f {
                                 // `pangbox/server` Client004F has no fields: it is the client's
                                 // local chat-gag notification. Validate the exact empty body
@@ -1861,6 +1930,15 @@ where
                                 if !frame.payload.is_empty() {
                                     break Err(GameRuntimeError::Protocol);
                                 }
+                                self.observer.unknown(GameUnknownObservation::Ignored);
+                            } else if self.config.retail_bootstrap
+                                && is_retail_explicit_social_refusal(frame.opcode)
+                            {
+                                // The reference corpus does not establish a response layout for
+                                // these AFK/report/team/ticker states. Keep the client alive, but
+                                // record an explicit refusal rather than silently treating a
+                                // stateful request as implemented.
+                                tracing::debug!(opcode = frame.opcode, "retail social request refused");
                                 self.observer.unknown(GameUnknownObservation::Ignored);
                             } else if self.config.retail_bootstrap
                                 && is_retail_accepted_session_opcode(frame.opcode)
@@ -1892,6 +1970,9 @@ where
                                 if let Err(error) = handled {
                                     break Err(error);
                                 }
+                                self.refresh_social_projection(connection_id, established.account_id)
+                                    .await
+                                    .map_err(|_| GameRuntimeError::Snapshot)?;
                             } else if self.config.retail_bootstrap
                                 && is_retail_match_opcode(frame.opcode)
                             {
@@ -4439,6 +4520,10 @@ where
                 }
             }
             RoomEvent::SoloCommitted(result) => {
+                if let Some(account_id) = self.social.account_for_connection(connection_id) {
+                    self.refresh_social_projection(connection_id, account_id)
+                        .await?;
+                }
                 self.send_committed_result(framed, result).await?;
                 Ok(RoomEventEffect::EnterRoom)
             }
@@ -4573,6 +4658,10 @@ where
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::StrokeCommitted(result) => {
+                if let Some(account_id) = self.social.account_for_connection(connection_id) {
+                    self.refresh_social_projection(connection_id, account_id)
+                        .await?;
+                }
                 self.send_stroke_committed(framed, connection_id, result, match_context.stroke)
                     .await?;
                 Ok(RoomEventEffect::EnterRoom)
@@ -6706,6 +6795,22 @@ where
             },
         )
         .await
+    }
+
+    /// Rebuilds the shared social card after a durable Pang/EXP/equipment mutation.
+    async fn refresh_social_projection(
+        &self,
+        connection_id: PlayerConnectionId,
+        account_id: AccountId,
+    ) -> Result<(), GameRuntimeError> {
+        let snapshot = self
+            .repository
+            .load_player_snapshot(account_id)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        self.social
+            .update_card(connection_id, member_card(&snapshot));
+        Ok(())
     }
 
     /// Reads an account's current balances straight from storage.
@@ -8986,8 +9091,8 @@ mod tests {
     }
 
     #[test]
-    fn retail_client_exception_is_not_a_silent_session_or_match_allowlist_entry() {
-        assert!(!is_retail_accepted_session_opcode(
+    fn retail_client_exception_is_a_handled_session_not_match_opcode() {
+        assert!(is_retail_accepted_session_opcode(
             RetailClientException::OPCODE
         ));
         assert!(!is_retail_match_opcode(RetailClientException::OPCODE));

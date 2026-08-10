@@ -2,12 +2,12 @@
 
 use pangya_protocol::{
     CompatibilityProfile, EncodePacket, GameChat, GameChatResponse, LoungeAction,
-    LoungeActionResponse, MacroUpdate, TypingIndicator, UserCharacterInfoResponse,
-    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
-    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
-    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
-    UserTrophiesInfoResponse, Whisper, WhisperRefusalResponse, WhisperResponse,
-    decode_packet_payload, encode_packet_payload,
+    LoungeActionResponse, MacroUpdate, MessageServerList, MessageServerListRequest, NoteSend,
+    RetailPangBalance, TypingIndicator, UserCharacterInfoResponse, UserCourseRecordsInfoResponse,
+    UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse,
+    UserInfoRequest, UserInfoResponse, UserNameInfoResponse, UserRelatedInfoResponse,
+    UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse, UserTrophiesInfoResponse, Whisper,
+    WhisperRefusalResponse, WhisperResponse, decode_packet_payload, encode_packet_payload,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
@@ -222,10 +222,67 @@ fn all_user_info_fanout_packets_have_reference_bodies() {
 }
 
 #[test]
+fn note_and_message_server_fixtures_are_exact() {
+    let note = NoteSend {
+        subtype: 0x0111,
+        user_id: 0x0102_0304,
+        message: b"hello".to_vec(),
+        unknown: 0,
+    };
+    let note_bytes = encode_packet_payload(&note, &PROFILE).expect("note encoding");
+    assert_eq!(&note_bytes[..6], &[0x11, 0x01, 4, 3, 2, 1]);
+    assert_eq!(&note_bytes[6..], &[5, 0, b'h', b'e', b'l', b'l', b'o', 0]);
+    let request = decode_packet_payload::<MessageServerListRequest>(
+        &[],
+        &PROFILE,
+        pangya_protocol::ServiceKind::Game,
+    )
+    .expect("message server request");
+    assert_eq!(request, MessageServerListRequest);
+    let list = encode_packet_payload(&MessageServerList, &PROFILE).expect("message server list");
+    assert_eq!(list.as_slice(), [0]);
+    let balance = encode_packet_payload(&RetailPangBalance { pang: 0x1122_3344 }, &PROFILE)
+        .expect("money update");
+    assert_eq!(
+        balance.as_slice(),
+        [0x11, 0x01, 0, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0]
+    );
+}
+
+#[test]
+fn social_requests_refuse_trailing_or_invalid_bodies() {
+    assert!(
+        decode_packet_payload::<MessageServerListRequest>(
+            &[0],
+            &PROFILE,
+            pangya_protocol::ServiceKind::Game,
+        )
+        .is_err()
+    );
+    assert!(
+        decode_packet_payload::<NoteSend>(
+            &[0x11, 1, 1, 0, 0, 0, 0],
+            &PROFILE,
+            pangya_protocol::ServiceKind::Game,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn response_opcodes_are_retail() {
     assert_eq!(GameChatResponse::OPCODE, 0x0040);
     assert_eq!(WhisperResponse::OPCODE, 0x0084);
     assert_eq!(LoungeActionResponse::OPCODE, 0x00c4);
+}
+
+fn stats_request() -> UserStatisticsInfoResponse {
+    UserStatisticsInfoResponse {
+        request_type: 5,
+        user_id: 7,
+        experience: 123,
+        pang: 456,
+    }
 }
 
 #[test]
@@ -257,6 +314,20 @@ fn user_info_fanout_has_reference_widths_and_real_projection_fields() {
     assert_eq!(
         stats.len(),
         1 + 4 + pangya_protocol::PLAYER_STATISTICS_BYTES
+    );
+    assert_eq!(&stats[1 + 4 + 74..1 + 4 + 78], &123_u32.to_le_bytes());
+    assert_eq!(&stats[1 + 4 + 79..1 + 4 + 83], &456_u32.to_le_bytes());
+    assert_eq!(&stats[1 + 4 + 91..1 + 4 + 96], &[0x7f; 5]);
+    assert!(stats[1 + 4 + 96..].iter().all(|byte| *byte == 0));
+    assert!(
+        encode_packet_payload(
+            &UserStatisticsInfoResponse {
+                pang: u64::from(u32::MAX) + 1,
+                ..stats_request()
+            },
+            &PROFILE,
+        )
+        .is_err()
     );
     let equipment = encode_packet_payload(
         &UserEquipmentInfoResponse {
