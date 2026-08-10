@@ -2053,6 +2053,9 @@ mod tests {
             )
             .await
             .expect("join same channel");
+        let listed = lobby.list_on_channel(1).await.expect("list after join");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].channel(), Some(1));
     }
 
     #[tokio::test]
