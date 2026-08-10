@@ -879,6 +879,23 @@ pub enum EconomyCommit<T> {
     Replayed(T),
 }
 
+impl<T> EconomyCommit<T> {
+    /// Returns whether this result applied a new mutation.
+    #[must_use]
+    pub const fn was_applied(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+
+    /// Splits the durable result from its applied-versus-replayed outcome.
+    #[must_use]
+    pub fn into_parts(self) -> (T, bool) {
+        match self {
+            Self::Committed(value) => (value, true),
+            Self::Replayed(value) => (value, false),
+        }
+    }
+}
+
 /// Stable economy failures safe for application outcome mapping.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum EconomyError {
@@ -4606,6 +4623,17 @@ pub const fn crate_boundary() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn economy_commit_exposes_applied_vs_replayed_metadata() {
+        let committed = EconomyCommit::Committed(7_u8);
+        assert!(committed.was_applied());
+        assert_eq!(committed.into_parts(), (7, true));
+
+        let replayed = EconomyCommit::Replayed(9_u8);
+        assert!(!replayed.was_applied());
+        assert_eq!(replayed.into_parts(), (9, false));
+    }
 
     #[test]
     fn normalization_keeps_display_separate() {

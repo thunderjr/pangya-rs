@@ -491,6 +491,11 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
     );
     let left = left.expect("left concurrent retry");
     let right = right.expect("right concurrent retry");
+    assert_ne!(
+        matches!(left, EconomyCommit::Committed(_)),
+        matches!(right, EconomyCommit::Committed(_)),
+        "same-key concurrency must expose exactly one newly-applied result"
+    );
     let left_state = match left {
         EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
     };

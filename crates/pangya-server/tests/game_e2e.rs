@@ -6087,6 +6087,33 @@ async fn game_retail_bulk_equipment_is_acknowledged_owned_and_restart_safe(pool:
         1
     );
 
+    // Subtype zero acknowledgements come from the durable projection, including after B
+    // intervenes. The character body is reference-width (513 bytes); only the durable fields are
+    // asserted here, while the remaining words stay opaque/zero.
+    let mut character_a = vec![0_u8; 1 + 513];
+    character_a[1..5].copy_from_slice(&0x0400_0000_u32.to_le_bytes());
+    character_a[5..9].copy_from_slice(
+        &u32::try_from(character_id)
+            .expect("character")
+            .to_le_bytes(),
+    );
+    character_a[9] = 7;
+    send_packet(&mut stream, key, 5, 0x0020, &character_a).await;
+    let (_, character_ack_a) = receive_packet(&mut stream, key).await;
+    assert_eq!(&character_ack_a[0..2], &[4, 0]);
+    assert_eq!(&character_ack_a[2..6], &character_a[1..5]);
+    assert_eq!(&character_ack_a[6..10], &character_a[5..9]);
+    assert_eq!(character_ack_a[10], 7);
+    let mut character_b = character_a.clone();
+    character_b[9] = 8;
+    send_packet(&mut stream, key, 6, 0x0020, &character_b).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x006b);
+    send_packet(&mut stream, key, 7, 0x0020, &character_a).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await,
+        (0x006b, character_ack_a)
+    );
+
     // Subtype 9 acknowledgements come from the durable projection, including after B intervenes.
     let mut cut_in_a = vec![9];
     cut_in_a.extend_from_slice(
@@ -6246,7 +6273,18 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
             .to_le_bytes(),
     );
     send_packet(&mut host, host_key, 3, 0x000b, &lobby_change).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..100 {
+        let current: i64 =
+            sqlx::query_scalar("SELECT character_id FROM equipment_sets WHERE account_id = $1")
+                .bind(owner.account.id.get())
+                .fetch_one(&pool)
+                .await
+                .expect("lobby projection");
+        if current == owner_alt_character {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT character_id FROM equipment_sets WHERE account_id = $1",
@@ -6293,6 +6331,7 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
             .expect("owner character")
             .to_le_bytes(),
     );
+    // An exact retry produces one durable mutation and one room broadcast.
     send_packet(&mut host, host_key, 5, 0x000c, &room_change).await;
     let expected = encode_packet_payload(
         &RetailEquipmentAnnounce::Character {
@@ -6313,7 +6352,7 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         (0x004b, expected.clone())
     );
 
-    // An intervening B mutation must not turn an exact A retry into a second announcement.
+    // Intervening B and C mutations must not turn an exact A retry into a second announcement.
     let mut intervening_change = vec![4];
     intervening_change.extend_from_slice(
         &u32::try_from(owner_third_character)
@@ -6339,7 +6378,32 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         receive_packet(&mut visitor, visitor_key).await,
         (0x004b, intervening_expected)
     );
-    send_packet(&mut host, host_key, 7, 0x000c, &room_change).await;
+    let mut final_change = vec![4];
+    final_change.extend_from_slice(
+        &u32::try_from(owner_alt_character)
+            .expect("alternate character")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 7, 0x000c, &final_change).await;
+    let final_expected = encode_packet_payload(
+        &RetailEquipmentAnnounce::Character {
+            connection_id: host_connection,
+            character_type_id: 0x0400_0000,
+            character_uid: u32::try_from(owner_alt_character).expect("alternate character"),
+        },
+        &CompatibilityProfile::US_852,
+    )
+    .expect("004b payload")
+    .to_vec();
+    assert_eq!(
+        receive_packet(&mut host, host_key).await,
+        (0x004b, final_expected.clone())
+    );
+    assert_eq!(
+        receive_packet(&mut visitor, visitor_key).await,
+        (0x004b, final_expected)
+    );
+    send_packet(&mut host, host_key, 8, 0x000c, &room_change).await;
     assert!(
         drain_frames(&mut host, host_key, Duration::from_millis(150))
             .await
@@ -6356,7 +6420,7 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
             .fetch_one(&pool)
             .await
             .expect("room replay version"),
-        3
+        4
     );
     drop(visitor);
     drop(host);

@@ -5419,8 +5419,14 @@ where
         // Room equipment packets have no application operation id. Derive a stable key from the
         // authenticated account and exact frame so transport retries replay the same economy
         // operation instead of incrementing the equipment version again.
+        // The exact authenticated frame includes its opcode. Without it, identical lobby and
+        // room bodies (for example `0x000b` and `0x000c` character changes) would alias one
+        // durable operation and incorrectly suppress the room mutation as a replay.
+        let mut operation_scope = Vec::with_capacity(2 + payload.len());
+        operation_scope.extend_from_slice(&opcode.to_le_bytes());
+        operation_scope.extend_from_slice(payload);
         let mut scope_bytes = [0_u8; 16];
-        scope_bytes.copy_from_slice(&Sha256::digest(payload)[..16]);
+        scope_bytes.copy_from_slice(&Sha256::digest(operation_scope)[..16]);
         let scope = uuid::Uuid::from_bytes(scope_bytes);
         let announce = match update {
             RetailRoomEquipmentUpdate::Caddie(item_id) => {
@@ -5441,10 +5447,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let (state, announce) = match result {
-                    EconomyCommit::Committed(state) => (state, true),
-                    EconomyCommit::Replayed(state) => (state, false),
-                };
+                let (state, announce) = result.into_parts();
                 should_announce = announce;
                 let (uid, type_id) = state
                     .caddie
@@ -5512,7 +5515,7 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                should_announce = matches!(result, EconomyCommit::Committed(_));
+                should_announce = result.was_applied();
                 RetailEquipmentAnnounce::Ball {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     ball_type_id,
@@ -5574,7 +5577,7 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                should_announce = matches!(result, EconomyCommit::Committed(_));
+                should_announce = result.was_applied();
                 RetailEquipmentAnnounce::ClubSet {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     club_item_id,
@@ -5636,7 +5639,7 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                should_announce = matches!(result, EconomyCommit::Committed(_));
+                should_announce = result.was_applied();
                 RetailEquipmentAnnounce::Character {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     character_type_id: character.item_type_id.get(),
@@ -5721,9 +5724,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let state = match result {
-                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
-                };
+                let (state, _was_applied) = result.into_parts();
                 let (durable_id, durable_types, durable_uids) = state
                     .character_parts
                     .filter(|(id, _, _)| *id == character_id)
@@ -5754,9 +5755,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let state = match result {
-                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
-                };
+                let (state, _was_applied) = result.into_parts();
                 Some(RetailEquipmentUpdated::Caddie {
                     caddie_id: state
                         .caddie
@@ -5780,9 +5779,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let state = match result {
-                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
-                };
+                let (state, _was_applied) = result.into_parts();
                 Some(RetailEquipmentUpdated::Consumables {
                     item_type_ids: state.consumables,
                 })
@@ -5803,9 +5800,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let state = match result {
-                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
-                };
+                let (state, _was_applied) = result.into_parts();
                 Some(RetailEquipmentUpdated::Decoration {
                     type_ids: state.decoration,
                 })
@@ -5853,9 +5848,7 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                let state = match result {
-                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
-                };
+                let (state, _was_applied) = result.into_parts();
                 let (durable_character_id, durable_data) =
                     state.cut_in.ok_or(GameRuntimeError::EconomyPersistence)?;
                 Some(RetailEquipmentUpdated::CutIn {
