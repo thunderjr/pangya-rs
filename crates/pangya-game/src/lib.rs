@@ -1261,8 +1261,6 @@ where
         // replay reuses its commit, while a later intentional purchase (new salt) is a new command.
         let retail_purchase_scope = uuid::Uuid::new_v4();
         let mut retail_purchase_replays = RetailWireReplayWindow::new();
-        let retail_equipment_scope = uuid::Uuid::new_v4();
-        let mut retail_equipment_replays = RetailWireReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
@@ -1464,16 +1462,11 @@ where
                                 let Some(established) = identity.as_mut() else {
                                     break Err(GameRuntimeError::Protocol);
                                 };
-                                let payload_digest: [u8; 32] = Sha256::digest(&frame.payload).into();
-                                let equipment_sequence = retail_equipment_replays
-                                    .sequence(frame.metadata.salt, payload_digest);
                                 match self
                                     .handle_retail_equipment_update(
                                         &mut framed,
                                         established.account_id,
                                         &frame.payload,
-                                        retail_equipment_scope,
-                                        equipment_sequence,
                                     )
                                     .await
                                 {
@@ -5431,6 +5424,14 @@ where
                     .repository
                     .update_retail_equipment(
                         identity.account_id,
+                        retail_equipment_operation_id(
+                            identity.account_id,
+                            RetailEquipmentSlot::Caddie,
+                            item_id,
+                            0,
+                            scope,
+                            0,
+                        ),
                         snapshot.equipment.version,
                         RetailEquipmentChange::Caddie(item_id),
                     )
@@ -5660,8 +5661,6 @@ where
         framed: &mut Framed<TcpStream, FrameCodec>,
         account_id: AccountId,
         payload: &[u8],
-        operation_scope: uuid::Uuid,
-        operation_sequence: u64,
     ) -> Result<Option<MemberCard>, GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         let request =
@@ -5672,6 +5671,7 @@ where
             requested = ?request.requested,
             "retail equipment update decoded"
         );
+        let operation_id = retail_equipment_update_operation_id(account_id, payload);
         // Every non-minimum slot goes through one ownership-checked transaction. The returned
         // projection is the acknowledgement, never the packet's untrusted values.
         let persisted = match request.requested {
@@ -5695,6 +5695,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::CharacterParts {
                             character_id,
@@ -5725,6 +5726,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::Caddie(item_id),
                     )
@@ -5747,6 +5749,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::Consumables(values),
                     )
@@ -5766,6 +5769,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::Decoration(values),
                     )
@@ -5785,6 +5789,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::Mascot(item_id),
                     )
@@ -5811,6 +5816,7 @@ where
                     .repository
                     .update_retail_equipment(
                         account_id,
+                        operation_id,
                         snapshot.equipment.version,
                         RetailEquipmentChange::CutIn { character_id, data },
                     )
@@ -5948,8 +5954,8 @@ where
                         request.slot,
                         ball_type_id,
                         requested_aux,
-                        operation_scope,
-                        operation_sequence,
+                        operation_id.get(),
+                        0,
                     );
                     match timeout(
                         economy.command_timeout,
@@ -7308,6 +7314,24 @@ impl RetailWireReplayWindow {
     }
 }
 
+/// Derives a restart-stable operation key for one exact retail `0x0020` frame.
+///
+/// The packet has no application operation identifier, so the authenticated account and complete
+/// wire payload form its durable identity. This intentionally does not include connection state.
+fn retail_equipment_update_operation_id(
+    account_id: AccountId,
+    payload: &[u8],
+) -> EconomyOperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"retail-equipment-update-v1");
+    hasher.update(account_id.get().to_le_bytes());
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    EconomyOperationId::new(uuid::Uuid::from_bytes(bytes))
+}
+
 /// Derives a stable operation key for one retail equipment frame.
 fn retail_equipment_operation_id(
     account_id: AccountId,
@@ -7735,6 +7759,28 @@ mod tests {
             window.sequence(7, digest),
             first,
             "an evicted replay key becomes a new bounded command"
+        );
+    }
+
+    #[test]
+    fn retail_equipment_operation_id_is_restart_stable_and_payload_bound() {
+        let account = AccountId::new(7).unwrap_or_else(|_| unreachable!());
+        let payload = [RetailEquipmentSlot::Consumables.tag(), 1, 2, 3];
+        let same = retail_equipment_update_operation_id(account, &payload);
+        assert_eq!(
+            same,
+            retail_equipment_update_operation_id(account, &payload)
+        );
+        assert_ne!(
+            same,
+            retail_equipment_update_operation_id(account, &[payload[0], 1, 2, 4])
+        );
+        assert_ne!(
+            same,
+            retail_equipment_update_operation_id(
+                AccountId::new(8).unwrap_or_else(|_| unreachable!()),
+                &payload
+            )
         );
     }
 

@@ -1717,10 +1717,31 @@ impl PgRepository {
     async fn update_retail_equipment_inner(
         &self,
         account_id: AccountId,
+        operation_id: EconomyOperationId,
         expected_version: u32,
         change: RetailEquipmentChange,
     ) -> Result<RetailEquipmentState, RepositoryError> {
+        let request_payload = retail_equipment_request_payload(&change);
         let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        lock_retail_equipment_operation(&mut transaction, operation_id).await?;
+        if let Some(row) = sqlx::query!(
+            "SELECT account_id, request_payload, expected_version FROM retail_equipment_operations \
+             WHERE operation_id = $1 FOR UPDATE",
+            operation_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        {
+            if row.account_id != account_id.get()
+                || row.expected_version != i64::from(expected_version)
+                || row.request_payload != request_payload
+            {
+                return Err(RepositoryError::CorruptData);
+            }
+            transaction.commit().await.map_err(repository_db_error)?;
+            return self.load_retail_equipment_inner(account_id).await;
+        }
         let version = sqlx::query_scalar!(
             "SELECT version FROM equipment_sets WHERE account_id = $1 FOR UPDATE",
             account_id.get()
@@ -1871,11 +1892,85 @@ impl PgRepository {
                 }
             }
         }
-        sqlx::query!("UPDATE equipment_sets SET version = version + 1, updated_at = now() WHERE account_id = $1 AND version = $2", account_id.get(), i64::from(expected_version))
-            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+        let updated = sqlx::query!("UPDATE equipment_sets SET version = version + 1, updated_at = now() WHERE account_id = $1 AND version = $2 RETURNING version", account_id.get(), i64::from(expected_version))
+            .fetch_optional(&mut *transaction).await.map_err(repository_db_error)?
+            .ok_or(RepositoryError::CorruptData)?;
+        sqlx::query!(
+            "INSERT INTO retail_equipment_operations \
+             (operation_id, account_id, request_payload, expected_version, result_version) \
+             VALUES ($1, $2, $3, $4, $5)",
+            operation_id.get(),
+            account_id.get(),
+            &request_payload,
+            i64::from(expected_version),
+            updated.version
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
         transaction.commit().await.map_err(repository_db_error)?;
         self.load_retail_equipment_inner(account_id).await
     }
+}
+
+async fn lock_retail_equipment_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    operation_id: EconomyOperationId,
+) -> Result<(), RepositoryError> {
+    let key = operation_id.get().to_string();
+    sqlx::query!("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(repository_db_error)?;
+    Ok(())
+}
+
+fn retail_equipment_request_payload(change: &RetailEquipmentChange) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(100);
+    match change {
+        RetailEquipmentChange::Caddie(value) => {
+            payload.push(1);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        RetailEquipmentChange::Consumables(values) => {
+            payload.push(2);
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        RetailEquipmentChange::Decoration(values) => {
+            payload.push(3);
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        RetailEquipmentChange::Mascot(value) => {
+            payload.push(4);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        RetailEquipmentChange::CutIn { character_id, data } => {
+            payload.push(5);
+            payload.extend_from_slice(&character_id.get().to_le_bytes());
+            payload.extend_from_slice(data);
+        }
+        RetailEquipmentChange::CharacterParts {
+            character_id,
+            type_ids,
+            inventory_ids,
+            hair_color,
+        } => {
+            payload.push(6);
+            payload.extend_from_slice(&character_id.get().to_le_bytes());
+            for value in type_ids {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in inventory_ids {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            payload.push(*hair_color);
+        }
+    }
+    payload
 }
 
 async fn ensure_owned_character(
@@ -1938,11 +2033,13 @@ impl PlayerRepository for PgRepository {
     fn update_retail_equipment(
         &self,
         account_id: AccountId,
+        operation_id: EconomyOperationId,
         expected_version: u32,
         change: RetailEquipmentChange,
     ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
         Box::pin(self.observed(self.update_retail_equipment_inner(
             account_id,
+            operation_id,
             expected_version,
             change,
         )))

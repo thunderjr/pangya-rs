@@ -4035,11 +4035,13 @@ pub trait PlayerRepository: Send + Sync {
         Box::pin(async { Ok(RetailEquipmentState::default()) })
     }
 
-    /// Validates ownership and atomically persists one retail equipment update against the same
-    /// optimistic equipment version used by the minimum aggregate.
+    /// Validates ownership and atomically persists or replays one retail equipment update against
+    /// the same optimistic equipment version used by the minimum aggregate. The operation key is
+    /// durable and is not a wire field; callers derive it from the exact authenticated frame.
     fn update_retail_equipment(
         &self,
         _account_id: AccountId,
+        _operation_id: EconomyOperationId,
         _expected_version: u32,
         _change: RetailEquipmentChange,
     ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {

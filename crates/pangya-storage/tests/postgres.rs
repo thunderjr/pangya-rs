@@ -167,6 +167,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             aggregate.equipment.version,
             RetailEquipmentChange::Caddie(u32::try_from(caddie_id).expect("caddie id")),
         )
@@ -207,6 +208,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::Consumables([consumable_type, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         )
@@ -217,6 +219,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::Decoration([skin_type, 0, 0, 0, 0, 0]),
         )
@@ -227,6 +230,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::Mascot(u32::try_from(mascot_id).expect("mascot id")),
         )
@@ -237,6 +241,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::CutIn {
                 character_id: aggregate.equipment.character_id,
@@ -254,6 +259,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
     let state = repository
         .update_retail_equipment(
             account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::CharacterParts {
                 character_id: aggregate.equipment.character_id,
@@ -273,6 +279,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         repository
             .update_retail_equipment(
                 account_id,
+                EconomyOperationId::new(uuid::Uuid::new_v4()),
                 u32::try_from(version).expect("version"),
                 RetailEquipmentChange::Caddie(999_999)
             )
@@ -290,6 +297,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         repository
             .update_retail_equipment(
                 account_id,
+                EconomyOperationId::new(uuid::Uuid::new_v4()),
                 u32::try_from(version).expect("version"),
                 RetailEquipmentChange::CutIn {
                     character_id: missing_character,
@@ -299,6 +307,165 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
             .await
             .is_err(),
         "an empty cut-in still must name an owned character"
+    );
+}
+
+#[sqlx::test]
+async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
+    migrate(&pool).await.expect("migration");
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_operator_account(account("retailreplay", Some("RetailReplay")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let first_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762049, 'test.replay.caddie.one', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("first caddie");
+    let second_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762050, 'test.replay.caddie.two', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("second caddie");
+    let first = u32::try_from(first_id).expect("first id");
+    let second = u32::try_from(second_id).expect("second id");
+    let operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let initial_version = aggregate.equipment.version;
+    let committed = repository
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("initial update");
+    assert_eq!(committed.caddie.map(|(_, kind)| kind), Some(469762049));
+    let version_after_commit: i64 =
+        sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after commit");
+    let replayed = repository
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("exact replay");
+    assert_eq!(replayed, committed);
+    assert_eq!(version_after_commit, i64::from(initial_version) + 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM retail_equipment_operations WHERE operation_id = $1",
+        )
+        .bind(operation.get())
+        .fetch_one(&pool)
+        .await
+        .expect("operation ledger count"),
+        1
+    );
+
+    let intervening_operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let intervening = repository
+        .update_retail_equipment(
+            account_id,
+            intervening_operation,
+            u32::try_from(version_after_commit).expect("version"),
+            RetailEquipmentChange::Caddie(second),
+        )
+        .await
+        .expect("intervening update");
+    // A fresh repository instance must use the durable ledger, not connection-local replay state.
+    let restarted = PgRepository::new(pool.clone());
+    let replay_after_mutation = restarted
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("replay after mutation");
+    assert_eq!(replay_after_mutation, intervening);
+    assert!(
+        restarted
+            .update_retail_equipment(
+                account_id,
+                operation,
+                initial_version,
+                RetailEquipmentChange::Caddie(second),
+            )
+            .await
+            .is_err(),
+        "reusing an operation key with changed input must be rejected"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after replay"),
+        version_after_commit + 1
+    );
+    assert_eq!(
+        repository
+            .load_retail_equipment(account_id)
+            .await
+            .expect("projection")
+            .caddie,
+        intervening.caddie
+    );
+
+    let concurrent_operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let expected_version = u32::try_from(version_after_commit + 1).expect("version");
+    let left = repository.clone();
+    let right = repository.clone();
+    let (left, right) = tokio::join!(
+        left.update_retail_equipment(
+            account_id,
+            concurrent_operation,
+            expected_version,
+            RetailEquipmentChange::Caddie(first),
+        ),
+        right.update_retail_equipment(
+            account_id,
+            concurrent_operation,
+            expected_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+    );
+    let left = left.expect("left concurrent retry");
+    let right = right.expect("right concurrent retry");
+    assert_eq!(left, right);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after concurrent retries"),
+        version_after_commit + 2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM retail_equipment_operations WHERE operation_id = $1",
+        )
+        .bind(concurrent_operation.get())
+        .fetch_one(&pool)
+        .await
+        .expect("concurrent operation ledger count"),
+        1
     );
 }
 
