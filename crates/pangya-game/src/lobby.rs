@@ -419,6 +419,11 @@ enum LobbyCommand {
         channel: u8,
         reply: oneshot::Sender<Vec<RoomSummary>>,
     },
+    RoomInfo {
+        room_id: RoomId,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    }
+    },
     Join {
         room_id: RoomId,
         identity: RoomIdentity,
@@ -651,6 +656,15 @@ impl LobbyHandle {
             Arc::clone(&gate),
         )?;
         Self::await_reply(&gate, receive, self.command_timeout).await
+    }
+
+    /// Returns the public member projection for a room directory request.
+    pub async fn room_info(&self, room_id: RoomId) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(LobbyCommand::RoomInfo { room_id, reply }, Arc::clone(&gate))?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
     }
 
     /// Atomically admits a connection to one room only.
@@ -1850,6 +1864,15 @@ async fn run_lobby(
                         .map(|record| record.summary.clone())
                         .collect();
                     let _ignored = reply.send(summaries);
+                }
+                Some(LobbyCommand::RoomInfo { room_id, reply }) => {
+                    let handle = registry.rooms.get(&room_id).map(|record| record.handle.clone());
+                    let result = match handle {
+                        Some(handle) => handle.state().await,
+                        None => Err(RoomError::RoomNotFound),
+                    };
+                    let _ignored = reply.send(result);
+                }
                 }
                 Some(LobbyCommand::Join { room_id, identity, password, outbound, cancellation, reply }) => {
                     let result = registry.join_with_channel(room_id, identity, password, None, outbound, cancellation).await;

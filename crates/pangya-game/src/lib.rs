@@ -7685,21 +7685,27 @@ where
                 Ok(state)
             }
             (GameState::InChannel, RETAIL_C2S_ROOM_INFO) => {
-                let _request = decode_packet_payload::<RetailRoomInformationRequest>(
+                let request = decode_packet_payload::<RetailRoomInformationRequest>(
                     payload,
                     profile,
                     ServiceKind::Game,
                 )
                 .map_err(|_| GameRuntimeError::Protocol)?;
-                // Directory information is public but the registry deliberately exposes only
-                // summaries here; never leak a private room's roster through this request.
-                self.send(
-                    framed,
-                    &RetailRoomInformationResponse {
-                        players: Vec::new(),
-                    },
-                )
-                .await?;
+                let room_id = RoomId::new(u32::from(request.room_number))
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let snapshot = self
+                    .lobby
+                    .room_info(room_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let players = snapshot
+                    .members()
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, member)| retail_room_player(slot, member))
+                    .collect();
+                self.send(framed, &RetailRoomInformationResponse { players })
+                    .await?;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_INFO) => {
