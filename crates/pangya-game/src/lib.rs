@@ -30,7 +30,7 @@ pub use stroke_state::{
 };
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -849,17 +849,25 @@ enum SocialEvent {
 #[derive(Clone)]
 struct SocialMember {
     account_id: AccountId,
+    /// The OID assigned by the authoritative live-session registry, not a cast from a GM packet.
+    oid: u32,
     nickname: Vec<u8>,
     card: MemberCard,
     room: Option<RoomId>,
     /// Retail sub-server presence; absent until the initial channel selection succeeds.
     channel: Option<u8>,
     whisper_accept: bool,
+    /// Cancels the owning connection task for a real GM disconnect.
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone)]
 struct SocialHub {
-    members: Arc<Mutex<std::collections::BTreeMap<PlayerConnectionId, SocialMember>>>,
+    members: Arc<Mutex<BTreeMap<PlayerConnectionId, SocialMember>>>,
+    /// Process-authoritative OID to durable account mapping. Entries outlive a live connection so
+    /// a catalog-valid GM grant can still address an account immediately after logout.
+    oid_accounts: Arc<Mutex<BTreeMap<u32, AccountId>>>,
+    oid_capacity: usize,
     events: broadcast::Sender<SocialEvent>,
 }
 
@@ -867,13 +875,16 @@ impl SocialHub {
     fn new(capacity: usize) -> Self {
         let (events, _) = broadcast::channel(capacity.max(1));
         Self {
-            members: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            members: Arc::new(Mutex::new(BTreeMap::new())),
+            oid_accounts: Arc::new(Mutex::new(BTreeMap::new())),
+            oid_capacity: capacity.max(1),
             events,
         }
     }
     fn subscribe(&self) -> broadcast::Receiver<SocialEvent> {
         self.events.subscribe()
     }
+    #[cfg(test)]
     fn register(
         &self,
         id: PlayerConnectionId,
@@ -881,16 +892,57 @@ impl SocialHub {
         nickname: Vec<u8>,
         card: MemberCard,
     ) {
+        let oid = u32::try_from(id.get()).unwrap_or(u32::MAX);
+        self.register_with_oid(id, oid, account_id, nickname, card);
+    }
+    #[cfg(test)]
+    fn register_with_oid(
+        &self,
+        id: PlayerConnectionId,
+        oid: u32,
+        account_id: AccountId,
+        nickname: Vec<u8>,
+        card: MemberCard,
+    ) {
+        self.register_with_oid_and_cancellation(
+            id,
+            oid,
+            account_id,
+            nickname,
+            card,
+            CancellationToken::new(),
+        );
+    }
+    fn register_with_oid_and_cancellation(
+        &self,
+        id: PlayerConnectionId,
+        oid: u32,
+        account_id: AccountId,
+        nickname: Vec<u8>,
+        card: MemberCard,
+        cancellation: CancellationToken,
+    ) {
+        if let Ok(mut accounts) = self.oid_accounts.lock() {
+            accounts.insert(oid, account_id);
+            while accounts.len() > self.oid_capacity {
+                let Some(oldest) = accounts.keys().next().copied() else {
+                    break;
+                };
+                accounts.remove(&oldest);
+            }
+        }
         if let Ok(mut members) = self.members.lock() {
             members.insert(
                 id,
                 SocialMember {
                     account_id,
+                    oid,
                     nickname,
                     card,
                     room: None,
                     channel: None,
                     whisper_accept: true,
+                    cancellation,
                 },
             );
         }
@@ -935,6 +987,27 @@ impl SocialHub {
             .ok()?
             .get(&id)
             .map(|member| member.account_id)
+    }
+    fn connection_for_oid(&self, oid: u32) -> Option<PlayerConnectionId> {
+        self.members
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(_, member)| member.oid == oid)
+            .map(|(connection, _)| *connection)
+    }
+    fn account_for_oid(&self, oid: u32) -> Option<AccountId> {
+        self.oid_accounts.lock().ok()?.get(&oid).copied()
+    }
+    fn cancel_connection_for_oid(&self, oid: u32) -> bool {
+        let Ok(members) = self.members.lock() else {
+            return false;
+        };
+        let Some(member) = members.values().find(|member| member.oid == oid) else {
+            return false;
+        };
+        member.cancellation.cancel();
+        true
     }
     fn contains_account(&self, id: u32) -> bool {
         let Ok(members) = self.members.lock() else {
@@ -1874,11 +1947,15 @@ where
                             };
                             match authenticated {
                                 Ok((guard, established)) => {
-                                    self.social.register(
+                                    let oid = u32::try_from(connection_id.get())
+                                        .map_err(|_| GameRuntimeError::Limited)?;
+                                    self.social.register_with_oid_and_cancellation(
                                         connection_id,
+                                        oid,
                                         established.account_id,
                                         established.nickname.display().as_bytes().to_vec(),
                                         established.card.clone(),
+                                        room_cancellation.clone(),
                                     );
                                     // Claim pending durable notes only after authentication. The
                                     // lease is not acknowledged until the outbound write succeeds,
@@ -2745,18 +2822,25 @@ where
 
     async fn handle_gm_command(
         &self,
-        _connection_id: PlayerConnectionId,
+        connection_id: PlayerConnectionId,
         room_id: Option<RoomId>,
         command: GmSubcommand,
     ) -> Result<(), GameRuntimeError> {
         match command {
-            GmSubcommand::Kick { oid, .. } | GmSubcommand::Disconnect { oid } => {
-                let target = PlayerConnectionId::new(u64::from(oid))
-                    .map_err(|_| GameRuntimeError::Protocol)?;
+            GmSubcommand::Kick { oid, .. } => {
+                let target = self
+                    .social
+                    .connection_for_oid(oid)
+                    .ok_or(GameRuntimeError::Protocol)?;
                 self.lobby
                     .disconnect(target)
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
+            }
+            GmSubcommand::Disconnect { oid } => {
+                if !self.social.cancel_connection_for_oid(oid) {
+                    return Err(GameRuntimeError::Protocol);
+                }
             }
             GmSubcommand::Destroy { room } => {
                 let room = RoomId::new(u32::from(room)).map_err(|_| GameRuntimeError::Protocol)?;
@@ -2766,12 +2850,12 @@ where
                     .map_err(|_| GameRuntimeError::Protocol)?;
             }
             GmSubcommand::Wind { speed, direction } => {
-                let Some(room_id) = room_id else {
+                if room_id.is_none() {
                     return Err(GameRuntimeError::Protocol);
                 };
                 self.lobby
                     .route(
-                        _connection_id,
+                        connection_id,
                         LobbyRoomCommand::Atmosphere {
                             weather: None,
                             wind: Some((speed, direction)),
@@ -2779,15 +2863,14 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                let _ = room_id;
             }
             GmSubcommand::Weather { weather } => {
-                let Some(room_id) = room_id else {
+                if room_id.is_none() {
                     return Err(GameRuntimeError::Protocol);
                 };
                 self.lobby
                     .route(
-                        _connection_id,
+                        connection_id,
                         LobbyRoomCommand::Atmosphere {
                             weather: Some(weather),
                             wind: None,
@@ -2795,7 +2878,6 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                let _ = room_id;
             }
             GmSubcommand::GiveItem {
                 oid,
@@ -2834,11 +2916,9 @@ where
                         return Ok(());
                     }
                 };
-                let target_connection = PlayerConnectionId::new(u64::from(oid))
-                    .map_err(|_| GameRuntimeError::Protocol)?;
                 let target = self
                     .social
-                    .account_for_connection(target_connection)
+                    .account_for_oid(oid)
                     .ok_or(GameRuntimeError::Protocol)?;
                 self.repository
                     .gm_grant_item(AdminItemGrant {
@@ -10171,7 +10251,10 @@ mod tests {
         assert!(hub.cancel_connection_for_oid(target_oid));
         assert!(token.is_cancelled());
         assert_eq!(hub.connection_for_oid(target_oid), Some(connection));
-        assert!(!hub.cancel_connection_for_oid(7), "wire OID must not be cast to a connection ID");
+        assert!(
+            !hub.cancel_connection_for_oid(7),
+            "wire OID must not be cast to a connection ID"
+        );
     }
 
     #[test]
