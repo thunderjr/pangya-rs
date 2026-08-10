@@ -2343,7 +2343,9 @@ where
             .acquire(session.account_id)
             .map_err(|error| {
                 match error {
-                    RegistryError::Duplicate => self.observer.authentication("duplicate"),
+                    RegistryError::Duplicate(_) | RegistryError::Stale(_) => {
+                        self.observer.authentication("duplicate")
+                    }
                     RegistryError::Capacity => {
                         self.observer.rate_limited(GameRateClass::ConnectionGlobal)
                     }

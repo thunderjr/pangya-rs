@@ -19,10 +19,12 @@ use pangya_domain::{
 use pangya_protocol::{
     ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket,
     EmptyMessageServerList, EncodePacket, ErrorClass, FrameCodec, GameServerEntry, GameServerList,
-    InboundFrame, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey,
-    LoginResult, LoginSuccess, NicknameCheckResult, OutboundFrame, PacketEncodeError, PacketReader,
-    SelectCharacter, SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes,
-    encode_packet_payload, us852_login_hello,
+    GhostLogin, InboundFrame, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
+    LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN, LoginKey, LoginResult,
+    LoginSuccess, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_SUCCESS, NicknameCheckResult,
+    OutboundFrame, PacketEncodeError, PacketReader, ReconnectRequest, SelectCharacter,
+    SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes, encode_packet_payload,
+    us852_login_hello,
 };
 use rand::{RngCore, rngs::OsRng};
 use thiserror::Error;
@@ -41,7 +43,7 @@ use crate::{
     BoundedCredentialExecutor, CanonicalTransportSecret, CapacityRegistry, CredentialError,
     CredentialExecutorError, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry,
     LoginEvent, LoginState, LoginStateMachine, RateDecision, RegistryError, RegistryGuard,
-    generate_handover,
+    SessionControl, SessionProbeReceiver, generate_handover,
 };
 
 /// Generated process-local connection identifier safe for logs and metrics.
@@ -629,12 +631,23 @@ where
             let codec = FrameCodec::new(key, ServiceKind::Login, self.config.limits.codec);
             let framed = Framed::new(stream, codec);
             let connection_shutdown = shutdown.clone();
+            let (session_control, probes) = SessionControl::new();
+            // Keep a control handle outside the timed future. If the outer total deadline wins,
+            // Tokio drops `run_connection` before this branch returns; retaining first makes the
+            // authoritative stale bit visible to the RAII presence guard during that drop.
+            let stale_control = session_control.clone();
             tokio::select! {
                 biased;
                 result = timeout(
                     self.config.limits.login_timeout,
-                    self.run_connection(framed, prefix, connection_shutdown),
-                ) => result.map_err(|_| LoginRuntimeError::Timeout)?,
+                    self.run_connection(framed, prefix, connection_shutdown, session_control, probes),
+                ) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stale_control.retain_stale();
+                        Err(LoginRuntimeError::Timeout)
+                    }
+                },
                 () = shutdown.cancelled() => Ok(ConnectionTermination::Cancelled),
             }
         }
@@ -657,27 +670,59 @@ where
         mut framed: Framed<TcpStream, FrameCodec>,
         source: SourceAddressPrefix,
         shutdown: CancellationToken,
+        session_control: SessionControl,
+        mut probes: SessionProbeReceiver,
     ) -> Result<ConnectionTermination, LoginRuntimeError> {
         let started = Instant::now();
         let mut packet_window = LocalRateWindow::new(self.config.limits.rate_window);
         let mut machine = LoginStateMachine::new(self.config.limits.max_retries)
             .map_err(|_| LoginRuntimeError::Protocol)?;
         let mut account: Option<AuthenticationRecord> = None;
+        // Keep the task lease alive until after the presence guard is dropped. Normal task exits
+        // therefore retire their generation deterministically; a task that is externally ended
+        // before cleanup still leaves a stale generation for authenticated ghost recovery.
+        let _task_lease = session_control.start_task();
         let mut _presence: Option<RegistryGuard<AccountId>> = None;
         let mut handover_token: Option<Zeroizing<Vec<u8>>> = None;
+        // Only an authenticated stale duplicate is held until the client explicitly requests
+        // ghost recovery. The account ID is authenticated before it is stored; the 0x0004 packet
+        // itself has no identity fields and can never ghost an arbitrary account.
+        let mut pending_ghost: Option<(AccountId, u64)> = None;
 
         loop {
+            // Ghost invalidation cancels the old owner before a replacement can acquire the
+            // account. Check at every state-machine turn so an old socket cannot continue after
+            // its lease was revoked, even when an earlier await just completed.
+            if session_control.is_revoked() {
+                let _ = machine.apply(LoginEvent::Disconnect);
+                return Ok(ConnectionTermination::Rejected);
+            }
             match machine.state() {
-                LoginState::Complete => return Ok(ConnectionTermination::Completed),
+                LoginState::Complete => {
+                    // A clean handover is a normal retirement, not a stale owner. Release the
+                    // generation while the task lease is still live; unexpected task exits keep
+                    // the generation as a stale ghost until authenticated recovery retires it.
+                    _presence.take();
+                    return Ok(ConnectionTermination::Completed);
+                }
                 LoginState::Closed => return Ok(ConnectionTermination::Rejected),
                 _ => {}
             }
-            let login_remaining = self
+            let login_remaining = match self
                 .config
                 .limits
                 .login_timeout
                 .checked_sub(started.elapsed())
-                .ok_or(LoginRuntimeError::Timeout)?;
+            {
+                Some(remaining) => remaining,
+                None => {
+                    // A task that reaches its total deadline is no longer servicing its
+                    // authenticated socket. Retain the generation so the next authenticated
+                    // client can perform the explicit stale/ghost handshake.
+                    session_control.retain_stale();
+                    return Err(LoginRuntimeError::Timeout);
+                }
+            };
             let wait = login_remaining.min(self.config.limits.idle_timeout);
             let frame = tokio::select! {
                 biased;
@@ -685,8 +730,20 @@ where
                     let _ = machine.apply(LoginEvent::Disconnect);
                     return Ok(ConnectionTermination::Cancelled);
                 }
-                result = timeout(wait, framed.next()) => {
-                    result.map_err(|_| LoginRuntimeError::Timeout)?
+                () = session_control.cancelled() => {
+                    let _ = machine.apply(LoginEvent::Disconnect);
+                    return Ok(ConnectionTermination::Rejected);
+                }
+                Some(reply) = probes.recv() => {
+                    let _ = reply.send(());
+                    continue;
+                }
+                result = timeout(wait, framed.next()) => match result {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        session_control.retain_stale();
+                        return Err(LoginRuntimeError::Timeout);
+                    }
                 }
             };
             let Some(frame) = frame else {
@@ -763,16 +820,35 @@ where
                         }
                         continue;
                     };
-                    let guard = match self.active_accounts.acquire(authenticated.account.id) {
+                    let guard = match self
+                        .active_accounts
+                        .acquire_with_control(authenticated.account.id, session_control.clone())
+                    {
                         Ok(guard) => guard,
-                        Err(RegistryError::Duplicate) => {
-                            self.observer.login("duplicate");
+                        Err(RegistryError::Duplicate(_lease)) => {
+                            // No bounded probe can distinguish a live task blocked in repository
+                            // or socket I/O from a dead task. Registry liveness is explicit: a
+                            // non-revoked, running owner is always the live duplicate outcome.
+                            self.observer.login("duplicate_live");
                             self.send(
                                 &mut framed,
                                 &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
                             )
                             .await?;
                             return Ok(ConnectionTermination::Rejected);
+                        }
+                        Err(RegistryError::Stale(lease)) => {
+                            self.observer.login("duplicate_stale");
+                            self.send(
+                                &mut framed,
+                                &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
+                            )
+                            .await?;
+                            pending_ghost = Some((authenticated.account.id, lease));
+                            machine
+                                .apply(LoginEvent::AuthenticationRejected)
+                                .map_err(|_| LoginRuntimeError::Protocol)?;
+                            continue;
                         }
                         Err(RegistryError::Capacity) => return Err(LoginRuntimeError::Limited),
                     };
@@ -805,7 +881,11 @@ where
                     self.send(
                         &mut framed,
                         &NicknameCheckResult {
-                            unknown_result: u32::from(!available),
+                            unknown_result: if available {
+                                NICKNAME_CHECK_SUCCESS
+                            } else {
+                                NICKNAME_CHECK_IN_USE
+                            },
                             nickname: packet.nickname,
                         },
                     )
@@ -833,7 +913,7 @@ where
                             self.send(
                                 &mut framed,
                                 &NicknameCheckResult {
-                                    unknown_result: 1,
+                                    unknown_result: NICKNAME_CHECK_IN_USE,
                                     nickname: packet.nickname,
                                 },
                             )
@@ -872,8 +952,67 @@ where
                         .await?;
                     handover_token = Some(token);
                 }
+                LoginState::AwaitLogin if frame.opcode == 0x0004 => {
+                    if self.decode_packet::<GhostLogin>(&frame).is_err() {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                    let Some((account_id, lease)) = pending_ghost.take() else {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    };
+                    if !self
+                        .active_accounts
+                        .invalidate_and_wait(&account_id, lease)
+                        .await
+                    {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                }
+                LoginState::AwaitLogin if frame.opcode == 0x000b => {
+                    if self.decode_packet::<ReconnectRequest>(&frame).is_err() {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_RECONNECT_TOKEN),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                    // A reconnect token is intentionally not accepted by LoginService yet. The
+                    // reference-safe behavior is a typed refusal, never a silent close; the token
+                    // packet's Drop implementation zeroizes the bearer after this branch.
+                    self.send(
+                        &mut framed,
+                        &LoginResult::Error(LOGIN_ERROR_INVALID_RECONNECT_TOKEN),
+                    )
+                    .await?;
+                    return Ok(ConnectionTermination::Rejected);
+                }
                 LoginState::AwaitCharacterSelect if frame.opcode == 0x0008 => {
-                    let packet = self.decode_packet::<SelectCharacter>(&frame)?;
+                    let packet = match self.decode_packet::<SelectCharacter>(&frame) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            self.send(
+                                &mut framed,
+                                &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                            )
+                            .await?;
+                            return Ok(ConnectionTermination::Rejected);
+                        }
+                    };
                     if !self
                         .config
                         .allowed_character_types
@@ -886,7 +1025,12 @@ where
                             character_id = packet.character_id,
                             "refused a character selection outside the configured allowlist"
                         );
-                        return Err(LoginRuntimeError::Protocol);
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
                     }
                     let account_id = account
                         .as_ref()
@@ -949,8 +1093,20 @@ where
                 }
                 LoginState::AwaitServerSelect if frame.opcode == 0x0003 => {
                     let packet = self.decode_packet::<SelectServer>(&frame)?;
+                    // Ghost invalidation revokes both the task control and this generation. The
+                    // old socket must not reach server selection after a replacement wins.
+                    if session_control.is_revoked()
+                        || !_presence.as_ref().is_some_and(RegistryGuard::is_current)
+                    {
+                        return Ok(ConnectionTermination::Rejected);
+                    }
                     if packet.server_id != self.config.game_server.id {
-                        return Err(LoginRuntimeError::Protocol);
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
                     }
                     let token = handover_token.take().ok_or(LoginRuntimeError::Handover)?;
                     self.send(
@@ -1271,7 +1427,10 @@ fn encode_error_class(error: &PacketEncodeError) -> ProtocolMetricClass {
 }
 
 fn is_known_opcode(opcode: u16) -> bool {
-    matches!(opcode, 0x0001 | 0x0003 | 0x0006 | 0x0007 | 0x0008)
+    matches!(
+        opcode,
+        0x0001 | 0x0003 | 0x0004 | 0x0006 | 0x0007 | 0x0008 | 0x000b
+    )
 }
 
 fn unknown_opcode_bucket(opcode: u16) -> UnknownOpcodeBucket {
@@ -1340,6 +1499,13 @@ mod tests {
         let encode = PacketEncodeError::Io(io::Error::other("synthetic"));
         assert_eq!(decode_error_class(&decode), ProtocolMetricClass::Io);
         assert_eq!(encode_error_class(&encode), ProtocolMetricClass::Io);
+    }
+
+    #[test]
+    fn ghost_and_reconnect_are_known_for_invalid_state_classification() {
+        assert!(is_known_opcode(0x0004));
+        assert!(is_known_opcode(0x000b));
+        assert!(!is_known_opcode(0x7777));
     }
 
     #[test]

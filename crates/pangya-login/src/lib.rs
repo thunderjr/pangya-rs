@@ -13,7 +13,7 @@ mod state;
 pub use executor::{BoundedCredentialExecutor, CredentialEngine, CredentialExecutorError};
 pub use limits::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
-    RegistryError, RegistryGuard,
+    RegistryError, RegistryGuard, SessionControl, SessionProbeReceiver, SessionTaskLease,
 };
 pub use runtime::{
     AdvertisedGameServer, ConnectionId, ConnectionTermination, CredentialWorkerOutcome,
