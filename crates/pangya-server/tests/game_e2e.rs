@@ -49,6 +49,7 @@ use pangya_protocol::{
     decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
+use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -452,6 +453,104 @@ fn economy_catalog() -> Catalog {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../pangya-data/tests/fixtures/synthetic-catalog-v2");
     Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("M7 catalog")
+}
+
+/// Builds a test-only real-schema catalog with every exact Rookie mission/completion item. The
+/// shipped economy fixture intentionally omits these IDs so the refusal test can prove catalog
+/// gating; this separate catalog keeps the successful encrypted flow server-authoritative without
+/// changing production catalog data.
+fn tutorial_catalog() -> Catalog {
+    const RECORD_SIZE: usize = 0x90;
+    let root = std::env::temp_dir().join(format!("pangya-tutorial-e2e-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).expect("tutorial catalog directory");
+    let iff = |binding: u16, ids: &[u32], listed: bool| {
+        let mut bytes = Vec::with_capacity(8 + ids.len() * RECORD_SIZE);
+        bytes.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&binding.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        for id in ids {
+            let mut record = vec![0_u8; RECORD_SIZE];
+            record[..4].copy_from_slice(&1_u32.to_le_bytes());
+            record[4..8].copy_from_slice(&id.to_le_bytes());
+            if listed {
+                record[0x5c..0x60].copy_from_slice(&1_u32.to_le_bytes());
+                record[0x68] = 0x20;
+            }
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    };
+    let files = [
+        (
+            "character.bin",
+            "character",
+            1_u16,
+            [0x0400_0000_u32].as_slice(),
+        ),
+        (
+            "club_set.bin",
+            "club_set",
+            2,
+            [0x1000_0000_u32, 0x1000_0012].as_slice(),
+        ),
+        ("ball.bin", "ball", 3, [0x1400_0000_u32].as_slice()),
+        (
+            "consumable.bin",
+            "consumable",
+            5,
+            [
+                0x1a00_000f_u32,
+                0x1800_0007,
+                0x1800_0005,
+                0x1800_0008,
+                0x1a00_0010,
+                0x1800_0004,
+            ]
+            .as_slice(),
+        ),
+        ("caddie.bin", "caddie", 7, [0x1c00_0000_u32].as_slice()),
+    ];
+    let mut manifest = String::from("manifest_version = 3\n\n");
+    for (filename, kind, binding, ids) in files {
+        let bytes = iff(binding, ids, kind == "consumable");
+        std::fs::write(root.join(filename), &bytes).expect("write tutorial catalog family");
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        manifest.push_str(&format!(
+            "[[files]]\nfilename = \"{filename}\"\nsha256 = \"{digest}\"\nkind = \"{kind}\"\ncount = {}\nbinding = {binding}\nversion = 3\nrecord_size = {RECORD_SIZE}\n\n",
+            ids.len()
+        ));
+    }
+    std::fs::write(root.join("manifest.toml"), manifest).expect("write tutorial manifest");
+    let catalog =
+        Catalog::load(&root, std::path::Path::new("manifest.toml")).expect("tutorial catalog");
+    std::fs::remove_dir_all(root).expect("remove tutorial catalog");
+    catalog
+}
+
+fn tutorial_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
+    let catalog = tutorial_catalog();
+    Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool)),
+            catalog,
+            GameRuntimeConfig {
+                channel_id: 1,
+                advertised_channel_ids: vec![1],
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: Some(default_economy()),
+                login_bonus: None,
+                retail_bootstrap: true,
+            },
+            metrics,
+        )
+        .expect("tutorial service"),
+    )
 }
 
 fn economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameService<PgRepository>> {
@@ -910,6 +1009,16 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
     })
     .await
     .expect("bounded packet receive")
+}
+
+fn assert_tutorial_status(body: &[u8], code: u16, mission_id: u32) {
+    let mut expected = Vec::with_capacity(19);
+    expected.extend_from_slice(&code.to_le_bytes());
+    expected.extend_from_slice(&mission_id.to_le_bytes());
+    expected.push(0);
+    expected.extend_from_slice(&u32::from(code).to_le_bytes());
+    expected.extend_from_slice(&[0; 8]);
+    assert_eq!(body, expected.as_slice(), "exact 19-byte tutorial status");
 }
 
 /// Drains whatever a stream has to say within a short window, without asserting an order.
@@ -9424,4 +9533,210 @@ async fn tutorial_catalog_validation_runs_over_encrypted_game_service(pool: PgPo
 
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn tutorial_progression_is_encrypted_durable_idempotent_and_concurrent(pool: PgPool) {
+    let account = create_account(&pool, "tutorialsuccess", 0, 0x1000_0000).await;
+    let service = tutorial_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    // Separate service processes let the duplicate requests race in PostgreSQL without a
+    // per-process single-session guard masking the storage concurrency contract.
+    let duplicate_service = tutorial_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (duplicate_address, duplicate_shutdown, duplicate_task) =
+        start_service(duplicate_service).await;
+
+    async fn authenticated(
+        address: std::net::SocketAddr,
+        account: &AccountAggregate,
+        token: String,
+        expected_mask: u32,
+    ) -> (TcpStream, u8) {
+        let (mut stream, key) = connect_game_retail(address).await;
+        send_typed(
+            &mut stream,
+            key,
+            1,
+            &pangya_protocol::RetailGameAuth {
+                username: b"tutorialsuccess".to_vec(),
+                user_id: u32::try_from(account.account.id.get()).expect("user id"),
+                login_key: zeroize::Zeroizing::new(token.into_bytes()),
+                client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+                session_key: zeroize::Zeroizing::new(Vec::new()),
+            },
+        )
+        .await;
+        let mut saw_tutorial = false;
+        for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+            let (opcode, body) = receive_packet(&mut stream, key).await;
+            if opcode == 0x011f {
+                assert_tutorial_status(&body, 3, expected_mask);
+                saw_tutorial = true;
+            }
+        }
+        assert!(saw_tutorial, "bootstrap includes tutorial state");
+        send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+        assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+        (stream, key)
+    }
+
+    let token_a = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let token_b = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let ((mut first, key_a), (mut second, key_b)) = tokio::join!(
+        authenticated(address, &account, token_a, 0),
+        authenticated(duplicate_address, &account, token_b, 0),
+    );
+
+    // Two authenticated encrypted sessions submit the same mission concurrently. Both receive
+    // the active K4T 19-byte form, while the storage ledger retains one mission reward.
+    tokio::join!(
+        send_packet(&mut first, key_a, 3, 0x00ae, &[0, 0, 1, 0, 0, 0]),
+        send_packet(&mut second, key_b, 3, 0x00ae, &[0, 0, 1, 0, 0, 0]),
+    );
+    let ((opcode_a, body_a), (opcode_b, body_b)) = tokio::join!(
+        receive_packet(&mut first, key_a),
+        receive_packet(&mut second, key_b),
+    );
+    assert_eq!((opcode_a, opcode_b), (0x011f, 0x011f));
+    assert_tutorial_status(&body_a, 0, 1);
+    assert_tutorial_status(&body_b, 0, 1);
+
+    let mut mask = 1_u32;
+    for mission in [2_u32, 4, 8, 16, 32, 64] {
+        let mut mission_payload = [0_u8; 6];
+        mission_payload[..2].copy_from_slice(&0_u16.to_le_bytes());
+        mission_payload[2..].copy_from_slice(&mission.to_le_bytes());
+        send_packet(&mut first, key_a, 3, 0x00ae, &mission_payload).await;
+        let (opcode, body) = receive_packet(&mut first, key_a).await;
+        assert_eq!(opcode, 0x011f);
+        mask |= mission;
+        assert_tutorial_status(&body, 0, mask);
+    }
+
+    let progress: (i32, i32) = sqlx::query_as(
+        "SELECT rookie_mask, beginner_mask FROM tutorial_progress WHERE account_id = $1",
+    )
+    .bind(account.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("durable tutorial progression");
+    assert_eq!(progress, (127, 0));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tutorial_mission_rewards WHERE account_id = $1",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("mission reward ledger"),
+        7
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tutorial_reward_claims WHERE account_id = $1",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("completion claim ledger"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inventory_items WHERE account_id = $1 AND starter_key LIKE 'tutorial.1.%'",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("completion inventory"),
+        0
+    );
+
+    drop(first);
+    drop(second);
+    shutdown.cancel();
+    assert!(task.await.expect("first service join").is_ok());
+    duplicate_shutdown.cancel();
+    assert!(
+        duplicate_task
+            .await
+            .expect("duplicate service join")
+            .is_ok()
+    );
+
+    // A fresh service process reads the same durable mask and emits the 19-byte login projection.
+    let restarted_service = tutorial_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (restarted_address, restarted_shutdown, restarted_task) =
+        start_service(restarted_service).await;
+    let replay_token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut replay, replay_key) =
+        authenticated(restarted_address, &account, replay_token, 127).await;
+    // Replay a mission after restart before completing the family; the durable ledger remains
+    // exactly-once and the 19-byte projection remains at the persisted mask.
+    send_packet(&mut replay, replay_key, 3, 0x00ae, &[0, 0, 64, 0, 0, 0]).await;
+    let (opcode, body) = receive_packet(&mut replay, replay_key).await;
+    assert_eq!(opcode, 0x011f);
+    assert_tutorial_status(&body, 0, 127);
+    send_packet(&mut replay, replay_key, 3, 0x00ae, &[0, 0, 128, 0, 0, 0]).await;
+    let (opcode, body) = receive_packet(&mut replay, replay_key).await;
+    assert_eq!(opcode, 0x011f);
+    assert_tutorial_status(&body, 0, 0xff);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tutorial_reward_claims WHERE account_id = $1",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("completion claim after restart"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inventory_items WHERE account_id = $1 AND starter_key LIKE 'tutorial.1.%'",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("completion rewards after restart"),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tutorial_mission_rewards WHERE account_id = $1",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("replayed mission reward ledger"),
+        8
+    );
+
+    drop(replay);
+    restarted_shutdown.cancel();
+    assert!(
+        restarted_task
+            .await
+            .expect("restarted service join")
+            .is_ok()
+    );
 }

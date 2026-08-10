@@ -77,28 +77,3 @@ impl EncodePacket for TutorialStatusLogin {
         Ok(())
     }
 }
-
-/// Exact 6-byte completion body sent as server `0x011f`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TutorialStatusCompletion {
-    /// Tutorial family/code in the completion body.
-    pub code: u8,
-    /// Durable mission mask after applying the mission.
-    pub mission_id: u32,
-}
-
-impl EncodePacket for TutorialStatusCompletion {
-    const OPCODE: u16 = TUTORIAL_STATUS_OPCODE;
-
-    fn encode(
-        &self,
-        writer: &mut PacketWriter,
-        profile: &CompatibilityProfile,
-    ) -> Result<(), PacketEncodeError> {
-        check_encode(profile)?;
-        writer.u8(self.code);
-        writer.u8(1);
-        writer.u32_le(self.mission_id);
-        Ok(())
-    }
-}

@@ -2,8 +2,7 @@
 
 use pangya_protocol::{
     CompatibilityProfile, RetailLobbyEquipmentUpdate, RetailRoomEquipmentUpdate, ServiceKind,
-    TutorialMission, TutorialStatusCompletion, TutorialStatusLogin, decode_packet_payload,
-    encode_packet_payload,
+    TutorialMission, TutorialStatusLogin, decode_packet_payload, encode_packet_payload,
 };
 
 #[test]
@@ -46,14 +45,17 @@ fn status_packets_are_exact_reference_bodies() {
         [3, 0, 0xff, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     let completion = encode_packet_payload(
-        &TutorialStatusCompletion {
-            code: 1,
+        &TutorialStatusLogin {
+            code: 0,
             mission_id: 0xff,
         },
         &CompatibilityProfile::US_852,
     )
-    .expect("completion status");
-    assert_eq!(completion.as_slice(), [1, 1, 0xff, 0, 0, 0]);
+    .expect("completion status uses the active K4T login form");
+    assert_eq!(
+        completion.as_slice(),
+        [0, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[test]

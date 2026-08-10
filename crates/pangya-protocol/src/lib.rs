@@ -119,8 +119,7 @@ pub use social::{
     WhisperRefusalResponse, WhisperResponse,
 };
 pub use tutorial::{
-    TUTORIAL_MISSION_OPCODE, TUTORIAL_STATUS_OPCODE, TutorialMission, TutorialStatusCompletion,
-    TutorialStatusLogin,
+    TUTORIAL_MISSION_OPCODE, TUTORIAL_STATUS_OPCODE, TutorialMission, TutorialStatusLogin,
 };
 pub use us852_bootstrap::{
     CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_BLOCK_BYTES, CHARACTER_CARDS,

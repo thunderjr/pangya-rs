@@ -508,6 +508,12 @@ Three sources against one, including both 852-targeting servers, say
 confusion survived: upstream's blob happens to be a valid-looking `0x004b` and
 the client does not visibly complain.
 
+This remains **live-capture blocked** for the U.S. 852 client: no capture has
+proven a tutorial interpretation of client `0x000b`, so this PR does not claim
+one or implement the unproven tutorial-start body. The active PacketDoc and
+multi-source server evidence support the equipment handler only; revisit the
+collision when an immutable U.S. capture is available.
+
 ### 5.2 `0x0065` — time booster body conflict (deferred)
 
 The vendored PacketDoc `gameservice/client/0065.ksy` defines a `u4 item_id` and pairs it

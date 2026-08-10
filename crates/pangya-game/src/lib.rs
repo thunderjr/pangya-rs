@@ -125,14 +125,14 @@ use pangya_protocol::{
     StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
     StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
     StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, TutorialMission, TutorialStatusCompletion,
-    TutorialStatusLogin, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
-    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
-    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
-    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
-    UserStatisticsInfoResponse, UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse,
-    Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse, Wind,
-    authorize_gm_request, decode_gm_request, decode_packet_payload, encode_packet_payload,
+    StrokeStandings, StrokeTurnStarted, TutorialMission, TutorialStatusLogin, TypingIndicator,
+    TypingIndicatorResponse, UnknownBytes, UserCharacterInfoResponse,
+    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
+    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
+    UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather,
+    Whisper, WhisperRefusalResponse, WhisperResponse, Wind, authorize_gm_request,
+    decode_gm_request, decode_packet_payload, encode_packet_payload,
     is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
@@ -2590,9 +2590,11 @@ where
                                 let Some(definition) = self.catalog.item_definition(mission_reward.item_type_id) else {
                                     break Err(GameRuntimeError::Catalog);
                                 };
-                                if definition.kind != ItemKind::Consumable
-                                    || !matches!(definition.stacking, ItemStacking::Stackable { max_stack } if max_stack >= mission_reward.quantity)
-                                {
+                                // A tutorial reward may intentionally exceed one client stack
+                                // (K4T gives 500/1000 Pang items). The catalog still must identify
+                                // the exact item as a consumable; stack presentation is not a
+                                // reason to refuse an otherwise authoritative mission grant.
+                                if definition.kind != ItemKind::Consumable {
                                     break Err(GameRuntimeError::Catalog);
                                 }
                                 let result = self
@@ -2628,7 +2630,11 @@ where
                                 };
                                 self.send(
                                     &mut framed,
-                                    &TutorialStatusCompletion {
+                                    // K4T's active TutorialCoreSystem calls ShowTutorialPlayer
+                                    // with its default IsLogin=true even after a mission. Keep the
+                                    // exact 19-byte form; the 6-byte branch is unproven for the
+                                    // active U.S. client and is intentionally not emitted.
+                                    &TutorialStatusLogin {
                                         code: match kind { TutorialKind::Rookie => 0, TutorialKind::Beginner => 1 },
                                         mission_id: mask,
                                     },
