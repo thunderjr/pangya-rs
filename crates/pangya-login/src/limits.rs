@@ -1,7 +1,7 @@
 //! Fixed-capacity admission, rate-limit, and duplicate-login registries.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     hash::Hash,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
@@ -202,8 +202,9 @@ pub enum RegistryError {
 /// Bounded set whose guards remove keys through RAII.
 #[derive(Debug)]
 pub struct CapacityRegistry<K> {
-    entries: Arc<Mutex<HashSet<K>>>,
+    entries: Arc<Mutex<HashMap<K, u64>>>,
     capacity: usize,
+    next_generation: Arc<Mutex<u64>>,
 }
 
 impl<K> CapacityRegistry<K>
@@ -214,8 +215,9 @@ where
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashSet::with_capacity(capacity))),
+            entries: Arc::new(Mutex::new(HashMap::with_capacity(capacity))),
             capacity,
+            next_generation: Arc::new(Mutex::new(1)),
         }
     }
 
@@ -225,17 +227,35 @@ where
     /// Returns a duplicate or capacity failure without exposing the key.
     pub fn acquire(&self, key: K) -> Result<RegistryGuard<K>, RegistryError> {
         let mut entries = self.entries.lock().map_err(|_| RegistryError::Capacity)?;
-        if entries.contains(&key) {
+        if entries.contains_key(&key) {
             return Err(RegistryError::Duplicate);
         }
         if entries.len() >= self.capacity {
             return Err(RegistryError::Capacity);
         }
-        entries.insert(key.clone());
+        let mut generation = self
+            .next_generation
+            .lock()
+            .map_err(|_| RegistryError::Capacity)?;
+        let lease = *generation;
+        *generation = generation.wrapping_add(1).max(1);
+        entries.insert(key.clone(), lease);
         Ok(RegistryGuard {
             entries: Arc::downgrade(&self.entries),
             key: Some(key),
+            lease,
         })
+    }
+
+    /// Invalidates one active registration. A stale guard cannot remove a later lease for the same
+    /// key, which makes ghost recovery safe when the old connection eventually unwinds.
+    #[must_use]
+    pub fn invalidate(&self, key: &K) -> bool {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|mut entries| entries.remove(key))
+            .is_some()
     }
 
     /// Returns current occupancy for low-cardinality metrics/tests.
@@ -259,8 +279,9 @@ pub struct RegistryGuard<K>
 where
     K: Eq + Hash,
 {
-    entries: Weak<Mutex<HashSet<K>>>,
+    entries: Weak<Mutex<HashMap<K, u64>>>,
     key: Option<K>,
+    lease: u64,
 }
 
 impl<K> Drop for RegistryGuard<K>
@@ -274,7 +295,9 @@ where
         let Some(key) = self.key.take() else {
             return;
         };
-        if let Ok(mut entries) = entries.lock() {
+        if let Ok(mut entries) = entries.lock()
+            && entries.get(&key).copied() == Some(self.lease)
+        {
             entries.remove(&key);
         }
     }
@@ -318,6 +341,18 @@ mod tests {
         let guard = registry.acquire(7).expect("first");
         assert!(matches!(registry.acquire(7), Err(RegistryError::Duplicate)));
         drop(guard);
+        assert!(registry.acquire(7).is_ok());
+    }
+
+    #[test]
+    fn invalidation_does_not_let_stale_guard_remove_new_lease() {
+        let registry = CapacityRegistry::new(1);
+        let stale = registry.acquire(7).expect("stale lease");
+        assert!(registry.invalidate(&7));
+        let current = registry.acquire(7).expect("replacement lease");
+        drop(stale);
+        assert!(matches!(registry.acquire(7), Err(RegistryError::Duplicate)));
+        drop(current);
         assert!(registry.acquire(7).is_ok());
     }
 }

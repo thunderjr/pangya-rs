@@ -21,7 +21,7 @@ use pangya_login::{
 };
 use pangya_observability::M2Metrics;
 use pangya_protocol::{
-    CodecLimits, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, PacketWriter,
+    CodecLimits, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_INVALID_CREDENTIALS, PacketWriter,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -243,6 +243,14 @@ fn login_payload(username: &str, secret: &str) -> Vec<u8> {
     writer.into_inner()
 }
 
+fn reconnect_payload(username: &str, user_id: u32, token: &[u8]) -> Vec<u8> {
+    let mut writer = PacketWriter::new();
+    writer.pstring(username.as_bytes(), 64).expect("username");
+    writer.u32_le(user_id);
+    writer.pstring(token, 128).expect("token");
+    writer.into_inner()
+}
+
 async fn create_ready_account(pool: &PgPool, username: &str) {
     let policy = CredentialPolicy::new().expect("policy");
     let secret = pangya_login::CanonicalTransportSecret::parse(SECRET).expect("secret");
@@ -256,6 +264,37 @@ async fn create_ready_account(pool: &PgPool, username: &str) {
         })
         .await
         .expect("ready account");
+}
+
+async fn create_needs_starter_account(pool: &PgPool, username: &str) {
+    let policy = CredentialPolicy::new().expect("policy");
+    let secret = pangya_login::CanonicalTransportSecret::parse(SECRET).expect("secret");
+    let hash = policy.hash(&secret).expect("hash");
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username_normalized, username_display) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(username.to_ascii_lowercase())
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO credentials (account_id, scheme, password_hash) VALUES ($1, 'argon2id-client-md5-v1', $2)",
+    )
+    .bind(account_id)
+    .bind(hash.expose_phc())
+    .execute(pool)
+    .await
+    .expect("credential");
+    sqlx::query(
+        "INSERT INTO profiles (account_id, nickname_display, nickname_normalized, setup_state) VALUES ($1, $2, $3, 'needs_starter')",
+    )
+    .bind(account_id)
+    .bind("starter_nick")
+    .bind("starter_nick")
+    .execute(pool)
+    .await
+    .expect("profile");
 }
 
 async fn assert_second_packet_limited(
@@ -398,7 +437,8 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     assert_eq!(counts, (1, 1, 1, 1));
     assert!(consumed.account_id.get() > 0);
 
-    // Duplicate authenticated LoginService handshake is rejected while the first waits on select.
+    // Duplicate authenticated LoginService handshake arms the reference ghost recovery flow
+    // while the first waits on select.
     let (mut first_active, first_key) = connect(address).await;
     send_packet(
         &mut first_active,
@@ -427,9 +467,29 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     assert_eq!(duplicate_body[0], 0xe3);
     assert_eq!(
         u32::from_le_bytes(duplicate_body[1..5].try_into().expect("duplicate code")),
-        LOGIN_ERROR_DUPLICATE_CONNECTION
+        LOGIN_ERROR_ALREADY_LOGGED_IN
     );
-    send_packet(&mut first_active, first_key, 7, 3, &[7, 0, 0, 0]).await;
+    // 0x0004 has an empty body and no response; the retry is accepted on this same connection.
+    send_packet(&mut duplicate, duplicate_key, 7, 4, &[]).await;
+    send_packet(
+        &mut duplicate,
+        duplicate_key,
+        8,
+        1,
+        &login_payload("Synthetic_One", SECRET),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut duplicate, duplicate_key).await.0, 1);
+    for expected in [0x10, 6, 9, 2] {
+        assert_eq!(
+            receive_packet(&mut duplicate, duplicate_key).await.0,
+            expected
+        );
+    }
+    send_packet(&mut duplicate, duplicate_key, 9, 3, &[7, 0, 0, 0]).await;
+    assert_eq!(receive_packet(&mut duplicate, duplicate_key).await.0, 3);
+    // The old guard may unwind after replacement; its generation cannot remove the new lease.
+    send_packet(&mut first_active, first_key, 10, 3, &[7, 0, 0, 0]).await;
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 3);
 
     // Invalid-state packet closes without mutating another connection's state.
@@ -522,7 +582,7 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     .await;
     let (opcode, conflict_body) = receive_packet(&mut nickname_conflict, conflict_key).await;
     assert_eq!(opcode, 0x000e);
-    assert_eq!(&conflict_body[..4], &[1, 0, 0, 0]);
+    assert_eq!(&conflict_body[..4], &[2, 0, 0, 0]);
 
     create_ready_account(&pool, "PolicyUser").await;
     sqlx::query(
@@ -553,6 +613,99 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     assert!(rendered.contains("class=\"unknown_opcode\"} 1"));
     assert!(rendered.contains("range=\"other\"} 1"));
 
+    shutdown.cancel();
+    task.await.expect("join");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn disallowed_character_refusal_is_client_visible(pool: PgPool) {
+    create_needs_starter_account(&pool, "WrongCharacterUser").await;
+    let (address, shutdown, task, _) = start(pool, LoginRuntimeLimits::default()).await;
+    let (mut stream, key) = connect(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        1,
+        &login_payload("WrongCharacterUser", SECRET),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 1);
+    send_packet(&mut stream, key, 2, 8, &[0x09, 0, 0, 4, 0, 0]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 1);
+    assert_eq!(body[0], 0xe3);
+    assert_eq!(
+        u32::from_le_bytes(body[1..5].try_into().expect("character refusal code")),
+        LOGIN_ERROR_INVALID_CREDENTIALS
+    );
+    let mut eof = [0_u8; 1];
+    assert_eq!(
+        stream
+            .read(&mut eof)
+            .await
+            .expect("character refusal close"),
+        0
+    );
+    shutdown.cancel();
+    task.await.expect("join");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn configured_server_refusal_is_client_visible(pool: PgPool) {
+    create_ready_account(&pool, "WrongServerUser").await;
+    let (address, shutdown, task, _) = start(pool, LoginRuntimeLimits::default()).await;
+    let (mut stream, key) = connect(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        1,
+        &login_payload("WrongServerUser", SECRET),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 1);
+    for expected in [0x10, 6, 9, 2] {
+        assert_eq!(receive_packet(&mut stream, key).await.0, expected);
+    }
+    send_packet(&mut stream, key, 2, 3, &[99, 0, 0, 0]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 1);
+    assert_eq!(body[0], 0xe3);
+    assert_eq!(
+        u32::from_le_bytes(body[1..5].try_into().expect("server refusal code")),
+        LOGIN_ERROR_INVALID_CREDENTIALS
+    );
+    let mut eof = [0_u8; 1];
+    assert_eq!(
+        stream.read(&mut eof).await.expect("server refusal close"),
+        0
+    );
+    shutdown.cancel();
+    task.await.expect("join");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn reconnect_is_refused_with_a_client_visible_token_error(pool: PgPool) {
+    let (address, shutdown, task, _) = start(pool, LoginRuntimeLimits::default()).await;
+    let (mut stream, key) = connect(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        1,
+        0x000b,
+        &reconnect_payload("ReconnectUser", 42, b"stale-session-token"),
+    )
+    .await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 1);
+    assert_eq!(body[0], 0xe3);
+    assert_eq!(
+        u32::from_le_bytes(body[1..5].try_into().expect("reconnect code")),
+        pangya_protocol::LOGIN_ERROR_INVALID_RECONNECT_TOKEN
+    );
+    let mut eof = [0_u8; 1];
+    assert_eq!(stream.read(&mut eof).await.expect("reconnect close"), 0);
     shutdown.cancel();
     task.await.expect("join");
 }
@@ -723,7 +876,7 @@ async fn nickname_unavailable_and_duplicate_retries_are_bounded(pool: PgPool) {
         send_packet(&mut check, check_key, salt, 7, &pstring(b"TakenNick")).await;
         let (opcode, body) = receive_packet(&mut check, check_key).await;
         assert_eq!(opcode, 0x000e);
-        assert_eq!(&body[..4], &[1, 0, 0, 0]);
+        assert_eq!(&body[..4], &[2, 0, 0, 0]);
     }
     let mut eof = [0_u8; 1];
     assert_eq!(check.read(&mut eof).await.expect("check retries close"), 0);
@@ -775,7 +928,7 @@ async fn nickname_unavailable_and_duplicate_retries_are_bounded(pool: PgPool) {
         send_packet(&mut set, set_key, salt, 6, &pstring(b"TakenNick")).await;
         let (opcode, body) = receive_packet(&mut set, set_key).await;
         assert_eq!(opcode, 0x000e);
-        assert_eq!(&body[..4], &[1, 0, 0, 0]);
+        assert_eq!(&body[..4], &[2, 0, 0, 0]);
     }
     assert_eq!(set.read(&mut eof).await.expect("set retries close"), 0);
     shutdown.cancel();

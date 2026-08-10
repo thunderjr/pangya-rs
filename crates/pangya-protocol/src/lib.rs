@@ -35,11 +35,15 @@ pub use game::{
     us852_game_hello,
 };
 pub use login::{
-    ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList,
-    LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_STATUS_SET_CHARACTER,
-    LOGIN_STATUS_SET_NICKNAME, LoginKey, LoginRequest, LoginResult, LoginSuccess,
-    MAX_LOGIN_SERVER_CHANNELS, NicknameCheckResult, SelectCharacter, SelectServer,
-    ServerChannelEntry, SessionKey, SetNickname, us852_login_hello,
+    ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList, GhostLogin,
+    LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
+    LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN,
+    LOGIN_STATUS_SET_CHARACTER, LOGIN_STATUS_SET_NICKNAME, LoginKey, LoginRequest, LoginResult,
+    LoginSuccess, MAX_LOGIN_SERVER_CHANNELS, NICKNAME_CHECK_BAD_WORD,
+    NICKNAME_CHECK_DATABASE_ERROR, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_INVALID,
+    NICKNAME_CHECK_NOT_ENOUGH_COOKIE, NICKNAME_CHECK_SAME_NICKNAME, NICKNAME_CHECK_SUCCESS,
+    NicknameCheckResult, ReconnectRequest, SelectCharacter, SelectServer, ServerChannelEntry,
+    SessionKey, SetNickname, us852_login_hello,
 };
 pub use m4_room::{
     MAX_ROOM_MEMBERS, MAX_ROOM_SUMMARIES, RoomChatEvent, RoomChatRequest, RoomCommand,

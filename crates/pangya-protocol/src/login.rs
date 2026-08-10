@@ -18,10 +18,14 @@ pub const LOGIN_STATUS_SET_NICKNAME: u8 = 0xd8;
 ///
 /// See [`LOGIN_STATUS_SET_NICKNAME`] for why this differs from the TH capture fixtures.
 pub const LOGIN_STATUS_SET_CHARACTER: u8 = 0xd9;
-/// Legacy candidate invalid-credential result code; real-client acceptance remains external.
+/// Reference LoginService invalid-credential result code.
 pub const LOGIN_ERROR_INVALID_CREDENTIALS: u32 = 5_100_143;
-/// Legacy candidate duplicate-login result code; real-client acceptance remains external.
+/// Reference LoginService stale-session result code which arms the ghost flow.
+pub const LOGIN_ERROR_ALREADY_LOGGED_IN: u32 = 5_100_019;
+/// Reference LoginService live duplicate-connection result code.
 pub const LOGIN_ERROR_DUPLICATE_CONNECTION: u32 = 5_100_107;
+/// Reference LoginService reconnect-token refusal result code.
+pub const LOGIN_ERROR_INVALID_RECONNECT_TOKEN: u32 = 5_157_002;
 
 fn check_decode_profile(
     profile: &CompatibilityProfile,
@@ -93,6 +97,76 @@ impl DecodePacket for LoginRequest {
         })
     }
 }
+/// LoginService client opcode `0x0004`, sent after the stale-session error.
+///
+/// The PacketDoc reference defines this packet as an empty body. It is intentionally a distinct
+/// type so the runtime cannot accidentally accept credentials or a client-selected account ID as
+/// an invalidation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhostLogin;
+impl DecodePacket for GhostLogin {
+    const OPCODE: u16 = 0x0004;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("ghost packet must have an empty body"));
+        }
+        Ok(Self)
+    }
+}
+
+/// LoginService client opcode `0x000b`, reconnect with the original identity and session token.
+///
+/// The reconnect token is retained only for validation and is zeroized when the packet is dropped;
+/// its debug representation is redacted so malformed/replay diagnostics cannot disclose it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReconnectRequest {
+    /// Original display username.
+    pub username: Vec<u8>,
+    /// Original numeric account identifier.
+    pub user_id: u32,
+    /// Bearer issued by server opcode `0x0010`.
+    pub session_token: Vec<u8>,
+}
+impl Drop for ReconnectRequest {
+    fn drop(&mut self) {
+        self.session_token.zeroize();
+    }
+}
+impl std::fmt::Debug for ReconnectRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReconnectRequest")
+            .field("username", &self.username)
+            .field("user_id", &self.user_id)
+            .field("session_token", &"<redacted>")
+            .finish()
+    }
+}
+impl DecodePacket for ReconnectRequest {
+    const OPCODE: u16 = 0x000b;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let packet = Self {
+            username: reader.pstring(64)?.to_vec(),
+            user_id: reader.u32_le()?,
+            session_token: reader.pstring(128)?.to_vec(),
+        };
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("reconnect packet has trailing bytes"));
+        }
+        Ok(packet)
+    }
+}
+
 /// LoginService client opcode `0x0003`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectServer {
@@ -225,11 +299,27 @@ impl crate::EncodePacket for LoginResult {
         Ok(())
     }
 }
-/// Provisional LoginService nickname-check response for opcode `0x000e`.
+/// Nickname availability result values used by the reference LoginService.
+/// Nickname is available.
+pub const NICKNAME_CHECK_SUCCESS: u32 = 0;
+/// Nickname is already owned by another account.
+pub const NICKNAME_CHECK_IN_USE: u32 = 2;
+/// Nickname violates length or character policy.
+pub const NICKNAME_CHECK_INVALID: u32 = 3;
+/// Request lacks the required cookie.
+pub const NICKNAME_CHECK_NOT_ENOUGH_COOKIE: u32 = 4;
+/// Nickname contains a prohibited word.
+pub const NICKNAME_CHECK_BAD_WORD: u32 = 5;
+/// Nickname lookup failed in storage.
+pub const NICKNAME_CHECK_DATABASE_ERROR: u32 = 6;
+/// Nickname matches an existing nickname under the reference's policy.
+pub const NICKNAME_CHECK_SAME_NICKNAME: u32 = 9;
+
+/// LoginService nickname-check response for opcode `0x000e`.
 ///
-/// Legacy U.S.-service behavior places an opaque little-endian result before the
-/// echoed PangYa string. The field's success/error values and exact client
-/// acceptance remain capture-gated.
+/// The result is kept as a numeric field because the wire also carries reference-side database
+/// failures; the named constants above cover every documented result without accepting a client
+/// claim as an enum variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NicknameCheckResult {
     /// Opaque legacy result/status value; runtime policy currently uses `0` for available.

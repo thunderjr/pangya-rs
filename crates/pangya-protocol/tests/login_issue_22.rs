@@ -1,21 +1,31 @@
 //! Reference-derived regression tests for LoginService ghost/reconnect/refusal behavior.
 use pangya_protocol::{
-    CompatibilityProfile, DecodePacket, Direction, EncodePacket, GhostLogin, LoginResult,
-    PacketReader, PacketWriter, ReconnectRequest, ServiceKind,
+    CompatibilityProfile, DecodePacket, Direction, EncodePacket, GhostLogin,
     LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
-    LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN,
+    LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN, LoginResult,
+    NICKNAME_CHECK_BAD_WORD, NICKNAME_CHECK_DATABASE_ERROR, NICKNAME_CHECK_IN_USE,
+    NICKNAME_CHECK_INVALID, NICKNAME_CHECK_NOT_ENOUGH_COOKIE, NICKNAME_CHECK_SAME_NICKNAME,
+    NICKNAME_CHECK_SUCCESS, PacketReader, PacketWriter, ReconnectRequest, ServiceKind,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
 
 fn reader(bytes: &[u8], opcode: u16) -> PacketReader<'_> {
-    PacketReader::new(bytes, Direction::ClientToServer, ServiceKind::Login, Some(opcode))
+    PacketReader::new(
+        bytes,
+        Direction::ClientToServer,
+        ServiceKind::Login,
+        Some(opcode),
+    )
 }
 
 #[test]
 fn ghost_is_the_empty_reference_packet() {
     let mut reader = reader(&[], 0x0004);
-    assert_eq!(GhostLogin::decode(&mut reader, &PROFILE).expect("ghost"), GhostLogin);
+    assert_eq!(
+        GhostLogin::decode(&mut reader, &PROFILE).expect("ghost"),
+        GhostLogin
+    );
     assert_eq!(GhostLogin::OPCODE, 0x0004);
 }
 
@@ -44,6 +54,22 @@ fn reconnect_trailing_bytes_and_oversized_token_are_rejected() {
 }
 
 #[test]
+fn nickname_result_codes_cover_reference_enum() {
+    assert_eq!(
+        [
+            NICKNAME_CHECK_SUCCESS,
+            NICKNAME_CHECK_IN_USE,
+            NICKNAME_CHECK_INVALID,
+            NICKNAME_CHECK_NOT_ENOUGH_COOKIE,
+            NICKNAME_CHECK_BAD_WORD,
+            NICKNAME_CHECK_DATABASE_ERROR,
+            NICKNAME_CHECK_SAME_NICKNAME,
+        ],
+        [0, 2, 3, 4, 5, 6, 9]
+    );
+}
+
+#[test]
 fn refusal_codes_follow_reference_error_enum() {
     assert_eq!(LOGIN_ERROR_INVALID_CREDENTIALS, 5_100_143);
     assert_eq!(LOGIN_ERROR_ALREADY_LOGGED_IN, 5_100_019);
@@ -53,5 +79,5 @@ fn refusal_codes_follow_reference_error_enum() {
     LoginResult::Error(LOGIN_ERROR_INVALID_RECONNECT_TOKEN)
         .encode(&mut writer, &PROFILE)
         .expect("error packet");
-    assert_eq!(writer.into_inner(), [0xe3, 0x4a, 0x9e, 0x4e, 0x00]);
+    assert_eq!(writer.into_inner(), [0xe3, 0x8a, 0xb0, 0x4e, 0x00]);
 }

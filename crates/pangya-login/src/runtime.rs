@@ -19,10 +19,12 @@ use pangya_domain::{
 use pangya_protocol::{
     ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket,
     EmptyMessageServerList, EncodePacket, ErrorClass, FrameCodec, GameServerEntry, GameServerList,
-    InboundFrame, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, LoginKey,
-    LoginResult, LoginSuccess, NicknameCheckResult, OutboundFrame, PacketEncodeError, PacketReader,
-    SelectCharacter, SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes,
-    encode_packet_payload, us852_login_hello,
+    GhostLogin, InboundFrame, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
+    LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN, LoginKey, LoginResult,
+    LoginSuccess, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_SUCCESS, NicknameCheckResult,
+    OutboundFrame, PacketEncodeError, PacketReader, ReconnectRequest, SelectCharacter,
+    SelectServer, ServiceKind, SessionKey, SetNickname, UnknownBytes, encode_packet_payload,
+    us852_login_hello,
 };
 use rand::{RngCore, rngs::OsRng};
 use thiserror::Error;
@@ -665,6 +667,10 @@ where
         let mut account: Option<AuthenticationRecord> = None;
         let mut _presence: Option<RegistryGuard<AccountId>> = None;
         let mut handover_token: Option<Zeroizing<Vec<u8>>> = None;
+        // A duplicate login is held in this connection until the client explicitly requests ghost
+        // recovery. The account ID is authenticated before it is stored; the 0x0004 packet itself
+        // has no identity fields and can never ghost an arbitrary account.
+        let mut pending_ghost: Option<AccountId> = None;
 
         loop {
             match machine.state() {
@@ -767,12 +773,21 @@ where
                         Ok(guard) => guard,
                         Err(RegistryError::Duplicate) => {
                             self.observer.login("duplicate");
+                            // PacketDoc distinguishes a stale-session refusal (which arms 0x0004)
+                            // from a live duplicate connection. LoginService cannot observe a
+                            // crashed peer's final packet, so the authenticated retry is explicitly
+                            // armed for ghost resolution; generation-tagged registry leases make
+                            // this safe if the old task unwinds after the replacement starts.
                             self.send(
                                 &mut framed,
-                                &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
+                                &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
                             )
                             .await?;
-                            return Ok(ConnectionTermination::Rejected);
+                            pending_ghost = Some(authenticated.account.id);
+                            machine
+                                .apply(LoginEvent::AuthenticationRejected)
+                                .map_err(|_| LoginRuntimeError::Protocol)?;
+                            continue;
                         }
                         Err(RegistryError::Capacity) => return Err(LoginRuntimeError::Limited),
                     };
@@ -805,7 +820,11 @@ where
                     self.send(
                         &mut framed,
                         &NicknameCheckResult {
-                            unknown_result: u32::from(!available),
+                            unknown_result: if available {
+                                NICKNAME_CHECK_SUCCESS
+                            } else {
+                                NICKNAME_CHECK_IN_USE
+                            },
                             nickname: packet.nickname,
                         },
                     )
@@ -833,7 +852,7 @@ where
                             self.send(
                                 &mut framed,
                                 &NicknameCheckResult {
-                                    unknown_result: 1,
+                                    unknown_result: NICKNAME_CHECK_IN_USE,
                                     nickname: packet.nickname,
                                 },
                             )
@@ -872,8 +891,63 @@ where
                         .await?;
                     handover_token = Some(token);
                 }
+                LoginState::AwaitLogin if frame.opcode == 0x0004 => {
+                    if self.decode_packet::<GhostLogin>(&frame).is_err() {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                    let Some(account_id) = pending_ghost.take() else {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    };
+                    if !self.active_accounts.invalidate(&account_id) {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                }
+                LoginState::AwaitLogin if frame.opcode == 0x000b => {
+                    if self.decode_packet::<ReconnectRequest>(&frame).is_err() {
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_RECONNECT_TOKEN),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
+                    }
+                    // A reconnect token is intentionally not accepted by LoginService yet. The
+                    // reference-safe behavior is a typed refusal, never a silent close; the token
+                    // packet's Drop implementation zeroizes the bearer after this branch.
+                    self.send(
+                        &mut framed,
+                        &LoginResult::Error(LOGIN_ERROR_INVALID_RECONNECT_TOKEN),
+                    )
+                    .await?;
+                    return Ok(ConnectionTermination::Rejected);
+                }
                 LoginState::AwaitCharacterSelect if frame.opcode == 0x0008 => {
-                    let packet = self.decode_packet::<SelectCharacter>(&frame)?;
+                    let packet = match self.decode_packet::<SelectCharacter>(&frame) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            self.send(
+                                &mut framed,
+                                &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                            )
+                            .await?;
+                            return Ok(ConnectionTermination::Rejected);
+                        }
+                    };
                     if !self
                         .config
                         .allowed_character_types
@@ -886,7 +960,12 @@ where
                             character_id = packet.character_id,
                             "refused a character selection outside the configured allowlist"
                         );
-                        return Err(LoginRuntimeError::Protocol);
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
                     }
                     let account_id = account
                         .as_ref()
@@ -950,7 +1029,12 @@ where
                 LoginState::AwaitServerSelect if frame.opcode == 0x0003 => {
                     let packet = self.decode_packet::<SelectServer>(&frame)?;
                     if packet.server_id != self.config.game_server.id {
-                        return Err(LoginRuntimeError::Protocol);
+                        self.send(
+                            &mut framed,
+                            &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
+                        )
+                        .await?;
+                        return Ok(ConnectionTermination::Rejected);
                     }
                     let token = handover_token.take().ok_or(LoginRuntimeError::Handover)?;
                     self.send(
