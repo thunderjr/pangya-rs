@@ -581,6 +581,20 @@ impl RoomState {
         Ok(self.snapshot())
     }
 
+    fn update_member_projection(
+        &mut self,
+        caller: PlayerConnectionId,
+        card: MemberCard,
+        character_id: Option<CharacterId>,
+        character_iff_id: Option<u32>,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let member = self.member_index(caller).ok_or(RoomError::NotMember)?;
+        self.members[member].identity.card = card;
+        self.members[member].identity.character_id = character_id;
+        self.members[member].identity.character_iff_id = character_iff_id;
+        Ok(self.snapshot())
+    }
+
     fn set_ready(
         &mut self,
         caller: PlayerConnectionId,
@@ -1492,6 +1506,13 @@ enum RoomCommand {
         announce: pangya_protocol::RetailEquipmentAnnounce,
         reply: oneshot::Sender<Result<(), RoomError>>,
     },
+    UpdateMemberProjection {
+        caller: PlayerConnectionId,
+        card: MemberCard,
+        character_id: Option<CharacterId>,
+        character_iff_id: Option<u32>,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
     Kick {
         caller: PlayerConnectionId,
         target: PlayerConnectionId,
@@ -1812,6 +1833,25 @@ impl RoomHandle {
     ) -> Result<(), RoomError> {
         let (reply, receive) = oneshot::channel();
         self.send_normal(RoomCommand::EquipmentAnnounce { announce, reply })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Replaces one member's storage-derived public projection and broadcasts a census.
+    pub async fn update_member_projection(
+        &self,
+        caller: PlayerConnectionId,
+        card: MemberCard,
+        character_id: Option<CharacterId>,
+        character_iff_id: Option<u32>,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::UpdateMemberProjection {
+            caller,
+            card,
+            character_id,
+            character_iff_id,
+            reply,
+        })?;
         receive.await.map_err(|_| RoomError::Closed)?
     }
 
@@ -2497,6 +2537,21 @@ fn handle_normal(
             let _ignored = reply.send(Ok(()));
             true
         }
+        RoomCommand::UpdateMemberProjection {
+            caller,
+            card,
+            character_id,
+            character_iff_id,
+            reply,
+        } => {
+            let result =
+                state.update_member_projection(caller, card, character_id, character_iff_id);
+            if let Ok(snapshot) = &result {
+                after_mutation(state, Some(snapshot), events);
+            }
+            let _ignored = reply.send(result);
+            true
+        }
         RoomCommand::Kick {
             caller,
             target,
@@ -2894,6 +2949,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn pure_projection_refresh_replaces_character_and_card_atomically() {
+        let (mut state, _rx) = state(2, None);
+        let fresh_character = CharacterId::new(99).unwrap_or_else(|_| unreachable!());
+        let fresh_card = MemberCard {
+            club_set_uid: 1234,
+            club_set_iff_id: 0x1a00_0001,
+            ..MemberCard::default()
+        };
+        let snapshot = state
+            .update_member_projection(
+                id(1),
+                fresh_card.clone(),
+                Some(fresh_character),
+                Some(0x0400_0001),
+            )
+            .expect("projection refresh");
+        let member = snapshot.members().first().expect("owner");
+        assert_eq!(member.card(), &fresh_card);
+        assert_eq!(member.character_id(), Some(fresh_character));
+        assert_eq!(member.character_iff_id(), Some(0x0400_0001));
     }
 
     #[test]

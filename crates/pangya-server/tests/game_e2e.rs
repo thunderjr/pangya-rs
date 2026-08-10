@@ -1018,6 +1018,14 @@ async fn maybe_receive_opcode(stream: &mut TcpStream, key: u8) -> Option<u16> {
     .flatten()
 }
 
+async fn assert_no_synthetic_projection_refresh(stream: &mut TcpStream, key: u8) {
+    assert_eq!(
+        maybe_receive_opcode(stream, key).await,
+        None,
+        "synthetic M5/M6 settlement must not emit a retail projection refresh frame",
+    );
+}
+
 async fn assert_closed(stream: &mut TcpStream) {
     assert_closed_within(stream, Duration::from_secs(1)).await;
 }
@@ -3465,6 +3473,8 @@ async fn game_m5_encrypted_tcp_happy_path_persists_once_and_restarts_projection(
             ("committed".to_owned(), "success".to_owned(), None),
         ]
     );
+    // Synthetic M5 settlement ends with Finished; no retail room-projection census follows.
+    assert_no_synthetic_projection_refresh(&mut client.stream, client.key).await;
 
     send_typed(&mut client.stream, client.key, 11, &FinishHole::new()).await;
     assert_closed(&mut client.stream).await;
@@ -5156,11 +5166,9 @@ async fn game_m6_encrypted_tcp_two_player_turns_and_atomic_settlement(pool: PgPo
     assert_eq!(balances[0], StrokeBalanceUpdate::new(14, 5));
     assert_eq!(balances[1], StrokeBalanceUpdate::new(114, 55));
     assert_ne!(balances[0], balances[1]);
-    assert_eq!(
-        maybe_receive_opcode(&mut owner.stream, owner.key).await,
-        None
-    );
-    assert_eq!(maybe_receive_opcode(&mut peer.stream, peer.key).await, None);
+    // Synthetic M6 settlement ends with Finished; no retail room-projection census follows.
+    assert_no_synthetic_projection_refresh(&mut owner.stream, owner.key).await;
+    assert_no_synthetic_projection_refresh(&mut peer.stream, peer.key).await;
 
     let (matches, players, ledgers, records): (i64, i64, i64, i64) = tokio::try_join!(
         sqlx::query_scalar("SELECT count(*) FROM matches WHERE mode = 'stroke_two' AND status = 'committed'").fetch_one(&pool),
@@ -6431,6 +6439,11 @@ async fn game_retail_bulk_equipment_is_acknowledged_owned_and_restart_safe(pool:
 async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(pool: PgPool) {
     let owner = create_account(&pool, "REquipOwner", 0, 0x1000_0000).await;
     let guest = create_account(&pool, "REquipGuest", 0, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
+        .bind(owner.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund purchase");
     let owner_character: i64 =
         sqlx::query_scalar("SELECT id FROM characters WHERE account_id = $1")
             .bind(owner.account.id.get())
@@ -6494,6 +6507,25 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
 
     let (mut host, host_key, host_connection) =
         connect_retail(&pool, address, owner.account.id, "REquipOwner").await;
+
+    // Buy on the encrypted lobby connection before room admission. The subsequent two-client
+    // census assertions pin that a committed economy mutation does not require relogging before
+    // room/bootstrap projections are rebuilt.
+    let mut purchase = pangya_protocol::PacketWriter::default();
+    purchase.u8(0);
+    purchase.u16_le(1);
+    purchase.u32_le(0);
+    purchase.u32_le(0x1000_0001);
+    purchase.u16_le(0);
+    purchase.u16_le(0);
+    purchase.u32_le(1);
+    purchase.u32_le(500);
+    purchase.u32_le(0);
+    send_packet(&mut host, host_key, 3, 0x001d, &purchase.into_inner()).await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x00c8);
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0096);
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0068);
+
     let (mut visitor, visitor_key, _) =
         connect_retail(&pool, address, guest.account.id, "REquipGuest").await;
 
@@ -6583,6 +6615,8 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         receive_packet(&mut visitor, visitor_key).await,
         (0x004b, expected.clone())
     );
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0048);
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0048);
 
     // Intervening B and C mutations must not turn an exact A retry into a second announcement.
     let mut intervening_change = vec![4];
@@ -6610,6 +6644,8 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         receive_packet(&mut visitor, visitor_key).await,
         (0x004b, intervening_expected)
     );
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0048);
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0048);
     let mut final_change = vec![4];
     final_change.extend_from_slice(
         &u32::try_from(owner_alt_character)
@@ -6635,6 +6671,8 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         receive_packet(&mut visitor, visitor_key).await,
         (0x004b, final_expected)
     );
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0048);
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0048);
     send_packet(&mut host, host_key, 8, 0x000c, &room_change).await;
     assert!(
         drain_frames(&mut host, host_key, Duration::from_millis(150))
@@ -6654,6 +6692,26 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
             .expect("room replay version"),
         4
     );
+
+    // A later census must rebuild the member's character projection from the committed
+    // equipment mutation, not the handover-time identity captured by the room actor.
+    send_packet(&mut host, host_key, 9, 0x000d, &[0]).await;
+    let (opcode, census) = receive_packet(&mut host, host_key).await;
+    assert_eq!(opcode, 0x0048);
+    assert_eq!(census[3], 2);
+    let owner_character_at = 4 + 341 + 4;
+    assert_eq!(
+        u32::from_le_bytes(
+            census[owner_character_at..owner_character_at + 4]
+                .try_into()
+                .expect("owner census character")
+        ),
+        u32::try_from(owner_alt_character).expect("alternate character census"),
+    );
+    let (opcode, peer_census) = receive_packet(&mut visitor, visitor_key).await;
+    assert_eq!(opcode, 0x0048);
+    assert_eq!(peer_census[3], 2);
+
     drop(visitor);
     drop(host);
     shutdown.cancel();
@@ -7763,6 +7821,11 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
+        .bind(owner.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund purchase");
     let service = Arc::new(
         GameService::new(
             Arc::new(PgRepository::new(pool.clone())),
@@ -7796,7 +7859,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                         .expect("recovery limit"),
                     shot_packets_per_window: 120,
                 }),
-                economy: None,
+                economy: Some(default_economy()),
                 retail_bootstrap: true,
             },
             Arc::new(M2Metrics::default()),
@@ -7841,6 +7904,61 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     let mut tokens = Vec::new();
     let (mut host, host_key) =
         join_retail(&pool, address, owner.account.id, "PartyHost", &mut tokens).await;
+
+    // Purchase and equip a club on the already-encrypted lobby connection. The room and match
+    // assertions below must observe this durable mutation without reconnecting the buyer.
+    let mut purchase = pangya_protocol::PacketWriter::default();
+    purchase.u8(0);
+    purchase.u16_le(1);
+    purchase.u32_le(0);
+    purchase.u32_le(0x1000_0001);
+    purchase.u16_le(0);
+    purchase.u16_le(0);
+    purchase.u32_le(1);
+    purchase.u32_le(500);
+    purchase.u32_le(0);
+    send_packet(&mut host, host_key, 3, 0x001d, &purchase.into_inner()).await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x00c8);
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0096);
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0068);
+    let purchased_club: i64 = sqlx::query_scalar(
+        "SELECT id FROM inventory_items WHERE account_id = $1 AND item_type_id = $2 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(owner.account.id.get())
+    .bind(0x1000_0001_i64)
+    .fetch_one(&pool)
+    .await
+    .expect("purchased club inventory row");
+    let mut equip_purchased = vec![3];
+    equip_purchased.extend_from_slice(
+        &u32::try_from(purchased_club)
+            .expect("purchased club inventory id")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 4, 0x000b, &equip_purchased).await;
+    for _ in 0..100 {
+        let current: i64 =
+            sqlx::query_scalar("SELECT club_item_id FROM equipment_sets WHERE account_id = $1")
+                .bind(owner.account.id.get())
+                .fetch_one(&pool)
+                .await
+                .expect("club projection");
+        if current == purchased_club {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT club_item_id FROM equipment_sets WHERE account_id = $1",
+        )
+        .bind(owner.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("club projection"),
+        purchased_club
+    );
+    let purchased_club_u32 = u32::try_from(purchased_club).expect("purchased club id");
     let (mut visitor, visitor_key) =
         join_retail(&pool, address, guest.account.id, "PartyGuest", &mut tokens).await;
 
@@ -7983,9 +8101,34 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             "{who} roster carries whole players, not a stub: {} bytes",
             roster.len()
         );
-        // Seat numbers are one-based, and the first entry is the host.
+        // Seat numbers are one-based, and the first entry is the host. The club inventory id
+        // and catalog id sit in the reference PlayerData ClubSetInfo block. Both encrypted
+        // clients receive the same fresh post-purchase equipment in 0x0076.
         assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
         assert_eq!(&roster[4..13], b"PartyHost");
+        // The reference PlayerData record is fixed-width, and ClubSetInfo is the adjacent
+        // inventory/catalog pair. Search only within each fixed record so this remains resilient
+        // to opaque fields while still pinning the exact wire values and both player views.
+        let stride = 0x2f94;
+        let host_entry = 4;
+        let peer_entry = host_entry + stride;
+        let purchased_club_wire = [
+            purchased_club_u32.to_le_bytes().as_slice(),
+            0x1000_0001_u32.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert!(
+            roster[host_entry..host_entry + stride]
+                .windows(purchased_club_wire.len())
+                .any(|bytes| bytes == purchased_club_wire),
+            "{who} sees purchased club"
+        );
+        assert!(
+            !roster[peer_entry..peer_entry + stride]
+                .windows(purchased_club_wire.len())
+                .any(|bytes| bytes == purchased_club_wire),
+            "{who} peer does not inherit buyer's purchased club"
+        );
     }
 
     // Both load. The turn opens only once both have, and both are told whose it is.
