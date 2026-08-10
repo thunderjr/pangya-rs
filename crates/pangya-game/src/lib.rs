@@ -1401,6 +1401,13 @@ where
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
                             } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailClientException::OPCODE
+                            {
+                                // This report is fire-and-forget. Decode failures are ignored
+                                // after the bounded frame has been consumed: a client diagnostic
+                                // must never turn into a second disconnect or stall the session.
+                                observe_retail_client_exception(&frame.payload);
+                            } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
                                     RetailLoginBonusRequest::OPCODE
@@ -4921,20 +4928,6 @@ where
         // What matters is that it is answered by an explicit allowlist rather than by the
         // unknown-opcode policy, which under the shipped `disconnect` would end the session
         // mid-hole.
-        // The client's own error handler reporting home. It is the only channel through which
-        // a closed-source client says what went wrong, and it is the last thing it sends
-        // before it exits, so it is logged rather than ignored. The message is client-
-        // controlled, so it is sanitised and bounded before it reaches a log line.
-        if opcode == RetailClientException::OPCODE
-            && let Ok(report) = decode_packet_payload::<RetailClientException>(
-                payload,
-                &CompatibilityProfile::US_852,
-                ServiceKind::Game,
-            )
-        {
-            tracing::warn!(message = %report.sanitized(), "client reported an exception");
-            return Ok(Some(state));
-        }
         if is_retail_accepted_match_opcode(opcode)
             && !(state == GameState::InRoom && opcode == RetailPracticeStart::OPCODE)
         {
@@ -7025,6 +7018,26 @@ fn retail_shot_announce_payload(payload: &[u8]) -> Result<Vec<u8>, GameRuntimeEr
     Ok(shot.to_vec())
 }
 const RETAIL_C2S_LOAD_PROGRESS: u16 = 0x0048;
+
+/// Observes a fire-and-forget retail client exception without making it fatal.
+///
+/// The frame has already been bounded by the codec. Decode errors are deliberately redacted and
+/// ignored: the client is reporting a failure, and a malformed report must not cause a second
+/// disconnect or prevent it from sending whatever diagnostic follows.
+fn observe_retail_client_exception(payload: &[u8]) {
+    match decode_packet_payload::<RetailClientException>(
+        payload,
+        &CompatibilityProfile::US_852,
+        ServiceKind::Game,
+    ) {
+        Ok(report) => {
+            tracing::warn!(message = %report.sanitized(), "client reported an exception");
+        }
+        Err(error) => {
+            tracing::debug!(%error, "malformed client exception report");
+        }
+    }
+}
 
 fn is_retail_match_opcode(opcode: u16) -> bool {
     matches!(

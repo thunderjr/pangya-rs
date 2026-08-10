@@ -274,7 +274,6 @@ pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
     0x0007, // online status of another user
     0x0018, // typing indicator
     0x0032, // idle status
-    0x0033, // client-side exception report
     0x004f, // unclassified
     0x0069, // chat macro set
     0x0088, // unclassified
