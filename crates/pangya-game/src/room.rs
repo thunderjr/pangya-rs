@@ -2,7 +2,10 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -321,7 +324,17 @@ pub enum RoomOutbound {
     Ordered {
         /// Shared queue sender serialized with ordinary-capacity checks.
         sender: Arc<Mutex<mpsc::Sender<RoomEvent>>>,
+        /// Generation of the terminal frame queued for this session, retained until the socket
+        /// write is acknowledged. This state is shared with the room actor's member clone.
+        terminal_pending_delivery: Arc<AtomicU64>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrdinarySendResult {
+    Sent,
+    Backpressured { terminal_pending: bool },
+    Closed,
 }
 
 impl From<mpsc::Sender<RoomEvent>> for RoomOutbound {
@@ -339,25 +352,85 @@ impl RoomOutbound {
         (
             Self::Ordered {
                 sender: Arc::new(Mutex::new(sender)),
+                terminal_pending_delivery: Arc::new(AtomicU64::new(0)),
             },
             receiver,
         )
     }
 
-    pub(crate) fn try_send(&self, event: RoomEvent) -> bool {
+    fn try_send_ordinary(&self, event: RoomEvent) -> OrdinarySendResult {
         match self {
-            Self::Legacy(sender) => sender.try_send(event).is_ok(),
-            Self::Ordered { sender } => {
+            Self::Legacy(sender) => match sender.try_send(event) {
+                Ok(()) => OrdinarySendResult::Sent,
+                Err(mpsc::error::TrySendError::Full(_)) => OrdinarySendResult::Backpressured {
+                    terminal_pending: false,
+                },
+                Err(mpsc::error::TrySendError::Closed(_)) => OrdinarySendResult::Closed,
+            },
+            Self::Ordered {
+                sender,
+                terminal_pending_delivery,
+            } => {
                 let Ok(sender) = sender.lock() else {
-                    return false;
+                    return OrdinarySendResult::Closed;
                 };
                 // The final queue slot is reserved exclusively for 0x0066 settlement. Holding
-                // the lock makes the capacity check and send atomic across invite/room writers.
+                // this lock while reading the pending flag makes the backpressure decision atomic
+                // with terminal enqueue: an ordinary writer can never cancel a session between a
+                // queued terminal frame and its flag publication.
                 if sender.capacity() <= 1 {
-                    return false;
+                    return OrdinarySendResult::Backpressured {
+                        terminal_pending: terminal_pending_delivery.load(Ordering::Acquire) != 0,
+                    };
                 }
-                sender.try_send(event).is_ok()
+                match sender.try_send(event) {
+                    Ok(()) => OrdinarySendResult::Sent,
+                    Err(mpsc::error::TrySendError::Full(_)) => OrdinarySendResult::Backpressured {
+                        terminal_pending: terminal_pending_delivery.load(Ordering::Acquire) != 0,
+                    },
+                    Err(mpsc::error::TrySendError::Closed(_)) => OrdinarySendResult::Closed,
+                }
             }
+        }
+    }
+
+    pub(crate) fn try_send(&self, event: RoomEvent) -> bool {
+        matches!(self.try_send_ordinary(event), OrdinarySendResult::Sent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_pending_generation(&self) -> Option<u64> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Ordered {
+                terminal_pending_delivery,
+                ..
+            } => match terminal_pending_delivery.load(Ordering::Acquire) {
+                0 => None,
+                generation => Some(generation),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_pending_delivery(&self) -> bool {
+        self.terminal_pending_generation().is_some()
+    }
+
+    /// A successful socket write acknowledges only the generation that produced it. A stale
+    /// connection event can therefore never clear a newer pending terminal delivery.
+    pub(crate) fn acknowledge_terminal_delivery(&self, generation: u64) {
+        if let Self::Ordered {
+            terminal_pending_delivery,
+            ..
+        } = self
+        {
+            let _ = terminal_pending_delivery.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
@@ -383,14 +456,32 @@ impl RoomOutbound {
                     Err(mpsc::error::TrySendError::Closed(_)) => return false,
                     Err(mpsc::error::TrySendError::Full(_)) => false,
                 },
-                Self::Ordered { sender } => {
+                Self::Ordered {
+                    sender,
+                    terminal_pending_delivery,
+                } => {
                     let Ok(sender) = sender.lock() else {
                         return false;
                     };
+                    // Publish while holding the queue lock. If the queue is full, ordinary
+                    // delivery observes this generation and retains the member instead of
+                    // canceling its session; if enqueue fails, remove the reservation below.
+                    terminal_pending_delivery.store(delivery.generation, Ordering::Release);
                     match sender.try_send(event.clone()) {
                         Ok(()) => return true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
-                        Err(mpsc::error::TrySendError::Full(_)) => false,
+                        Err(mpsc::error::TrySendError::Closed(_))
+                        | Err(mpsc::error::TrySendError::Full(_)) => {
+                            let _ = terminal_pending_delivery.compare_exchange(
+                                delivery.generation,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            if sender.is_closed() {
+                                return false;
+                            }
+                            false
+                        }
                     }
                 }
             };
@@ -605,15 +696,29 @@ impl RoomState {
         if member.cancellation.is_cancelled() {
             return false;
         }
-        if member.outbound.try_send(event) {
-            true
-        } else if self.pending_stroke_persistence.is_some() {
-            // Retain captured members while persistence is pending; terminal delivery may still
-            // fail over or wait for the reserved slot.
-            false
-        } else {
-            member.cancellation.cancel();
-            false
+        match member.outbound.try_send_ordinary(event) {
+            OrdinarySendResult::Sent => true,
+            OrdinarySendResult::Backpressured {
+                terminal_pending: true,
+            } => {
+                // A terminal frame already occupies (or is publishing into) the reserved slot.
+                // Keep this session alive until its socket ACK clears that generation.
+                false
+            }
+            OrdinarySendResult::Backpressured {
+                terminal_pending: false,
+            } if self.pending_stroke_persistence.is_some() => {
+                // Retain captured members while persistence is pending; terminal delivery may
+                // still fail over or wait for the reserved slot.
+                false
+            }
+            OrdinarySendResult::Backpressured {
+                terminal_pending: false,
+            }
+            | OrdinarySendResult::Closed => {
+                member.cancellation.cancel();
+                false
+            }
         }
     }
 
@@ -3348,6 +3453,73 @@ mod tests {
             StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
         });
         StrokeMatchResult::new(commit.match_id(), commit.result_key(), players)
+    }
+
+    #[tokio::test]
+    async fn terminal_pending_delivery_protects_full_queue_until_ack() {
+        let first = identity(1);
+        let second = identity(2);
+        let (outbound, mut events) = RoomOutbound::ordered(1);
+        let cancellation = CancellationToken::new();
+        let (second_tx, mut second_events) = mpsc::channel(8);
+        let mut state = RoomState::new(
+            RoomId::new(61).expect("room"),
+            RoomName::parse("terminal-pending").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            outbound.clone(),
+            cancellation.clone(),
+        );
+        state.join(second.clone(), None, second_tx).expect("join");
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+        while second_events.try_recv().is_ok() {}
+        // Setup broadcasts may have exercised the tiny queue. Start the post-commit assertion
+        // with a live session token, independent of that setup backpressure.
+        state.members[0].cancellation = CancellationToken::new();
+        let cancellation = state.members[0].cancellation.clone();
+
+        // Post-commit, the reserved queue is full in order: one preceding event and 0x0066.
+        assert!(outbound.try_send(RoomEvent::Closed));
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let result = persisted_stroke(commit);
+        state
+            .apply_stroke_commit(result)
+            .await
+            .expect("apply settlement");
+        assert!(outbound.terminal_pending_delivery());
+        assert!(!state.deliver(&state.members[0], RoomEvent::Closed));
+        assert!(
+            !cancellation.is_cancelled(),
+            "ordinary backpressure must not cancel before terminal ACK"
+        );
+
+        assert_eq!(events.recv().await, Some(RoomEvent::Closed));
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 1,
+            })
+        );
+        outbound.acknowledge_terminal_delivery(2);
+        assert!(outbound.terminal_pending_delivery());
+        outbound.acknowledge_terminal_delivery(1);
+        assert!(!outbound.terminal_pending_delivery());
     }
 
     #[tokio::test]

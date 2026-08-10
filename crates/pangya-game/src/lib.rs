@@ -54,6 +54,7 @@ use pangya_domain::{
     OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest,
     RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState,
     RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+
     ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
     StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
     StrokeRosterOrder,
@@ -123,6 +124,7 @@ use pangya_protocol::{
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
     StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
+
     UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
     UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
     UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
@@ -134,6 +136,7 @@ use pangya_protocol::{
     RetailTeamChange, RetailTeamChangeAnnounce, RetailRoomInviteNotification, encode_packet_payload,
     is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
+
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -1671,6 +1674,7 @@ where
                                         &mut match_context,
                                         &mut terminal_generation,
                                         &mut terminal_identity,
+                                        &terminal_outbound,
                                     ).await
                                 }
                                 event => self.handle_room_event(
@@ -4510,6 +4514,7 @@ where
         match_context: &mut ConnectionMatchContext,
         terminal_generation: &mut u64,
         terminal_identity: &mut Option<(MatchId, MatchResultKey)>,
+        terminal_outbound: &RoomOutbound,
     ) -> Result<RoomEventEffect, GameRuntimeError> {
         let Some(context) = match_context.stroke else {
             return Ok(RoomEventEffect::Remain);
@@ -4524,17 +4529,25 @@ where
         {
             return Ok(RoomEventEffect::Remain);
         }
-        *terminal_generation = delivery.generation;
-        *terminal_identity = Some(identity);
-        self.handle_room_event(
-            framed,
-            state,
-            RoomEvent::StrokeCommitted(delivery.result),
-            room_id,
-            connection_id,
-            match_context,
-        )
-        .await
+        let handled = self
+            .handle_room_event(
+                framed,
+                state,
+                RoomEvent::StrokeCommitted(delivery.result),
+                room_id,
+                connection_id,
+                match_context,
+            )
+            .await;
+        if handled.is_ok() {
+            // Only a completed socket write is an ACK. Keep identity/generation untouched on a
+            // failed write so reconnect/replay remains eligible, and clear only this generation
+            // so a stale queued event cannot drop a newer terminal reservation.
+            *terminal_generation = delivery.generation;
+            *terminal_identity = Some(identity);
+            terminal_outbound.acknowledge_terminal_delivery(delivery.generation);
+        }
+        handled
     }
 
     async fn handle_room_event(
