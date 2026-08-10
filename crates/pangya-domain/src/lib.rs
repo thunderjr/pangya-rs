@@ -4612,6 +4612,7 @@ pub struct MemberSnapshot {
     ready: bool,
     character_id: Option<CharacterId>,
     character_iff_id: Option<u32>,
+    team: u8,
     card: MemberCard,
 }
 
@@ -4635,8 +4636,22 @@ impl MemberSnapshot {
             ready,
             character_id,
             character_iff_id,
+            team: 0,
             card: MemberCard::default(),
         }
+    }
+
+    /// Attaches the room team projection.
+    #[must_use]
+    pub const fn with_team(mut self, team: u8) -> Self {
+        self.team = team;
+        self
+    }
+
+    /// Team selected by this member.
+    #[must_use]
+    pub const fn team(&self) -> u8 {
+        self.team
     }
 
     /// Attaches what the rest of the room sees of this member.
@@ -4836,6 +4851,9 @@ pub enum RoomError {
     /// An owner cannot kick itself.
     #[error("room owner cannot kick itself")]
     CannotKickSelf,
+    /// A team value outside the retail red/blue set was requested.
+    #[error("room team is invalid")]
+    InvalidTeam,
     /// The requested member was not found.
     #[error("room member was not found")]
     MemberNotFound,

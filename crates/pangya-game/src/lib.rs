@@ -44,8 +44,8 @@ use pangya_data::Catalog;
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
     BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome,
-    CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, EconomyCommit, EconomyError,
-    EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
+    CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, CourseId, EconomyCommit,
+    EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
@@ -4500,6 +4500,24 @@ where
                     }
                     return Ok(RoomEventEffect::Remain);
                 }
+                RoomEvent::TeamChanged {
+                    connection_id,
+                    team,
+                } => {
+                    self.send(
+                        framed,
+                        &RetailTeamChangeAnnounce {
+                            connection_id: u32::try_from(connection_id.get()).unwrap_or(u32::MAX),
+                            team: match team {
+                                0 => pangya_protocol::RetailTeam::Red,
+                                1 => pangya_protocol::RetailTeam::Blue,
+                                _ => return Err(GameRuntimeError::Protocol),
+                            },
+                        },
+                    )
+                    .await?;
+                    return Ok(RoomEventEffect::Remain);
+                }
                 RoomEvent::Kicked { .. } => {
                     self.observer.room(GameRoomObservation::Kicked);
                     return Ok(RoomEventEffect::EnterChannel);
@@ -4696,6 +4714,24 @@ where
                 )
                 .await?;
                 self.observer.chat(GameChatObservation::Delivered);
+                Ok(RoomEventEffect::Remain)
+            }
+            RoomEvent::TeamChanged {
+                connection_id,
+                team,
+            } => {
+                self.send(
+                    framed,
+                    &RetailTeamChangeAnnounce {
+                        connection_id: u32::try_from(connection_id.get()).unwrap_or(u32::MAX),
+                        team: match team {
+                            0 => pangya_protocol::RetailTeam::Red,
+                            1 => pangya_protocol::RetailTeam::Blue,
+                            _ => return Err(GameRuntimeError::Protocol),
+                        },
+                    },
+                )
+                .await?;
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::Kicked { by } => {
@@ -5026,12 +5062,26 @@ where
         .await
     }
 
+    /// Derives the authoritative match plan from the room's complete profile.
+    fn retail_match_plan(&self, profile: RoomProfile) -> Result<MatchPlan, GameRuntimeError> {
+        let course_id = CourseId::new(u32::from(profile.course))
+            .map_err(|_| GameRuntimeError::InvalidConfig)?;
+        let declared = self
+            .catalog
+            .one_hole_course(course_id)
+            .map_err(|_| GameRuntimeError::InvalidConfig)?;
+        MatchPlan::with_holes(
+            course_id,
+            profile.hole_count,
+            profile.hole_progression,
+            declared.par(),
+        )
+        .map_err(|_| GameRuntimeError::InvalidConfig)
+    }
+
     /// The course ordinal the client will be told to load.
     ///
-    /// The retail wire carries a one-byte course, so a configured id outside that range cannot
-    /// be named and falls back to the first course rather than truncating into another one.
-    /// Stroke and solo describe the same hole; stroke wins because a real client can only start
-    /// a two-player match.
+    /// This remains for synthetic compositions; retail starts use [`Self::retail_match_plan`].
     fn retail_course(&self) -> u8 {
         self.config
             .stroke_two
@@ -5642,6 +5692,15 @@ where
             .ok_or(GameRuntimeError::Protocol)?;
         match (state, opcode) {
             (GameState::InRoom, RETAIL_C2S_START_MATCH | RetailPracticeStart::OPCODE) => {
+                let Ok(LobbyRouteResult::Snapshot(snapshot)) = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                else {
+                    return Ok(GameState::InRoom);
+                };
+                let profile = snapshot.summary().profile();
+                let course = self.retail_match_plan(profile)?;
                 if opcode == RetailPracticeStart::OPCODE {
                     let _request = decode_packet_payload::<RetailPracticeStart>(
                         payload,
@@ -5677,7 +5736,7 @@ where
                     match_id,
                     result_key,
                     identity.account_id,
-                    solo.course,
+                    course,
                     solo.catalog_fingerprint,
                     seed,
                     weather,
@@ -7593,13 +7652,17 @@ where
                 let request =
                     decode_packet_payload::<RetailTeamChange>(payload, profile, ServiceKind::Game)
                         .map_err(|_| GameRuntimeError::Protocol)?;
-                // Team membership is a room-local projection not yet persisted by the domain
-                // model. Announcing only after a valid member request keeps the client in sync
-                // without granting a non-member an arbitrary connection ID.
-                self.lobby
-                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                let routed = self
+                    .lobby
+                    .route(
+                        identity.connection_id,
+                        LobbyRoomCommand::ChangeTeam(request.team as u8),
+                    )
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
                 self.send(
                     framed,
                     &RetailTeamChangeAnnounce {
@@ -7609,6 +7672,8 @@ where
                     },
                 )
                 .await?;
+                self.send(framed, &retail_census_from_snapshot(&snapshot))
+                    .await?;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_RESYNC) => {
@@ -9082,7 +9147,7 @@ fn room_error_result(error: RoomError) -> RoomCommandResult {
         RoomError::IdExhausted => RoomCommandResult::IdExhausted,
         RoomError::Timeout => RoomCommandResult::Timeout,
         // M4 has no match-active discriminator; M5 network mapping is intentionally deferred.
-        RoomError::MatchActive => RoomCommandResult::Closed,
+        RoomError::MatchActive | RoomError::InvalidTeam => RoomCommandResult::Closed,
     }
 }
 

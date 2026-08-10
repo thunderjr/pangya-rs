@@ -108,6 +108,13 @@ pub enum RoomEvent {
         /// Authoritative owner projection.
         by: MemberSnapshot,
     },
+    /// A member changed teams in a team-capable room.
+    TeamChanged {
+        /// Member whose team changed.
+        connection_id: PlayerConnectionId,
+        /// New team, reference values 0 red or 1 blue.
+        team: u8,
+    },
     /// A persisted checked solo plan was confirmed and loading started.
     SoloStarted(SoloStartPlan),
     /// Authoritative solo phase changed for an exact match.
@@ -270,6 +277,7 @@ struct Member {
     identity: RoomIdentity,
     owner: bool,
     ready: bool,
+    team: u8,
     joined_order: u64,
     outbound: mpsc::Sender<RoomEvent>,
     cancellation: CancellationToken,
@@ -286,6 +294,7 @@ impl Member {
             self.identity.character_id,
             self.identity.character_iff_id,
         )
+        .with_team(self.team)
         .with_card(self.identity.card.clone())
     }
 }
@@ -428,6 +437,7 @@ impl RoomState {
                 identity: owner,
                 owner: true,
                 ready: false,
+                team: 0,
                 joined_order: 0,
                 outbound,
                 cancellation,
@@ -529,6 +539,7 @@ impl RoomState {
             identity,
             owner: false,
             ready: false,
+            team: 0,
             joined_order,
             outbound,
             cancellation,
@@ -608,6 +619,31 @@ impl RoomState {
         self.members[member].identity.card = card;
         self.members[member].identity.character_id = character_id;
         self.members[member].identity.character_iff_id = character_iff_id;
+        Ok(self.snapshot())
+    }
+
+    fn change_team(
+        &mut self,
+        caller: PlayerConnectionId,
+        team: u8,
+    ) -> Result<RoomSnapshot, RoomError> {
+        if self.match_active() {
+            return Err(RoomError::MatchActive);
+        }
+        if team > 1 {
+            return Err(RoomError::InvalidTeam);
+        }
+        let index = self.member_index(caller).ok_or(RoomError::NotMember)?;
+        self.members[index].team = team;
+        for member in &self.members {
+            let _delivered = self.deliver(
+                member,
+                RoomEvent::TeamChanged {
+                    connection_id: caller,
+                    team,
+                },
+            );
+        }
         Ok(self.snapshot())
     }
 
@@ -1541,6 +1577,11 @@ enum RoomCommand {
         target: PlayerConnectionId,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
+    Team {
+        caller: PlayerConnectionId,
+        team: u8,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
     State {
         reply: oneshot::Sender<RoomSnapshot>,
     },
@@ -1848,6 +1889,21 @@ impl RoomHandle {
             settings,
             name,
             password,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Changes the authoritative caller's team.
+    pub async fn change_team(
+        &self,
+        caller: PlayerConnectionId,
+        team: u8,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::Team {
+            caller,
+            team,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -2562,6 +2618,18 @@ fn handle_normal(
             reply,
         } => {
             let result = state.update_room(caller, settings, name, password);
+            if let Ok(snapshot) = &result {
+                after_mutation(state, Some(snapshot), events);
+            }
+            let _ignored = reply.send(result);
+            true
+        }
+        RoomCommand::Team {
+            caller,
+            team,
+            reply,
+        } => {
+            let result = state.change_team(caller, team);
             if let Ok(snapshot) = &result {
                 after_mutation(state, Some(snapshot), events);
             }

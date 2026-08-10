@@ -178,6 +178,8 @@ pub enum LobbyRoomCommand {
     },
     /// Owner-only removal of another authoritative connection ID.
     Kick(PlayerConnectionId),
+    /// Change the caller's red/blue team.
+    ChangeTeam(u8),
     /// Fetch the caller's current authoritative room state.
     GetState,
 }
@@ -1345,6 +1347,10 @@ impl LobbyRegistry {
                 }
                 result.map(LobbyRouteResult::Snapshot)
             }
+            LobbyRoomCommand::ChangeTeam(team) => handle
+                .change_team(connection_id, team)
+                .await
+                .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::GetState => handle.state().await.map(LobbyRouteResult::Snapshot),
         };
         match result {
