@@ -48,8 +48,8 @@ use pangya_domain::{
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
-    MatchPlan, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
+    MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan, MatchRepository, MatchResultKey,
+    MatchSeed, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
     OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest,
     RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState,
     RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
@@ -9604,12 +9604,31 @@ mod tests {
             vec![10, 11, 12, 13, 14, 15, 16, 17, 18]
         );
         let random = GameService::<FakeRepository>::retail_hole_order(7, 18, 2);
-        assert_eq!(random, GameService::<FakeRepository>::retail_hole_order(7, 18, 2));
+        assert_eq!(
+            random,
+            GameService::<FakeRepository>::retail_hole_order(7, 18, 2)
+        );
         assert_eq!(random.len(), 18);
-        assert_eq!(random.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 18);
+        assert_eq!(
+            random
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            18
+        );
         let shuffle = GameService::<FakeRepository>::retail_hole_order(7, 18, 3);
-        assert_eq!(shuffle, GameService::<FakeRepository>::retail_hole_order(7, 18, 3));
-        assert_eq!(shuffle.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 18);
+        assert_eq!(
+            shuffle,
+            GameService::<FakeRepository>::retail_hole_order(7, 18, 3)
+        );
+        assert_eq!(
+            shuffle
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            18
         );
     }
 

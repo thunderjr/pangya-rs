@@ -920,12 +920,27 @@ fn assert_retail_hole_intro_order(frames: &[(u16, Vec<u8>)], label: &str) {
         .enumerate()
         .filter_map(|(index, (opcode, _))| (*opcode == 0x0053).then_some(index))
         .collect();
-    assert_eq!(intro_positions.len(), 1, "{label} has one hole introduction");
+    assert_eq!(
+        intro_positions.len(),
+        1,
+        "{label} has one hole introduction"
+    );
     if let Some(finish) = frames.iter().position(|(opcode, _)| *opcode == 0x0065) {
-        assert!(finish < intro_positions[0], "{label} finishes before introduction: {frames:04x?}");
-        assert!(!frames[finish + 1..intro_positions[0]].iter().any(|(opcode, _)| *opcode == 0x0063), "{label} has no stale handover after finish: {frames:04x?}");
+        assert!(
+            finish < intro_positions[0],
+            "{label} finishes before introduction: {frames:04x?}"
+        );
+        assert!(
+            !frames[finish + 1..intro_positions[0]]
+                .iter()
+                .any(|(opcode, _)| *opcode == 0x0063),
+            "{label} has no stale handover after finish: {frames:04x?}"
+        );
     } else if let Some(turn) = frames.iter().position(|(opcode, _)| *opcode == 0x0063) {
-        assert!(intro_positions[0] < turn, "{label} introduces before handover: {frames:04x?}");
+        assert!(
+            intro_positions[0] < turn,
+            "{label} introduces before handover: {frames:04x?}"
+        );
     }
 }
 

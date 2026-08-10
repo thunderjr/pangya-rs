@@ -489,14 +489,17 @@ impl RoomState {
         }
         match member.outbound.try_send(event) {
             Ok(()) => true,
-            // Once a persistence coordinator has accepted the critical request, a full queue on
-            // another captured member is ordinary backpressure. Keep that member alive so the
-            // retained terminal result can wait for a permit; before that point, preserve the
-            // existing bounded-queue disconnect policy.
+            // Once terminal persistence is pending, a full queue on any captured member is
+            // ordinary backpressure. Keep that member alive so the retained terminal result can
+            // wait for a permit; the persistence request can fail over without invalidating the
+            // captured socket.
             Err(mpsc::error::TrySendError::Full(_))
-                if self.pending_stroke_persistence.is_some()
-                    && self.stroke_persistence_event_delivered =>
+                if self.pending_stroke_persistence.is_some() =>
             {
+                // A captured roster member must remain eligible for the terminal event even
+                // when its queue is full before persistence ownership is established. The
+                // settlement may fail over to another member; canceling this sender here would
+                // make the eventual 0x0066 impossible for that socket.
                 false
             }
             Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -4151,7 +4154,10 @@ mod tests {
         let commit = fallback
             .stroke_give_up(first.connection_id)
             .expect("give-up settlement");
-        assert!(owner_cancel.is_cancelled());
+        assert!(
+            !owner_cancel.is_cancelled(),
+            "backpressure must not cancel a captured terminal recipient"
+        );
         assert!(!second_cancel.is_cancelled());
         let second_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
         assert_eq!(
@@ -4198,8 +4204,8 @@ mod tests {
         let commit = retained
             .stroke_give_up(first.connection_id)
             .expect("give-up settlement");
-        assert!(owner_cancel.is_cancelled());
-        assert!(second_cancel.is_cancelled());
+        assert!(!owner_cancel.is_cancelled());
+        assert!(!second_cancel.is_cancelled());
         assert!(
             std::iter::from_fn(|| owner_rx.try_recv().ok())
                 .chain(std::iter::from_fn(|| second_rx.try_recv().ok()))

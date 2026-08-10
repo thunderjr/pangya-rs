@@ -17,11 +17,11 @@ use pangya_domain::{
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchPlan, MatchRepository,
     MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
-    OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest,
-    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
-    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
-    Weather, WindConditions,
+    OfflineNoteClaim, OfflineNoteRequest, PlayerRepository, PurchaseRequest, RepairItem,
+    RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix, StarterCharacter,
+    StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver, StrokeCompletion,
+    StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
+    WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
