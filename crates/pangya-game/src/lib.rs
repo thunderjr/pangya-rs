@@ -10150,6 +10150,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gm_oid_resolves_authoritative_live_connection_and_cancels_only_that_token() {
+        let hub = SocialHub::new(16);
+        let connection = PlayerConnectionId::new(7).unwrap_or(PlayerConnectionId::new(1).unwrap());
+        let target_oid = 42;
+        let token = CancellationToken::new();
+        let account = AccountId::new(99).unwrap_or(AccountId::new(1).unwrap());
+        hub.register_with_oid_and_cancellation(
+            connection,
+            target_oid,
+            account,
+            b"target".to_vec(),
+            MemberCard::default(),
+            token.clone(),
+        );
+
+        assert_eq!(hub.connection_for_oid(target_oid), Some(connection));
+        assert_eq!(hub.account_for_oid(target_oid), Some(account));
+        assert!(!token.is_cancelled());
+        assert!(hub.cancel_connection_for_oid(target_oid));
+        assert!(token.is_cancelled());
+        assert_eq!(hub.connection_for_oid(target_oid), Some(connection));
+        assert!(!hub.cancel_connection_for_oid(7), "wire OID must not be cast to a connection ID");
+    }
+
+    #[test]
+    fn gm_oid_keeps_durable_account_target_after_connection_leaves() {
+        let hub = SocialHub::new(16);
+        let connection = PlayerConnectionId::new(7).unwrap_or(PlayerConnectionId::new(1).unwrap());
+        let target_oid = 42;
+        let account = AccountId::new(99).unwrap_or(AccountId::new(1).unwrap());
+        hub.register_with_oid(
+            connection,
+            target_oid,
+            account,
+            b"target".to_vec(),
+            MemberCard::default(),
+        );
+        hub.remove(connection);
+
+        assert_eq!(hub.connection_for_oid(target_oid), None);
+        assert_eq!(hub.account_for_oid(target_oid), Some(account));
+    }
+
+    #[test]
     fn issue12_social_hub_scopes_ordered_chat_typing_and_lounge_to_room_members() {
         let hub = SocialHub::new(16);
         let first = PlayerConnectionId::new(1).unwrap_or(PlayerConnectionId::new(2).unwrap());
