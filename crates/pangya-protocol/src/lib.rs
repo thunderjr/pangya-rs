@@ -103,10 +103,12 @@ pub use us852_bootstrap::{
 };
 pub use us852_match::{
     MAX_MATCH_HOLES, MAX_MATCH_STANDINGS, RATE_TABLE_BYTES, RETAIL_STANDING_BYTES, RetailAimRotate,
-    RetailFinishHole, RetailHole, RetailHoleWeather, RetailHoleWind, RetailLoadProgress,
-    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
-    RetailMatchPlayer, RetailMatchStart, RetailPangRate, RetailPlayerStartHole,
-    RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailRateTable, RetailShotCommitRelay,
+    RetailAimRotateRequest, RetailClubChange, RetailClubChangeRequest, RetailCometRelief,
+    RetailCometReliefRequest, RetailFinishHole, RetailHole, RetailHoleWeather, RetailHoleWind,
+    RetailItemUse, RetailItemUseRequest, RetailLoadProgress, RetailMascotSeed, RetailMatchFinish,
+    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
+    RetailPangRate, RetailPlayerStartHole, RetailPracticeShotSync, RetailPracticeShotSyncRequest,
+    RetailRateTable, RetailShotCommitRelay, RetailShotPower, RetailShotPowerRequest,
     RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart, RetailWeather,
 };
 pub use us852_room::{

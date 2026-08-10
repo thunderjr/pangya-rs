@@ -700,6 +700,247 @@ impl EncodePacket for RetailAimRotate {
     }
 }
 
+/// Client aim rotation, opcode `0x0013`.
+///
+/// # Provenance
+///
+/// Layout from `pangbox/packetdoc` `gameservice/client/0013.ksy`; the corresponding
+/// announcement is emitted by `pangbox/server` `game/room/room.go:580-584` (ISC licensed).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailAimRotateRequest {
+    /// New bearing.
+    pub rotation: f32,
+}
+
+impl DecodePacket for RetailAimRotateRequest {
+    const OPCODE: u16 = 0x0013;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let rotation = reader.f32_le()?;
+        if !rotation.is_finite() || reader.remaining() != 0 {
+            return Err(reader.invalid("aim rotation must be finite and exactly four bytes"));
+        }
+        Ok(Self { rotation })
+    }
+}
+
+/// Client extra-power selection, opcode `0x0015`.
+///
+/// # Provenance
+///
+/// Layout and closed value set from `pangbox/packetdoc` `gameservice/client/0015.ksy`;
+/// `pangbox/server` `game/room/room.go:587-592` announces it as `0x0058` (ISC licensed).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailShotPowerRequest {
+    /// `0` normal, `1` power, or `2` double power.
+    pub level: u8,
+}
+
+impl DecodePacket for RetailShotPowerRequest {
+    const OPCODE: u16 = 0x0015;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let level = reader.u8()?;
+        if level > 2 || reader.remaining() != 0 {
+            return Err(reader.invalid("shot power must be 0, 1, or 2 and exactly one byte"));
+        }
+        Ok(Self { level })
+    }
+}
+
+/// Extra-power selection relayed to room members, server opcode `0x0058`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailShotPower {
+    /// Who selected the power level.
+    pub connection_id: u32,
+    /// `0` normal, `1` power, or `2` double power.
+    pub level: u8,
+}
+
+impl EncodePacket for RetailShotPower {
+    const OPCODE: u16 = 0x0058;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.level);
+        Ok(())
+    }
+}
+
+/// Client active-club selection, opcode `0x0016`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailClubChangeRequest {
+    /// Zero-based club index, ending with the putter at `13`.
+    pub club: u8,
+}
+
+impl DecodePacket for RetailClubChangeRequest {
+    const OPCODE: u16 = 0x0016;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let club = reader.u8()?;
+        if club > 13 || reader.remaining() != 0 {
+            return Err(reader.invalid("club must be in the retail range 0 through 13"));
+        }
+        Ok(Self { club })
+    }
+}
+
+/// Active-club selection relayed to room members, server opcode `0x0059`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailClubChange {
+    /// Who changed club.
+    pub connection_id: u32,
+    /// Zero-based club index.
+    pub club: u8,
+}
+
+impl EncodePacket for RetailClubChange {
+    const OPCODE: u16 = 0x0059;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.club);
+        Ok(())
+    }
+}
+
+/// Client in-match item selection, opcode `0x0017`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailItemUseRequest {
+    /// The selected item type ID.
+    pub item_type_id: u32,
+}
+
+impl DecodePacket for RetailItemUseRequest {
+    const OPCODE: u16 = 0x0017;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let item_type_id = reader.u32_le()?;
+        if reader.remaining() != 0 {
+            return Err(reader.invalid("item-use request has trailing bytes"));
+        }
+        Ok(Self { item_type_id })
+    }
+}
+
+/// In-match item selection relayed to room members, server opcode `0x005a`.
+///
+/// The unknown field is zero in `pangbox/server` `game/packet/server.go:563-568`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailItemUse {
+    /// The selected item type ID.
+    pub item_type_id: u32,
+    /// Who selected the item.
+    pub connection_id: u32,
+}
+
+impl EncodePacket for RetailItemUse {
+    const OPCODE: u16 = 0x005a;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.item_type_id);
+        writer.u32_le(0);
+        writer.u32_le(self.connection_id);
+        Ok(())
+    }
+}
+
+/// Client comet-relief location, opcode `0x0019`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailCometReliefRequest {
+    /// Client-selected coordinates.
+    pub position: [f32; 3],
+}
+
+impl DecodePacket for RetailCometReliefRequest {
+    const OPCODE: u16 = 0x0019;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile
+            .require_us852()
+            .map_err(|error| reader.invalid(error.to_string()))?;
+        let position = [reader.f32_le()?, reader.f32_le()?, reader.f32_le()?];
+        if !position.iter().all(|value| value.is_finite()) || reader.remaining() != 0 {
+            return Err(
+                reader.invalid("comet-relief coordinates must be finite and exactly 12 bytes")
+            );
+        }
+        Ok(Self { position })
+    }
+}
+
+/// Comet-relief location relayed to room members, server opcode `0x0060`.
+///
+/// `pangbox/server` includes the authoritative connection ID before the three coordinates in
+/// `game/packet/server.go:585-589` and broadcasts it from `game/room/room.go:615-621`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetailCometRelief {
+    /// Who selected the relief location.
+    pub connection_id: u32,
+    /// Client-selected coordinates.
+    pub position: [f32; 3],
+}
+
+impl EncodePacket for RetailCometRelief {
+    const OPCODE: u16 = 0x0060;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.connection_id);
+        for coordinate in self.position {
+            writer.f32_le(coordinate);
+        }
+        Ok(())
+    }
+}
+
 /// Shot relayed to the other players, server opcode `0x0055`.
 ///
 /// The client computes trajectory, so the server relays the committed shot rather than
@@ -1074,5 +1315,97 @@ mod tests {
     fn finishing_a_hole_carries_no_body() {
         let payload = encode_packet_payload(&RetailFinishHole, &profile()).expect("encode");
         assert!(payload.is_empty());
+    }
+
+    // `pangbox/server` `game/room/room.go:580-621` broadcasts these five projections. The
+    // request layouts and closed enums are the paired PacketDoc client definitions.
+    #[test]
+    fn preview_requests_decode_only_the_documented_complete_values() {
+        let aim = decode_packet_payload::<RetailAimRotateRequest>(
+            &1.25_f32.to_le_bytes(),
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("aim");
+        assert_eq!(aim.rotation, 1.25);
+        assert!(
+            decode_packet_payload::<RetailAimRotateRequest>(&[0; 3], &profile(), ServiceKind::Game)
+                .is_err()
+        );
+        assert!(
+            decode_packet_payload::<RetailShotPowerRequest>(&[3], &profile(), ServiceKind::Game)
+                .is_err()
+        );
+        assert!(
+            decode_packet_payload::<RetailClubChangeRequest>(&[14], &profile(), ServiceKind::Game)
+                .is_err()
+        );
+        assert!(
+            decode_packet_payload::<RetailItemUseRequest>(&[0; 3], &profile(), ServiceKind::Game)
+                .is_err()
+        );
+        assert!(
+            decode_packet_payload::<RetailCometReliefRequest>(
+                &[0; 11],
+                &profile(),
+                ServiceKind::Game
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preview_announcements_prefix_the_authoritative_connection_id() {
+        let aim = encode_packet_payload(
+            &RetailAimRotate {
+                connection_id: 77,
+                rotation: 1.25,
+            },
+            &profile(),
+        )
+        .expect("aim");
+        assert_eq!(aim.as_slice(), &[77, 0, 0, 0, 0, 0, 160, 63]);
+        let power = encode_packet_payload(
+            &RetailShotPower {
+                connection_id: 77,
+                level: 2,
+            },
+            &profile(),
+        )
+        .expect("power");
+        assert_eq!(power.as_slice(), &[77, 0, 0, 0, 2]);
+        let club = encode_packet_payload(
+            &RetailClubChange {
+                connection_id: 77,
+                club: 13,
+            },
+            &profile(),
+        )
+        .expect("club");
+        assert_eq!(club.as_slice(), &[77, 0, 0, 0, 13]);
+        let item = encode_packet_payload(
+            &RetailItemUse {
+                item_type_id: 0x1a2b_3c4d,
+                connection_id: 77,
+            },
+            &profile(),
+        )
+        .expect("item");
+        assert_eq!(
+            item.as_slice(),
+            &[0x4d, 0x3c, 0x2b, 0x1a, 0, 0, 0, 0, 77, 0, 0, 0]
+        );
+        let comet = encode_packet_payload(
+            &RetailCometRelief {
+                connection_id: 77,
+                position: [1.0, -2.0, 3.5],
+            },
+            &profile(),
+        )
+        .expect("comet relief");
+        assert_eq!(
+            comet.as_slice(),
+            &[77, 0, 0, 0, 0, 0, 128, 63, 0, 0, 0, 192, 0, 0, 96, 64]
+        );
     }
 }

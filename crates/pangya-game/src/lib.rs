@@ -68,26 +68,28 @@ use pangya_protocol::{
     Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
     MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
-    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
-    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
-    RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
-    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
-    RetailInventoryItem, RetailLoadProgress, RetailLockerCombinationAttempt,
-    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
-    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
-    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
-    RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
-    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeShotSync,
-    RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin,
-    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd,
-    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailAimRotate, RetailAimRotateRequest, RetailCaddie, RetailChannel, RetailChannelJoinNotice,
+    RetailChannelJoined, RetailCharacter, RetailClientException, RetailClubChange,
+    RetailClubChangeRequest, RetailCometRelief, RetailCometReliefRequest, RetailDailyQuestDelta,
+    RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment, RetailEquipmentRequested,
+    RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole,
+    RetailFirstShotReady, RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather,
+    RetailHoleWind, RetailInventoryClass, RetailInventoryItem, RetailItemUse, RetailItemUseRequest,
+    RetailLoadProgress, RetailLockerCombinationAttempt, RetailLockerCombinationResponse,
+    RetailLockerInventoryRequest, RetailLockerInventoryResponse, RetailLoginBonusRequest,
+    RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen,
+    RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined,
+    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest,
+    RetailMyRoomLayout, RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData,
+    RetailPlayerHistory, RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo,
+    RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
+    RetailPointBalance, RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart,
+    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom,
+    RetailRoomCensus, RetailRoomCreate, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
+    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType,
+    RetailSelectChannel, RetailShopJoin, RetailShopJoined, RetailShotCommitRelay, RetailShotPower,
+    RetailShotPowerRequest, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -3757,6 +3759,56 @@ where
                             self.send(framed, &RetailShotSync { data: body.clone() })
                                 .await?;
                         }
+                        RetailMatchRelay::Aim(rotation) => {
+                            self.send(
+                                framed,
+                                &RetailAimRotate {
+                                    connection_id: from,
+                                    rotation: f32::from_bits(*rotation),
+                                },
+                            )
+                            .await?;
+                        }
+                        RetailMatchRelay::Power(level) => {
+                            self.send(
+                                framed,
+                                &RetailShotPower {
+                                    connection_id: from,
+                                    level: *level,
+                                },
+                            )
+                            .await?;
+                        }
+                        RetailMatchRelay::Club(club) => {
+                            self.send(
+                                framed,
+                                &RetailClubChange {
+                                    connection_id: from,
+                                    club: *club,
+                                },
+                            )
+                            .await?;
+                        }
+                        RetailMatchRelay::Item(item_type_id) => {
+                            self.send(
+                                framed,
+                                &RetailItemUse {
+                                    connection_id: from,
+                                    item_type_id: *item_type_id,
+                                },
+                            )
+                            .await?;
+                        }
+                        RetailMatchRelay::CometRelief(position) => {
+                            self.send(
+                                framed,
+                                &RetailCometRelief {
+                                    connection_id: from,
+                                    position: position.map(f32::from_bits),
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     return Ok(RoomEventEffect::Remain);
                 }
@@ -4933,6 +4985,13 @@ where
             )
         {
             tracing::warn!(message = %report.sanitized(), "client reported an exception");
+            return Ok(Some(state));
+        }
+        if let Some(relay) = retail_preview_relay(opcode, payload)? {
+            if state == GameState::InStrokeMatch {
+                self.relay_retail_match_frame(identity.connection_id, relay)
+                    .await;
+            }
             return Ok(Some(state));
         }
         if is_retail_accepted_match_opcode(opcode)
@@ -6998,6 +7057,65 @@ const RETAIL_SOLO_GAME_TIMER: Duration = Duration::from_secs(600);
 const RETAIL_C2S_SHOT_SYNC: u16 = 0x001b;
 const RETAIL_C2S_SHOT_END: u16 = 0x001c;
 const RETAIL_C2S_HOLE_FINISH: u16 = 0x0031;
+
+/// Decodes the retail preview frames whose established server projection is a room relay.
+///
+/// `0x0014` deliberately remains absent: PacketDoc explicitly documents no response for that
+/// meter-input packet, while `0x0015` is the `0x0058` power-selection request.
+fn retail_preview_relay(
+    opcode: u16,
+    payload: &[u8],
+) -> Result<Option<RetailMatchRelay>, GameRuntimeError> {
+    let profile = &CompatibilityProfile::US_852;
+    match opcode {
+        RetailAimRotateRequest::OPCODE => {
+            let request = decode_packet_payload::<RetailAimRotateRequest>(
+                payload,
+                profile,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::Aim(request.rotation.to_bits())))
+        }
+        RetailShotPowerRequest::OPCODE => {
+            let request = decode_packet_payload::<RetailShotPowerRequest>(
+                payload,
+                profile,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::Power(request.level)))
+        }
+        RetailClubChangeRequest::OPCODE => {
+            let request = decode_packet_payload::<RetailClubChangeRequest>(
+                payload,
+                profile,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::Club(request.club)))
+        }
+        RetailItemUseRequest::OPCODE => {
+            let request =
+                decode_packet_payload::<RetailItemUseRequest>(payload, profile, ServiceKind::Game)
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::Item(request.item_type_id)))
+        }
+        RetailCometReliefRequest::OPCODE => {
+            let request = decode_packet_payload::<RetailCometReliefRequest>(
+                payload,
+                profile,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?;
+            Ok(Some(RetailMatchRelay::CometRelief(
+                request.position.map(f32::to_bits),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Removes the client-only shot subtype before relaying a committed shot as server `0x0055`.
 fn retail_shot_announce_payload(payload: &[u8]) -> Result<Vec<u8>, GameRuntimeError> {
     let subtype = payload

@@ -71,6 +71,16 @@ pub enum RetailMatchRelay {
     Shot(Vec<u8>),
     /// Post-shot ball state, echoed to the participants.
     Sync(Vec<u8>),
+    /// Aim rotation, represented as the original IEEE-754 wire bits.
+    Aim(u32),
+    /// Extra-power selection.
+    Power(u8),
+    /// Active-club selection.
+    Club(u8),
+    /// In-match item type selection.
+    Item(u32),
+    /// Comet-relief coordinates, represented as their original IEEE-754 wire bits.
+    CometRelief([u32; 3]),
 }
 
 impl RetailMatchRelay {
@@ -79,13 +89,25 @@ impl RetailMatchRelay {
     pub fn body(&self) -> &[u8] {
         match self {
             Self::Shot(body) | Self::Sync(body) => body,
+            Self::Aim(_)
+            | Self::Power(_)
+            | Self::Club(_)
+            | Self::Item(_)
+            | Self::CometRelief(_) => &[],
         }
     }
 
     /// Whether the payload is within the relay bound.
     #[must_use]
     pub fn is_bounded(&self) -> bool {
-        self.body().len() <= MAX_RETAIL_RELAY_BYTES
+        match self {
+            Self::Shot(body) | Self::Sync(body) => body.len() <= MAX_RETAIL_RELAY_BYTES,
+            Self::Aim(_)
+            | Self::Power(_)
+            | Self::Club(_)
+            | Self::Item(_)
+            | Self::CometRelief(_) => true,
+        }
     }
 }
 

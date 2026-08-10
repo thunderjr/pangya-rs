@@ -6740,6 +6740,58 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         salt = salt.wrapping_add(1);
     }
 
+    // The shot-preview relays are observed in pangbox's room handlers
+    // (`game/room/room.go:580-621`) and their packet bodies come from PacketDoc
+    // (`gameservice/client/0013.ksy`, `0015.ksy`, `0016.ksy`, `0017.ksy`, `0019.ksy`).
+    // They go only to the other participant: the peer must receive the server projection with
+    // its authoritative connection ID before it can animate the host's choice.
+    let preview_relays = [
+        (0x0013_u16, 1.25_f32.to_le_bytes().to_vec(), 0x0056_u16),
+        (0x0015_u16, vec![2], 0x0058_u16),
+        (0x0016_u16, vec![0x0d], 0x0059_u16),
+        (
+            0x0017_u16,
+            0x1a2b_3c4d_u32.to_le_bytes().to_vec(),
+            0x005a_u16,
+        ),
+        (
+            0x0019_u16,
+            [1.0_f32, -2.0, 3.5]
+                .into_iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            0x0060_u16,
+        ),
+    ];
+    for (opcode, payload, expected) in preview_relays {
+        salt = salt.wrapping_add(1);
+        send_packet(&mut host, host_key, salt, opcode, &payload).await;
+        let relayed = drain_frames(&mut visitor, visitor_key, Duration::from_millis(900)).await;
+        let body = relayed
+            .iter()
+            .find(|(received, _)| *received == expected)
+            .map(|(_, body)| body)
+            .expect("the other participant receives the preview relay");
+        if opcode == 0x0017 {
+            assert_eq!(
+                body.get(..4),
+                Some(payload.as_slice()),
+                "item ID leads the 0x005a announcement"
+            );
+            assert_eq!(
+                body.get(4..8),
+                Some(&[0; 4][..]),
+                "the documented unknown 0x005a field is zero"
+            );
+        } else {
+            assert!(
+                body.ends_with(&payload),
+                "{opcode:#06x} becomes {expected:#06x} with the client value unchanged"
+            );
+        }
+        let _ = drain_available(&mut host, host_key, Duration::from_millis(300)).await;
+    }
+
     // The cosmetic in-match chatter a real client sends around a shot must not drop it. The
     // shipped policy is `disconnect`, so an unlisted opcode here would end the session.
     salt = salt.wrapping_add(1);
@@ -6749,7 +6801,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         ready.contains(&0x0090),
         "the client is told it may take its first shot: {ready:04x?}"
     );
-    for opcode in [0x0013_u16, 0x0015, 0x0016, 0x001a, 0x0022] {
+    for opcode in [0x001a_u16, 0x0022] {
         salt = salt.wrapping_add(1);
         send_packet(&mut host, host_key, salt, opcode, &[0; 4]).await;
         let noise = drain_available(&mut host, host_key, Duration::from_millis(300)).await;
