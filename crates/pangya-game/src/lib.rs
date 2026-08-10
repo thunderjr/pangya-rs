@@ -48,15 +48,15 @@ use pangya_domain::{
     CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, CourseId, EconomyCommit,
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
-    ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan, MatchRepository, MatchResultKey,
-    MatchSeed, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer,
-    RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId,
-    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
-    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
-    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
-    StrokeRosterOrder,
+    ItemTypeId, LoginBonusReward, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
+    MatchRepository, MatchResultKey, MatchSeed, MemberCard, MemberSnapshot, Nickname,
+    OfflineNoteClaim, OfflineNoteRequest, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
+    PurchaseRequest, RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange,
+    RetailEquipmentState, RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings,
+    RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult,
+    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
+    StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -82,7 +82,8 @@ use pangya_protocol::{
     RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
     RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailLockerInventoryResponse, RetailLoginBonusClaimRequest, RetailLoginBonusClaimResponse,
+    RetailLoginBonusItemGrant, RetailLoginBonusRequest, RetailLoginBonusStatus,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
     RetailMessageServerList, RetailMessageServerListRequest, RetailMultiplayerJoined,
@@ -629,6 +630,46 @@ pub struct EconomyRuntimeConfig {
     pub max_purchase_quantity: u32,
 }
 
+/// Checked daily login bonus configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginBonusRuntimeConfig {
+    /// One catalog-defined reward used for each server day.
+    pub reward: LoginBonusReward,
+    /// Number of calendar days before the display day wraps to one.
+    pub calendar_days: u32,
+}
+
+impl LoginBonusRuntimeConfig {
+    /// Validates the bounded calendar and configured reward quantity.
+    fn validate(self, catalog: &Catalog) -> Result<(), GameRuntimeError> {
+        // The whole definition is authoritative, not just the type ID. Comparing every field
+        // prevents an operator from changing the family, stacking cap, durability, sale policy,
+        // or character compatibility while retaining a valid-looking catalog identifier.
+        if self.calendar_days == 0
+            || self.reward.quantity == 0
+            || catalog.item_definition(self.reward.definition.type_id)
+                != Some(&self.reward.definition)
+        {
+            return Err(GameRuntimeError::Catalog);
+        }
+        match self.reward.definition.stacking {
+            ItemStacking::Unique if self.reward.quantity != 1 => {
+                return Err(GameRuntimeError::Catalog);
+            }
+            ItemStacking::Stackable { max_stack }
+                if max_stack == 0 || self.reward.quantity > max_stack =>
+            {
+                return Err(GameRuntimeError::Catalog);
+            }
+            ItemStacking::Unique | ItemStacking::Stackable { .. } => {}
+        }
+        if self.reward.definition.kind == ItemKind::Character {
+            return Err(GameRuntimeError::Catalog);
+        }
+        Ok(())
+    }
+}
+
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
@@ -649,6 +690,8 @@ pub struct GameRuntimeConfig {
     pub stroke_two: Option<StrokeRuntimeConfig>,
     /// Optional local-only synthetic economy.
     pub economy: Option<EconomyRuntimeConfig>,
+    /// Optional daily login bonus. The reward is resolved against the immutable catalog at startup.
+    pub login_bonus: Option<LoginBonusRuntimeConfig>,
     /// Emits the reference-derived retail bootstrap instead of the synthetic one.
     ///
     /// Required by a real U.S. client, which never sends or understands the synthetic
@@ -666,6 +709,7 @@ impl Default for GameRuntimeConfig {
             solo_practice: None,
             stroke_two: None,
             economy: None,
+            login_bonus: None,
             retail_bootstrap: false,
         }
     }
@@ -1067,6 +1111,25 @@ impl CaptureSink {
     }
 }
 
+/// Clock used for wall-clock server-day and packet timestamps.
+///
+/// Production uses [`SystemGameClock`]. Tests and deterministic integrations can inject a fixed
+/// implementation at the service boundary without changing the persisted server-day contract.
+pub trait GameClock: Send + Sync {
+    /// Returns the current wall-clock instant.
+    fn now(&self) -> SystemTime;
+}
+
+/// Production wall clock for [`GameService`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemGameClock;
+
+impl GameClock for SystemGameClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
 /// Generic bounded GameService over domain repositories and an immutable catalog.
 pub struct GameService<R>
 where
@@ -1082,6 +1145,7 @@ where
     /// database. Defaults to empty, which resolves to exactly the catalog's own answers.
     shop_overlay: watch::Receiver<ShopOverlay>,
     config: GameRuntimeConfig,
+    clock: Arc<dyn GameClock>,
     message_server: pangya_protocol::MessageServerEntry,
     observer: Arc<dyn GameObserver>,
     lobby: LobbyHandle,
@@ -1129,6 +1193,16 @@ where
         self.shop_overlay = overlay;
         self
     }
+    /// Injects the wall clock used by login-bonus server-day calculations and timestamps.
+    #[must_use]
+    pub fn with_clock<C>(mut self, clock: C) -> Self
+    where
+        C: GameClock + 'static,
+    {
+        self.clock = Arc::new(clock);
+        self
+    }
+
     /// Sets the configured MessageService endpoint used by 0x008b responses.
     #[must_use]
     pub fn with_message_server(
@@ -1252,6 +1326,9 @@ where
                     || solo.shot_packets_per_window == 0
                     || solo.shot_packets_per_window > 1_000_000
             })
+            || config
+                .login_bonus
+                .is_some_and(|bonus| bonus.calendar_days == 0 || bonus.reward.quantity == 0)
             || config.economy.is_some_and(|economy| {
                 economy.command_timeout.is_zero()
                     || economy.command_timeout > limits.shutdown_grace
@@ -1285,6 +1362,11 @@ where
             });
         if invalid {
             return Err(GameRuntimeError::InvalidConfig);
+        }
+        if let Some(login_bonus) = config.login_bonus
+            && login_bonus.validate(&catalog).is_err()
+        {
+            return Err(GameRuntimeError::Catalog);
         }
         if config.economy.is_some()
             && (catalog.shop_offers().is_empty()
@@ -1334,6 +1416,7 @@ where
         Ok(Self {
             repository,
             catalog,
+            clock: Arc::new(SystemGameClock),
             // Empty by default; composition swaps in a live receiver when the operator
             // admin surface is enabled.
             shop_overlay: watch::channel(ShopOverlay::default()).1,
@@ -1973,15 +2056,47 @@ where
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
-                                && matches!(
-                                    frame.opcode,
-                                    RetailLoginBonusRequest::OPCODE
-                                        | RetailPlayerHistoryRequest::OPCODE
-                                )
+                                && frame.opcode == RetailLoginBonusRequest::OPCODE
                             {
-                                // A real client sends both of these the moment it finishes entering
-                                // a channel. Leaving them unanswered means the lobby only survives
-                                // under a permissive unknown-opcode policy.
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if decode_packet_payload::<RetailLoginBonusRequest>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                )
+                                .is_err()
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let status = self
+                                    .retail_login_bonus_status(established.account_id)
+                                    .await?;
+                                self.send(&mut framed, &status).await?;
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailLoginBonusClaimRequest::OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if decode_packet_payload::<RetailLoginBonusClaimRequest>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                )
+                                .is_err()
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                self.retail_login_bonus_claim(
+                                    &mut framed,
+                                    established.account_id,
+                                )
+                                .await?;
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailPlayerHistoryRequest::OPCODE
+                            {
                                 if !frame.payload.is_empty() {
                                     break Err(GameRuntimeError::Protocol);
                                 }
@@ -1989,18 +2104,14 @@ where
                                     biased;
                                     () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
                                     sent = async {
-                                        if frame.opcode == RetailLoginBonusRequest::OPCODE {
-                                            self.send(&mut framed, &RetailLoginBonusStatus).await
-                                        } else {
-                                            let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
-                                            let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
-                                            let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
-                                                let account_id = u32::try_from(player.account_id.get()).ok()?;
-                                                let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
-                                                Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
-                                            }).collect::<Vec<_>>();
-                                            self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
-                                        }
+                                        let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
+                                        let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
+                                        let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
+                                            let account_id = u32::try_from(player.account_id.get()).ok()?;
+                                            let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
+                                            Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
+                                        }).collect::<Vec<_>>();
+                                        self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
                                     } => sent,
                                 };
                                 if let Err(error) = sent {
@@ -6715,6 +6826,117 @@ where
         }
     }
 
+    fn retail_server_day(now: SystemTime) -> i64 {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX)
+            })
+    }
+
+    async fn retail_login_bonus_status(
+        &self,
+        account_id: AccountId,
+    ) -> Result<RetailLoginBonusStatus, GameRuntimeError> {
+        let Some(config) = self.config.login_bonus else {
+            return Ok(RetailLoginBonusStatus::Collected {
+                unknown_a: [0; 4],
+                current_item_id: 0,
+                current_item_quantity: 0,
+                future_item_id: 0,
+                future_item_quantity: 0,
+                future_bonus_day: 0,
+            });
+        };
+        let server_day = Self::retail_server_day(self.clock.now());
+        let claimed = self
+            .repository
+            .login_bonus_claimed(account_id, server_day)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        let day = u32::try_from(server_day.rem_euclid(i64::from(config.calendar_days)))
+            .map_err(|_| GameRuntimeError::Catalog)?
+            .saturating_add(1);
+        let item_id = config.reward.definition.type_id.get();
+        if claimed {
+            Ok(RetailLoginBonusStatus::Collected {
+                unknown_a: [0; 4],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                future_item_id: item_id,
+                future_item_quantity: config.reward.quantity,
+                future_bonus_day: if day == config.calendar_days {
+                    1
+                } else {
+                    day + 1
+                },
+            })
+        } else {
+            Ok(RetailLoginBonusStatus::Uncollected {
+                unknown_a: [0; 4],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                padding_a: [0; 8],
+                current_bonus_day: day,
+            })
+        }
+    }
+
+    async fn retail_login_bonus_claim(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+    ) -> Result<(), GameRuntimeError> {
+        let Some(config) = self.config.login_bonus else {
+            return Err(GameRuntimeError::Protocol);
+        };
+        let server_day = Self::retail_server_day(self.clock.now());
+        let calendar_day = u32::try_from(server_day.rem_euclid(i64::from(config.calendar_days)))
+            .map_err(|_| GameRuntimeError::Catalog)?
+            .saturating_add(1);
+        let claim = self
+            .repository
+            .claim_login_bonus(account_id, server_day, calendar_day, config.reward)
+            .await
+            .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+        let item_id = config.reward.definition.type_id.get();
+        if !claim.already_claimed {
+            let old = claim
+                .quantity_after
+                .checked_sub(config.reward.quantity)
+                .ok_or(GameRuntimeError::Snapshot)?;
+            let unix_time = self
+                .clock
+                .now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
+                });
+            self.send(
+                framed,
+                &RetailLoginBonusItemGrant {
+                    status_date_unix_time: unix_time,
+                    item_id,
+                    inventory_slot: u32::try_from(claim.inventory_item_id.get())
+                        .map_err(|_| GameRuntimeError::Snapshot)?,
+                    quantity_old: old,
+                    quantity_new: claim.quantity_after,
+                },
+            )
+            .await?;
+        }
+        self.send(
+            framed,
+            &RetailLoginBonusClaimResponse {
+                unknown_a: [0; 5],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                future_item_id: item_id,
+                future_item_quantity: config.reward.quantity,
+                current_bonus_day: calendar_day,
+            },
+        )
+        .await
+    }
     /// Handles one retail lobby/room command.
     ///
     /// Serves the lobby-side services a real client opens from its menu bar: the shop and the
@@ -10195,6 +10417,13 @@ mod tests {
             .unwrap_or_else(|_| unreachable!())
     }
 
+    fn catalog_v2() -> Catalog {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pangya-data/tests/fixtures/synthetic-catalog-v2");
+        Catalog::load(&root, std::path::Path::new("manifest.toml"))
+            .unwrap_or_else(|_| unreachable!())
+    }
+
     fn solo_config(catalog: &Catalog, commit_timeout: Duration) -> SoloRuntimeConfig {
         SoloRuntimeConfig {
             course: catalog
@@ -10229,6 +10458,86 @@ mod tests {
             Arc::new(NoopGameObserver),
         )
         .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[tokio::test]
+    async fn login_bonus_requires_the_exact_catalog_definition() {
+        let catalog = catalog_v2();
+        let definition = catalog
+            .item_definition(ItemTypeId::new(0x1a00_0001))
+            .copied()
+            .unwrap_or_else(|| unreachable!());
+        let reward = LoginBonusReward {
+            definition,
+            quantity: 1,
+        };
+        let valid = GameRuntimeConfig {
+            login_bonus: Some(LoginBonusRuntimeConfig {
+                reward,
+                calendar_days: 30,
+            }),
+            ..GameRuntimeConfig::default()
+        };
+        assert!(
+            GameService::new(
+                Arc::new(FakeRepository::default()),
+                catalog.clone(),
+                valid,
+                Arc::new(NoopGameObserver),
+            )
+            .is_ok()
+        );
+
+        for changed in [
+            ItemDefinition {
+                kind: ItemKind::Ball,
+                ..definition
+            },
+            ItemDefinition {
+                stacking: ItemStacking::Stackable { max_stack: 98 },
+                ..definition
+            },
+            ItemDefinition {
+                durability: ItemDurability::Durable {
+                    max: 10,
+                    repair_pang_per_point: 1,
+                },
+                ..definition
+            },
+        ] {
+            assert_eq!(
+                GameService::new(
+                    Arc::new(FakeRepository::default()),
+                    catalog.clone(),
+                    GameRuntimeConfig {
+                        login_bonus: Some(LoginBonusRuntimeConfig {
+                            reward: LoginBonusReward {
+                                definition: changed,
+                                quantity: 1,
+                            },
+                            calendar_days: 30,
+                        }),
+                        ..GameRuntimeConfig::default()
+                    },
+                    Arc::new(NoopGameObserver),
+                )
+                .err(),
+                Some(GameRuntimeError::Catalog)
+            );
+        }
+    }
+
+    #[test]
+    fn login_bonus_server_day_changes_only_at_utc_epoch_boundaries() {
+        let boundary = SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 * 30);
+        assert_eq!(
+            GameService::<FakeRepository>::retail_server_day(boundary - Duration::from_secs(1)),
+            29
+        );
+        assert_eq!(
+            GameService::<FakeRepository>::retail_server_day(boundary),
+            30
+        );
     }
 
     fn test_identity() -> RoomIdentity {

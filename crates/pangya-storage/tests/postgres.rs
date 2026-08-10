@@ -14,19 +14,33 @@ use pangya_domain::{
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
-    ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
-    MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname,
-    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository, PurchaseRequest,
-    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
-    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
-    Weather, WindConditions,
+    ItemTypeId, LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
+    MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId,
+    MatchPlan, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
+    Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository,
+    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+fn login_bonus_reward() -> LoginBonusReward {
+    LoginBonusReward {
+        definition: ItemDefinition {
+            type_id: ItemTypeId::new(0x1a00_0001),
+            kind: ItemKind::Consumable,
+            sale: ItemSale::NotSold,
+            stacking: ItemStacking::Stackable { max_stack: 100 },
+            durability: ItemDurability::Nondurable,
+            compatibility: ItemCompatibility::Any,
+        },
+        quantity: 2,
+    }
+}
 
 fn source() -> SourceAddressPrefix {
     SourceAddressPrefix::from_ip("198.51.100.77".parse().expect("test source IP"))
@@ -625,6 +639,35 @@ async fn upgraded_pre_recent_players_database_keeps_migration_0022_path(pool: Pg
             .map(|migration| migration.description.as_ref()),
         Some("retail recent players"),
         "the released migration remains version 0022",
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_bonus_forward_migration_follows_message_migrations(pool: PgPool) {
+    for migration in MIGRATOR.iter().filter(|migration| migration.version <= 31) {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .expect("previous released migration");
+    }
+    sqlx::raw_sql(include_str!("../migrations/0032_login_bonus.sql"))
+        .execute(&pool)
+        .await
+        .expect("0032 login bonus migration");
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'login_bonus_claims')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("login bonus catalog query");
+    assert!(table_exists);
+    assert_eq!(
+        MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 32)
+            .map(|migration| migration.description.as_ref()),
+        Some("login bonus"),
     );
 }
 
@@ -4824,4 +4867,89 @@ async fn operator_balance_grants_accumulate_and_refuse_overflow(pool: PgPool) {
             .await,
         Err(RepositoryError::NotFound)
     );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn login_bonus_claim_is_exactly_once_and_crosses_server_day(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("LoginBonusStorage", Some("LoginBonusNick")))
+        .await
+        .expect("account");
+    let reward = login_bonus_reward();
+    assert!(
+        !repository
+            .login_bonus_claimed(aggregate.account.id, 20_000)
+            .await
+            .expect("unclaimed")
+    );
+    let (first, second) = tokio::join!(
+        repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
+        repository.claim_login_bonus(aggregate.account.id, 20_000, 1, reward),
+    );
+    let first = first.expect("first claim");
+    let second = second.expect("replayed claim");
+    assert_ne!(first.already_claimed, second.already_claimed);
+    assert_eq!(first.inventory_item_id, second.inventory_item_id);
+    assert_eq!(first.quantity_after, 2);
+    assert_eq!(second.quantity_after, 2);
+    let next = repository
+        .claim_login_bonus(aggregate.account.id, 20_001, 2, reward)
+        .await
+        .expect("next day claim");
+    assert!(!next.already_claimed);
+    assert_eq!(next.quantity_after, 4);
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("claim rows");
+    assert_eq!(count, 2);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn login_bonus_cumulative_stack_cap_is_atomic(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("LoginBonusCap", Some("CapNick")))
+        .await
+        .expect("account");
+    let mut reward = login_bonus_reward();
+    reward.definition.stacking = ItemStacking::Stackable { max_stack: 2 };
+    reward.quantity = 1;
+
+    let first = repository
+        .claim_login_bonus(aggregate.account.id, 30_000, 1, reward)
+        .await
+        .expect("first claim");
+    let second = repository
+        .claim_login_bonus(aggregate.account.id, 30_001, 2, reward)
+        .await
+        .expect("second claim reaches cap");
+    assert_eq!((first.quantity_after, second.quantity_after), (1, 2));
+
+    // The third server day must refuse before either the inventory or claim ledger is changed.
+    assert_eq!(
+        repository
+            .claim_login_bonus(aggregate.account.id, 30_002, 1, reward)
+            .await,
+        Err(RepositoryError::CorruptData)
+    );
+    let quantity: i64 = sqlx::query_scalar(
+        "SELECT quantity FROM inventory_items WHERE account_id = $1 AND item_type_id = $2",
+    )
+    .bind(aggregate.account.id.get())
+    .bind(i64::from(reward.definition.type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("inventory quantity");
+    assert_eq!(quantity, 2);
+    let claims: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("claim count");
+    assert_eq!(claims, 2);
 }

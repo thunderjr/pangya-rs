@@ -24,19 +24,20 @@ use pangya_domain::{
     EquipmentChange, EquipmentChangeResult, EquipmentSet, EquipmentSetId, HandoverDigest,
     HandoverError, HandoverRepository, IncompleteMatchAbortLimit, InventoryClass,
     InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind, ItemSale,
-    ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_RECENT_PLAYERS,
-    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MessageEligibilityRepository, MyRoomFurniture,
-    MyRoomProjection, NewAccount, NewHandover, NewMessageEligibility, Nickname,
-    NoopStorageObserver, NormalizedNickname, NormalizedUsername, OfflineNote, OfflineNoteClaim,
-    OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
-    PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem, RepairItemResult, RepositoryError,
-    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
-    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
-    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
-    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    ItemStacking, ItemTypeId, LoginBonusClaim, LoginBonusReward, MAX_PLAYER_CHARACTERS,
+    MAX_PLAYER_INVENTORY, MAX_RECENT_PLAYERS, MAX_STARTER_ITEMS, MarkSoloInGame,
+    MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate,
+    MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey,
+    MessageEligibilityRepository, MyRoomFurniture, MyRoomProjection, NewAccount, NewHandover,
+    NewMessageEligibility, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
+    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
+    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem,
+    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
+    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
+    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
+    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
+    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
+    synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -2608,6 +2609,161 @@ impl PgRepository {
         .map_err(repository_db_error)?;
         tx.commit().await.map_err(repository_db_error)
     }
+
+    async fn login_bonus_claimed_inner(
+        &self,
+        account_id: AccountId,
+        server_day: i64,
+    ) -> Result<bool, RepositoryError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM login_bonus_claims WHERE account_id = $1 AND server_day = $2)",
+        )
+        .bind(account_id.get())
+        .bind(server_day)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(repository_db_error)
+    }
+
+    async fn claim_login_bonus_inner(
+        &self,
+        account_id: AccountId,
+        server_day: i64,
+        calendar_day: u32,
+        reward: LoginBonusReward,
+    ) -> Result<LoginBonusClaim, RepositoryError> {
+        if server_day < 0 || calendar_day == 0 || reward.quantity == 0 {
+            return Err(RepositoryError::CorruptData);
+        }
+        match reward.definition.stacking {
+            ItemStacking::Unique if reward.quantity != 1 => {
+                return Err(RepositoryError::CorruptData);
+            }
+            ItemStacking::Stackable { max_stack }
+                if max_stack == 0 || reward.quantity > max_stack =>
+            {
+                return Err(RepositoryError::CorruptData);
+            }
+            ItemStacking::Unique | ItemStacking::Stackable { .. } => {}
+        }
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        // The account lock serializes this reward with all other inventory mutations for the
+        // account. The primary key below is still the durable exactly-once fence across sessions.
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id.get())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        if let Some(row) = sqlx::query(
+            "SELECT inventory_item_id, quantity, calendar_day FROM login_bonus_claims \
+             WHERE account_id = $1 AND server_day = $2 FOR UPDATE",
+        )
+        .bind(account_id.get())
+        .bind(server_day)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        {
+            let inventory_id = row
+                .try_get::<i64, _>("inventory_item_id")
+                .map_err(|_| RepositoryError::CorruptData)?;
+            let quantity = row
+                .try_get::<i32, _>("quantity")
+                .map_err(|_| RepositoryError::CorruptData)?;
+            let day = row
+                .try_get::<i32, _>("calendar_day")
+                .map_err(|_| RepositoryError::CorruptData)?;
+            transaction.commit().await.map_err(repository_db_error)?;
+            return Ok(LoginBonusClaim {
+                already_claimed: true,
+                inventory_item_id: InventoryItemId::new(inventory_id)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                quantity_after: u32::try_from(quantity)
+                    .map_err(|_| RepositoryError::CorruptData)?,
+                calendar_day: u32::try_from(day).map_err(|_| RepositoryError::CorruptData)?,
+            });
+        }
+        let class = match reward.definition.kind {
+            ItemKind::ClubSet => "club_set",
+            ItemKind::Ball => "ball",
+            ItemKind::Consumable => "consumable",
+            ItemKind::CharacterPart => "character_part",
+            ItemKind::Caddie => "caddie",
+            ItemKind::CaddieItem => "caddie_item",
+            ItemKind::Mascot => "mascot",
+            ItemKind::Card => "card",
+            ItemKind::Furniture => "furniture",
+            ItemKind::Skin => "skin",
+            ItemKind::HairStyle => "hair_style",
+            ItemKind::SetItem => "set_item",
+            ItemKind::Character => return Err(RepositoryError::CorruptData),
+        };
+        let item_type_id = i64::from(reward.definition.type_id.get());
+        let quantity = i64::from(reward.quantity);
+        let inventory = if class == "consumable" {
+            if let Some(row) = sqlx::query(
+                "SELECT id, quantity FROM inventory_items WHERE account_id = $1 AND item_type_id = $2 AND inventory_class = 'consumable' FOR UPDATE",
+            )
+            .bind(account_id.get())
+            .bind(item_type_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(repository_db_error)? {
+                let id = row.try_get::<i64, _>("id").map_err(|_| RepositoryError::CorruptData)?;
+                let before = row.try_get::<i64, _>("quantity").map_err(|_| RepositoryError::CorruptData)?;
+                let max_stack = match reward.definition.stacking {
+                    ItemStacking::Stackable { max_stack } => i64::from(max_stack),
+                    ItemStacking::Unique => 1,
+                };
+                if before < 0 || before > max_stack || quantity > max_stack - before {
+                    // The account lock and row lock make this cumulative check atomic with the
+                    // update and the claim ledger insert; no concurrent claim can overshoot the
+                    // canonical catalog cap.
+                    return Err(RepositoryError::CorruptData);
+                }
+                let after = before.checked_add(quantity).ok_or(RepositoryError::CorruptData)?;
+                sqlx::query("UPDATE inventory_items SET quantity = $1, updated_at = now() WHERE account_id = $2 AND id = $3")
+                    .bind(after).bind(account_id.get()).bind(id).execute(&mut *transaction).await.map_err(repository_db_error)?;
+                (id, after)
+            } else {
+                let id = sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) VALUES ($1, $2, $3, $4, 'consumable') RETURNING id",
+                )
+                .bind(account_id.get()).bind(item_type_id).bind(format!("login_bonus.{server_day}" )).bind(quantity)
+                .fetch_one(&mut *transaction).await.map_err(repository_db_error)?;
+                (id, quantity)
+            }
+        } else {
+            let id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) VALUES ($1, $2, $3, 1, $4) RETURNING id",
+            )
+            .bind(account_id.get()).bind(item_type_id).bind(format!("login_bonus.{server_day}" )).bind(class)
+            .fetch_one(&mut *transaction).await.map_err(repository_db_error)?;
+            (id, 1)
+        };
+        sqlx::query(
+            "INSERT INTO login_bonus_claims (account_id, server_day, calendar_day, item_type_id, quantity, inventory_item_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(account_id.get())
+        .bind(server_day)
+        .bind(i32::try_from(calendar_day).map_err(|_| RepositoryError::CorruptData)?)
+        .bind(item_type_id)
+        .bind(i32::try_from(reward.quantity).map_err(|_| RepositoryError::CorruptData)?)
+        .bind(inventory.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        transaction.commit().await.map_err(repository_db_error)?;
+        Ok(LoginBonusClaim {
+            already_claimed: false,
+            inventory_item_id: InventoryItemId::new(inventory.0)
+                .map_err(|_| RepositoryError::CorruptData)?,
+            quantity_after: u32::try_from(inventory.1).map_err(|_| RepositoryError::CorruptData)?,
+            calendar_day,
+        })
+    }
 }
 
 impl PlayerRepository for PgRepository {
@@ -2624,6 +2780,29 @@ impl PlayerRepository for PgRepository {
         recent: RecentPlayer,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(self.observed(self.record_recent_player_inner(account_id, recent)))
+    }
+
+    fn login_bonus_claimed(
+        &self,
+        account_id: AccountId,
+        server_day: i64,
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(self.observed(self.login_bonus_claimed_inner(account_id, server_day)))
+    }
+
+    fn claim_login_bonus(
+        &self,
+        account_id: AccountId,
+        server_day: i64,
+        calendar_day: u32,
+        reward: LoginBonusReward,
+    ) -> RepositoryFuture<'_, Result<LoginBonusClaim, RepositoryError>> {
+        Box::pin(self.observed(self.claim_login_bonus_inner(
+            account_id,
+            server_day,
+            calendar_day,
+            reward,
+        )))
     }
 
     fn claim_offline_notes(
