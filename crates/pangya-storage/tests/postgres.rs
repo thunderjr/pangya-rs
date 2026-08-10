@@ -8,13 +8,14 @@ use std::{
 use chrono::{DateTime, Utc};
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
-    AccountRepository, AccountStatus, BalanceGrant, BeginSoloMatch, BeginSoloMatchOutcome,
-    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CharacterId, CommitSoloHole,
-    CommitStrokeMatch, ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit,
-    EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
-    HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
-    ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
-    ItemTypeId, LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
+    AccountRepository, AccountStatus, AdminItemGrant, AdminRepository, BalanceGrant,
+    BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome,
+    CatalogFingerprint, CharacterId, CommitSoloHole, CommitStrokeMatch, ConsumeHandover,
+    ConsumeItem, CourseId, CredentialHash, EconomyCommit, EconomyError, EconomyItemSelector,
+    EconomyOperationId, EconomyRepository, EquipmentChange, HandoverDigest, HandoverError,
+    HandoverRepository, IncompleteMatchAbortLimit, InventoryClass, ItemCompatibility,
+    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId,
+    LoginBonusReward, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome,
     MarkStrokeInGame, MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId,
     MatchPlan, MatchRepository, MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount,
     Nickname, NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, PlayerRepository,
@@ -893,6 +894,41 @@ async fn aggregate_creation_is_atomic_and_duplicate_username_is_friendly(pool: P
         .await
         .expect("count");
     assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn persisted_gm_capability_and_offline_catalog_grant_are_account_scoped(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("GmCapability", Some("GmCapability")))
+        .await
+        .expect("account created");
+    let account_id = aggregate.account.id;
+
+    repository
+        .set_game_master(account_id, true, SystemTime::now())
+        .await
+        .expect("GM capability persisted");
+    let authentication = repository
+        .load_authentication(&NormalizedUsername::parse("gmcapability").expect("username"))
+        .await
+        .expect("authentication query")
+        .expect("authentication record");
+    assert!(authentication.account.game_master);
+
+    let granted = repository
+        .grant_item(AdminItemGrant {
+            account_id,
+            item_type_id: ItemTypeId::new(0x1000_0002),
+            class: InventoryClass::ClubSet,
+            quantity: 1,
+            durability: Some(100),
+        })
+        .await
+        .expect("offline account grant");
+    assert_eq!(granted.account_id, account_id);
+    assert_eq!(granted.item_type_id, ItemTypeId::new(0x1000_0002));
+    assert_eq!(granted.quantity, 1);
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
