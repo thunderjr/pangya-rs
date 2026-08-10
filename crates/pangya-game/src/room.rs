@@ -567,6 +567,16 @@ impl RoomState {
         caller: PlayerConnectionId,
         settings: RoomSettings,
     ) -> Result<RoomSnapshot, RoomError> {
+        self.update_room(caller, settings, None, None)
+    }
+
+    fn update_room(
+        &mut self,
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
+    ) -> Result<RoomSnapshot, RoomError> {
         if self.match_active() {
             return Err(RoomError::MatchActive);
         }
@@ -578,6 +588,12 @@ impl RoomState {
             return Err(RoomError::CapacityBelowOccupancy);
         }
         self.settings = settings;
+        if let Some(name) = name {
+            self.name = name;
+        }
+        if let Some(password) = password {
+            self.password = password.as_ref().map(PasswordDigest::new);
+        }
         Ok(self.snapshot())
     }
 
@@ -1492,6 +1508,13 @@ enum RoomCommand {
         settings: RoomSettings,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
+    RoomUpdate {
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
     Ready {
         caller: PlayerConnectionId,
         ready: bool,
@@ -1806,6 +1829,25 @@ impl RoomHandle {
         self.send_normal(RoomCommand::Settings {
             caller,
             settings,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Applies owner-controlled identity and settings in one actor transaction.
+    pub async fn update_room(
+        &self,
+        caller: PlayerConnectionId,
+        settings: RoomSettings,
+        name: Option<RoomName>,
+        password: Option<Option<RoomPassword>>,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::RoomUpdate {
+            caller,
+            settings,
+            name,
+            password,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -2512,6 +2554,20 @@ fn handle_normal(
             let _ignored = reply.send(result);
             true
         }
+        RoomCommand::RoomUpdate {
+            caller,
+            settings,
+            name,
+            password,
+            reply,
+        } => {
+            let result = state.update_room(caller, settings, name, password);
+            if let Ok(snapshot) = &result {
+                after_mutation(state, Some(snapshot), events);
+            }
+            let _ignored = reply.send(result);
+            true
+        }
         RoomCommand::Ready {
             caller,
             ready,
@@ -2770,7 +2826,7 @@ mod tests {
     use std::collections::HashSet;
 
     use pangya_domain::{
-        CatalogFingerprint, CourseId, MatchSeed, OneHoleConfig, ServerBalances, SoloReward,
+        CatalogFingerprint, CourseId, MatchPlan, MatchSeed, ServerBalances, SoloReward,
         StrokeCount, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
         synthetic_stroke_reward_v1,
     };
@@ -2805,7 +2861,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(101)),
                 MatchResultKey::new(Uuid::from_u128(102)),
                 account_id,
-                OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -2843,7 +2899,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(204)),
                 ),
             ],
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

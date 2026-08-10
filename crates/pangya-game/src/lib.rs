@@ -49,10 +49,10 @@ use pangya_domain::{
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
-    MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer,
-    RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId,
-    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    MatchPlan, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
+    OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest,
+    RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState,
+    RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
     ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
     StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
     StrokeRosterOrder,
@@ -123,9 +123,12 @@ use pangya_protocol::{
     UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
     UserStatisticsInfoResponse, UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse,
     Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse, Wind,
-    decode_packet_payload, encode_packet_payload, is_retail_accepted_match_opcode,
-    is_retail_accepted_session_opcode, is_retail_explicit_social_refusal, packed_system_time,
-    synthetic_game_hello, us852_game_hello,
+    decode_packet_payload, RetailRoomInformationRequest, RetailRoomInformationResponse,
+    RetailRoomInvite, RetailRoomInviteInfo, RetailRoomInviteInfoResponse, RetailRoomInviteResponse,
+    RetailRoomKick, RetailRoomResync, RetailRoomSettingChange, RetailRoomSettingsUpdate,
+    RetailTeamChange, RetailTeamChangeAnnounce, encode_packet_payload,
+    is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
+    is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -558,7 +561,7 @@ impl Default for GameRuntimeLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoloRuntimeConfig {
     /// Catalog-validated one-hole course.
-    pub course: OneHoleConfig,
+    pub course: MatchPlan,
     /// Exact fingerprint of the loaded catalog.
     pub catalog_fingerprint: CatalogFingerprint,
     /// Actor-owned loading deadline, represented exactly in protocol milliseconds.
@@ -577,7 +580,7 @@ pub struct SoloRuntimeConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StrokeRuntimeConfig {
     /// Catalog-validated one-hole course.
-    pub course: OneHoleConfig,
+    pub course: MatchPlan,
     /// Exact fingerprint of the loaded catalog.
     pub catalog_fingerprint: CatalogFingerprint,
     /// Actor-owned loading barrier deadline.
@@ -7342,6 +7345,13 @@ where
                 self.send(framed, &RetailMultiplayerLeft).await?;
                 Ok(state)
             }
+            (GameState::InChannel, RETAIL_C2S_REJOIN_INVITED | RETAIL_C2S_GM_ENTER_ROOM) => {
+                if !payload.is_empty() {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.observer.unknown(GameUnknownObservation::Ignored);
+                Ok(state)
+            }
             (GameState::InChannel, RetailRoomCreate::OPCODE) => {
                 let request =
                     decode_packet_payload::<RetailRoomCreate>(payload, profile, ServiceKind::Game)
@@ -7366,14 +7376,18 @@ where
                 let Ok(settings) = RoomSettings::new(request.max_players) else {
                     return self.reject_retail_join(framed, state).await;
                 };
-                // The room keeps the shape the client asked for. It renders its own header
-                // from this and gates Start on it, so a practice room told it is a versus room
-                // of one leaves Start disabled and goes nowhere. The course is still the
-                // configured one: that is the hole this server actually settles.
+                // Preserve the complete client-selected room shape. The match plan is derived
+                // from this profile when Start is accepted; no configured-course fallback may
+                // overwrite the requested course or hole card.
+                if !matches!(request.hole_count, 3 | 6 | 9 | 18)
+                    || !is_retail_course_value(request.course)
+                {
+                    return self.reject_retail_join(framed, state).await;
+                }
                 let settings = settings.with_profile(RoomProfile {
                     mode: request.room_type,
-                    course: self.retail_course(),
-                    hole_count: 1,
+                    course: request.course,
+                    hole_count: request.hole_count,
                     hole_progression: 0,
                     shot_timer_ms: request.shot_timer_ms,
                     game_timer_ms: request.game_timer_ms,
@@ -7480,16 +7494,85 @@ where
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_EDIT) => {
-                // The requested changes are read but not applied: this server settles exactly
-                // one hole on the course its configuration names, and the room header already
-                // says so. What the client needs is an answer describing the room it is now
-                // in, which upstream gives as the room status followed by the roster
-                // (`pangbox/server`, `game/room/room.go` `handleRoomSettingsChange` ->
-                // `stateUpdated`). Left unanswered the client sits on a modal; left
-                // unrecognized the connection drops mid-room.
+                let request = decode_packet_payload::<RetailRoomSettingsUpdate>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
                 let routed = self
                     .lobby
                     .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                let current = snapshot.summary().profile();
+                let mut profile_update = current;
+                let mut capacity = snapshot.summary().max_members();
+                let mut name = None;
+                let mut password = None;
+                for change in request.changes {
+                    match change {
+                        RetailRoomSettingChange::Name(value) => {
+                            let text = std::str::from_utf8(&value)
+                                .map_err(|_| GameRuntimeError::Protocol)?;
+                            name = Some(
+                                RoomName::parse(text).map_err(|_| GameRuntimeError::Protocol)?,
+                            );
+                        }
+                        RetailRoomSettingChange::Password(value) => {
+                            password = if value.is_empty() {
+                                Some(None)
+                            } else {
+                                let text = std::str::from_utf8(&value)
+                                    .map_err(|_| GameRuntimeError::Protocol)?;
+                                Some(Some(
+                                    RoomPassword::parse(text)
+                                        .map_err(|_| GameRuntimeError::Protocol)?,
+                                ))
+                            };
+                        }
+                        RetailRoomSettingChange::Mode(mode) => profile_update.mode = mode as u8,
+                        RetailRoomSettingChange::Course(course) => profile_update.course = course,
+                        RetailRoomSettingChange::HoleCount(count) => {
+                            profile_update.hole_count = count
+                        }
+                        RetailRoomSettingChange::HoleProgression(progression) => {
+                            profile_update.hole_progression = progression as u8
+                        }
+                        RetailRoomSettingChange::ShotTimerSeconds(seconds) => {
+                            profile_update.shot_timer_ms = u32::from(seconds) * 1000
+                        }
+                        RetailRoomSettingChange::PlayerCount(count) => capacity = count,
+                        RetailRoomSettingChange::GameTimerMinutes(minutes) => {
+                            profile_update.game_timer_ms = u32::from(minutes) * 60_000
+                        }
+                        RetailRoomSettingChange::NaturalWind(enabled) => {
+                            profile_update.natural_wind = enabled
+                        }
+                        RetailRoomSettingChange::RepeatHole(_)
+                        | RetailRoomSettingChange::FixedRepeatHole(_)
+                        | RetailRoomSettingChange::Artifact(_) => {
+                            // The reference carries these tags, but this server has no repeat-hole
+                            // or artifact state. Keep the frame client-safe without inventing it.
+                        }
+                    }
+                }
+                let settings = RoomSettings::new(capacity)
+                    .map_err(|_| GameRuntimeError::Protocol)?
+                    .with_profile(profile_update);
+                let routed = self
+                    .lobby
+                    .route(
+                        identity.connection_id,
+                        LobbyRoomCommand::UpdateRoom {
+                            settings,
+                            name,
+                            password,
+                        },
+                    )
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
@@ -7504,6 +7587,163 @@ where
                 .await?;
                 self.send(framed, &retail_census_from_snapshot(&snapshot))
                     .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_TEAM_CHANGE) => {
+                let request =
+                    decode_packet_payload::<RetailTeamChange>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                // Team membership is a room-local projection not yet persisted by the domain
+                // model. Announcing only after a valid member request keeps the client in sync
+                // without granting a non-member an arbitrary connection ID.
+                self.lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                self.send(
+                    framed,
+                    &RetailTeamChangeAnnounce {
+                        connection_id: u32::try_from(identity.connection_id.get())
+                            .unwrap_or(u32::MAX),
+                        team: request.team,
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_RESYNC) => {
+                let _request =
+                    decode_packet_payload::<RetailRoomResync>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                self.send_retail_census(framed, identity.connection_id)
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InChannel, RETAIL_C2S_ROOM_INFO) => {
+                let _request = decode_packet_payload::<RetailRoomInformationRequest>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                // Directory information is public but the registry deliberately exposes only
+                // summaries here; never leak a private room's roster through this request.
+                self.send(
+                    framed,
+                    &RetailRoomInformationResponse {
+                        players: Vec::new(),
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_INFO) => {
+                let _request = decode_packet_payload::<RetailRoomInformationRequest>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                let routed = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                let players = snapshot
+                    .members()
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, member)| retail_room_player(slot, member))
+                    .collect();
+                self.send(framed, &RetailRoomInformationResponse { players })
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_KICK) => {
+                let request =
+                    decode_packet_payload::<RetailRoomKick>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let Ok(target) = PlayerConnectionId::new(u64::from(request.connection_id)) else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                let routed = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::Kick(target))
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                self.send(
+                    framed,
+                    &RetailRoomStatus {
+                        room: retail_room_from_snapshot(&snapshot),
+                    },
+                )
+                .await?;
+                self.send(framed, &retail_census_from_snapshot(&snapshot))
+                    .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_INVITE_INFO) => {
+                let request = decode_packet_payload::<RetailRoomInviteInfo>(
+                    payload,
+                    profile,
+                    ServiceKind::Game,
+                )
+                .map_err(|_| GameRuntimeError::Protocol)?;
+                self.lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                self.send(
+                    framed,
+                    &RetailRoomInviteInfoResponse {
+                        account_id: request.account_id,
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_ROOM_INVITE) => {
+                let request =
+                    decode_packet_payload::<RetailRoomInvite>(payload, profile, ServiceKind::Game)
+                        .map_err(|_| GameRuntimeError::Protocol)?;
+                let routed = self
+                    .lobby
+                    .route(identity.connection_id, LobbyRoomCommand::GetState)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let LobbyRouteResult::Snapshot(snapshot) = routed else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                let room_id = snapshot.summary().id();
+                let nickname = identity.nickname.display().as_bytes().to_vec();
+                self.send(
+                    framed,
+                    &RetailRoomInviteResponse {
+                        server_id: 0,
+                        channel_id: 0,
+                        room_id: u16::try_from(room_id.get()).unwrap_or(u16::MAX),
+                        inviter_id: u32::try_from(identity.account_id.get()).unwrap_or(u32::MAX),
+                        inviter_nickname: nickname,
+                        invitee_id: request.account_id,
+                    },
+                )
+                .await?;
+                Ok(state)
+            }
+            (GameState::InRoom, RETAIL_C2S_GM_ENTER_ROOM | RETAIL_C2S_REJOIN_INVITED) => {
+                // 0x003e is a privileged observer entry and 0x00b4 is a reference stub. No
+                // unauthenticated elevation or guessed rejoin body is safe; consume only an
+                // empty frame and keep this connection alive for the client-safe no-op.
+                if !payload.is_empty() {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                self.observer.unknown(GameUnknownObservation::Ignored);
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_LOUNGE_ACTION) => {
@@ -8581,7 +8821,12 @@ fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom
         mode,
         play_mode,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
-        hole_progression: RetailHoleProgression::FrontStart,
+        hole_progression: match profile.hole_progression {
+            1 => RetailHoleProgression::BackStart,
+            2 => RetailHoleProgression::RandomStart,
+            3 => RetailHoleProgression::ShuffleAll,
+            _ => RetailHoleProgression::FrontStart,
+        },
         course: profile.course,
         shot_timer_ms: profile.shot_timer_ms,
         game_timer_ms: profile.game_timer_ms,
@@ -8594,6 +8839,10 @@ fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom
 /// equal for the minimum versus path, but retail Practice is semantic type 19 in UI family 4.
 /// `alter-pangya` spells this out as `PRACTICE(19, uiType = 4)` and serializes both fields
 /// (`RoomType.kt:8-28`, `Room.kt:145-174`).
+fn is_retail_course_value(course: u8) -> bool {
+    matches!(course, 0x00..=0x0b | 0x0d..=0x10 | 0x12..=0x14 | 0x7f)
+}
+
 fn retail_room_wire_modes(semantic_mode: u8) -> (u8, u8) {
     if semantic_mode == RetailRoomType::Practice as u8 {
         (
@@ -8611,6 +8860,14 @@ const RETAIL_C2S_ROOM_READY: u16 = 0x000d;
 /// Retail room-edit client opcode. The client sends it whenever the room master touches the
 /// room's settings, and it sends one on the way into a match.
 const RETAIL_C2S_ROOM_EDIT: u16 = 0x000a;
+const RETAIL_C2S_TEAM_CHANGE: u16 = 0x0010;
+const RETAIL_C2S_ROOM_RESYNC: u16 = 0x001c;
+const RETAIL_C2S_ROOM_KICK: u16 = 0x0026;
+const RETAIL_C2S_ROOM_INVITE_INFO: u16 = 0x0029;
+const RETAIL_C2S_ROOM_INFO: u16 = 0x002d;
+const RETAIL_C2S_GM_ENTER_ROOM: u16 = 0x003e;
+const RETAIL_C2S_ROOM_INVITE: u16 = 0x00ba;
+const RETAIL_C2S_REJOIN_INVITED: u16 = 0x00b4;
 /// Cosmetic lounge/avatar action sent by clicks in the room's character stage.
 const RETAIL_C2S_LOUNGE_ACTION: u16 = 0x0063;
 const RETAIL_C2S_START_MATCH: u16 = 0x000e;
@@ -8703,6 +8960,14 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
             | RETAIL_C2S_ROOM_LEAVE
             | RETAIL_C2S_ROOM_READY
             | RETAIL_C2S_ROOM_EDIT
+            | RETAIL_C2S_TEAM_CHANGE
+            | RETAIL_C2S_ROOM_RESYNC
+            | RETAIL_C2S_ROOM_KICK
+            | RETAIL_C2S_ROOM_INVITE_INFO
+            | RETAIL_C2S_ROOM_INFO
+            | RETAIL_C2S_GM_ENTER_ROOM
+            | RETAIL_C2S_ROOM_INVITE
+            | RETAIL_C2S_REJOIN_INVITED
             | RETAIL_C2S_LOUNGE_ACTION
             | RETAIL_C2S_MULTIPLAYER_JOIN
             | RETAIL_C2S_MULTIPLAYER_LEAVE
@@ -11107,7 +11372,7 @@ mod tests {
     #[test]
     fn stroke_runtime_rejects_invalid_course_before_listener_binding() {
         let catalog = test_catalog();
-        let invalid_course = OneHoleConfig::new(
+        let invalid_course = MatchPlan::new(
             pangya_domain::CourseId::new(99).unwrap_or_else(|_| unreachable!()),
             3,
         )

@@ -564,7 +564,7 @@ fn same_result(left: ShotResult, right: ShotResult) -> bool {
 #[cfg(test)]
 mod tests {
     use pangya_domain::{
-        CatalogFingerprint, CourseId, MatchResultKey, OneHoleConfig, ServerBalances, SoloReward,
+        CatalogFingerprint, CourseId, MatchPlan, MatchResultKey, ServerBalances, SoloReward,
     };
     use pangya_protocol::Lie;
     use uuid::Uuid;
@@ -582,7 +582,7 @@ mod tests {
             MatchId::new(Uuid::from_u128(1)),
             MatchResultKey::new(Uuid::from_u128(2)),
             account(),
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

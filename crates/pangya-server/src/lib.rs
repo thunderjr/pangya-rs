@@ -24,8 +24,8 @@ use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::{Catalog, CatalogKind, CatalogPricing};
 use pangya_domain::{
     AccountId, AccountRepository, AccountRole, AdminRepository, BalanceGrant, CourseId,
-    EconomyRepository, HandoverRepository, ItemTypeId, MatchRepository, NewAccount, Nickname,
-    OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver, Username,
+    EconomyRepository, HandoverRepository, ItemTypeId, MatchPlan, MatchRepository, NewAccount,
+    Nickname, PlayerRepository, RepositoryError, StorageObserver, Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
@@ -316,7 +316,7 @@ fn resolve_one_hole_course(
     catalog: &Catalog,
     course_id: CourseId,
     declared_par: Option<u8>,
-) -> Result<OneHoleConfig, ServerError> {
+) -> Result<MatchPlan, ServerError> {
     match declared_par {
         Some(par) => catalog
             .declared_one_hole_course(course_id, par)

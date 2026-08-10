@@ -150,8 +150,17 @@ pub(crate) struct MatchLifecycle {
 /// A room operation routed by the registry using the caller's registered connection identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LobbyRoomCommand {
-    /// Owner-only capacity update.
+    /// Owner-only room settings update.
     UpdateSettings(RoomSettings),
+    /// Atomically updates owner-controlled room identity and settings.
+    UpdateRoom {
+        /// New settings.
+        settings: RoomSettings,
+        /// New name, when requested.
+        name: Option<RoomName>,
+        /// `Some(None)` clears the password; `None` leaves it unchanged.
+        password: Option<Option<RoomPassword>>,
+    },
     /// Set the caller's ready state.
     SetReady(bool),
     /// Broadcast validated chat.
@@ -1301,6 +1310,14 @@ impl LobbyRegistry {
                 .update_settings(connection_id, settings)
                 .await
                 .map(LobbyRouteResult::Snapshot),
+            LobbyRoomCommand::UpdateRoom {
+                settings,
+                name,
+                password,
+            } => handle
+                .update_room(connection_id, settings, name, password)
+                .await
+                .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::SetReady(ready) => handle
                 .set_ready(connection_id, ready)
                 .await
@@ -1902,8 +1919,8 @@ mod tests {
 
     use super::*;
     use pangya_domain::{
-        AccountId, CatalogFingerprint, CourseId, MatchSeed, MemberSnapshot, Nickname,
-        OneHoleConfig, ServerBalances, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
+        AccountId, CatalogFingerprint, CourseId, MatchPlan, MatchSeed, MemberSnapshot, Nickname,
+        ServerBalances, StrokeParticipant, StrokePlayerResult, StrokeRosterOrder,
         synthetic_stroke_reward_v1,
     };
     use uuid::Uuid;
@@ -1938,7 +1955,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(201)),
                 MatchResultKey::new(Uuid::from_u128(202)),
                 account_id,
-                OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -1969,7 +1986,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(304)),
                 ),
             ],
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

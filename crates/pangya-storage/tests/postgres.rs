@@ -16,12 +16,12 @@ use pangya_domain::{
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername,
-    OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest,
-    RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix,
-    StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver,
-    StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username,
-    Weather, WindConditions,
+    MatchRepositoryError, MatchResultKey, MatchSeed, MatchPlan, NewAccount, Nickname,
+    NormalizedUsername, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig, PlayerRepository,
+    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, ServiceKind,
+    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -1560,7 +1560,7 @@ fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
         MatchId::new(Uuid::new_v4()),
         MatchResultKey::new(Uuid::new_v4()),
         account_id,
-        OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+        MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
         CatalogFingerprint::new([0x42; 32]),
         MatchSeed::new([0x24; 32]),
         Weather::Clear,
@@ -1585,7 +1585,7 @@ fn solo_commit(begin: &BeginSoloMatch, strokes: u16) -> CommitSoloHole {
 fn stroke_begin_with_config(
     first: AccountId,
     second: AccountId,
-    config: OneHoleConfig,
+    config: MatchPlan,
 ) -> BeginStrokeMatch {
     BeginStrokeMatch::new(
         MatchId::new(Uuid::new_v4()),
@@ -1615,7 +1615,7 @@ fn stroke_begin(first: AccountId, second: AccountId) -> BeginStrokeMatch {
     stroke_begin_with_config(
         first,
         second,
-        OneHoleConfig::new(CourseId::new(17).expect("course"), 3).expect("configuration"),
+        MatchPlan::new(CourseId::new(17).expect("course"), 3).expect("configuration"),
     )
 }
 
@@ -2085,7 +2085,7 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
         begin.match_id(),
         begin.result_key(),
         begin.account_id(),
-        OneHoleConfig::new(CourseId::new(8).expect("course"), 3).expect("config"),
+        MatchPlan::new(CourseId::new(8).expect("course"), 3).expect("config"),
         StrokeCount::new(3).expect("strokes"),
     );
     assert_eq!(
@@ -3275,7 +3275,7 @@ async fn stroke_course_records_keep_deterministic_best_and_count_only_holed(pool
         let begin = stroke_begin_with_config(
             first.account.id,
             second.account.id,
-            OneHoleConfig::new(course, par).expect("configuration"),
+            MatchPlan::new(course, par).expect("configuration"),
         );
         repository.begin_stroke(begin.clone()).await.expect("begin");
         repository

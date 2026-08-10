@@ -3111,7 +3111,7 @@ fn persisted_stroke_result(
     if row.status != "committed" {
         return Err(MatchRepositoryError::CorruptData);
     }
-    let config = pangya_domain::OneHoleConfig::new(
+    let config = pangya_domain::MatchPlan::new(
         pangya_domain::CourseId::try_from(row.course_id)
             .map_err(|_| MatchRepositoryError::CorruptData)?,
         u8::try_from(row.par).map_err(|_| MatchRepositoryError::CorruptData)?,

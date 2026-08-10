@@ -19,7 +19,7 @@ use std::{
 use cap_std::{ambient_authority, fs::Dir};
 use pangya_domain::{
     CatalogFingerprint, CourseId, InventoryClass, InventoryDurability, ItemCompatibility,
-    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId, OneHoleConfig,
+    ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking, ItemTypeId, MatchPlan,
     PlayerSnapshot, StarterGrant,
 };
 use serde::Deserialize;
@@ -504,12 +504,12 @@ impl Catalog {
     ///
     /// # Errors
     /// Rejects a missing course, a zero/out-of-range course ID, or invalid generated par.
-    pub fn one_hole_course(&self, course_id: CourseId) -> Result<OneHoleConfig, CatalogError> {
+    pub fn one_hole_course(&self, course_id: CourseId) -> Result<MatchPlan, CatalogError> {
         let record = self
             .record(CatalogKind::Course, ItemTypeId::new(course_id.get()))
             .ok_or(CatalogError::Binding)?;
         let par = record.local_one_hole_par().ok_or(CatalogError::Structure)?;
-        OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)
+        MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)
     }
 
     /// Returns a checked one-hole configuration whose par the operator declared.
@@ -528,11 +528,11 @@ impl Catalog {
         &self,
         course_id: CourseId,
         par: u8,
-    ) -> Result<OneHoleConfig, CatalogError> {
+    ) -> Result<MatchPlan, CatalogError> {
         if !self.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {
             return Err(CatalogError::Binding);
         }
-        OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)
+        MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)
     }
 
     /// Cross-checks configured starter IDs against the minimum catalog.
@@ -688,7 +688,7 @@ pub fn parse_iff_bytes(
         let (local_one_hole_par, opaque) = if entry.kind == CatalogKind::Course {
             let course_id = CourseId::new(type_id).map_err(|_| CatalogError::Structure)?;
             let par = *record.get(4).ok_or(CatalogError::Structure)?;
-            OneHoleConfig::new(course_id, par).map_err(|_| CatalogError::Structure)?;
+            MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)?;
             (Some(par), &record[5..])
         } else {
             (None, &record[4..])

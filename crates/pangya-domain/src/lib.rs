@@ -1213,7 +1213,10 @@ pub enum MatchValueError {
     /// Course zero is reserved and cannot identify a configured course.
     #[error("course identifier must be nonzero")]
     InvalidCourse,
-    /// Synthetic one-hole par must be in `1..=10`.
+    /// Hole count must be in `1..=18`.
+    #[error("hole count is outside policy")]
+    InvalidHole,
+    /// Match par must be in `1..=10`.
     #[error("hole par is outside policy")]
     InvalidPar,
     /// A stroke count must fit the persisted positive `SMALLINT` range.
@@ -1333,14 +1336,16 @@ impl WindConditions {
     }
 }
 
-/// Immutable one-hole synthetic course configuration. Hole number is always one.
+/// Immutable match plan carrying the selected course and hole progression.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OneHoleConfig {
+pub struct MatchPlan {
     course_id: CourseId,
+    hole_count: u8,
+    hole_mode: u8,
     par: u8,
 }
 
-impl OneHoleConfig {
+impl MatchPlan {
     /// Lowest accepted par.
     pub const MIN_PAR: u8 = 1;
     /// Highest accepted par.
@@ -1355,13 +1360,30 @@ impl OneHoleConfig {
         par >= Self::MIN_PAR && par <= Self::MAX_PAR
     }
 
-    /// Validates a local one-hole course configuration.
+    /// Validates a plan with the legacy default of one hole.
     ///
-    /// # Errors
-    /// Returns [`MatchValueError::InvalidPar`] unless par is in `1..=10`.
+    /// New room-driven callers should use [`Self::with_holes`].
     pub const fn new(course_id: CourseId, par: u8) -> Result<Self, MatchValueError> {
+        Self::with_holes(course_id, 1, 0, par)
+    }
+
+    /// Validates a room-driven plan with an explicit hole count and progression mode.
+    pub const fn with_holes(
+        course_id: CourseId,
+        hole_count: u8,
+        hole_mode: u8,
+        par: u8,
+    ) -> Result<Self, MatchValueError> {
+        if hole_count == 0 || hole_count > 18 {
+            return Err(MatchValueError::InvalidHole);
+        }
         if Self::par_in_range(par) {
-            Ok(Self { course_id, par })
+            Ok(Self {
+                course_id,
+                hole_count,
+                hole_mode,
+                par,
+            })
         } else {
             Err(MatchValueError::InvalidPar)
         }
@@ -1373,7 +1395,19 @@ impl OneHoleConfig {
         self.course_id
     }
 
-    /// Fixed local hole number.
+    /// Number of holes in this plan.
+    #[must_use]
+    pub const fn hole_count(self) -> u8 {
+        self.hole_count
+    }
+
+    /// Hole progression mode from the room settings.
+    #[must_use]
+    pub const fn hole_mode(self) -> u8 {
+        self.hole_mode
+    }
+
+    /// Configured first-hole ordinal for legacy consumers.
     #[must_use]
     pub const fn hole(self) -> u8 {
         1
@@ -1480,7 +1514,7 @@ pub struct BeginSoloMatch {
     match_id: MatchId,
     result_key: MatchResultKey,
     account_id: AccountId,
-    config: OneHoleConfig,
+    config: MatchPlan,
     catalog_fingerprint: CatalogFingerprint,
     seed: MatchSeed,
     weather: Weather,
@@ -1495,7 +1529,7 @@ impl BeginSoloMatch {
         match_id: MatchId,
         result_key: MatchResultKey,
         account_id: AccountId,
-        config: OneHoleConfig,
+        config: MatchPlan,
         catalog_fingerprint: CatalogFingerprint,
         seed: MatchSeed,
         weather: Weather,
@@ -1530,7 +1564,7 @@ impl BeginSoloMatch {
     }
     /// Persisted course configuration.
     #[must_use]
-    pub const fn config(&self) -> OneHoleConfig {
+    pub const fn config(&self) -> MatchPlan {
         self.config
     }
     /// Persisted catalog fingerprint.
@@ -1679,7 +1713,7 @@ pub struct CommitSoloHole {
     match_id: MatchId,
     result_key: MatchResultKey,
     account_id: AccountId,
-    config: OneHoleConfig,
+    config: MatchPlan,
     strokes: StrokeCount,
 }
 
@@ -1690,7 +1724,7 @@ impl CommitSoloHole {
         match_id: MatchId,
         result_key: MatchResultKey,
         account_id: AccountId,
-        config: OneHoleConfig,
+        config: MatchPlan,
         strokes: StrokeCount,
     ) -> Self {
         Self {
@@ -1718,7 +1752,7 @@ impl CommitSoloHole {
     }
     /// Authoritative one-hole configuration.
     #[must_use]
-    pub const fn config(self) -> OneHoleConfig {
+    pub const fn config(self) -> MatchPlan {
         self.config
     }
     /// Checked stroke evidence.
@@ -1879,7 +1913,7 @@ impl SoloMatchResult {
 /// # Errors
 /// Returns [`MatchValueError::ArithmeticOverflow`] if an intermediate cannot be represented.
 pub fn synthetic_solo_reward_v1(
-    config: OneHoleConfig,
+    config: MatchPlan,
     strokes: StrokeCount,
 ) -> Result<SoloReward, MatchValueError> {
     let strokes_i32 = i32::from(strokes.get());
@@ -1992,7 +2026,7 @@ pub struct BeginStrokeMatch {
     match_id: MatchId,
     result_key: MatchResultKey,
     participants: [StrokeParticipant; 2],
-    config: OneHoleConfig,
+    config: MatchPlan,
     catalog_fingerprint: CatalogFingerprint,
     seed: MatchSeed,
     weather: Weather,
@@ -2010,7 +2044,7 @@ impl BeginStrokeMatch {
         match_id: MatchId,
         result_key: MatchResultKey,
         participants: [StrokeParticipant; 2],
-        config: OneHoleConfig,
+        config: MatchPlan,
         catalog_fingerprint: CatalogFingerprint,
         seed: MatchSeed,
         weather: Weather,
@@ -2052,7 +2086,7 @@ impl BeginStrokeMatch {
     }
     /// Persisted course configuration.
     #[must_use]
-    pub const fn config(&self) -> OneHoleConfig {
+    pub const fn config(&self) -> MatchPlan {
         self.config
     }
     /// Persisted catalog fingerprint.
@@ -2294,7 +2328,7 @@ impl StrokePlayerCommit {
 pub struct CommitStrokeMatch {
     match_id: MatchId,
     result_key: MatchResultKey,
-    config: OneHoleConfig,
+    config: MatchPlan,
     players: [StrokePlayerCommit; 2],
 }
 
@@ -2306,7 +2340,7 @@ impl CommitStrokeMatch {
     pub fn new(
         match_id: MatchId,
         result_key: MatchResultKey,
-        config: OneHoleConfig,
+        config: MatchPlan,
         players: [StrokePlayerCommit; 2],
     ) -> Result<Self, MatchValueError> {
         let participants = [players[0].participant, players[1].participant];
@@ -2374,7 +2408,7 @@ impl CommitStrokeMatch {
     }
     /// Authoritative one-hole configuration.
     #[must_use]
-    pub const fn config(self) -> OneHoleConfig {
+    pub const fn config(self) -> MatchPlan {
         self.config
     }
     /// Exact roster-ordered player inputs.
@@ -2427,7 +2461,7 @@ impl StrokeReward {
 /// # Errors
 /// Returns [`MatchValueError::ArithmeticOverflow`] from checked non-forfeit math.
 pub fn synthetic_stroke_reward_v1(
-    config: OneHoleConfig,
+    config: MatchPlan,
     strokes: u16,
     completion: StrokeCompletion,
 ) -> Result<StrokeReward, MatchValueError> {
@@ -4441,6 +4475,12 @@ impl RoomPassword {
     }
 }
 
+impl Clone for RoomPassword {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl Drop for RoomPassword {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -4841,6 +4881,20 @@ mod tests {
     }
 
     #[test]
+    fn match_plan_retains_full_card_shape() {
+        let course = CourseId::new(7).expect("course");
+        let plan = MatchPlan::with_holes(course, 18, 3, 4).expect("plan");
+        assert_eq!(plan.course_id(), course);
+        assert_eq!(plan.hole_count(), 18);
+        assert_eq!(plan.hole_mode(), 3);
+        assert_eq!(plan.par(), 4);
+        assert_eq!(
+            MatchPlan::with_holes(course, 19, 0, 4),
+            Err(MatchValueError::InvalidHole)
+        );
+    }
+
+    #[test]
     fn normalization_keeps_display_separate() {
         let username = Username::parse("  Player_One\t").expect("valid username");
         assert_eq!(username.display(), "Player_One");
@@ -4879,7 +4933,7 @@ mod tests {
             MatchId::new(Uuid::nil()),
             MatchResultKey::new(Uuid::nil()),
             AccountId::new(1).expect("account"),
-            OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+            MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
             CatalogFingerprint::new([0; 32]),
             seed,
             Weather::Clear,
@@ -4947,7 +5001,7 @@ mod tests {
     #[test]
     fn synthetic_match_values_and_rewards_are_checked() {
         let course = CourseId::new(7).expect("course");
-        let config = OneHoleConfig::new(course, 3).expect("configuration");
+        let config = MatchPlan::new(course, 3).expect("configuration");
         assert_eq!(config.hole(), 1);
         assert_eq!(
             synthetic_solo_reward_v1(config, StrokeCount::new(2).expect("strokes")),
@@ -4958,10 +5012,7 @@ mod tests {
             Ok(SoloReward::from_persisted(2, 10, 5))
         );
         assert_eq!(CourseId::new(0), Err(MatchValueError::InvalidCourse));
-        assert_eq!(
-            OneHoleConfig::new(course, 0),
-            Err(MatchValueError::InvalidPar)
-        );
+        assert_eq!(MatchPlan::new(course, 0), Err(MatchValueError::InvalidPar));
         assert_eq!(StrokeCount::new(0), Err(MatchValueError::InvalidStrokes));
         assert_eq!(
             WindConditions::new(151, 0),
@@ -5003,8 +5054,7 @@ mod tests {
             StrokeRosterOrder::Second,
             MatchResultKey::new(Uuid::from_u128(3)),
         );
-        let config =
-            OneHoleConfig::new(CourseId::new(7).expect("course"), 3).expect("configuration");
+        let config = MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration");
         assert!(
             BeginStrokeMatch::new(
                 MatchId::new(Uuid::from_u128(4)),
@@ -5063,8 +5113,7 @@ mod tests {
                 MatchResultKey::new(Uuid::from_u128(12)),
             ),
         ];
-        let config =
-            OneHoleConfig::new(CourseId::new(7).expect("course"), 4).expect("configuration");
+        let config = MatchPlan::new(CourseId::new(7).expect("course"), 4).expect("configuration");
         let commit = |left: (StrokePlace, StrokeCompletion),
                       right: (StrokePlace, StrokeCompletion)| {
             let strokes = |completion| {

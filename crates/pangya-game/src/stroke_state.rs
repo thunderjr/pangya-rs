@@ -1054,7 +1054,7 @@ fn same_result(left: StrokeShotResult, right: StrokeShotResult) -> bool {
 #[cfg(test)]
 mod tests {
     use pangya_domain::{
-        AccountId, CatalogFingerprint, CourseId, MatchSeed, OneHoleConfig, ServerBalances,
+        AccountId, CatalogFingerprint, CourseId, MatchPlan, MatchSeed, ServerBalances,
         StrokeParticipant, StrokePlayerResult, StrokeRosterOrder, synthetic_stroke_reward_v1,
     };
     use pangya_protocol::Lie;
@@ -1086,7 +1086,7 @@ mod tests {
             MatchId::new(Uuid::from_u128(1)),
             MatchResultKey::new(Uuid::from_u128(2)),
             participants,
-            OneHoleConfig::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([7; 32]),
             seed,
