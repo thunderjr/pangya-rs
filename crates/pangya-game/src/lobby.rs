@@ -669,7 +669,7 @@ impl LobbyHandle {
         settings: RoomSettings,
         owner: RoomIdentity,
         channel: u8,
-        outbound: RoomOutbound,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -681,7 +681,7 @@ impl LobbyHandle {
                 settings,
                 owner,
                 channel,
-                outbound,
+                outbound: outbound.into(),
                 terminal_outbox: None,
                 cancellation,
                 reply,
@@ -822,7 +822,7 @@ impl LobbyHandle {
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         channel: u8,
-        outbound: RoomOutbound,
+        outbound: impl Into<RoomOutbound>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
@@ -833,7 +833,7 @@ impl LobbyHandle {
                 identity,
                 password,
                 channel,
-                outbound,
+                outbound: outbound.into(),
                 terminal_outbox: None,
                 cancellation,
                 reply,
@@ -1356,6 +1356,7 @@ impl LobbyRegistry {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn join_with_channel(
         &mut self,
         room_id: RoomId,
@@ -2035,8 +2036,6 @@ async fn run_lobby(
                     let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, terminal_outbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                    let _ignored = reply.send(result);
-                }
                 Some(LobbyCommand::List { reply }) => {
                     let summaries = registry.rooms.values()
                         .filter(|record| !record.retain_for_persistence)
@@ -2066,8 +2065,6 @@ async fn run_lobby(
                 }
                 Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, terminal_outbox, cancellation, reply }) => {
                     let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, terminal_outbox, cancellation).await;
-                    let _ignored = reply.send(result);
-                }
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
