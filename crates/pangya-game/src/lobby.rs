@@ -1630,7 +1630,11 @@ impl LobbyRegistry {
         match event {
             RoomActorEvent::Summary(summary) => {
                 if let Some(record) = self.rooms.get_mut(&summary.id()) {
-                    record.summary = summary;
+                    let channel = record.summary.channel();
+                    record.summary = channel.map_or_else(
+                        || summary.clone(),
+                        |channel| summary.clone().with_channel(channel),
+                    );
                 }
             }
             RoomActorEvent::Closed(room_id) => {
