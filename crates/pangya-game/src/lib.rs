@@ -861,28 +861,6 @@ impl SocialHub {
             .get(&id)
             .map(|member| member.account_id)
     }
-    fn snapshots_for_connections(&self, ids: &[PlayerConnectionId]) -> Vec<MemberSnapshot> {
-        let Ok(members) = self.members.lock() else {
-            return Vec::new();
-        };
-        ids.iter()
-            .filter_map(|id| {
-                let member = members.get(id)?;
-                Some(
-                    MemberSnapshot::new(
-                        *id,
-                        member.account_id,
-                        String::from_utf8_lossy(&member.nickname).into_owned(),
-                        false,
-                        false,
-                        None,
-                        None,
-                    )
-                    .with_card(member.card.clone()),
-                )
-            })
-            .collect()
-    }
     fn contains_account(&self, id: u32) -> bool {
         let Ok(members) = self.members.lock() else {
             return false;
@@ -2285,6 +2263,7 @@ where
                                         established,
                                         outbound.clone(),
                                         room_cancellation.clone(),
+                                        current_channel.ok_or(GameRuntimeError::Protocol)?,
                                         frame.opcode,
                                         &frame.payload,
                                         &mut room_id,
@@ -4677,10 +4656,7 @@ where
                     // The actor emitted this only after durable settlement. Recording before the
                     // completion frames keeps a client-visible completed match and its history
                     // atomic from an observer's point of view.
-                    if let Some(context) = context {
-                        let members = self.social.snapshots_for_connections(&context.roster);
-                        self.record_retail_match_history(&members).await?;
-                    }
+                    self.record_retail_match_history(result).await?;
                     self.send_retail_stroke_committed(framed, *result, context)
                         .await?;
                     match_context.stroke = None;
@@ -5219,23 +5195,40 @@ where
     ///
     /// Every figure here is the committed server-side result. A forfeit has no golf score, so
     /// its line reports zero rather than inventing one.
-    /// Records only players who entered the same authoritative match roster. Lobby presence is
-    /// not match history: a user merely seeing another account online must not populate 0x010e.
+    /// Records only players in the durable completed-match result. The result carries account
+    /// identity from `match_players`, so a disconnect between settlement and this frame cannot
+    /// remove a participant from history; nicknames are loaded from durable player projections.
     async fn record_retail_match_history(
         &self,
-        members: &[MemberSnapshot],
+        result: &StrokeMatchResult,
     ) -> Result<(), GameRuntimeError> {
-        for owner in members {
-            for recent in members {
-                if owner.account_id() == recent.account_id() {
+        let participants = result
+            .players()
+            .map(|player| player.participant().account_id());
+        let mut snapshots = Vec::with_capacity(participants.len());
+        for account_id in participants {
+            let snapshot = self
+                .repository
+                .load_player_snapshot(account_id)
+                .await
+                .map_err(|_| GameRuntimeError::Snapshot)?;
+            let nickname = snapshot
+                .profile
+                .nickname
+                .ok_or(GameRuntimeError::Snapshot)?;
+            snapshots.push((account_id, nickname));
+        }
+        for (owner, _) in &snapshots {
+            for (recent, nickname) in &snapshots {
+                if owner == recent {
                     continue;
                 }
                 self.repository
                     .record_recent_player(
-                        owner.account_id(),
+                        *owner,
                         RecentPlayer {
-                            account_id: recent.account_id(),
-                            nickname: recent.nickname().to_owned(),
+                            account_id: *recent,
+                            nickname: nickname.clone(),
                             seen_at: SystemTime::now(),
                         },
                     )
@@ -7293,10 +7286,10 @@ where
     }
 
     /// Current rooms as retail list records, bounded by what one list frame can carry.
-    async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
+    async fn retail_room_list(&self, channel: u8) -> Result<Vec<RetailRoom>, GameRuntimeError> {
         let summaries = self
             .lobby
-            .list()
+            .list_on_channel(channel)
             .await
             .map_err(|_| GameRuntimeError::Protocol)?;
         Ok(summaries
@@ -7317,6 +7310,7 @@ where
         identity: &RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
         room_cancellation: CancellationToken,
+        channel: u8,
         opcode: u16,
         payload: &[u8],
         room_id: &mut Option<RoomId>,
@@ -7329,7 +7323,7 @@ where
                 if !payload.is_empty() {
                     return Err(GameRuntimeError::Protocol);
                 }
-                let rooms = self.retail_room_list().await?;
+                let rooms = self.retail_room_list(channel).await?;
                 self.send(
                     framed,
                     &RetailRoomList {
@@ -7387,11 +7381,12 @@ where
                 });
                 let created = self
                     .lobby
-                    .create(
+                    .create_on_channel(
                         name,
                         password,
                         settings,
                         identity.clone(),
+                        channel,
                         outbound,
                         room_cancellation,
                     )
@@ -7438,10 +7433,11 @@ where
                 };
                 let joined = self
                     .lobby
-                    .join(
+                    .join_on_channel(
                         target,
                         identity.clone(),
                         password,
+                        channel,
                         outbound,
                         room_cancellation,
                     )
@@ -7527,7 +7523,7 @@ where
                 self.social.set_room(identity.connection_id, None);
                 self.observer.room(GameRoomObservation::Left);
                 self.send(framed, &RetailRoomLeave::to_lobby()).await?;
-                self.send_retail_room_list(framed).await?;
+                self.send_retail_room_list(framed, channel).await?;
                 Ok(GameState::InChannel)
             }
             // A room opcode in the wrong state is a protocol violation, matching the
@@ -7572,10 +7568,11 @@ where
     async fn send_retail_room_list(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
+        channel: u8,
     ) -> Result<(), GameRuntimeError> {
         let rooms = self
             .lobby
-            .list()
+            .list_on_channel(channel)
             .await
             .map_err(|_| GameRuntimeError::Protocol)?;
         let rooms = rooms.iter().map(retail_room_from_summary_only).collect();

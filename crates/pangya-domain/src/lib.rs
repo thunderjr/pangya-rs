@@ -4667,6 +4667,7 @@ pub struct RoomSummary {
     max_members: u8,
     password_protected: bool,
     profile: RoomProfile,
+    channel: Option<u8>,
 }
 
 impl RoomSummary {
@@ -4689,8 +4690,23 @@ impl RoomSummary {
             max_members,
             password_protected,
             profile,
+            channel: None,
         }
     }
+
+    /// Associates this summary with the retail channel that owns it.
+    #[must_use]
+    pub const fn with_channel(mut self, channel: u8) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// Retail channel ownership, when the lobby is channel-scoped.
+    #[must_use]
+    pub const fn channel(&self) -> Option<u8> {
+        self.channel
+    }
+
     /// Room identity.
     #[must_use]
     pub const fn id(&self) -> RoomId {
