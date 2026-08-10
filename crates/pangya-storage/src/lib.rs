@@ -1622,8 +1622,7 @@ impl PgRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(repository_db_error)?;
-        let mut state = RetailEquipmentState::default();
-        state.character_hair_color = sqlx::query_scalar::<_, i16>(
+        let character_hair_color = sqlx::query_scalar::<_, i16>(
             "SELECT c.hair_color FROM characters c JOIN profiles p ON p.selected_character_id = c.id WHERE c.account_id = $1",
         )
         .bind(account_id.get())
@@ -1633,6 +1632,10 @@ impl PgRepository {
         .map(|value| u8::try_from(value).map_err(|_| RepositoryError::CorruptData))
         .transpose()?
         .unwrap_or(0);
+        let mut state = RetailEquipmentState {
+            character_hair_color,
+            ..RetailEquipmentState::default()
+        };
         let part_rows = sqlx::query!(
             "SELECT s.character_id, s.slot_index, s.item_type_id, s.inventory_item_id \
              FROM character_part_slots s JOIN profiles p ON p.selected_character_id = s.character_id \
