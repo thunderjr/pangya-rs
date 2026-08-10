@@ -6668,17 +6668,13 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         connect_retail_social_client(&pool, address, offline.account.id, "SocialOffline").await;
     let (opcode, body) = receive_packet(&mut offline_stream, offline_key).await;
     assert_eq!(opcode, WhisperResponse::OPCODE);
+    // Literal PacketDoc golden bytes keep the E2E independent from the encoder under test.
     assert_eq!(
         body,
-        wire(
-            &WhisperResponse {
-                status: 0,
-                nickname: b"NSocialAlice".to_vec(),
-                message: b"queued while away".to_vec(),
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("offline delivery")
+        [
+            0, 12, 0, 78, 83, 111, 99, 105, 97, 108, 65, 108, 105, 99, 101, 17, 0, 113, 117, 101,
+            117, 101, 100, 32, 119, 104, 105, 108, 101, 32, 97, 119, 97, 121
+        ]
     );
 
     // Both sockets are independently encrypted, and lobby chat is broadcast to every member.
@@ -6705,29 +6701,19 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
     assert_eq!(opcode, WhisperResponse::OPCODE);
     assert_eq!(
         body,
-        wire(
-            &WhisperResponse {
-                status: 0,
-                nickname: b"NSocialAlice".to_vec(),
-                message: b"private".to_vec(),
-            },
-            &CompatibilityProfile::US_852
-        )
-        .expect("whisper delivery")
+        [
+            0, 12, 0, 78, 83, 111, 99, 105, 97, 108, 65, 108, 105, 99, 101, 7, 0, 112, 114, 105,
+            118, 97, 116, 101
+        ]
     );
     let (opcode, body) = receive_packet(&mut first, first_key).await;
     assert_eq!(opcode, WhisperResponse::OPCODE);
     assert_eq!(
         body,
-        wire(
-            &WhisperResponse {
-                status: 1,
-                nickname: b"NSocialBob".to_vec(),
-                message: b"private".to_vec(),
-            },
-            &CompatibilityProfile::US_852
-        )
-        .expect("whisper acknowledgement")
+        [
+            1, 10, 0, 78, 83, 111, 99, 105, 97, 108, 66, 111, 98, 7, 0, 112, 114, 105, 118, 97,
+            116, 101
+        ]
     );
 
     // Lounge action and the 0x00EB per-occupant query both remain process-wide and multi-client.
@@ -7097,13 +7083,27 @@ async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgP
     let (address, shutdown, task) = start_service(service).await;
     let (mut stream, key, _) =
         connect_retail_social_client(&pool, address, account.account.id, "SocialRate").await;
-    let chat = GameChat::new(b"NSocialRate".to_vec(), b"one".to_vec());
-    send_typed(&mut stream, key, 3, &chat).await;
+    // Exercise the whisper limiter with the actual whisper body/opcode, rather than a chat
+    // packet that bypasses the 0x002a -> 0x0084 path under review.
+    let whisper = Whisper::new(b"NSocialRate".to_vec(), b"one".to_vec());
+    send_typed(&mut stream, key, 4, &whisper).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
     assert_eq!(
-        receive_packet(&mut stream, key).await.0,
-        GameChatResponse::OPCODE
+        body,
+        [
+            0, 11, 0, 78, 83, 111, 99, 105, 97, 108, 82, 97, 116, 101, 3, 0, 111, 110, 101
+        ]
     );
-    send_typed(&mut stream, key, 4, &chat).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            1, 11, 0, 78, 83, 111, 99, 105, 97, 108, 82, 97, 116, 101, 3, 0, 111, 110, 101
+        ]
+    );
+    send_typed(&mut stream, key, 4, &whisper).await;
     assert_closed(&mut stream).await;
     shutdown.cancel();
     assert!(task.await.expect("rate join").is_ok());

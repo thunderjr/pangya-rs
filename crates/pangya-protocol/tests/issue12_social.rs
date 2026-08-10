@@ -6,8 +6,9 @@ use pangya_protocol::{
     RetailPangBalance, TypingIndicator, UserCharacterInfoResponse, UserCourseRecordsInfoResponse,
     UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse,
     UserInfoRequest, UserInfoResponse, UserNameInfoResponse, UserRelatedInfoResponse,
-    UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse, UserTrophiesInfoResponse, Whisper,
-    WhisperRefusalResponse, WhisperResponse, decode_packet_payload, encode_packet_payload,
+    UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse, UserStatusRequest,
+    UserStatusResponse, UserTrophiesInfoResponse, Whisper, WhisperRefusalResponse, WhisperResponse,
+    decode_packet_payload, encode_packet_payload,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
@@ -125,6 +126,24 @@ fn macros_are_nine_fixed_64_byte_slots_and_user_info_is_typed() {
             .expect("zero request type")
             .as_slice(),
         [1, 0, 0, 0, 0, 77, 0, 0, 0]
+    );
+}
+
+#[test]
+fn whisper_response_uses_literal_packetdoc_body_and_opcode() {
+    let response = WhisperResponse {
+        status: 0,
+        nickname: b"Alice".to_vec(),
+        message: b"hello".to_vec(),
+    };
+    assert_eq!(WhisperResponse::OPCODE, 0x0084);
+    assert_eq!(
+        encode_packet_payload(&response, &PROFILE)
+            .expect("whisper response")
+            .as_slice(),
+        [
+            0, 5, 0, b'A', b'l', b'i', b'c', b'e', 5, 0, b'h', b'e', b'l', b'l', b'o'
+        ]
     );
 }
 
@@ -266,6 +285,37 @@ fn social_requests_refuse_trailing_or_invalid_bodies() {
             pangya_protocol::ServiceKind::Game,
         )
         .is_err()
+    );
+}
+
+#[test]
+fn user_status_and_message_server_replies_match_reference_golden_bytes() {
+    let request = [1, 5, 0, b'A', b'l', b'i', b'c', b'e'];
+    assert_eq!(
+        decode_packet_payload::<UserStatusRequest>(
+            &request,
+            &PROFILE,
+            pangya_protocol::ServiceKind::Game,
+        )
+        .expect("status request"),
+        UserStatusRequest {
+            unknown: 1,
+            username: b"Alice".to_vec(),
+        }
+    );
+    assert_eq!(UserStatusResponse::OPCODE, 0x00a1);
+    assert_eq!(
+        encode_packet_payload(&UserStatusResponse, &PROFILE)
+            .expect("status response")
+            .as_slice(),
+        [2]
+    );
+    assert_eq!(MessageServerList::OPCODE, 0x00fc);
+    assert_eq!(
+        encode_packet_payload(&MessageServerList, &PROFILE)
+            .expect("empty message list")
+            .as_slice(),
+        [0]
     );
 }
 

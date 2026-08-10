@@ -91,7 +91,7 @@ merely accepted, because that is the decision that matters when scoping work.
 | `0x003c` | offline note send (costs 10 Pang) | PD:152; PY (`PLAYER_REQUEST_CHAT_OFFLINE`) | `0x0095` money update | Balance never moves; client may resend |
 | `0x0029` + `0x00ba` | room invite (sent as a pair) | PD:147,175; PY:—; `client/00ba.ksy` doc | `0x0083` to invitee, `0x012f`/`0x0130` to inviter | Invite silently vanishes |
 | `0x0038` | change nickname in-game | PY:550 only | unknown | **unknown** — no layout in any permissive source |
-| `0x0007` | user status / gift eligibility | PD:125; **accepted-silent today** | `0x00a1` | PD `client/0007.ksy` says the response is mandatory. The "check user for gift" dialog likely spins. This is a latent bug in the current allowlist |
+| `0x0007` | user status / gift eligibility | PD:125; `UserStatusRequest` | `0x00a1` body `0x02` | Implemented: validates discriminator `1` + username and answers the mandatory one-byte response. |
 | `0x00c1` | **accepted-silent today**; PY calls it `PLAYER_REQUEST_WEB_COOKIES`, PB calls it my-room-related (conn.go:687) | PD:— ; PY:— ; AP:84 | unknown | Two references disagree on meaning. Currently harmless because the client reaches the lobby, but the cash-shop path is untested |
 
 `0x0003` is the highest-value single row in this document: it is one packet in,
@@ -353,8 +353,8 @@ handling would need to mirror.
 
 | Opcode | State | Evidence |
 |---|---|---|
-| `0x008b` messenger server list request | **Accepted, never answered** | `game.rs:281` |
-| `0x00fc` messenger server list | Not implemented | `server/00fc.ksy` |
+| `0x008b` messenger server list request | Empty request answered with `0x00fc` count `0` | `client/008b.ksy`, `server/00fc.ksy` |
+| `0x00fc` messenger server list | Implemented zero-server response | `social.rs:MessageServerList` |
 
 `client/008b.ksy:2-4` is precise about when it fires: *"only sent if the client
 has failed to connect to the message server at login"*. So the current silent
@@ -561,13 +561,12 @@ pang if a ticket is used"*, *"Fix pang able to go negative"*. It also hardcodes
 None of the costs, draw counts, or rarity rules in that file are evidence.
 SPEC §14.3 forbids all four of those defects outright.
 
-### 5.7 `0x0007` is in the accepted-silent allowlist but PacketDoc says it needs a reply
+### 5.7 `0x0007` now answers the mandatory PacketDoc reply
 
-`crates/pangya-protocol/src/game.rs:274` accepts `0x0007` on the stated grounds
-that upstream handles it with an empty case. Upstream does — but with
-`// TODO` and a debug log (`conn.go:183-185`), not because no reply is expected.
-`client/0007.ksy:2-3` states the response is `0x00a1`. The allowlist comment
-overstates the evidence for this one row.
+`client/0007.ksy` defines discriminator `1` plus a username and requires server
+opcode `0x00a1`; the implementation validates that body and emits the exact
+one-byte `0x02` response. The previous accepted-silent gap is closed without
+claiming any unproven gift/status semantics.
 
 ### 5.8 There is no `Achievement.iff`
 

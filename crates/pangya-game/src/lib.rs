@@ -48,12 +48,12 @@ use pangya_domain::{
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
-    MemberSnapshot, Nickname, OfflineNoteRequest, OneHoleConfig, PlayerConnectionId,
-    PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem, RepositoryError,
-    RetailEquipmentChange, RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings,
-    RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult,
-    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
-    StrokeParticipant, StrokeRosterOrder,
+    MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
+    RepositoryError, RetailEquipmentChange, RoomError, RoomId, RoomName, RoomPassword, RoomProfile,
+    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay,
+    SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
+    StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -729,6 +729,7 @@ enum SocialEvent {
     },
     OfflineNote {
         target: PlayerConnectionId,
+        claim: OfflineNoteClaim,
         nickname: Vec<u8>,
         message: Vec<u8>,
     },
@@ -848,6 +849,7 @@ impl SocialHub {
     fn deliver_offline_note(
         &self,
         recipient: AccountId,
+        claim: OfflineNoteClaim,
         sender_nickname: Vec<u8>,
         message: Vec<u8>,
     ) {
@@ -862,6 +864,7 @@ impl SocialHub {
         };
         let _ = self.events.send(SocialEvent::OfflineNote {
             target: *target.0,
+            claim,
             nickname: sender_nickname,
             message,
         });
@@ -1640,16 +1643,20 @@ where
                                         established.card.clone(),
                                     );
                                     // Claim pending durable notes only after authentication. The
-                                    // repository marks each row delivered in the same bridge
-                                    // transaction, so reconnecting cannot lose the offline queue.
+                                    // lease is not acknowledged until the outbound write succeeds,
+                                    // so disconnects and crashes leave the note retryable.
                                     let pending = self
                                         .repository
-                                        .take_offline_notes(established.account_id)
+                                        .claim_offline_notes(established.account_id)
                                         .await
                                         .map_err(|_| GameRuntimeError::Snapshot)?;
                                     for note in pending {
                                         let _ = self.social.events.send(SocialEvent::OfflineNote {
                                             target: connection_id,
+                                            claim: OfflineNoteClaim {
+                                                id: note.id,
+                                                lease_token: note.lease_token,
+                                            },
                                             nickname: note.sender_nickname,
                                             message: note.message,
                                         });
@@ -1900,12 +1907,16 @@ where
                                         if self.social.contains_account(request.user_id) {
                                             for note in self
                                                 .repository
-                                                .take_offline_notes(recipient_id)
+                                                .claim_offline_notes(recipient_id)
                                                 .await
                                                 .map_err(|_| GameRuntimeError::Snapshot)?
                                             {
                                                 self.social.deliver_offline_note(
                                                     recipient_id,
+                                                    OfflineNoteClaim {
+                                                        id: note.id,
+                                                        lease_token: note.lease_token,
+                                                    },
                                                     note.sender_nickname,
                                                     note.message,
                                                 );
@@ -4022,6 +4033,7 @@ where
             }
             SocialEvent::OfflineNote {
                 target,
+                claim,
                 nickname,
                 message,
             } if target == connection_id => {
@@ -4034,6 +4046,10 @@ where
                     },
                 )
                 .await?;
+                self.repository
+                    .ack_offline_note(claim)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
             }
             SocialEvent::Whisper {
                 target,

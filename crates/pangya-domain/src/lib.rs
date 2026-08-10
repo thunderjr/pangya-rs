@@ -4068,13 +4068,26 @@ pub struct OfflineNoteRequest {
     pub message: Vec<u8>,
 }
 
-/// One note removed from the pending offline bridge for delivery.
+/// One leased offline note pending delivery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfflineNote {
+    /// Durable note row id.
+    pub id: i64,
+    /// Opaque lease token fencing stale acknowledgements.
+    pub lease_token: [u8; 16],
     /// Sender's display nickname.
     pub sender_nickname: Vec<u8>,
     /// Note text.
     pub message: Vec<u8>,
+}
+
+/// A successful outbound delivery acknowledgement for one leased note.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineNoteClaim {
+    /// Durable note row id.
+    pub id: i64,
+    /// Lease token returned by the claim operation.
+    pub lease_token: [u8; 16],
 }
 
 /// Durable result of an offline-note submission.
@@ -4125,12 +4138,24 @@ pub trait PlayerRepository: Send + Sync {
         Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
 
-    /// Takes pending notes for delivery after a recipient authenticates.
-    fn take_offline_notes(
+    /// Leases pending notes for delivery after a recipient authenticates.
+    ///
+    /// A lease is recoverable after expiry; implementations must not mark a row delivered here.
+    fn claim_offline_notes(
         &self,
         _recipient_id: AccountId,
     ) -> RepositoryFuture<'_, Result<Vec<OfflineNote>, RepositoryError>> {
         Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+
+    /// Acknowledges one note only after its outbound socket write succeeds.
+    ///
+    /// The token fences a delayed acknowledgement from an expired lease and a later claimant.
+    fn ack_offline_note(
+        &self,
+        _claim: OfflineNoteClaim,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Ok(())))
     }
 
     /// Stores an offline note and debits its fixed 10-Pang cost in one transaction.

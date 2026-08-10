@@ -16,11 +16,12 @@ use pangya_domain::{
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OfflineNoteRequest,
-    OneHoleConfig, PlayerRepository, PurchaseRequest, RepairItem, RepositoryError,
-    RetailEquipmentChange, ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant,
-    StarterItem, StarterKey, StorageFault, StorageObserver, StrokeCompletion, StrokeCount,
-    StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather, WindConditions,
+    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OfflineNoteClaim,
+    OfflineNoteRequest, OneHoleConfig, PlayerRepository, PurchaseRequest, RepairItem,
+    RepositoryError, RetailEquipmentChange, ServiceKind, SourceAddressPrefix, StarterCharacter,
+    StarterGrant, StarterItem, StarterKey, StorageFault, StorageObserver, StrokeCompletion,
+    StrokeCount, StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather,
+    WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -793,7 +794,7 @@ async fn operator_success_audit_failure_rolls_back_whole_aggregate(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
-async fn offline_note_acceptance_is_atomic_idempotent_and_delivered_by_account_id(pool: PgPool) {
+async fn offline_note_acceptance_is_atomic_idempotent_and_leased_by_account_id(pool: PgPool) {
     let repository = PgRepository::new(pool.clone());
     let sender = repository
         .create_account(account("NoteSender", Some("SenderNick")))
@@ -827,17 +828,41 @@ async fn offline_note_acceptance_is_atomic_idempotent_and_delivered_by_account_i
     assert_eq!(replay.pang, 15);
     assert!(!replay.accepted);
     let pending = repository
-        .take_offline_notes(recipient.account.id)
+        .claim_offline_notes(recipient.account.id)
         .await
-        .expect("take pending");
+        .expect("claim pending");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].sender_nickname, b"SenderNick");
     assert_eq!(pending[0].message, b"offline fixture");
+    // A second consumer cannot claim a live lease. Expiry makes it claimable again, which is the
+    // crash/disconnect recovery path; only the replacement lease can acknowledge it.
     let pending_again = repository
-        .take_offline_notes(recipient.account.id)
+        .claim_offline_notes(recipient.account.id)
         .await
-        .expect("take once");
+        .expect("claim once");
     assert!(pending_again.is_empty());
+    sqlx::query("UPDATE offline_notes SET delivery_lease_until = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .expect("expire lease");
+    let recovered = repository
+        .claim_offline_notes(recipient.account.id)
+        .await
+        .expect("claim after disconnect");
+    assert_eq!(recovered.len(), 1);
+    assert_ne!(recovered[0].lease_token, pending[0].lease_token);
+    repository
+        .ack_offline_note(OfflineNoteClaim {
+            id: recovered[0].id,
+            lease_token: recovered[0].lease_token,
+        })
+        .await
+        .expect("ack pending");
+    let acknowledged = repository
+        .claim_offline_notes(recipient.account.id)
+        .await
+        .expect("claim acknowledged");
+    assert!(acknowledged.is_empty());
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_notes")
         .fetch_one(&pool)
         .await

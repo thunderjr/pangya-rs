@@ -28,11 +28,11 @@ use pangya_domain::{
     MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
     NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
-    OfflineNote, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
-    PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult, RepositoryError,
-    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
-    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
+    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult,
+    RepositoryError, RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances,
+    ServiceKind, SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault,
+    StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
     StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
     WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
@@ -471,16 +471,20 @@ impl PgRepository {
         Ok(())
     }
 
-    async fn take_offline_notes_inner(
+    async fn claim_offline_notes_inner(
         &self,
         recipient_id: AccountId,
     ) -> Result<Vec<OfflineNote>, RepositoryError> {
+        // Claiming is deliberately separate from delivery acknowledgement. A process crash or
+        // socket failure leaves the row leased, not lost; the short lease makes it claimable by a
+        // reconnect without charging the sender again.
         let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
         let rows = sqlx::query(
             "SELECT n.id, p.nickname_display, n.message \
              FROM offline_notes n \
              JOIN profiles p ON p.account_id = n.sender_account_id \
              WHERE n.recipient_account_id = $1 AND n.delivered_at IS NULL \
+               AND (n.delivery_lease_until IS NULL OR n.delivery_lease_until <= now()) \
              ORDER BY n.id FOR UPDATE OF n SKIP LOCKED",
         )
         .bind(recipient_id.get())
@@ -490,22 +494,43 @@ impl PgRepository {
         let mut notes = Vec::with_capacity(rows.len());
         for row in rows {
             let id: i64 = row.try_get("id").map_err(repository_db_error)?;
-            sqlx::query("UPDATE offline_notes SET delivered_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(repository_db_error)?;
+            let lease_token = *Uuid::new_v4().as_bytes();
+            sqlx::query(
+                "UPDATE offline_notes SET delivery_lease_until = now() + interval '30 seconds', \
+                 delivery_lease_token = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(lease_token.as_slice())
+            .execute(&mut *transaction)
+            .await
+            .map_err(repository_db_error)?;
             let nickname: Option<String> = row
                 .try_get("nickname_display")
                 .map_err(repository_db_error)?;
             let message: Vec<u8> = row.try_get("message").map_err(repository_db_error)?;
             notes.push(OfflineNote {
+                id,
+                lease_token,
                 sender_nickname: nickname.unwrap_or_default().into_bytes(),
                 message,
             });
         }
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(notes)
+    }
+
+    async fn ack_offline_note_inner(&self, claim: OfflineNoteClaim) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE offline_notes SET delivered_at = now(), delivery_lease_until = NULL, \
+             delivery_lease_token = NULL WHERE id = $1 AND delivered_at IS NULL \
+             AND delivery_lease_token = $2",
+        )
+        .bind(claim.id)
+        .bind(claim.lease_token.as_slice())
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        Ok(())
     }
 
     async fn accept_offline_note_inner(
@@ -2385,11 +2410,18 @@ async fn owned_by_type_any(
 }
 
 impl PlayerRepository for PgRepository {
-    fn take_offline_notes(
+    fn claim_offline_notes(
         &self,
         recipient_id: AccountId,
     ) -> RepositoryFuture<'_, Result<Vec<OfflineNote>, RepositoryError>> {
-        Box::pin(self.observed(self.take_offline_notes_inner(recipient_id)))
+        Box::pin(self.observed(self.claim_offline_notes_inner(recipient_id)))
+    }
+
+    fn ack_offline_note(
+        &self,
+        claim: OfflineNoteClaim,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.ack_offline_note_inner(claim)))
     }
 
     fn save_chat_macros(
