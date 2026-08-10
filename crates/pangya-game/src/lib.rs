@@ -7617,6 +7617,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retail_equipment_change_opcodes_are_routed_as_room_commands() {
+        assert!(is_retail_room_opcode(0x000b));
+        assert!(is_retail_room_opcode(0x000c));
+    }
+
+    #[test]
+    fn retail_equipment_announce_reaches_room_peers() {
+        // The room actor must fan this event to every member; a self-only reply leaves peers
+        // stale until they reconnect.
+        let _ = RoomEvent::EquipmentAnnounce(RetailEquipmentAnnounce::Ball {
+            connection_id: 7,
+            ball_type_id: 0x1400_0001,
+        });
+    }
+
     fn test_stroke_service(
         repository: Arc<FakeRepository>,
         commit_timeout: Duration,

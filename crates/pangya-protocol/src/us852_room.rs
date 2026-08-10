@@ -1565,6 +1565,38 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn packetdoc_000b_and_000c_equipment_bodies_are_distinct_and_little_endian() {
+        let lobby = decode_packet_payload::<RetailLobbyEquipmentUpdate>(
+            &[4, 0x2a, 0, 0, 0],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("decode lobby equipment");
+        assert_eq!(lobby, RetailLobbyEquipmentUpdate::Character(42));
+
+        let room = decode_packet_payload::<RetailRoomEquipmentUpdate>(
+            &[3, 0x37, 0, 0, 0],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("decode room equipment");
+        assert_eq!(room, RetailRoomEquipmentUpdate::ClubSet(55));
+    }
+
+    #[test]
+    fn packetdoc_004b_has_zero_prefix_type_connection_and_payload() {
+        let packet = RetailEquipmentAnnounce::Character {
+            connection_id: 0x1122_3344,
+            character_type_id: 0x0400_000b,
+            character_uid: 42,
+        };
+        let bytes = encode_packet_payload(&packet, &profile()).expect("encode announce");
+        assert_eq!(&bytes[..9], &[0, 0, 0, 0, 4, 0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(bytes.len(), 9 + CHARACTER_BLOCK_BYTES);
+    }
+
+    #[test]
     fn equipment_update_decodes_requested_ball_type() {
         let mut payload = vec![RetailEquipmentSlot::Ball.tag()];
         payload.extend_from_slice(&0x1400_00c9_u32.to_le_bytes());
