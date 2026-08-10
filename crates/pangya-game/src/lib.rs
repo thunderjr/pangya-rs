@@ -1778,7 +1778,7 @@ where
                                 {
                                     break Err(GameRuntimeError::Protocol);
                                 }
-                                if let Err(error) = self
+                                let changed = match self
                                     .handle_retail_room_equipment_update(
                                         &mut framed,
                                         state,
@@ -1788,7 +1788,27 @@ where
                                     )
                                     .await
                                 {
-                                    break Err(error);
+                                    Ok(changed) => changed,
+                                    Err(error) => break Err(error),
+                                };
+                                if changed {
+                                    let fresh = self
+                                        .refresh_social_projection(
+                                            connection_id,
+                                            established.account_id,
+                                        )
+                                        .await
+                                        .map_err(|_| GameRuntimeError::Snapshot)?;
+                                    if let Some(established) = identity.as_mut() {
+                                        established.character_id =
+                                            Some(fresh.equipment.character_id);
+                                        established.character_iff_id = fresh
+                                            .characters
+                                            .iter()
+                                            .find(|value| value.id == fresh.equipment.character_id)
+                                            .map(|value| value.item_type_id.get());
+                                        established.card = member_card(&fresh);
+                                    }
                                 }
                             } else if self.config.retail_bootstrap
                                 && frame.opcode == RetailEquipmentUpdate::OPCODE
@@ -1804,19 +1824,22 @@ where
                                     )
                                     .await
                                 {
-                                    Ok(Some(card)) => {
-                                        established.character_id = CharacterId::new(
-                                            i64::from(card.character_uid),
-                                        )
-                                        .ok();
-                                        established.character_iff_id =
-                                            Some(card.character_iff_id).filter(|value| *value != 0);
-                                        established.card = card.clone();
-                                        // User-info fan-out reads the social projection, not the
-                                        // connection's private identity. Rebuild it from the
-                                        // coherent snapshot after every durable equipment mutation.
-                                        self.refresh_social_projection(connection_id, established.account_id)
+                                    Ok(Some(_card)) => {
+                                        // Re-read all durable fields after the mutation. The
+                                        // acknowledgement card is intentionally only a wire
+                                        // projection; room census and match bootstrap need the
+                                        // complete coherent snapshot.
+                                        let account_id = established.account_id;
+                                        let fresh = self
+                                            .refresh_social_projection(connection_id, account_id)
                                             .await?;
+                                        established.character_id = Some(fresh.equipment.character_id);
+                                        established.character_iff_id = fresh
+                                            .characters
+                                            .iter()
+                                            .find(|value| value.id == fresh.equipment.character_id)
+                                            .map(|value| value.item_type_id.get());
+                                        established.card = member_card(&fresh);
                                     }
                                     Ok(None) => {}
                                     Err(GameRuntimeError::EconomyPersistence) => {
@@ -1953,13 +1976,14 @@ where
                                 let Some(established) = identity.as_ref() else {
                                     break Err(GameRuntimeError::Protocol);
                                 };
+                                let account_id = established.account_id;
                                 let payload_digest: [u8; 32] = Sha256::digest(&frame.payload).into();
                                 let purchase_sequence = retail_purchase_replays
                                     .sequence(frame.metadata.salt, payload_digest);
                                 if let Err(error) = self
                                     .handle_retail_purchase(
                                         &mut framed,
-                                        established.account_id,
+                                        account_id,
                                         &frame.payload,
                                         retail_purchase_scope,
                                         purchase_sequence,
@@ -1968,9 +1992,19 @@ where
                                 {
                                     break Err(error);
                                 }
-                                self.refresh_social_projection(connection_id, established.account_id)
+                                let fresh = self
+                                    .refresh_social_projection(connection_id, account_id)
                                     .await
                                     .map_err(|_| GameRuntimeError::Snapshot)?;
+                                if let Some(established) = identity.as_mut() {
+                                    established.character_id = Some(fresh.equipment.character_id);
+                                    established.character_iff_id = fresh
+                                        .characters
+                                        .iter()
+                                        .find(|value| value.id == fresh.equipment.character_id)
+                                        .map(|value| value.item_type_id.get());
+                                    established.card = member_card(&fresh);
+                                }
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -6167,7 +6201,7 @@ where
         identity: &RoomIdentity,
         opcode: u16,
         payload: &[u8],
-    ) -> Result<(), GameRuntimeError> {
+    ) -> Result<bool, GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         let update = if opcode == RETAIL_C2S_EQUIPMENT_LOBBY {
             decode_packet_payload::<RetailLobbyEquipmentUpdate>(payload, profile, ServiceKind::Game)
@@ -6441,7 +6475,7 @@ where
                 .await
                 .map_err(|_| GameRuntimeError::Protocol)?;
         }
-        Ok(())
+        Ok(should_announce)
     }
 
     /// Applies a tagged retail `0x0020` update and reports the transaction's stored projection.
@@ -7006,20 +7040,49 @@ where
         .await
     }
 
-    /// Rebuilds the shared social card after a durable Pang/EXP/equipment mutation.
+    /// Rebuilds every process-local public projection after a durable economy mutation.
+    ///
+    /// The room actor owns immutable member identities, so updating only the social card leaves
+    /// `0x0048` and `0x0076` stale until relog. Load one bounded coherent snapshot, update social
+    /// state, and replace the room member in actor order; a room update is also broadcast as the
+    /// next census to every current client.
     async fn refresh_social_projection(
         &self,
         connection_id: PlayerConnectionId,
         account_id: AccountId,
-    ) -> Result<(), GameRuntimeError> {
+    ) -> Result<PlayerSnapshot, GameRuntimeError> {
         let snapshot = self
             .repository
             .load_player_snapshot(account_id)
             .await
             .map_err(|_| GameRuntimeError::Snapshot)?;
-        self.social
-            .update_card(connection_id, member_card(&snapshot));
-        Ok(())
+        let card = member_card(&snapshot);
+        let character = snapshot
+            .characters
+            .iter()
+            .find(|value| value.id == snapshot.equipment.character_id);
+        self.social.update_card(connection_id, card.clone());
+        // Not being in a room is the normal path for a shop mutation; do not turn that into a
+        // failed purchase. Once admitted, the actor serializes this replacement with room
+        // commands and publishes one coherent snapshot to all members.
+        match self
+            .lobby
+            .route(
+                connection_id,
+                LobbyRoomCommand::UpdateMemberProjection {
+                    card,
+                    character_id: Some(snapshot.equipment.character_id),
+                    character_iff_id: character.map(|value| value.item_type_id.get()),
+                },
+            )
+            .await
+        {
+            Ok(LobbyRouteResult::Snapshot(_))
+            | Err(RoomError::NotMember | RoomError::RoomNotFound) => {}
+            Ok(_) => return Err(GameRuntimeError::Protocol),
+            Err(_) => return Err(GameRuntimeError::Protocol),
+        }
+        Ok(snapshot)
     }
 
     /// Reads an account's current balances straight from storage.

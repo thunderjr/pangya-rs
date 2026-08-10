@@ -158,6 +158,15 @@ pub enum LobbyRoomCommand {
     Chat(ChatText),
     /// Broadcast a durable retail equipment change to every room member.
     EquipmentAnnounce(pangya_protocol::RetailEquipmentAnnounce),
+    /// Replace the caller's storage-derived public projection and broadcast a fresh census.
+    UpdateMemberProjection {
+        /// Fresh public card loaded from durable storage.
+        card: pangya_domain::MemberCard,
+        /// Fresh equipped character inventory identity.
+        character_id: Option<pangya_domain::CharacterId>,
+        /// Fresh equipped character catalog identity.
+        character_iff_id: Option<u32>,
+    },
     /// Owner-only removal of another authoritative connection ID.
     Kick(PlayerConnectionId),
     /// Fetch the caller's current authoritative room state.
@@ -1199,6 +1208,14 @@ impl LobbyRegistry {
                 .announce_equipment(announce)
                 .await
                 .map(|()| LobbyRouteResult::ChatAccepted),
+            LobbyRoomCommand::UpdateMemberProjection {
+                card,
+                character_id,
+                character_iff_id,
+            } => handle
+                .update_member_projection(connection_id, card, character_id, character_iff_id)
+                .await
+                .map(LobbyRouteResult::Snapshot),
             LobbyRoomCommand::Kick(target) => {
                 let result = handle.kick(connection_id, target).await;
                 if result.is_ok() {
