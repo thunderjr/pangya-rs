@@ -4523,6 +4523,8 @@ pub struct RoomProfile {
     pub shot_timer_ms: u32,
     /// Whole-game timer in milliseconds.
     pub game_timer_ms: u32,
+    /// Artifact catalog id selected for this room (reference server defaults to zero).
+    pub artifact_id: u32,
     /// Whether wind varies naturally.
     pub natural_wind: bool,
 }
@@ -4555,6 +4557,7 @@ impl RoomSettings {
                     hole_progression: 0,
                     shot_timer_ms: 30_000,
                     game_timer_ms: 600_000,
+                    artifact_id: 0,
                     natural_wind: false,
                 },
             })

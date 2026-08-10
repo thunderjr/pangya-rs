@@ -7685,9 +7685,19 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     );
     assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x004c);
 
+    // Repeat-hole has no authoritative semantics in the vendored references. It is a safe
+    // deterministic refusal, not a disconnect or a partial room mutation.
+    send_packet(&mut host, host_key, 11, 0x000a, &[0xff, 0xff, 1, 11, 1]).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(250))
+            .await
+            .is_empty(),
+        "unsupported repeat-hole edit has no misleading acknowledgement"
+    );
+
     // A truncated settings frame is malformed and closes the stream rather than being treated
     // as an empty edit or allowing a partial mutation.
-    send_packet(&mut host, host_key, 11, 0x000a, &[0xff]).await;
+    send_packet(&mut host, host_key, 12, 0x000a, &[0xff]).await;
     assert_closed(&mut host).await;
 
     drop(visitor);
@@ -8505,13 +8515,15 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (&mut visitor, visitor_key, "visitor"),
     ] {
         let frames = drain_available(stream, key, Duration::from_millis(2000)).await;
-        assert!(
-            frames.contains(&0x0065),
-            "{who} receives final hole finish: {frames:04x?}"
+        assert_eq!(
+            frames.iter().filter(|opcode| **opcode == 0x0065).count(),
+            1,
+            "{who} receives exactly one final hole finish: {frames:04x?}"
         );
-        assert!(
-            frames.contains(&0x0066),
-            "{who} receives final standings: {frames:04x?}"
+        assert_eq!(
+            frames.iter().filter(|opcode| **opcode == 0x0066).count(),
+            1,
+            "{who} receives exactly one final standings frame: {frames:04x?}"
         );
     }
 

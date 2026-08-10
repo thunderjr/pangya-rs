@@ -659,6 +659,8 @@ pub struct RetailRoom {
     pub game_timer_ms: u32,
     /// Numeric identity of the room owner.
     pub owner_uid: u32,
+    /// Artifact catalog id selected for the room.
+    pub artifact_id: u32,
     /// Whether wind varies naturally.
     pub natural_wind: bool,
 }
@@ -689,7 +691,7 @@ impl RetailRoom {
         writer.u32_le(self.owner_uid);
         // The later semantic type is distinct from the earlier UI-family byte for Practice.
         writer.u8(self.play_mode);
-        writer.u32_le(0); // artifact catalog id
+        writer.u32_le(self.artifact_id);
         writer.u32_le(u32::from(self.natural_wind));
         for _ in 0..4 {
             writer.u32_le(0); // event info
@@ -2561,6 +2563,7 @@ mod tests {
             shot_timer_ms: 30_000,
             game_timer_ms: 600_000,
             owner_uid: 42,
+            artifact_id: 1234,
             natural_wind: false,
         }
     }
@@ -2578,6 +2581,11 @@ mod tests {
         assert_eq!(payload[1], RoomListKind::Initial as u8);
         assert_eq!(u16::from_le_bytes([payload[2], payload[3]]), 0xffff);
         assert_eq!(&payload[4..13], b"Test Room");
+        assert_eq!(
+            u32::from_le_bytes(payload[4 + 186..4 + 190].try_into().expect("artifact")),
+            1234,
+            "the reference room-list record carries ArtifactID"
+        );
     }
 
     #[test]
@@ -2633,7 +2641,7 @@ mod tests {
     fn room_settings_update_decodes_every_applied_retail_setting() {
         let mut writer = PacketWriter::default();
         writer.u16_le(0xffff);
-        writer.u8(8);
+        writer.u8(9);
         writer.u8(1);
         writer
             .pstring(b"digest", ROOM_NAME_BYTES)
@@ -2652,6 +2660,8 @@ mod tests {
         writer.u8(30);
         writer.u8(14);
         writer.u32_le(1);
+        writer.u8(13);
+        writer.u32_le(0x1234_5678);
 
         let update = decode_packet_payload::<RetailRoomSettingsUpdate>(
             &writer.into_inner(),
@@ -2670,6 +2680,7 @@ mod tests {
                 RetailRoomSettingChange::PlayerCount(4),
                 RetailRoomSettingChange::GameTimerMinutes(30),
                 RetailRoomSettingChange::NaturalWind(true),
+                RetailRoomSettingChange::Artifact(0x1234_5678),
             ]
         );
     }

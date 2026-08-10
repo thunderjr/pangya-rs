@@ -194,7 +194,7 @@ All are gated on `game.retail_bootstrap = true` unless noted.
 | `0x0004` | `RetailSelectChannel` | `lib.rs:1271` | client-verified | `game.rs:147`; PacketDoc `gameservice/client/0004.ksy`, a **one-byte** sub-server ID |
 | `0x0008` | `RetailRoomCreate` | `lib.rs:5123` | client-verified | `us852_room.rs:101` |
 | `0x0009` | `RetailRoomJoin` | `lib.rs:5172` | client-verified | `us852_room.rs:141` |
-| `0x000a` | `RetailRoomSettingsUpdate` | decoder only; application still does not apply the changes | reference-derived | `us852_room.rs`; `pangbox--packetdoc` `gameservice/client/000a.ksy`; types 11/12 additionally `alter-pangya` `RoomSettingsUpdatePacketHandler.kt` |
+| `0x000a` | `RetailRoomSettingsUpdate` | applies validated identity, course/card shape, progression, timers, capacity, artifact id, and natural-wind edits atomically; unsupported repeat selectors (types 11/12) are refused without disconnecting | reference-derived | `us852_room.rs`; `pangbox--packetdoc` `gameservice/client/000a.ksy`; `pangbox/server` `RoomSettingsChange`/`RoomListRoom`; the checked corpus has no authoritative type-11/12 semantics |
 | `0x000d` | `RETAIL_C2S_ROOM_READY` | `lib.rs:5218` | client-verified (blocker 21) | one byte, zero meaning ready; the reply is the census, not an acknowledgement |
 | `0x000e` | `RETAIL_C2S_START_MATCH` | `lib.rs:4527` (stroke), `lib.rs:4384` (solo) | client-verified for start; the versus hole is CI-proven only | the room is read first: two members run the stroke aggregate, one runs solo |
 | `0x000f` | `RETAIL_C2S_ROOM_LEAVE` | `lib.rs:5234` | client-verified | |
@@ -293,9 +293,10 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 |---|---|---|
 | `RetailAimRotate` (`0x0056`) | `us852_match.rs:258` | aim rotation is never relayed; no handler decodes `0x0013` |
 | `RetailRoomCensus::Add` / `Remove` / `Update` | `us852_room.rs:1110` | lobby broadcasts are dropped in retail mode (`lib.rs:3425`), so a room does not update live |
+| `RetailRoomSettingChange::Artifact` | `us852_room.rs:118` | applied to the authoritative room profile and emitted in room-list records; reward calculation remains server-owned (`pangbox/server` `ArtifactID`) |
 | `HandoverRejection` (all eight codes) | `us852_bootstrap.rs:36` | a failed handover closes the connection instead of naming a client-visible reason |
 | `RetailRoomType::Chat` / `Tournament` / `Battle` | `us852_room.rs:41` | decoded from the create request, then discarded; every room runs the versus lifecycle |
-| `RetailRoomSettingChange::RepeatHole` / `FixedRepeatHole` / `Artifact` | `us852_room.rs:112-117` | explicitly refused until authoritative repeat/reward aggregates exist; values are never silently discarded |
+| `RetailRoomSettingChange::RepeatHole` / `FixedRepeatHole` | `us852_room.rs:112-117` | decoded for compatibility but deterministically refused without a disconnect; the checked references define no semantics for types 11/12, so the room remains unchanged |
 
 ### 2.7 Retail coverage in CI
 

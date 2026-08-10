@@ -5491,7 +5491,11 @@ where
             })
             .to_vec();
         standings.sort_by_key(|standing| standing.place);
-        self.send(framed, &RetailFinishHole).await?;
+        // The caller's accepted 0x0031 already received its 0x0065 in the command path when
+        // this was a nonterminal hole. On the terminal hole the room event is the single source
+        // of the finish frame for both roster members, including a member that has not sent its
+        // own duplicate 0x0031 yet. Never emit a second 0x0065 here: the retail client treats the
+        // duplicate as a second card completion and may leave the results screen twice.
         self.send(framed, &RetailMatchFinish { standings }).await
     }
 
@@ -6307,15 +6311,31 @@ where
                 // The holing shot was already counted through the ordinary action/result pair,
                 // so this completes the caller's hole without charging another stroke. The
                 // finish frame precedes the next 0x0053/turn sequence for a multi-hole card.
-                let _routed = self
+                let routed = self
                     .lobby
                     .route_stroke(identity.connection_id, LobbyStrokeCommand::HoleOut)
                     .await;
-                // Each connection's counter mirrors that participant's per-hole sequence;
-                // finishing this participant's hole resets it even while another participant
-                // may still be finishing the current card entry.
-                *strokes = 0;
-                self.send(framed, &RetailFinishHole).await?;
+                match routed {
+                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Waiting)) => {
+                        // Each connection's counter mirrors that participant's per-hole sequence;
+                        // finishing this participant's hole resets it even while another
+                        // participant may still be finishing the current card entry.
+                        *strokes = 0;
+                        self.send(framed, &RetailFinishHole).await?;
+                    }
+                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Settlement(_))) => {
+                        // The terminal room event sends one 0x0065 and one 0x0066 to every
+                        // captured roster member. Sending 0x0065 here as well duplicates the
+                        // final completion for whichever participant triggered settlement.
+                        *strokes = 0;
+                    }
+                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Duplicate))
+                    | Err(_) => {
+                        // Replayed 0x0031 is idempotent and has no wire reply. A transport race
+                        // after settlement is handled by the retained terminal room event.
+                    }
+                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                }
                 Ok(Some(state))
             }
             _ => Ok(None),
@@ -6391,12 +6411,18 @@ where
             wind,
         )
         .map_err(|_| GameRuntimeError::InvalidConfig)?;
+        // The room profile is authoritative for both the advertised and enforced deadlines.
+        // Process-wide values remain the loading fallback and stroke-count safety cap; using
+        // those turn/game defaults here made a 0x000a timer edit cosmetic.
+        let profile = snapshot.summary().profile();
+        let shot_timeout = Duration::from_millis(u64::from(profile.shot_timer_ms));
+        let game_timeout = Duration::from_millis(u64::from(profile.game_timer_ms));
         let plan = StrokeStartPlan::new(
             begin,
             [first.connection_id(), second.connection_id()],
             stroke.loading_timeout,
-            stroke.turn_timeout,
-            stroke.game_timeout,
+            shot_timeout,
+            game_timeout,
             stroke.max_strokes,
         )
         .map_err(|_| GameRuntimeError::InvalidConfig)?;
@@ -7666,6 +7692,10 @@ where
                 // overwrite the requested course or hole card.
                 if !matches!(request.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(request.course)
+                    || request.shot_timer_ms == 0
+                    || request.game_timer_ms == 0
+                    || request.shot_timer_ms > 3_600_000
+                    || request.game_timer_ms > 3_600_000
                 {
                     return self.reject_retail_join(framed, state).await;
                 }
@@ -7676,6 +7706,7 @@ where
                     hole_progression: 0,
                     shot_timer_ms: request.shot_timer_ms,
                     game_timer_ms: request.game_timer_ms,
+                    artifact_id: 0,
                     natural_wind: false,
                 });
                 let created = self
@@ -7836,13 +7867,19 @@ where
                         RetailRoomSettingChange::NaturalWind(enabled) => {
                             profile_update.natural_wind = enabled
                         }
+                        RetailRoomSettingChange::Artifact(artifact_id) => {
+                            // PacketDoc/pangbox carry this catalog id in the room record. The
+                            // reward aggregate does not yet consume it, so retain and advertise
+                            // the selected id while leaving reward calculation server-owned.
+                            profile_update.artifact_id = artifact_id;
+                        }
                         RetailRoomSettingChange::RepeatHole(_)
-                        | RetailRoomSettingChange::FixedRepeatHole(_)
-                        | RetailRoomSettingChange::Artifact(_) => {
-                            // These settings affect hole selection/rewards. Until their
-                            // authoritative aggregates exist, refuse them rather than silently
-                            // acknowledging a value the match will discard.
-                            return Err(GameRuntimeError::Protocol);
+                        | RetailRoomSettingChange::FixedRepeatHole(_) => {
+                            // No checked reference defines these tags or their reward/card
+                            // semantics. Refuse deterministically by leaving the room unchanged;
+                            // do not disconnect a real client for an unsupported optional edit.
+                            self.observer.unknown(GameUnknownObservation::Ignored);
+                            return Ok(state);
                         }
                     }
                 }
@@ -9090,6 +9127,7 @@ fn retail_room_from_summary(summary: &RoomSummary, request: &RetailRoomCreate) -
         shot_timer_ms: request.shot_timer_ms,
         game_timer_ms: request.game_timer_ms,
         owner_uid: 0,
+        artifact_id: 0,
         natural_wind: false,
     }
 }
@@ -9135,6 +9173,7 @@ fn retail_room_from_parts(summary: &RoomSummary, player_count: u8) -> RetailRoom
         shot_timer_ms: profile.shot_timer_ms,
         game_timer_ms: profile.game_timer_ms,
         owner_uid: 0,
+        artifact_id: profile.artifact_id,
         natural_wind: profile.natural_wind,
     }
 }
