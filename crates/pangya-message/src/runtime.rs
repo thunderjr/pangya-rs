@@ -3,11 +3,12 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_protocol::{FrameCodec, OutboundFrame, ServiceKind, us852_game_hello};
 use rand::{RngCore as _, rngs::OsRng};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    time::{Duration, interval},
+    time::{Duration, interval, timeout},
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
@@ -22,6 +23,7 @@ pub struct MessageService {
     key: u8,
     limits: pangya_protocol::CodecLimits,
     registry: std::sync::Arc<SessionRegistry>,
+    connections: Arc<tokio::sync::Semaphore>,
 }
 impl MessageService {
     /// Creates a listener around shared social state.
@@ -32,6 +34,7 @@ impl MessageService {
             key,
             limits,
             registry: std::sync::Arc::new(SessionRegistry::default()),
+            connections: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
     /// Composes a listener from durable storage.
@@ -46,6 +49,7 @@ impl MessageService {
             key,
             limits,
             registry: std::sync::Arc::new(SessionRegistry::default()),
+            connections: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
     /// Runs until cancellation. Each accepted connection gets a fresh authenticated session.
@@ -60,9 +64,16 @@ impl MessageService {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| MessageRuntimeError::Accept)?;
+                    let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let service = self.clone();
                     let token = shutdown.child_token();
-                    tokio::spawn(async move { let _ = service.connection(stream, peer.ip(), token).await; });
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = service.connection(stream, peer.ip(), token).await;
+                    });
                 }
             }
         }
@@ -81,9 +92,9 @@ impl MessageService {
             self.key
         };
         let hello = us852_game_hello(key).map_err(|_| MessageRuntimeError::Protocol)?;
-        stream
-            .write_all(&hello)
+        timeout(Duration::from_secs(5), stream.write_all(&hello))
             .await
+            .map_err(|_| MessageRuntimeError::Io)?
             .map_err(|_| MessageRuntimeError::Io)?;
         let mut framed = Framed::new(
             stream,
@@ -95,10 +106,20 @@ impl MessageService {
         let mut ticker = interval(Duration::from_millis(50));
         ticker.tick().await; // interval's immediate tick is not a useful poll
         let mut response_salt = 0;
+        let mut first_frame = true;
+        let mut last_activity = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => { let _ = session.disconnect().await; return Ok(()); },
+                _ = tokio::time::sleep_until(last_activity + if first_frame {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(120)
+                }) => {
+                    let _ = session.disconnect().await;
+                    return Err(MessageRuntimeError::Timeout);
+                }
                 _ = ticker.tick() => {
                     if session.is_authenticated() {
                         let responses = match session.poll().await {
@@ -112,6 +133,10 @@ impl MessageService {
                             let _ = session.disconnect().await;
                             return Err(error);
                         }
+                        if session.ack_pending().await.is_err() {
+                            let _ = session.disconnect().await;
+                            return Err(MessageRuntimeError::Rejected);
+                        }
                     }
                 }
                 next = framed.next() => {
@@ -120,7 +145,11 @@ impl MessageService {
                         return Ok(());
                     };
                     let frame = match frame {
-                        Ok(frame) => frame,
+                        Ok(frame) => {
+                            first_frame = false;
+                            last_activity = tokio::time::Instant::now();
+                            frame
+                        },
                         Err(_) => {
                             let _ = session.disconnect().await;
                             return Err(MessageRuntimeError::Protocol);
@@ -157,6 +186,10 @@ impl MessageService {
                     if let Err(error) = Self::send_responses(&mut framed, responses, response_salt).await {
                         let _ = session.disconnect().await;
                         return Err(error);
+                    }
+                    if session.ack_pending().await.is_err() {
+                        let _ = session.disconnect().await;
+                        return Err(MessageRuntimeError::Rejected);
                     }
                     if goodbye {
                         let _ = session.disconnect().await;
@@ -206,4 +239,6 @@ pub enum MessageRuntimeError {
     Protocol,
     #[error("MessageService authentication or operation was rejected")]
     Rejected,
+    #[error("MessageService connection timed out")]
+    Timeout,
 }

@@ -112,6 +112,78 @@ fn packetdoc_status_friend_entry_round_trips_without_single_hole_assumptions() {
     ));
 }
 
+#[test]
+fn super_ss_friend_entry_preserves_channel_status_relationship_and_block_fields() {
+    let entry = FriendEntry {
+        nickname: b"Bob".to_vec(),
+        alias: b"Friend".to_vec(),
+        user_id: 7,
+        channel: ChannelInfo {
+            room_number: 12,
+            room_type: 3,
+            server_id: 99,
+            channel_id: 4,
+            channel_name: b"Channel".to_vec(),
+        },
+        state: Presence::Busy,
+        relationship: Relationship::FriendAndGuild,
+        blocked: true,
+    };
+    let encoded = ServerPacket::FriendList {
+        page: Page {
+            number: 1,
+            total: 1,
+            current: 1,
+        },
+        entries: vec![entry.clone()],
+    }
+    .encode_payload()
+    .expect("encode");
+    let decoded = ServerPacket::decode(0x30, &encoded).expect("decode");
+    let ServerPacket::FriendList { entries, .. } = decoded else {
+        panic!("friend page")
+    };
+    assert_eq!(entries[0], entry);
+}
+
+#[tokio::test]
+async fn confirm_requires_pending_incoming_request() {
+    let store = MemoryStore::default();
+    store.register_user(User {
+        id: 1,
+        nickname: b"Alice".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    store.register_user(User {
+        id: 2,
+        nickname: b"Bob".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    let mut session = MessageSession::new(store.clone());
+    session
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+    assert_eq!(
+        session
+            .handle(ClientPacket::ConfirmFriend { user_id: 2 })
+            .await,
+        Err(MessageError::Rejected)
+    );
+    store.add_friend(2, 1).expect("incoming request");
+    assert!(
+        session
+            .handle(ClientPacket::ConfirmFriend { user_id: 2 })
+            .await
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn duplicate_message_sessions_fence_and_disconnect_old_generation() {
     let store = MemoryStore::default();

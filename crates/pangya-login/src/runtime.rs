@@ -1365,10 +1365,10 @@ where
             .map_err(|_| LoginRuntimeError::Repository)?;
         self.send(framed, &ChatMacros { values: macros }).await?;
         let message_servers = self.config.game_server.message_server.clone().map_or_else(
-            || pangya_protocol::MessageServerList {
+            || pangya_protocol::LoginMessageServerList {
                 servers: Vec::new(),
             },
-            |server| pangya_protocol::MessageServerList {
+            |server| pangya_protocol::LoginMessageServerList {
                 servers: vec![server],
             },
         );

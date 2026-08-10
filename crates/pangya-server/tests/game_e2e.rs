@@ -7371,6 +7371,7 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
                 starter: starter(1, 0x1000_0000),
                 allowed_character_types: vec![0x0400_0000],
                 game_server: AdvertisedGameServer {
+                    message_server: None,
                     id: 1,
                     name: "Macro Fixture".to_owned(),
                     ipv4: "127.0.0.1".to_owned(),

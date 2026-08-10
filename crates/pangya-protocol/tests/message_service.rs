@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
 use pangya_protocol::{
-    CompatibilityProfile, EncodePacket, MessageServerEntry, MessageServerList, PacketWriter,
-    RetailMessageServerList, UnknownBytes,
+    CompatibilityProfile, EncodePacket, LoginMessageServerList as MessageServerList,
+    MessageServerEntry, PacketWriter, RetailMessageServerList, UnknownBytes,
 };
 
 fn entry() -> MessageServerEntry {
