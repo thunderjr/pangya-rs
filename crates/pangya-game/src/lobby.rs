@@ -14,8 +14,8 @@ use futures_util::{StreamExt as _, stream::FuturesOrdered};
 use pangya_domain::{
     AbortMatch, AbortStrokeMatch, AccountId, BeginSoloMatch, BeginStrokeMatch, ChatText,
     CommitSoloHole, CommitStrokeMatch, MarkSoloInGame, MarkStrokeInGame, MatchAbortReason, MatchId,
-    MatchResultKey, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword, RoomSettings,
-    RoomSnapshot, RoomSummary, SoloMatchResult, StrokeMatchResult,
+    MatchResultKey, MemberSnapshot, PlayerConnectionId, RoomError, RoomId, RoomName, RoomPassword,
+    RoomSettings, RoomSnapshot, RoomSummary, SoloMatchResult, StrokeMatchResult,
 };
 use pangya_protocol::{
     LoadingComplete, ShotAction, ShotResult, StrokeLoadingComplete, StrokeShotAction,
@@ -456,6 +456,11 @@ enum LobbyCommand {
     Leave {
         connection_id: PlayerConnectionId,
         reply: oneshot::Sender<Result<Option<RoomSnapshot>, RoomError>>,
+    },
+    /// Privileged removal that still goes through the room actor's authoritative kick path.
+    Kick {
+        target: PlayerConnectionId,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
     Route {
         connection_id: PlayerConnectionId,
@@ -902,6 +907,14 @@ impl LobbyHandle {
             },
             Arc::clone(&gate),
         )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    /// Removes one live member through the authoritative room kick event path.
+    pub async fn kick(&self, target: PlayerConnectionId) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(LobbyCommand::Kick { target, reply }, Arc::clone(&gate))?;
         Self::await_reply(&gate, receive, self.command_timeout).await?
     }
 
@@ -1563,6 +1576,29 @@ impl LobbyRegistry {
         }
     }
 
+    async fn kick_target(&mut self, target: PlayerConnectionId) -> Result<RoomSnapshot, RoomError> {
+        let room_id = self.room_for(target)?;
+        let handle = self
+            .rooms
+            .get(&room_id)
+            .map(|record| record.handle.clone())
+            .ok_or(RoomError::RoomNotFound)?;
+        // Ask the actor for the owner rather than inventing a caller identity. The actor's normal
+        // kick implementation then performs all ownership/self-kick/membership checks and emits
+        // the exact Kicked event to the removed member.
+        let state = handle.state().await?;
+        let owner = state
+            .members()
+            .iter()
+            .find(|member| member.is_owner())
+            .map(MemberSnapshot::connection_id)
+            .ok_or(RoomError::MemberNotFound)?;
+        let snapshot = handle.kick(owner, target).await?;
+        self.connections.remove(&target);
+        self.update_snapshot(room_id, &snapshot);
+        Ok(snapshot)
+    }
+
     async fn route(
         &mut self,
         connection_id: PlayerConnectionId,
@@ -2152,6 +2188,10 @@ async fn run_lobby(
                     let result = registry.leave_connection(connection_id).await;
                     let _ignored = reply.send(result);
                 }
+                Some(LobbyCommand::Kick { target, reply }) => {
+                    let result = registry.kick_target(target).await;
+                    let _ignored = reply.send(result);
+                }
                 Some(LobbyCommand::Route { connection_id, command, reply }) => {
                     let result = registry.route(connection_id, command).await;
                     let _ignored = reply.send(result);
@@ -2442,6 +2482,39 @@ mod tests {
             listed
                 .first()
                 .is_some_and(|summary| summary.members() <= summary.max_members())
+        );
+        assert!(lobby.shutdown().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gm_kick_uses_room_kicked_event_and_removes_target_mapping() {
+        let lobby = spawn_lobby(limits(4));
+        let room = create(&lobby, 1, 3).await;
+        let (target_tx, mut target_rx) = mpsc::channel(8);
+        lobby
+            .join(
+                room.id(),
+                identity(2),
+                None,
+                target_tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("join target");
+
+        let snapshot = lobby.kick(id(2)).await.expect("gm kick");
+        assert_eq!(snapshot.members().len(), 1);
+        assert_eq!(lobby.leave(id(2)).await, Err(RoomError::NotMember));
+        let mut saw_kicked = false;
+        while let Some(event) = target_rx.recv().await {
+            if matches!(event, RoomEvent::Kicked { by } if by.connection_id() == id(1)) {
+                saw_kicked = true;
+                break;
+            }
+        }
+        assert!(
+            saw_kicked,
+            "GM kick must deliver the authoritative Kicked event"
         );
         assert!(lobby.shutdown().await.is_ok());
     }

@@ -787,6 +787,35 @@ async fn connect_game(address: std::net::SocketAddr) -> (TcpStream, u8) {
     (stream, hello[3])
 }
 
+async fn connect_synthetic_channel(
+    pool: &PgPool,
+    address: std::net::SocketAddr,
+    account_id: AccountId,
+    salt: u8,
+) -> (TcpStream, u8) {
+    let token = issue_token(pool, account_id, SystemTime::now(), ServiceKind::Game).await;
+    let (mut stream, key) = connect_game(address).await;
+    send_packet(
+        &mut stream,
+        key,
+        salt,
+        2,
+        &auth_payload(account_id.get(), &token),
+    )
+    .await;
+    read_bootstrap(&mut stream, key, 1).await;
+    send_packet(
+        &mut stream,
+        key,
+        salt.wrapping_add(1),
+        4,
+        &1_u32.to_le_bytes(),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    (stream, key)
+}
+
 /// Reads the nine-byte retail GameService hello, pinning its constants over real TCP.
 ///
 /// A real client that receives the shorter synthetic hello reads the following frame at the
@@ -933,6 +962,139 @@ async fn drain_available(stream: &mut TcpStream, key: u8, budget: Duration) -> V
         .into_iter()
         .map(|(opcode, _)| opcode)
         .collect()
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn encrypted_tcp_gm_kick_and_disconnect_use_persisted_capability_and_room_side_effects(
+    pool: PgPool,
+) {
+    let gm = create_account(&pool, "GmWire", 1, 0x1000_0000).await;
+    let host = create_account(&pool, "GmHost", 1, 0x1000_0000).await;
+    let target = create_account(&pool, "GmTarget", 1, 0x1000_0000).await;
+    let non_gm = create_account(&pool, "GmReject", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE accounts SET game_master = TRUE WHERE id = $1")
+        .bind(gm.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("persist GM capability");
+
+    let (address, shutdown, task, _) = start_game(pool.clone(), GameRuntimeLimits::default()).await;
+    // The persisted flag is read during authentication; a client-claimed identity packet is not
+    // involved. Authenticate the GM first so the target's live OID is the authoritative 3.
+    let (mut gm_stream, gm_key) = connect_synthetic_channel(&pool, address, gm.account.id, 1).await;
+    let (mut host_stream, host_key) =
+        connect_synthetic_channel(&pool, address, host.account.id, 3).await;
+    let (mut target_stream, target_key) =
+        connect_synthetic_channel(&pool, address, target.account.id, 5).await;
+    let (mut rejected_stream, rejected_key) =
+        connect_synthetic_channel(&pool, address, non_gm.account.id, 7).await;
+
+    // A non-GM cannot turn a client packet into capability and is terminated without mutation.
+    send_packet(
+        &mut rejected_stream,
+        rejected_key,
+        8,
+        0x008f,
+        &[10, 0, 3, 0, 0, 0, 1],
+    )
+    .await;
+    assert_closed(&mut rejected_stream).await;
+
+    send_typed(
+        &mut host_stream,
+        host_key,
+        9,
+        &RoomCreateRequest {
+            name: RoomName::parse("GM kick room").expect("room name"),
+            password: None,
+            settings: RoomSettings::new(3).expect("room settings"),
+        },
+    )
+    .await;
+    receive_result(
+        &mut host_stream,
+        host_key,
+        RoomCommand::Create,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let created = receive_typed::<RoomStateResponse>(&mut host_stream, host_key).await;
+    let room_id = created.room.summary().id();
+    assert_eq!(created.room.members().len(), 1);
+
+    send_typed(
+        &mut target_stream,
+        target_key,
+        10,
+        &RoomJoinRequest {
+            room_id,
+            password: None,
+        },
+    )
+    .await;
+    receive_result(
+        &mut target_stream,
+        target_key,
+        RoomCommand::Join,
+        RoomCommandResult::Success,
+    )
+    .await;
+    let joined = receive_typed::<RoomStateResponse>(&mut target_stream, target_key).await;
+    assert_eq!(joined.room.members().len(), 2);
+    let target_oid = 3_u32;
+
+    // GM subcommand 10 must use the room actor's kick event rather than silently disconnecting.
+    send_packet(
+        &mut gm_stream,
+        gm_key,
+        11,
+        0x008f,
+        &[10, 0, target_oid as u8, 0, 0, 0, 1],
+    )
+    .await;
+    let kicked_frames =
+        drain_frames_with_grace(&mut target_stream, target_key, Duration::from_secs(2)).await;
+    let kicked = kicked_frames
+        .iter()
+        .find_map(|(opcode, body)| {
+            (*opcode == <RoomMembershipEvent as DecodePacket>::OPCODE).then(|| {
+                decode_packet_payload::<RoomMembershipEvent>(
+                    body,
+                    &CompatibilityProfile::US_852,
+                    ProtocolServiceKind::Game,
+                )
+                .expect("Kicked event")
+            })
+        })
+        .expect("target receives a Kicked membership frame");
+    assert_eq!(kicked.room_id, room_id);
+    assert_eq!(kicked.kind, RoomMembershipKind::Kicked);
+    assert_eq!(
+        kicked.member.connection_id(),
+        PlayerConnectionId::new(2).expect("host OID")
+    );
+
+    // The target is in channel state, not a stale room state, after the Kicked event.
+    send_typed(&mut target_stream, target_key, 12, &RoomListRequest).await;
+    let listed = receive_typed::<RoomListResponse>(&mut target_stream, target_key).await;
+    assert_eq!(listed.rooms.len(), 1);
+    assert_eq!(listed.rooms[0].id(), room_id);
+
+    // GM subcommand 11 is deliberately different: it cancels the owning socket task.
+    send_packet(
+        &mut gm_stream,
+        gm_key,
+        13,
+        0x008f,
+        &[11, 0, target_oid as u8, 0, 0, 0],
+    )
+    .await;
+    assert_closed(&mut target_stream).await;
+
+    drop(host_stream);
+    drop(gm_stream);
+    shutdown.cancel();
+    task.await.expect("GM game task").expect("GM game serve");
 }
 
 #[tokio::test]

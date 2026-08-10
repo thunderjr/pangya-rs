@@ -1908,6 +1908,7 @@ where
                         Ok(RoomEventEffect::EnterChannel) => {
                             state = GameState::InChannel;
                             room_id = None;
+                            self.social.set_room(connection_id, None);
                         }
                         Ok(RoomEventEffect::EnterRoom) => {
                             state = GameState::InRoom;
@@ -2833,7 +2834,7 @@ where
                     .connection_for_oid(oid)
                     .ok_or(GameRuntimeError::Protocol)?;
                 self.lobby
-                    .disconnect(target)
+                    .kick(target)
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
             }
@@ -3604,6 +3605,7 @@ where
                         match initial {
                             Ok(snapshot) => {
                                 *room_id = Some(summary.id());
+                                self.social.set_room(identity.connection_id, *room_id);
                                 self.send_result(framed, RoomCommand::Create, Ok(()))
                                     .await?;
                                 self.send(framed, &RoomStateResponse { room: snapshot })
@@ -3649,6 +3651,7 @@ where
                 match result {
                     Ok(snapshot) => {
                         *room_id = Some(requested_room);
+                        self.social.set_room(identity.connection_id, *room_id);
                         self.send_result(framed, RoomCommand::Join, Ok(())).await?;
                         self.send(framed, &RoomStateResponse { room: snapshot })
                             .await?;
@@ -3671,6 +3674,7 @@ where
                         self.send_result(framed, RoomCommand::Leave, Ok(())).await?;
                         self.observer.room(GameRoomObservation::Left);
                         *room_id = None;
+                        self.social.set_room(identity.connection_id, None);
                         Ok(GameState::InChannel)
                     }
                     Err(error) => {
