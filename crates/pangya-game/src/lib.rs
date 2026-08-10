@@ -1277,12 +1277,12 @@ where
             // catalog does not: its Course table is a presentation row with no par field, so
             // par is operator-declared and there is nothing here to compare it against.
             let catalog_course = catalog
-                .declared_one_hole_course(course.course_id(), course.par())
+                .declared_course_plan(course.course_id(), course.par())
                 .map_err(|_| GameRuntimeError::Catalog)?;
             if catalog_course != course || catalog.fingerprint() != fingerprint {
                 return Err(GameRuntimeError::Catalog);
             }
-            if let Ok(derived) = catalog.one_hole_course(course.course_id())
+            if let Ok(derived) = catalog.course_plan(course.course_id())
                 && derived != course
             {
                 return Err(GameRuntimeError::Catalog);
@@ -5068,7 +5068,7 @@ where
             .map_err(|_| GameRuntimeError::InvalidConfig)?;
         let declared = self
             .catalog
-            .one_hole_course(course_id)
+            .course_plan(course_id)
             .map_err(|_| GameRuntimeError::InvalidConfig)?;
         MatchPlan::with_holes(
             course_id,
@@ -9655,7 +9655,7 @@ mod tests {
     fn solo_config(catalog: &Catalog, commit_timeout: Duration) -> SoloRuntimeConfig {
         SoloRuntimeConfig {
             course: catalog
-                .one_hole_course(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+                .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
                 .unwrap_or_else(|_| unreachable!()),
             catalog_fingerprint: catalog.fingerprint(),
             loading_timeout: Duration::from_secs(5),
@@ -9709,7 +9709,7 @@ mod tests {
     fn stroke_config(catalog: &Catalog, commit_timeout: Duration) -> StrokeRuntimeConfig {
         StrokeRuntimeConfig {
             course: catalog
-                .one_hole_course(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+                .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
                 .unwrap_or_else(|_| unreachable!()),
             catalog_fingerprint: catalog.fingerprint(),
             loading_timeout: Duration::from_secs(5),
@@ -11479,7 +11479,7 @@ mod tests {
     async fn solo_runtime_cross_checks_catalog_and_persists_cleanup_abort_once() {
         let catalog = test_catalog();
         let course = catalog
-            .one_hole_course(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+            .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
             .unwrap_or_else(|_| unreachable!());
         let solo = SoloRuntimeConfig {
             course,

@@ -312,16 +312,16 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
 ///
 /// A declared par wins over a catalog-derived one so that an operator can always override a
 /// generated catalog's value; a catalog with no par of its own then requires the declaration.
-fn resolve_one_hole_course(
+fn resolve_course_plan(
     catalog: &Catalog,
     course_id: CourseId,
     declared_par: Option<u8>,
 ) -> Result<MatchPlan, ServerError> {
     match declared_par {
         Some(par) => catalog
-            .declared_one_hole_course(course_id, par)
+            .declared_course_plan(course_id, par)
             .map_err(|_| ServerError::Data),
-        None => catalog.one_hole_course(course_id).map_err(|error| {
+        None => catalog.course_plan(course_id).map_err(|error| {
             // Distinguish "this catalog has no par to give" from "this course is not in the
             // catalog", because only the first one is fixed by editing configuration.
             if catalog.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {
@@ -339,7 +339,7 @@ fn resolve_solo_runtime_config(
     solo: Option<configuration::ValidatedSoloPractice>,
 ) -> Result<Option<SoloRuntimeConfig>, ServerError> {
     solo.map(|solo| {
-        let course = resolve_one_hole_course(catalog, solo.course_id, solo.course_par)?;
+        let course = resolve_course_plan(catalog, solo.course_id, solo.course_par)?;
         Ok(SoloRuntimeConfig {
             course,
             catalog_fingerprint: catalog.fingerprint(),
@@ -359,7 +359,7 @@ fn resolve_stroke_runtime_config(
 ) -> Result<Option<StrokeRuntimeConfig>, ServerError> {
     stroke
         .map(|stroke| {
-            let course = resolve_one_hole_course(catalog, stroke.course_id, stroke.course_par)?;
+            let course = resolve_course_plan(catalog, stroke.course_id, stroke.course_par)?;
             Ok(StrokeRuntimeConfig {
                 course,
                 catalog_fingerprint: catalog.fingerprint(),

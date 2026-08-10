@@ -598,7 +598,7 @@ fn solo_service(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"))
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -654,7 +654,7 @@ fn stroke_service_with_deadlines(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"))
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -4458,7 +4458,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
     let repository = Arc::new(BlockingStrokeCommitRepository::new(pool.clone()));
     let catalog = m5_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"))
         .expect("one-hole course");
     let service = Arc::new(
         GameService::new(
@@ -7571,7 +7571,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
 async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"))
         .expect("one-hole course");
     let account = create_account(&pool, "RetailGolfer", 1, 0x1000_0000).await;
     let service = Arc::new(
@@ -7831,7 +7831,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"))
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;

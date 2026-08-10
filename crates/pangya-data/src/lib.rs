@@ -184,7 +184,7 @@ pub struct CatalogRecord {
     pub type_id: ItemTypeId,
     /// Remaining unattested v1 record bytes. Exact v2 records always leave this empty.
     pub opaque: Arc<[u8]>,
-    local_one_hole_par: Option<u8>,
+    local_course_par: Option<u8>,
     definition: Option<ItemDefinition>,
     character_part_slot: Option<u8>,
     name: Option<Box<str>>,
@@ -194,8 +194,8 @@ pub struct CatalogRecord {
 impl CatalogRecord {
     /// Returns the explicit local one-hole par only for a generated Course record.
     #[must_use]
-    pub const fn local_one_hole_par(&self) -> Option<u8> {
-        self.local_one_hole_par
+    pub const fn local_course_par(&self) -> Option<u8> {
+        self.local_course_par
     }
 
     /// Returns the client's own display name, when the record carries one.
@@ -500,15 +500,15 @@ impl Catalog {
     /// Returns a checked local one-hole configuration from the optional Course family.
     ///
     /// Only the generated schemas carry a par byte. A real client catalog has none, so this
-    /// rejects it rather than inventing one; use [`Self::declared_one_hole_course`] there.
+    /// rejects it rather than inventing one; use [`Self::declared_course_plan`] there.
     ///
     /// # Errors
     /// Rejects a missing course, a zero/out-of-range course ID, or invalid generated par.
-    pub fn one_hole_course(&self, course_id: CourseId) -> Result<MatchPlan, CatalogError> {
+    pub fn course_plan(&self, course_id: CourseId) -> Result<MatchPlan, CatalogError> {
         let record = self
             .record(CatalogKind::Course, ItemTypeId::new(course_id.get()))
             .ok_or(CatalogError::Binding)?;
-        let par = record.local_one_hole_par().ok_or(CatalogError::Structure)?;
+        let par = record.local_course_par().ok_or(CatalogError::Structure)?;
         MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)
     }
 
@@ -524,7 +524,7 @@ impl Catalog {
     ///
     /// # Errors
     /// Rejects a course absent from the Course family, or a par outside the domain's range.
-    pub fn declared_one_hole_course(
+    pub fn declared_course_plan(
         &self,
         course_id: CourseId,
         par: u8,
@@ -685,7 +685,7 @@ pub fn parse_iff_bytes(
     let mut records = BTreeMap::new();
     for record in bytes[IFF_HEADER_BYTES..].chunks_exact(entry.record_size) {
         let type_id = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
-        let (local_one_hole_par, opaque) = if entry.kind == CatalogKind::Course {
+        let (local_course_par, opaque) = if entry.kind == CatalogKind::Course {
             let course_id = CourseId::new(type_id).map_err(|_| CatalogError::Structure)?;
             let par = *record.get(4).ok_or(CatalogError::Structure)?;
             MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)?;
@@ -696,7 +696,7 @@ pub fn parse_iff_bytes(
         let value = CatalogRecord {
             type_id: ItemTypeId::new(type_id),
             opaque: Arc::from(opaque),
-            local_one_hole_par,
+            local_course_par,
             definition: None,
             character_part_slot: None,
             // The synthetic schemas carry no name or icon field.
@@ -940,7 +940,7 @@ pub fn parse_client_iff_bytes(
         let value = CatalogRecord {
             type_id: ItemTypeId::new(type_id),
             opaque: Arc::from(&record[CLIENT_TYPE_ID_OFFSET + 4..]),
-            local_one_hole_par: None,
+            local_course_par: None,
             definition: client_definition(entry.kind, ItemTypeId::new(type_id), record)?,
             character_part_slot: None,
             name: client_name(record),
@@ -1014,7 +1014,7 @@ fn parse_iff_bytes_for_schema(
         let record = CatalogRecord {
             type_id: minimal.type_id,
             opaque: Arc::from([]),
-            local_one_hole_par: minimal.local_one_hole_par,
+            local_course_par: minimal.local_course_par,
             definition,
             character_part_slot: slot,
             // The synthetic v2 schemas carry neither field.
@@ -1462,7 +1462,7 @@ mod tests {
         let parsed = parse_iff_bytes(&entry(2, 8), &iff(&[11, 22], 8)).expect("catalog");
         assert_eq!(parsed[&11].type_id, ItemTypeId::new(11));
         assert_eq!(parsed[&22].opaque.as_ref(), [0xa5; 4]);
-        assert_eq!(parsed[&22].local_one_hole_par(), None);
+        assert_eq!(parsed[&22].local_course_par(), None);
     }
 
     #[test]
@@ -1472,7 +1472,7 @@ mod tests {
         let mut bytes = iff(&[7], 5);
         bytes[12] = 3;
         let parsed = parse_iff_bytes(&course_entry, &bytes).expect("course");
-        assert_eq!(parsed[&7].local_one_hole_par(), Some(3));
+        assert_eq!(parsed[&7].local_course_par(), Some(3));
         bytes[12] = 0;
         assert_eq!(
             parse_iff_bytes(&course_entry, &bytes),
@@ -1579,7 +1579,7 @@ mod tests {
         let character = CatalogRecord {
             type_id: ItemTypeId::new(10),
             opaque: Arc::from([]),
-            local_one_hole_par: None,
+            local_course_par: None,
             definition: None,
             character_part_slot: None,
             name: None,
@@ -1588,7 +1588,7 @@ mod tests {
         let part = CatalogRecord {
             type_id: ItemTypeId::new(20),
             opaque: Arc::from([]),
-            local_one_hole_par: None,
+            local_course_par: None,
             definition: Some(ItemDefinition {
                 type_id: ItemTypeId::new(20),
                 kind: ItemKind::CharacterPart,

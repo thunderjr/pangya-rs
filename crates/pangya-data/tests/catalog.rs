@@ -47,7 +47,7 @@ fn generated_golden_catalog_loads_and_cross_checks_starter() {
         b"CLUB"
     );
     let course = catalog
-        .one_hole_course(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"))
         .expect("generated course");
     assert_eq!(
         (course.course_id().get(), course.hole(), course.par()),
