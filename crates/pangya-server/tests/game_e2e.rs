@@ -7975,6 +7975,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 400,
+                    outbound_room_event_capacity: 256,
                     ..GameRuntimeLimits::default()
                 },
                 solo_practice: Some(SoloRuntimeConfig {

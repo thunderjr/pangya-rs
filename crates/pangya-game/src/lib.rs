@@ -5471,6 +5471,11 @@ where
         context: Option<ConnectionStrokeContext>,
     ) -> Result<(), GameRuntimeError> {
         let context = context.ok_or(GameRuntimeError::Protocol)?;
+        eprintln!(
+            "RETAIL_COMMIT conn={} match={}",
+            context.roster[0].get(),
+            result.match_id().get()
+        );
         if context.match_id != result.match_id() {
             return Err(GameRuntimeError::Protocol);
         }
