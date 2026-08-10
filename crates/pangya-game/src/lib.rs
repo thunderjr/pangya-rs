@@ -7836,7 +7836,9 @@ mod tests {
     }
 
     #[test]
-    fn retail_client_exception_uses_reference_body_and_rejects_truncation() {
+    fn retail_client_exception_uses_reference_body_and_rejects_truncation_or_trailing_bytes() {
+        // pangbox's ClientException is exactly one filler byte followed by one PString. The
+        // references do not define an extension tail, so an exact body is the safe policy.
         let valid = [0, 4, 0, b's', b'a', b'f', b'e'];
         let report = decode_packet_payload::<RetailClientException>(
             &valid,
@@ -7846,15 +7848,16 @@ mod tests {
         .unwrap_or_else(|_| unreachable!());
         assert_eq!(report.message, b"safe");
 
-        let malformed = [0, 1, 0];
-        assert!(
-            decode_packet_payload::<RetailClientException>(
-                &malformed,
-                &CompatibilityProfile::US_852,
-                ServiceKind::Game,
-            )
-            .is_err()
-        );
+        for malformed in [[0, 1, 0].as_slice(), &[0, 0, 0, 0][..]] {
+            assert!(
+                decode_packet_payload::<RetailClientException>(
+                    malformed,
+                    &CompatibilityProfile::US_852,
+                    ServiceKind::Game,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
