@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
     AccountRepository, AccountStatus, BalanceGrant, BeginSoloMatch, BeginSoloMatchOutcome,
-    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CommitSoloHole,
+    BeginStrokeMatch, BeginStrokeMatchOutcome, CatalogFingerprint, CharacterId, CommitSoloHole,
     CommitStrokeMatch, ConsumeHandover, ConsumeItem, CourseId, CredentialHash, EconomyCommit,
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverDigest, HandoverError, HandoverRepository, IncompleteMatchAbortLimit,
@@ -17,9 +17,9 @@ use pangya_domain::{
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
     MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
-    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange,
+    ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+    StorageFault, StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
     StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
@@ -145,6 +145,382 @@ fn account(username: &str, nickname: Option<&str>) -> NewAccount {
         nickname: nickname.map(|value| Nickname::parse(value).expect("test nickname")),
         starter: starter(),
     }
+}
+
+#[sqlx::test]
+async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
+    migrate(&pool).await.expect("migration");
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_operator_account(account("retailslots", Some("RetailSlots")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let caddie_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762049, 'test.caddie', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("owned caddie");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            aggregate.equipment.version,
+            RetailEquipmentChange::Caddie(u32::try_from(caddie_id).expect("caddie id")),
+        )
+        .await
+        .expect("owned equip");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(state.caddie.map(|(_, type_id)| type_id), Some(469762049));
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+    assert_eq!(version, i64::from(aggregate.equipment.version) + 1);
+    let consumable_type = 402_653_185_u32;
+    let skin_type = 1_879_048_961_u32;
+    let mascot_type = 1_073_741_825_u32;
+    let _consumable_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.consumable', 5, 'consumable') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(consumable_type)).fetch_one(&pool).await.expect("consumable");
+    let _skin_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.skin', 1, 'skin') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(skin_type)).fetch_one(&pool).await.expect("skin");
+    let mascot_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.mascot', 1, 'mascot') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(mascot_type)).fetch_one(&pool).await.expect("mascot");
+    let part_type = 134_217_729_u32;
+    let part_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.character-part', 1, 'character_part') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(part_type)).fetch_one(&pool).await.expect("character part");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Consumables([consumable_type, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        )
+        .await
+        .expect("consumables");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(state.consumables[0], consumable_type);
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Decoration([skin_type, 0, 0, 0, 0, 0]),
+        )
+        .await
+        .expect("decoration");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(state.decoration[0], skin_type);
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Mascot(u32::try_from(mascot_id).expect("mascot id")),
+        )
+        .await
+        .expect("mascot");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(state.mascot.map(|(_, type_id)| type_id), Some(mascot_type));
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::CutIn {
+                character_id: aggregate.equipment.character_id,
+                data: [7; 16],
+            },
+        )
+        .await
+        .expect("cut-in");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(state.cut_in.map(|(_, data)| data), Some([7; 16]));
+    let version = version + 1;
+    let mut part_types = [0_u32; 24];
+    let mut part_ids = [0_u32; 24];
+    part_types[23] = part_type;
+    part_ids[23] = u32::try_from(part_id).expect("part id");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            EconomyOperationId::new(uuid::Uuid::new_v4()),
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::CharacterParts {
+                character_id: aggregate.equipment.character_id,
+                type_ids: part_types,
+                inventory_ids: part_ids,
+                hair_color: 0,
+            },
+        )
+        .await
+        .expect("character parts");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
+    assert_eq!(
+        state.character_parts.map(|(_, types, _)| types[23]),
+        Some(part_type)
+    );
+    let version = version + 1;
+    assert!(
+        repository
+            .update_retail_equipment(
+                account_id,
+                EconomyOperationId::new(uuid::Uuid::new_v4()),
+                u32::try_from(version).expect("version"),
+                RetailEquipmentChange::Caddie(999_999)
+            )
+            .await
+            .is_err()
+    );
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'caddie'")
+        .bind(account_id.get()).fetch_one(&pool).await.expect("slot");
+    assert_eq!(
+        retained, 1,
+        "rejected ownership must not clear the prior selection"
+    );
+    let missing_character = CharacterId::new(9_999_999).expect("character id");
+    assert!(
+        repository
+            .update_retail_equipment(
+                account_id,
+                EconomyOperationId::new(uuid::Uuid::new_v4()),
+                u32::try_from(version).expect("version"),
+                RetailEquipmentChange::CutIn {
+                    character_id: missing_character,
+                    data: [0; 16],
+                },
+            )
+            .await
+            .is_err(),
+        "an empty cut-in still must name an owned character"
+    );
+}
+
+#[sqlx::test]
+async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
+    migrate(&pool).await.expect("migration");
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_operator_account(account("retailreplay", Some("RetailReplay")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let first_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762049, 'test.replay.caddie.one', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("first caddie");
+    let second_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762050, 'test.replay.caddie.two', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("second caddie");
+    let first = u32::try_from(first_id).expect("first id");
+    let second = u32::try_from(second_id).expect("second id");
+    let operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let initial_version = aggregate.equipment.version;
+    let committed = repository
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("initial update");
+    let committed_state = match committed {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("initial update unexpectedly replayed"),
+    };
+    assert_eq!(
+        committed_state.caddie.map(|(_, kind)| kind),
+        Some(469762049)
+    );
+    let version_after_commit: i64 =
+        sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after commit");
+    let replayed = repository
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("exact replay");
+    let replayed_state = match replayed {
+        EconomyCommit::Replayed(state) => state,
+        EconomyCommit::Committed(_) => panic!("exact retry unexpectedly committed"),
+    };
+    assert_eq!(replayed_state, committed_state);
+    assert_eq!(version_after_commit, i64::from(initial_version) + 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM retail_equipment_operations WHERE operation_id = $1",
+        )
+        .bind(operation.get())
+        .fetch_one(&pool)
+        .await
+        .expect("operation ledger count"),
+        1
+    );
+
+    let intervening_operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let intervening = repository
+        .update_retail_equipment(
+            account_id,
+            intervening_operation,
+            u32::try_from(version_after_commit).expect("version"),
+            RetailEquipmentChange::Caddie(second),
+        )
+        .await
+        .expect("intervening update");
+    // A fresh repository instance must use the durable ledger, not connection-local replay state.
+    let restarted = PgRepository::new(pool.clone());
+    let replay_after_mutation = restarted
+        .update_retail_equipment(
+            account_id,
+            operation,
+            initial_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+        .await
+        .expect("replay after mutation");
+    let replay_after_mutation_state = match replay_after_mutation {
+        EconomyCommit::Replayed(state) => state,
+        EconomyCommit::Committed(_) => panic!("replay after mutation unexpectedly committed"),
+    };
+    assert_eq!(replay_after_mutation_state, committed_state);
+    assert!(
+        restarted
+            .update_retail_equipment(
+                account_id,
+                operation,
+                initial_version,
+                RetailEquipmentChange::Caddie(second),
+            )
+            .await
+            .is_err(),
+        "reusing an operation key with changed input must be rejected"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after replay"),
+        version_after_commit + 1
+    );
+    let intervening_state = match intervening {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("intervening update unexpectedly replayed"),
+    };
+    assert_eq!(
+        repository
+            .load_retail_equipment(account_id)
+            .await
+            .expect("projection")
+            .caddie,
+        intervening_state.caddie
+    );
+
+    let concurrent_operation = EconomyOperationId::new(uuid::Uuid::new_v4());
+    let expected_version = u32::try_from(version_after_commit + 1).expect("version");
+    let left = repository.clone();
+    let right = repository.clone();
+    let (left, right) = tokio::join!(
+        left.update_retail_equipment(
+            account_id,
+            concurrent_operation,
+            expected_version,
+            RetailEquipmentChange::Caddie(first),
+        ),
+        right.update_retail_equipment(
+            account_id,
+            concurrent_operation,
+            expected_version,
+            RetailEquipmentChange::Caddie(first),
+        )
+    );
+    let left = left.expect("left concurrent retry");
+    let right = right.expect("right concurrent retry");
+    assert_ne!(
+        matches!(left, EconomyCommit::Committed(_)),
+        matches!(right, EconomyCommit::Committed(_)),
+        "same-key concurrency must expose exactly one newly-applied result"
+    );
+    let left_state = match left {
+        EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+    };
+    let right_state = match right {
+        EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+    };
+    assert_eq!(left_state, right_state);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version after concurrent retries"),
+        version_after_commit + 2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM retail_equipment_operations WHERE operation_id = $1",
+        )
+        .bind(concurrent_operation.get())
+        .fetch_one(&pool)
+        .await
+        .expect("concurrent operation ledger count"),
+        1
+    );
 }
 
 #[sqlx::test]
@@ -3305,6 +3681,36 @@ async fn economy_purchase_replay_consume_repair_equip_and_audits_are_atomic(pool
         panic!("equip must commit");
     };
     assert_eq!(equipped.version, 1);
+    // A different equipment commit may advance the live version before an encrypted runtime
+    // retry returns. The exact operation must replay its durable result, not compare this current
+    // version and must not overwrite the intervening selection.
+    let intervening = EquipmentChange {
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        expected_version: equipped.version,
+        club: None,
+        ..equipment
+    };
+    let EconomyCommit::Committed(intervening_result) = repository
+        .equip(intervening)
+        .await
+        .expect("intervening equip")
+    else {
+        panic!("intervening equip must commit");
+    };
+    assert_eq!(intervening_result.version, 2);
+    assert_eq!(
+        repository.equip(equipment).await,
+        Ok(EconomyCommit::Replayed(equipped))
+    );
+    assert_eq!(
+        repository
+            .load_player_snapshot(account_id)
+            .await
+            .expect("intervening projection")
+            .equipment
+            .version,
+        2
+    );
     let raced = EquipmentChange {
         operation_id: EconomyOperationId::new(Uuid::new_v4()),
         ..equipment
@@ -3338,7 +3744,7 @@ async fn economy_purchase_replay_consume_repair_equip_and_audits_are_atomic(pool
     .fetch_one(&pool)
     .await
     .expect("audit counts");
-    assert_eq!(counts, (6, 3, 5, 1));
+    assert_eq!(counts, (7, 3, 5, 2));
     assert!(
         sqlx::query("UPDATE economy_operations SET command = 'repair' WHERE operation_id = $1")
             .bind(purchase.operation_id.get())

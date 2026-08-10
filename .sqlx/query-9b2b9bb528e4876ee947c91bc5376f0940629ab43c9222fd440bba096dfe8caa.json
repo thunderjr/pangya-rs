@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.character_id, s.slot_index, s.item_type_id, s.inventory_item_id FROM character_part_slots s JOIN profiles p ON p.selected_character_id = s.character_id WHERE s.account_id = $1 ORDER BY s.slot_index",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "character_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "slot_index",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "inventory_item_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9b2b9bb528e4876ee947c91bc5376f0940629ab43c9222fd440bba096dfe8caa"
+}

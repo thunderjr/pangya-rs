@@ -94,6 +94,8 @@ impl RetailMatchRelay {
 pub enum RoomEvent {
     /// Membership/settings/ready state changed.
     Snapshot(RoomSnapshot),
+    /// A validated retail equipment change is broadcast to every room member.
+    EquipmentAnnounce(pangya_protocol::RetailEquipmentAnnounce),
     /// A validated chat message was broadcast.
     Chat {
         /// Authoritative sender projection.
@@ -1446,6 +1448,12 @@ impl RoomState {
         }
     }
 
+    fn announce_equipment(&self, announce: pangya_protocol::RetailEquipmentAnnounce) {
+        for member in &self.members {
+            let _delivered = self.deliver(member, RoomEvent::EquipmentAnnounce(announce.clone()));
+        }
+    }
+
     fn broadcast_snapshot(&self, snapshot: &RoomSnapshot) {
         for member in &self.members {
             let _delivered = self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
@@ -1478,6 +1486,10 @@ enum RoomCommand {
     Chat {
         caller: PlayerConnectionId,
         text: ChatText,
+        reply: oneshot::Sender<Result<(), RoomError>>,
+    },
+    EquipmentAnnounce {
+        announce: pangya_protocol::RetailEquipmentAnnounce,
         reply: oneshot::Sender<Result<(), RoomError>>,
     },
     Kick {
@@ -1790,6 +1802,16 @@ impl RoomHandle {
             ready,
             reply,
         })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Broadcasts a validated retail equipment change to all current room members.
+    pub async fn announce_equipment(
+        &self,
+        announce: pangya_protocol::RetailEquipmentAnnounce,
+    ) -> Result<(), RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::EquipmentAnnounce { announce, reply })?;
         receive.await.map_err(|_| RoomError::Closed)?
     }
 
@@ -2468,6 +2490,11 @@ fn handle_normal(
             reply,
         } => {
             let _ignored = reply.send(state.chat(caller, text));
+            true
+        }
+        RoomCommand::EquipmentAnnounce { announce, reply } => {
+            state.announce_equipment(announce);
+            let _ignored = reply.send(Ok(()));
             true
         }
         RoomCommand::Kick {
@@ -3364,6 +3391,41 @@ mod tests {
             state.prepare_solo_start(first.connection_id, solo),
             Err(SoloMatchError::InvalidPhase)
         );
+    }
+
+    #[tokio::test]
+    async fn retail_equipment_announce_is_delivered_to_every_room_member() {
+        let (owner_tx, mut owner_rx) = mpsc::channel(8);
+        let (guest_tx, mut guest_rx) = mpsc::channel(8);
+        let owner = identity(1);
+        let guest = identity(2);
+        let (handle, _) = spawn_room(
+            RoomId::new(1).unwrap_or_else(|_| unreachable!()),
+            RoomName::parse("equipment").unwrap_or_else(|_| unreachable!()),
+            None,
+            RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+            owner,
+            owner_tx,
+            RoomActorLimits::default(),
+        );
+        handle
+            .join(guest, None, guest_tx)
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        while owner_rx.try_recv().is_ok() {}
+        while guest_rx.try_recv().is_ok() {}
+        let announce = pangya_protocol::RetailEquipmentAnnounce::Ball {
+            connection_id: 1,
+            ball_type_id: 7,
+        };
+        handle
+            .announce_equipment(announce.clone())
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let owner_event = owner_rx.recv().await.unwrap_or_else(|| unreachable!());
+        let guest_event = guest_rx.recv().await.unwrap_or_else(|| unreachable!());
+        assert_eq!(owner_event, RoomEvent::EquipmentAnnounce(announce.clone()));
+        assert_eq!(guest_event, RoomEvent::EquipmentAnnounce(announce));
     }
 
     #[tokio::test]

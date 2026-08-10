@@ -11,6 +11,7 @@ struct OperationRow {
     request_type_id: Option<i64>,
     request_quantity: Option<i64>,
     request_inventory_id: Option<i64>,
+    #[allow(dead_code)]
     request_expected_version: Option<i64>,
     request_character_id: Option<i64>,
     request_character_type_id: Option<i64>,
@@ -801,8 +802,10 @@ fn replay_equip(
 ) -> Result<EquipmentChangeResult, EconomyError> {
     let club = request.club.map(|item| item.inventory_id.get());
     let ball = request.ball.map(|item| item.inventory_id.get());
+    // The operation key is the durable identity. A retry may arrive after another equipment
+    // mutation has advanced the live optimistic version; compare that version only on the new
+    // operation path, never while replaying this exact ledger row.
     if !same_account_command(row, request.account_id, "equip")
-        || row.request_expected_version != Some(i64::from(request.expected_version))
         || row.request_character_id != Some(request.character_id.get())
         || row.request_character_type_id != Some(i64::from(request.character_type_id.get()))
         || row.request_club_item_id != club

@@ -49,10 +49,11 @@ use pangya_domain::{
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
     MemberSnapshot, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
-    PurchaseRequest, RepairItem, RepositoryError, RoomError, RoomId, RoomName, RoomPassword,
-    RoomProfile, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind,
-    ShopOverlay, SoloMatchResult, SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion,
-    StrokeMatchResult, StrokeParticipant, StrokeRosterOrder,
+    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, RoomError, RoomId,
+    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
+    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
+    StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -70,24 +71,25 @@ use pangya_protocol::{
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
     RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
-    RetailEquipment, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
-    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
-    RetailInventoryItem, RetailLoadProgress, RetailLockerCombinationAttempt,
-    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
-    RetailLoginBonusRequest, RetailLoginBonusStatus, RetailMascotSeed, RetailMatchFinish,
-    RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance, RetailPangRate,
-    RetailPangSpent, RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryRequest,
-    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
-    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeShotSync,
-    RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest,
-    RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin,
-    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd,
-    RetailTurnStart, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
+    RetailEquipment, RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
+    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
+    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
+    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
+    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailMascotSeed, RetailMatchFinish, RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck,
+    RetailMatchPlayer, RetailMatchStart, RetailMultiplayerJoined, RetailMultiplayerLeft,
+    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
+    RetailPangBalance, RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
+    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
+    RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
+    RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem,
+    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
+    RetailRoomCreate, RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
+    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
+    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
+    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand, RoomCommandResult,
     RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection, RoomJoinRequest,
     RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest, RoomListResponse,
     RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
@@ -1259,8 +1261,6 @@ where
         // replay reuses its commit, while a later intentional purchase (new salt) is a new command.
         let retail_purchase_scope = uuid::Uuid::new_v4();
         let mut retail_purchase_replays = RetailWireReplayWindow::new();
-        let retail_equipment_scope = uuid::Uuid::new_v4();
-        let mut retail_equipment_replays = RetailWireReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
         let mut unknown_strikes = 0_u32;
@@ -1439,21 +1439,45 @@ where
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
+                                && matches!(frame.opcode, RETAIL_C2S_EQUIPMENT_LOBBY | RETAIL_C2S_EQUIPMENT_ROOM)
+                                // The existing retail practice start also uses 0x000c with the
+                                // reference-defined type-7 four-word body; preserve that full
+                                // lifecycle path rather than stealing its start frame.
+                                && !(frame.opcode == RETAIL_C2S_EQUIPMENT_ROOM
+                                    && frame.payload.first() == Some(&7)
+                                    && frame.payload.len() == 17)
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if (frame.opcode == RETAIL_C2S_EQUIPMENT_LOBBY && state != GameState::InChannel)
+                                    || (frame.opcode == RETAIL_C2S_EQUIPMENT_ROOM && state != GameState::InRoom)
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                if let Err(error) = self
+                                    .handle_retail_room_equipment_update(
+                                        &mut framed,
+                                        state,
+                                        established,
+                                        frame.opcode,
+                                        &frame.payload,
+                                    )
+                                    .await
+                                {
+                                    break Err(error);
+                                }
+                            } else if self.config.retail_bootstrap
                                 && frame.opcode == RetailEquipmentUpdate::OPCODE
                             {
                                 let Some(established) = identity.as_mut() else {
                                     break Err(GameRuntimeError::Protocol);
                                 };
-                                let payload_digest: [u8; 32] = Sha256::digest(&frame.payload).into();
-                                let equipment_sequence = retail_equipment_replays
-                                    .sequence(frame.metadata.salt, payload_digest);
                                 match self
                                     .handle_retail_equipment_update(
                                         &mut framed,
                                         established.account_id,
                                         &frame.payload,
-                                        retail_equipment_scope,
-                                        equipment_sequence,
                                     )
                                     .await
                                 {
@@ -1467,6 +1491,21 @@ where
                                         established.card = card;
                                     }
                                     Ok(None) => {}
+                                    Err(GameRuntimeError::EconomyPersistence) => {
+                                        if let Some(slot) = frame
+                                            .payload
+                                            .first()
+                                            .and_then(|tag| RetailEquipmentSlot::from_tag(*tag))
+                                        {
+                                            self.send(
+                                                &mut framed,
+                                                &RetailEquipmentUpdated::Rejected { slot },
+                                            )
+                                            .await?;
+                                        } else {
+                                            break Err(GameRuntimeError::Protocol);
+                                        }
+                                    }
                                     Err(error) => break Err(error),
                                 }
                             } else if self.config.retail_bootstrap
@@ -3569,6 +3608,12 @@ where
                 RoomEvent::Chat { .. } => {
                     return Ok(RoomEventEffect::Remain);
                 }
+                RoomEvent::EquipmentAnnounce(announce) => {
+                    if state == GameState::InRoom {
+                        self.send(framed, announce).await?;
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
                 RoomEvent::SoloStarted(plan) => {
                     let begin = plan.begin();
                     // A solo hole has no turn arbitration, so the client's own timers are the
@@ -3790,6 +3835,10 @@ where
             RoomEvent::Snapshot(room) => {
                 self.send(framed, &RoomStateResponse { room }).await?;
                 self.observer.room(GameRoomObservation::StateSent);
+                Ok(RoomEventEffect::Remain)
+            }
+            RoomEvent::EquipmentAnnounce(announce) => {
+                self.send(framed, &announce).await?;
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::Chat { from, text } => {
@@ -5333,19 +5382,300 @@ where
         }
     }
 
-    /// Applies the retail character/ball updates this server can persist and reports stored state.
+    async fn handle_retail_room_equipment_update(
+        &self,
+        _framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+        identity: &RoomIdentity,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), GameRuntimeError> {
+        let profile = &CompatibilityProfile::US_852;
+        let update = if opcode == RETAIL_C2S_EQUIPMENT_LOBBY {
+            decode_packet_payload::<RetailLobbyEquipmentUpdate>(payload, profile, ServiceKind::Game)
+                .map_err(|_| GameRuntimeError::Protocol)?
+                .0
+        } else {
+            decode_packet_payload::<RetailRoomEquipmentUpdatePacket>(
+                payload,
+                profile,
+                ServiceKind::Game,
+            )
+            .map_err(|_| GameRuntimeError::Protocol)?
+            .0
+        };
+        let snapshot = self
+            .repository
+            .load_player_snapshot(identity.account_id)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        // A replay returns the durable projection but must not fan out a second room event. The
+        // wire packet has no operation result bit, so suppress announcements when the requested
+        // selection already equals the coherent pre-update projection.
+        let should_announce;
+        // Room equipment packets have no application operation id. Derive a stable key from the
+        // authenticated account and exact frame so transport retries replay the same economy
+        // operation instead of incrementing the equipment version again.
+        // The exact authenticated frame includes its opcode. Without it, identical lobby and
+        // room bodies (for example `0x000b` and `0x000c` character changes) would alias one
+        // durable operation and incorrectly suppress the room mutation as a replay.
+        let mut operation_scope = Vec::with_capacity(2 + payload.len());
+        operation_scope.extend_from_slice(&opcode.to_le_bytes());
+        operation_scope.extend_from_slice(payload);
+        let mut scope_bytes = [0_u8; 16];
+        scope_bytes.copy_from_slice(&Sha256::digest(operation_scope)[..16]);
+        let scope = uuid::Uuid::from_bytes(scope_bytes);
+        let announce = match update {
+            RetailRoomEquipmentUpdate::Caddie(item_id) => {
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        identity.account_id,
+                        retail_equipment_operation_id(
+                            identity.account_id,
+                            RetailEquipmentSlot::Caddie,
+                            item_id,
+                            0,
+                            scope,
+                            0,
+                        ),
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::Caddie(item_id),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, announce) = result.into_parts();
+                should_announce = announce;
+                let (uid, type_id) = state
+                    .caddie
+                    .map(|(id, type_id)| (u32::try_from(id.get()).unwrap_or(0), type_id))
+                    .unwrap_or((0, 0));
+                RetailEquipmentAnnounce::Caddie {
+                    connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    caddie_uid: uid,
+                    caddie_type_id: type_id,
+                }
+            }
+            RetailRoomEquipmentUpdate::Ball(ball_type_id) => {
+                let ball = snapshot
+                    .inventory
+                    .iter()
+                    .find(|item| item.item_type_id.get() == ball_type_id)
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::Ball)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                let club = snapshot
+                    .equipment
+                    .club_item_id
+                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::ClubSet)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                if ball_type_id != 0 && ball.is_none() {
+                    return Err(GameRuntimeError::EconomyPersistence);
+                }
+                let result = self
+                    .repository
+                    .equip(EquipmentChange {
+                        account_id: identity.account_id,
+                        operation_id: retail_equipment_operation_id(
+                            identity.account_id,
+                            RetailEquipmentSlot::Ball,
+                            ball_type_id,
+                            0,
+                            scope,
+                            0,
+                        ),
+                        catalog: self.catalog.fingerprint(),
+                        expected_version: snapshot.equipment.version,
+                        character_id: snapshot.equipment.character_id,
+                        character_type_id: snapshot
+                            .characters
+                            .iter()
+                            .find(|c| c.id == snapshot.equipment.character_id)
+                            .map(|c| c.item_type_id)
+                            .ok_or(GameRuntimeError::Snapshot)?,
+                        club,
+                        ball,
+                    })
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = result.was_applied();
+                RetailEquipmentAnnounce::Ball {
+                    connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    ball_type_id,
+                }
+            }
+            RetailRoomEquipmentUpdate::ClubSet(club_item_id) => {
+                let club = snapshot
+                    .inventory
+                    .iter()
+                    .find(|item| item.id.get() == i64::from(club_item_id))
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::ClubSet)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                let ball = snapshot
+                    .equipment
+                    .ball_item_id
+                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::Ball)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                let club_type_id = club
+                    .map(|v| v.definition.type_id.get())
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
+                let result = self
+                    .repository
+                    .equip(EquipmentChange {
+                        account_id: identity.account_id,
+                        operation_id: retail_equipment_operation_id(
+                            identity.account_id,
+                            RetailEquipmentSlot::Ball,
+                            club_item_id,
+                            club_type_id,
+                            scope,
+                            0,
+                        ),
+                        catalog: self.catalog.fingerprint(),
+                        expected_version: snapshot.equipment.version,
+                        character_id: snapshot.equipment.character_id,
+                        character_type_id: snapshot
+                            .characters
+                            .iter()
+                            .find(|c| c.id == snapshot.equipment.character_id)
+                            .map(|c| c.item_type_id)
+                            .ok_or(GameRuntimeError::Snapshot)?,
+                        club,
+                        ball,
+                    })
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = result.was_applied();
+                RetailEquipmentAnnounce::ClubSet {
+                    connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    club_item_id,
+                    club_type_id,
+                }
+            }
+            RetailRoomEquipmentUpdate::Character(character_uid) => {
+                let character_id = CharacterId::new(i64::from(character_uid))
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let character = snapshot
+                    .characters
+                    .iter()
+                    .find(|value| value.id == character_id)
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
+                let club = snapshot
+                    .equipment
+                    .club_item_id
+                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::ClubSet)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                let ball = snapshot
+                    .equipment
+                    .ball_item_id
+                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
+                    .and_then(|item| {
+                        self.catalog
+                            .item_definition(item.item_type_id)
+                            .filter(|d| d.kind == ItemKind::Ball)
+                            .map(|definition| EconomyItemSelector {
+                                inventory_id: item.id,
+                                definition: *definition,
+                            })
+                    });
+                let result = self
+                    .repository
+                    .equip(EquipmentChange {
+                        account_id: identity.account_id,
+                        operation_id: retail_equipment_operation_id(
+                            identity.account_id,
+                            RetailEquipmentSlot::Character,
+                            character_uid,
+                            0,
+                            scope,
+                            0,
+                        ),
+                        catalog: self.catalog.fingerprint(),
+                        expected_version: snapshot.equipment.version,
+                        character_id,
+                        character_type_id: character.item_type_id,
+                        club,
+                        ball,
+                    })
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = result.was_applied();
+                RetailEquipmentAnnounce::Character {
+                    connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
+                    character_type_id: character.item_type_id.get(),
+                    character_uid,
+                }
+            }
+            RetailRoomEquipmentUpdate::UnknownSeven {
+                character,
+                caddie,
+                club_set,
+                ball,
+            } => {
+                let _ = (character, caddie, club_set, ball);
+                return Err(GameRuntimeError::Protocol);
+            }
+        };
+        if state == GameState::InRoom && should_announce {
+            let _ = self
+                .lobby
+                .route(
+                    identity.connection_id,
+                    LobbyRoomCommand::EquipmentAnnounce(announce),
+                )
+                .await
+                .map_err(|_| GameRuntimeError::Protocol)?;
+        }
+        Ok(())
+    }
+
+    /// Applies a tagged retail `0x0020` update and reports the transaction's stored projection.
     ///
-    /// A real client sends `0x0020` repeatedly in My Room. Character parts, caddies, consumables
-    /// and decoration still have no durable aggregate here, so those requests revert to the stored
-    /// zero/current projection rather than being falsely acknowledged. Character and Ball use the
-    /// same owned/catalog-validated optimistic equipment transaction as synthetic M7.
+    /// A real client sends this repeatedly in My Room. Every modeled family is ownership-checked
+    /// and persisted before the `0x006b` acknowledgement; character and ball continue to use the
+    /// proven minimum equipment transaction.
     async fn handle_retail_equipment_update(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
         account_id: AccountId,
         payload: &[u8],
-        operation_scope: uuid::Uuid,
-        operation_sequence: u64,
     ) -> Result<Option<MemberCard>, GameRuntimeError> {
         let profile = &CompatibilityProfile::US_852;
         let request =
@@ -5356,30 +5686,183 @@ where
             requested = ?request.requested,
             "retail equipment update decoded"
         );
-        // Character parts and the two unclassified slots have no reply this server can form
-        // honestly, so they are accepted and left alone rather than answered with a guess.
-        //
-        // The part set is now decoded rather than dropped — see `RetailCharacterParts` — but
-        // nothing persists it yet, so this still ends here. Logging the worn slot count makes
-        // the gap visible in a live session instead of silent. Migration 0011 adds the table
-        // this will write to; wiring it is the remaining half of `SPEC_DURABLE_PLAYER_STATE`
-        // milestone E2.
-        if let RetailEquipmentRequested::CharacterParts(parts) = request.requested {
-            let worn = parts.part_type_ids.iter().filter(|id| **id != 0).count();
-            tracing::debug!(
-                character_id = parts.character_id,
-                character_type_id = parts.character_type_id,
-                worn_slots = worn,
-                "retail character parts decoded but not yet persisted"
-            );
+        let operation_id = retail_equipment_update_operation_id(account_id, payload);
+        // Every non-minimum slot goes through one ownership-checked transaction. The returned
+        // projection is the acknowledgement, never the packet's untrusted values.
+        let persisted = match request.requested {
+            RetailEquipmentRequested::CharacterParts(parts) => {
+                let character_id = CharacterId::new(i64::from(parts.character_id))
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let character = snapshot
+                    .characters
+                    .iter()
+                    .find(|character| character.id == character_id)
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
+                if character.item_type_id.get() != parts.character_type_id {
+                    return Err(GameRuntimeError::EconomyPersistence);
+                }
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::CharacterParts {
+                            character_id,
+                            type_ids: parts.part_type_ids,
+                            inventory_ids: parts.part_uids,
+                            hair_color: parts.hair_color,
+                        },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, _was_applied) = result.into_parts();
+                let (durable_id, durable_types, durable_uids) = state
+                    .character_parts
+                    .filter(|(id, _, _)| *id == character_id)
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
+                Some(RetailEquipmentUpdated::CharacterFull(RetailCharacter {
+                    iff_id: character.item_type_id.get(),
+                    uid: u32::try_from(durable_id.get()).unwrap_or(0),
+                    hair_color: u32::from(state.character_hair_color),
+                    part_iff_ids: durable_types,
+                    part_uids: durable_uids,
+                    stats: [0; CHARACTER_STATS],
+                    mastery: 0,
+                }))
+            }
+            RetailEquipmentRequested::Caddie(item_id) => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::Caddie(item_id),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, _was_applied) = result.into_parts();
+                Some(RetailEquipmentUpdated::Caddie {
+                    caddie_id: state
+                        .caddie
+                        .map(|(id, _)| u32::try_from(id.get()).unwrap_or(0))
+                        .unwrap_or(0),
+                })
+            }
+            RetailEquipmentRequested::Consumables(values) => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::Consumables(values),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, _was_applied) = result.into_parts();
+                Some(RetailEquipmentUpdated::Consumables {
+                    item_type_ids: state.consumables,
+                })
+            }
+            RetailEquipmentRequested::Decoration(values) => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::Decoration(values),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, _was_applied) = result.into_parts();
+                Some(RetailEquipmentUpdated::Decoration {
+                    type_ids: state.decoration,
+                })
+            }
+            RetailEquipmentRequested::Mascot(item_id) => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let _state = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::Mascot(item_id),
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                Some(RetailEquipmentUpdated::Mascot { data: [0; 62] })
+            }
+            RetailEquipmentRequested::CutIn { character_id, data } => {
+                let snapshot = self
+                    .repository
+                    .load_player_snapshot(account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                let character_id = CharacterId::new(i64::from(character_id))
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                if !snapshot
+                    .characters
+                    .iter()
+                    .any(|character| character.id == character_id)
+                {
+                    return Err(GameRuntimeError::EconomyPersistence);
+                }
+                let result = self
+                    .repository
+                    .update_retail_equipment(
+                        account_id,
+                        operation_id,
+                        snapshot.equipment.version,
+                        RetailEquipmentChange::CutIn { character_id, data },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, _was_applied) = result.into_parts();
+                let (durable_character_id, durable_data) =
+                    state.cut_in.ok_or(GameRuntimeError::EconomyPersistence)?;
+                Some(RetailEquipmentUpdated::CutIn {
+                    character_id: u32::try_from(durable_character_id.get()).unwrap_or(0),
+                    data: durable_data,
+                })
+            }
+            _ => None,
+        };
+        if let Some(reply) = persisted {
+            self.send(framed, &reply).await?;
+            return Ok(None);
         }
         let reply = match request.requested {
             RetailEquipmentRequested::CharacterParts(_)
-            | RetailEquipmentRequested::UnknownEight(_)
-            | RetailEquipmentRequested::UnknownNine { .. } => {
-                self.observer.unknown(GameUnknownObservation::Ignored);
-                return Ok(None);
-            }
+            | RetailEquipmentRequested::Mascot(_)
+            | RetailEquipmentRequested::CutIn { .. } => return Ok(None),
             RetailEquipmentRequested::Caddie(_) => RetailEquipmentUpdated::Caddie { caddie_id: 0 },
             RetailEquipmentRequested::Consumables(_) => RetailEquipmentUpdated::Consumables {
                 item_type_ids: [0; pangya_protocol::RETAIL_CONSUMABLE_SLOTS],
@@ -5473,7 +5956,11 @@ where
                     request.requested,
                     RetailEquipmentRequested::BallAndClub { .. }
                 ) {
-                    valid &= club.is_some();
+                    // Zero clears a slot; a nonzero club row must be an owned catalog club set.
+                    valid &= requested_aux == 0 || club.is_some();
+                }
+                if !valid {
+                    return Err(GameRuntimeError::EconomyPersistence);
                 }
                 let changed = match request.requested {
                     RetailEquipmentRequested::BallAndClub { .. } => {
@@ -5497,8 +5984,8 @@ where
                         request.slot,
                         ball_type_id,
                         requested_aux,
-                        operation_scope,
-                        operation_sequence,
+                        operation_id.get(),
+                        0,
                     );
                     match timeout(
                         economy.command_timeout,
@@ -6067,8 +6554,17 @@ where
             .iter()
             .find(|value| value.id == snapshot.equipment.character_id)
             .ok_or(GameRuntimeError::Snapshot)?;
+        let retail_state = self
+            .repository
+            .load_retail_equipment(snapshot.account.id)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
         let equipment = RetailEquipment {
-            caddie_uid: 0,
+            caddie_uid: retail_state
+                .caddie
+                .map(|(id, _)| narrow(id.get()))
+                .transpose()?
+                .unwrap_or(0),
             character_uid: narrow(snapshot.equipment.character_id.get())?,
             club_set_uid: snapshot
                 .equipment
@@ -6087,7 +6583,10 @@ where
                         .map(|item| item.item_type_id.get())
                 })
                 .unwrap_or(0),
-            item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+            item_iff_ids: retail_state.consumables,
+            decoration_slots: retail_state.decoration_slots,
+            decoration_iff_ids: retail_state.decoration,
+            furniture_ids: [0; 2],
         };
         let reply = HandoverReply {
             server_name: b"pangya-rs".to_vec(),
@@ -6117,13 +6616,29 @@ where
                 character: RetailCharacter {
                     iff_id: character.item_type_id.get(),
                     uid: narrow(character.id.get())?,
-                    hair_color: 0,
-                    part_iff_ids: [0; CHARACTER_PARTS],
-                    part_uids: [0; CHARACTER_PARTS],
+                    hair_color: u32::from(retail_state.character_hair_color),
+                    part_iff_ids: retail_state
+                        .character_parts
+                        .filter(|(id, _, _)| *id == character.id)
+                        .map(|(_, types, _)| types)
+                        .unwrap_or([0; CHARACTER_PARTS]),
+                    part_uids: retail_state
+                        .character_parts
+                        .filter(|(id, _, _)| *id == character.id)
+                        .map(|(_, _, ids)| ids)
+                        .unwrap_or([0; CHARACTER_PARTS]),
                     stats: [0; CHARACTER_STATS],
                     mastery: 0,
                 },
-                caddie: RetailCaddie::default(),
+                caddie: retail_state
+                    .caddie
+                    .map(|(id, type_id)| RetailCaddie {
+                        uid: narrow(id.get()).unwrap_or(0),
+                        iff_id: type_id,
+                        level: 0,
+                        experience: 0,
+                    })
+                    .unwrap_or_default(),
                 club_set_iff_id: club_set_iff_id(snapshot),
             },
             server_time: retail_now(),
@@ -6729,6 +7244,9 @@ fn retail_match_player(slot: usize, member: &MemberSnapshot) -> RetailMatchPlaye
                 club_set_uid: card.club_set_uid,
                 comet_iff_id: card.comet_iff_id,
                 item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+                decoration_slots: [0; 6],
+                decoration_iff_ids: [0; 6],
+                furniture_ids: [0; 2],
             },
             character: RetailCharacter {
                 iff_id: card.character_iff_id,
@@ -6826,6 +7344,24 @@ impl RetailWireReplayWindow {
     }
 }
 
+/// Derives a restart-stable operation key for one exact retail `0x0020` frame.
+///
+/// The packet has no application operation identifier, so the authenticated account and complete
+/// wire payload form its durable identity. This intentionally does not include connection state.
+fn retail_equipment_update_operation_id(
+    account_id: AccountId,
+    payload: &[u8],
+) -> EconomyOperationId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"retail-equipment-update-v1");
+    hasher.update(account_id.get().to_le_bytes());
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    EconomyOperationId::new(uuid::Uuid::from_bytes(bytes))
+}
+
 /// Derives a stable operation key for one retail equipment frame.
 fn retail_equipment_operation_id(
     account_id: AccountId,
@@ -6876,6 +7412,10 @@ fn retail_purchase_operation_id(
     EconomyOperationId::new(uuid::Uuid::from_bytes(bytes))
 }
 
+/// Retail equipment change in channel/lobby, packetdoc client opcode `0x000b`.
+const RETAIL_C2S_EQUIPMENT_LOBBY: u16 = 0x000b;
+/// Retail equipment change in a room, packetdoc client opcode `0x000c`.
+const RETAIL_C2S_EQUIPMENT_ROOM: u16 = 0x000c;
 /// Retail room-leave client opcode.
 const RETAIL_C2S_ROOM_LEAVE: u16 = 0x000f;
 /// Retail multiplayer-mode enter client opcode, sent when the client opens the room directory.
@@ -7067,6 +7607,8 @@ fn is_retail_room_opcode(opcode: u16) -> bool {
         opcode,
         RetailRoomCreate::OPCODE
             | RetailRoomJoin::OPCODE
+            | RETAIL_C2S_EQUIPMENT_LOBBY
+            | RETAIL_C2S_EQUIPMENT_ROOM
             | RETAIL_C2S_ROOM_LEAVE
             | RETAIL_C2S_ROOM_READY
             | RETAIL_C2S_ROOM_EDIT
@@ -7267,6 +7809,28 @@ mod tests {
             window.sequence(7, digest),
             first,
             "an evicted replay key becomes a new bounded command"
+        );
+    }
+
+    #[test]
+    fn retail_equipment_operation_id_is_restart_stable_and_payload_bound() {
+        let account = AccountId::new(7).unwrap_or_else(|_| unreachable!());
+        let payload = [RetailEquipmentSlot::Consumables.tag(), 1, 2, 3];
+        let same = retail_equipment_update_operation_id(account, &payload);
+        assert_eq!(
+            same,
+            retail_equipment_update_operation_id(account, &payload)
+        );
+        assert_ne!(
+            same,
+            retail_equipment_update_operation_id(account, &[payload[0], 1, 2, 4])
+        );
+        assert_ne!(
+            same,
+            retail_equipment_update_operation_id(
+                AccountId::new(8).unwrap_or_else(|_| unreachable!()),
+                &payload
+            )
         );
     }
 
@@ -7632,6 +8196,22 @@ mod tests {
                 .unwrap_or_else(|_| unreachable!()),
             shot_packets_per_window: 80,
         }
+    }
+
+    #[test]
+    fn retail_equipment_change_opcodes_are_routed_as_room_commands() {
+        assert!(is_retail_room_opcode(0x000b));
+        assert!(is_retail_room_opcode(0x000c));
+    }
+
+    #[test]
+    fn retail_equipment_announce_reaches_room_peers() {
+        // The room actor must fan this event to every member; a self-only reply leaves peers
+        // stale until they reconnect.
+        let _ = RoomEvent::EquipmentAnnounce(RetailEquipmentAnnounce::Ball {
+            connection_id: 7,
+            ball_type_id: 0x1400_0001,
+        });
     }
 
     fn test_stroke_service(

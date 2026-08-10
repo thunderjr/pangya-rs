@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO retail_equipment_operations (operation_id, account_id, request_payload, expected_version, result_version) VALUES ($1, $2, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Bytea",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c4c9fa71b4aa3fab3daa9e88d26fd32bded8221ba01504d84719ab27241d59cf"
+}

@@ -879,6 +879,23 @@ pub enum EconomyCommit<T> {
     Replayed(T),
 }
 
+impl<T> EconomyCommit<T> {
+    /// Returns whether this result applied a new mutation.
+    #[must_use]
+    pub const fn was_applied(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+
+    /// Splits the durable result from its applied-versus-replayed outcome.
+    #[must_use]
+    pub fn into_parts(self) -> (T, bool) {
+        match self {
+            Self::Committed(value) => (value, true),
+            Self::Replayed(value) => (value, false),
+        }
+    }
+}
+
 /// Stable economy failures safe for application outcome mapping.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum EconomyError {
@@ -3963,6 +3980,61 @@ pub trait EconomyRepository: Send + Sync {
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>>;
 }
 
+/// Durable retail equipment selection beyond the minimum character/club/ball aggregate.
+///
+/// The values are catalog ids on the wire; storage resolves each nonzero value to an owned
+/// inventory row in the same transaction before writing the projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentChange {
+    /// Replace the equipped caddie, or clear it with zero.
+    Caddie(u32),
+    /// Replace all ten equipped consumable catalog ids.
+    Consumables([u32; 10]),
+    /// Replace all six profile decoration catalog ids.
+    Decoration([u32; 6]),
+    /// Replace the equipped mascot, or clear it with zero.
+    Mascot(u32),
+    /// Replace the opaque subtype-9 cut-in bytes for an owned character.
+    CutIn {
+        /// Character roster/inventory id.
+        character_id: CharacterId,
+        /// PacketDoc-defined opaque bytes; their meaning is intentionally not inferred.
+        data: [u8; 16],
+    },
+    /// Replace all 24 worn character parts for an owned character.
+    CharacterParts {
+        /// Character roster/inventory id.
+        character_id: CharacterId,
+        /// Catalog ids, zero means empty.
+        type_ids: [u32; 24],
+        /// Owned inventory row ids, zero means empty.
+        inventory_ids: [u32; 24],
+        /// Hair colour stored on the character row.
+        hair_color: u8,
+    },
+}
+
+/// Public projection of durable retail equipment selections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailEquipmentState {
+    /// Caddie inventory row and catalog id.
+    pub caddie: Option<(InventoryItemId, u32)>,
+    /// Ten consumable catalog ids.
+    pub consumables: [u32; 10],
+    /// Six decoration catalog ids.
+    pub decoration: [u32; 6],
+    /// Mascot inventory row and catalog id.
+    pub mascot: Option<(InventoryItemId, u32)>,
+    /// Cut-in character and PacketDoc-defined opaque bytes.
+    pub cut_in: Option<(CharacterId, [u8; 16])>,
+    /// Hair colour persisted with character-part changes.
+    pub character_hair_color: u8,
+    /// Inventory slots and catalog ids for the six proven decoration fields.
+    pub decoration_slots: [u32; 6],
+    /// Worn character part catalog ids and owned row ids.
+    pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
+}
+
 /// Technology-neutral coherent player-bootstrap repository contract.
 pub trait PlayerRepository: Send + Sync {
     /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
@@ -3970,6 +4042,28 @@ pub trait PlayerRepository: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>>;
+
+    /// Loads the durable retail equipment projection. Legacy/test repositories return the empty
+    /// projection by default so retail equipment remains additive to the minimum contract.
+    fn load_retail_equipment(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+        Box::pin(async { Ok(RetailEquipmentState::default()) })
+    }
+
+    /// Validates ownership and atomically persists or replays one retail equipment update against
+    /// the same optimistic equipment version used by the minimum aggregate. The operation key is
+    /// durable and is not a wire field; callers derive it from the exact authenticated frame.
+    fn update_retail_equipment(
+        &self,
+        _account_id: AccountId,
+        _operation_id: EconomyOperationId,
+        _expected_version: u32,
+        _change: RetailEquipmentChange,
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<RetailEquipmentState>, RepositoryError>> {
+        Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
+    }
 }
 
 /// Technology-neutral single-use handover repository contract.
@@ -4529,6 +4623,17 @@ pub const fn crate_boundary() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn economy_commit_exposes_applied_vs_replayed_metadata() {
+        let committed = EconomyCommit::Committed(7_u8);
+        assert!(committed.was_applied());
+        assert_eq!(committed.into_parts(), (7, true));
+
+        let replayed = EconomyCommit::Replayed(9_u8);
+        assert!(!replayed.was_applied());
+        assert_eq!(replayed.into_parts(), (9, false));
+    }
 
     #[test]
     fn normalization_keeps_display_separate() {
