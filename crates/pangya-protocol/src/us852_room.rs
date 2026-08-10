@@ -1807,6 +1807,31 @@ mod tests {
     }
 
     #[test]
+    fn equipment_update_decodes_mascot_and_cut_in_subtypes() {
+        let mascot = decode_packet_payload::<RetailEquipmentUpdate>(
+            &[8, 7, 0, 0, 0],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("decode mascot");
+        assert_eq!(mascot.requested, RetailEquipmentRequested::Mascot(7));
+        let mut cut_in = vec![9];
+        for value in [42_u32, 100, 200, 300, 400] {
+            cut_in.extend_from_slice(&value.to_le_bytes());
+        }
+        let cut_in =
+            decode_packet_payload::<RetailEquipmentUpdate>(&cut_in, &profile(), ServiceKind::Game)
+                .expect("decode cut-in");
+        assert_eq!(
+            cut_in.requested,
+            RetailEquipmentRequested::CutIn {
+                character_id: 42,
+                values: [100, 200, 300, 400],
+            }
+        );
+    }
+
+    #[test]
     fn equipment_update_decodes_requested_ball_type() {
         let mut payload = vec![RetailEquipmentSlot::Ball.tag()];
         payload.extend_from_slice(&0x1400_00c9_u32.to_le_bytes());

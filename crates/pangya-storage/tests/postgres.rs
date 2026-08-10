@@ -180,6 +180,67 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
             .await
             .expect("version");
     assert_eq!(version, i64::from(aggregate.equipment.version) + 1);
+    let consumable_type = 402_653_185_u32;
+    let skin_type = 1_879_048_961_u32;
+    let mascot_type = 1_073_741_825_u32;
+    let _consumable_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.consumable', 5, 'consumable') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(consumable_type)).fetch_one(&pool).await.expect("consumable");
+    let _skin_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.skin', 1, 'skin') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(skin_type)).fetch_one(&pool).await.expect("skin");
+    let mascot_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, $2, 'test.mascot', 1, 'mascot') RETURNING id",
+    )
+    .bind(account_id.get()).bind(i64::from(mascot_type)).fetch_one(&pool).await.expect("mascot");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Consumables([consumable_type, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        )
+        .await
+        .expect("consumables");
+    assert_eq!(state.consumables[0], consumable_type);
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Decoration([skin_type, 0, 0, 0, 0, 0]),
+        )
+        .await
+        .expect("decoration");
+    assert_eq!(state.decoration[0], skin_type);
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::Mascot(u32::try_from(mascot_id).expect("mascot id")),
+        )
+        .await
+        .expect("mascot");
+    assert_eq!(state.mascot.map(|(_, type_id)| type_id), Some(mascot_type));
+    let version = version + 1;
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            u32::try_from(version).expect("version"),
+            RetailEquipmentChange::CutIn {
+                character_id: aggregate.equipment.character_id,
+                values: [skin_type, 0, 0, 0],
+            },
+        )
+        .await
+        .expect("cut-in");
+    assert_eq!(state.cut_in.map(|(_, values)| values[0]), Some(skin_type));
+    let version = version + 1;
     assert!(
         repository
             .update_retail_equipment(
