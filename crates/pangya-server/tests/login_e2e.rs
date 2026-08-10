@@ -607,6 +607,78 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn stale_duplicate_ghosts_old_connection_and_retries_over_encrypted_tcp(pool: PgPool) {
+    create_ready_account(&pool, "StaleUser").await;
+    let limits = LoginRuntimeLimits {
+        login_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(10),
+        ..LoginRuntimeLimits::default()
+    };
+    let (address, shutdown, task, _) = start(pool, limits).await;
+
+    // Finish enough of the first encrypted login to install its account lease, then send a known
+    // packet in the wrong state. The server terminates that task while the client socket remains
+    // open, leaving an authoritative stale lease behind for the authenticated ghost flow.
+    let (mut old, old_key) = connect(address).await;
+    send_packet(&mut old, old_key, 1, 1, &login_payload("StaleUser", SECRET)).await;
+    for expected in [1, 0x10, 6, 9, 2] {
+        assert_eq!(receive_packet(&mut old, old_key).await.0, expected);
+    }
+    send_packet(&mut old, old_key, 2, 0x0007, &pstring(b"stale-state")).await;
+
+    let (mut replacement, replacement_key) = loop {
+        let (mut candidate, candidate_key) = connect(address).await;
+        send_packet(
+            &mut candidate,
+            candidate_key,
+            2,
+            1,
+            &login_payload("StaleUser", SECRET),
+        )
+        .await;
+        let (opcode, body) = receive_packet(&mut candidate, candidate_key).await;
+        assert_eq!(opcode, 1);
+        let code = u32::from_le_bytes(body[1..5].try_into().expect("stale code"));
+        if code == pangya_protocol::LOGIN_ERROR_ALREADY_LOGGED_IN {
+            break (candidate, candidate_key);
+        }
+        assert_eq!(code, LOGIN_ERROR_DUPLICATE_CONNECTION);
+        // The old task may still be unwinding its EOF branch. A fresh connection is required
+        // after a live duplicate refusal; once liveness is stale the typed 5100019 is stable.
+        drop(candidate);
+        tokio::task::yield_now().await;
+    };
+
+    // The empty ghost packet revokes/removes exactly the stale generation before this connection
+    // retries. The former task has terminated and its socket is no longer usable.
+    send_packet(&mut replacement, replacement_key, 3, 0x0004, &[]).await;
+    let mut old_eof = [0_u8; 1];
+    assert_eq!(
+        old.read(&mut old_eof).await.expect("old connection close"),
+        0
+    );
+    send_packet(
+        &mut replacement,
+        replacement_key,
+        4,
+        1,
+        &login_payload("StaleUser", SECRET),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut replacement, replacement_key).await.0, 1);
+    assert_eq!(
+        receive_packet(&mut replacement, replacement_key).await.0,
+        0x10
+    );
+    assert_eq!(receive_packet(&mut replacement, replacement_key).await.0, 6);
+    assert_eq!(receive_packet(&mut replacement, replacement_key).await.0, 9);
+    assert_eq!(receive_packet(&mut replacement, replacement_key).await.0, 2);
+
+    shutdown.cancel();
+    task.await.expect("join");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn disallowed_character_refusal_is_client_visible(pool: PgPool) {
     create_needs_starter_account(&pool, "WrongCharacterUser").await;
     let (address, shutdown, task, _) = start(pool, LoginRuntimeLimits::default()).await;

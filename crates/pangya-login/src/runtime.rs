@@ -39,8 +39,6 @@ use tokio_util::{codec::Framed, sync::CancellationToken};
 use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
-const DUPLICATE_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-
 use crate::{
     BoundedCredentialExecutor, CanonicalTransportSecret, CapacityRegistry, CredentialError,
     CredentialExecutorError, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry,
@@ -671,6 +669,10 @@ where
             .map_err(|_| LoginRuntimeError::Protocol)?;
         let mut account: Option<AuthenticationRecord> = None;
         let mut _presence: Option<RegistryGuard<AccountId>> = None;
+        // The task lease is declared after the registry guard so it is dropped first. A task
+        // that ends unexpectedly therefore leaves an explicitly stale lease for the authenticated
+        // retry/ghost flow; generation-checked cleanup still protects a replacement lease.
+        let _task_lease = session_control.start_task();
         let mut handover_token: Option<Zeroizing<Vec<u8>>> = None;
         // Only an authenticated stale duplicate is held until the client explicitly requests
         // ghost recovery. The account ID is authenticated before it is stored; the 0x0004 packet
@@ -678,6 +680,13 @@ where
         let mut pending_ghost: Option<(AccountId, u64)> = None;
 
         loop {
+            // Ghost invalidation cancels the old owner before a replacement can acquire the
+            // account. Check at every state-machine turn so an old socket cannot continue after
+            // its lease was revoked, even when an earlier await just completed.
+            if session_control.is_revoked() {
+                let _ = machine.apply(LoginEvent::Disconnect);
+                return Ok(ConnectionTermination::Rejected);
+            }
             match machine.state() {
                 LoginState::Complete => return Ok(ConnectionTermination::Completed),
                 LoginState::Closed => return Ok(ConnectionTermination::Rejected),
@@ -787,41 +796,17 @@ where
                         .acquire_with_control(authenticated.account.id, session_control.clone())
                     {
                         Ok(guard) => guard,
-                        Err(RegistryError::Duplicate(lease)) => {
+                        Err(RegistryError::Duplicate(_lease)) => {
+                            // No bounded probe can distinguish a live task blocked in repository
+                            // or socket I/O from a dead task. Registry liveness is explicit: a
+                            // non-revoked, running owner is always the live duplicate outcome.
                             self.observer.login("duplicate_live");
-                            // PacketDoc's 5100107 is reserved for a demonstrably live socket.
-                            // Probe the owning task before refusing: a dead/stalled owner is
-                            // instead the stale 5100019 flow, which explicitly arms 0x0004.
-                            let live = match self
-                                .active_accounts
-                                .control(&authenticated.account.id, lease)
-                            {
-                                Some(control) => {
-                                    control.probe(DUPLICATE_LIVENESS_PROBE_TIMEOUT).await
-                                }
-                                // A registry entry created without a task control is used by
-                                // pure registry callers and remains conservatively live.
-                                None => true,
-                            };
-                            if live {
-                                self.send(
-                                    &mut framed,
-                                    &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
-                                )
-                                .await?;
-                                return Ok(ConnectionTermination::Rejected);
-                            }
-                            self.observer.login("duplicate_stale");
                             self.send(
                                 &mut framed,
-                                &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
+                                &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
                             )
                             .await?;
-                            pending_ghost = Some((authenticated.account.id, lease));
-                            machine
-                                .apply(LoginEvent::AuthenticationRejected)
-                                .map_err(|_| LoginRuntimeError::Protocol)?;
-                            continue;
+                            return Ok(ConnectionTermination::Rejected);
                         }
                         Err(RegistryError::Stale(lease)) => {
                             self.observer.login("duplicate_stale");
@@ -955,7 +940,11 @@ where
                         .await?;
                         return Ok(ConnectionTermination::Rejected);
                     };
-                    if !self.active_accounts.invalidate(&account_id, lease) {
+                    if !self
+                        .active_accounts
+                        .invalidate_and_wait(&account_id, lease)
+                        .await
+                    {
                         self.send(
                             &mut framed,
                             &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
@@ -1409,7 +1398,10 @@ fn encode_error_class(error: &PacketEncodeError) -> ProtocolMetricClass {
 }
 
 fn is_known_opcode(opcode: u16) -> bool {
-    matches!(opcode, 0x0001 | 0x0003 | 0x0006 | 0x0007 | 0x0008)
+    matches!(
+        opcode,
+        0x0001 | 0x0003 | 0x0004 | 0x0006 | 0x0007 | 0x0008 | 0x000b
+    )
 }
 
 fn unknown_opcode_bucket(opcode: u16) -> UnknownOpcodeBucket {
@@ -1478,6 +1470,13 @@ mod tests {
         let encode = PacketEncodeError::Io(io::Error::other("synthetic"));
         assert_eq!(decode_error_class(&decode), ProtocolMetricClass::Io);
         assert_eq!(encode_error_class(&encode), ProtocolMetricClass::Io);
+    }
+
+    #[test]
+    fn ghost_and_reconnect_are_known_for_invalid_state_classification() {
+        assert!(is_known_opcode(0x0004));
+        assert!(is_known_opcode(0x000b));
+        assert!(!is_known_opcode(0x7777));
     }
 
     #[test]

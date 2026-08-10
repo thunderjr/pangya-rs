@@ -12,7 +12,7 @@ use std::{
 
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -122,8 +122,25 @@ where
 #[derive(Clone, Debug)]
 pub struct SessionControl {
     revoked: Arc<AtomicBool>,
+    task_alive: Arc<AtomicBool>,
+    task_started: Arc<AtomicBool>,
+    task_ended: Arc<Notify>,
     cancellation: CancellationToken,
     probes: mpsc::UnboundedSender<oneshot::Sender<()>>,
+}
+
+/// RAII liveness lease held by an owning LoginService task.
+#[derive(Debug)]
+pub struct SessionTaskLease {
+    task_alive: Arc<AtomicBool>,
+    task_ended: Arc<Notify>,
+}
+
+impl Drop for SessionTaskLease {
+    fn drop(&mut self) {
+        self.task_alive.store(false, Ordering::Release);
+        self.task_ended.notify_waiters();
+    }
 }
 
 /// Receiver held by the connection task so a duplicate can prove it is live.
@@ -139,6 +156,12 @@ impl SessionControl {
         (
             Self {
                 revoked: Arc::new(AtomicBool::new(false)),
+                // A control without an attached task is conservatively live. Runtime owners
+                // attach a SessionTaskLease immediately; only that RAII lease can authoritatively
+                // transition the entry to stale.
+                task_alive: Arc::new(AtomicBool::new(true)),
+                task_started: Arc::new(AtomicBool::new(false)),
+                task_ended: Arc::new(Notify::new()),
                 cancellation: CancellationToken::new(),
                 probes: sender,
             },
@@ -152,10 +175,41 @@ impl SessionControl {
         self.cancellation.cancel();
     }
 
+    /// Starts the owning connection task's liveness lease.
+    #[must_use]
+    pub fn start_task(&self) -> SessionTaskLease {
+        self.task_started.store(true, Ordering::Release);
+        self.task_alive.store(true, Ordering::Release);
+        SessionTaskLease {
+            task_alive: Arc::clone(&self.task_alive),
+            task_ended: Arc::clone(&self.task_ended),
+        }
+    }
+
     /// Returns whether the lease has been revoked and must not proceed.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Returns whether the owning task is authoritatively live.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        !self.is_revoked() && self.task_alive.load(Ordering::Acquire)
+    }
+
+    /// Waits until an attached owning task has dropped its liveness lease.
+    pub async fn wait_terminated(&self) {
+        if !self.task_started.load(Ordering::Acquire) {
+            return;
+        }
+        while self.task_alive.load(Ordering::Acquire) {
+            let notified = self.task_ended.notified();
+            if !self.task_alive.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Returns a cancellation future for the owning connection task.
@@ -283,6 +337,7 @@ pub enum RegistryError {
 struct RegistryEntry {
     lease: u64,
     control: Option<SessionControl>,
+    retiring: bool,
 }
 
 /// Bounded set whose guards remove keys through generation-checked RAII.
@@ -314,7 +369,7 @@ where
         self.acquire_inner(key, None)
     }
 
-    /// Acquires a session lease with a task control used for live duplicate probing.
+    /// Acquires a session lease with explicit task liveness and cancellation control.
     pub fn acquire_with_control(
         &self,
         key: K,
@@ -330,10 +385,11 @@ where
     ) -> Result<RegistryGuard<K>, RegistryError> {
         let mut entries = self.entries.lock().map_err(|_| RegistryError::Capacity)?;
         if let Some(entry) = entries.get(&key) {
-            if entry
-                .control
-                .as_ref()
-                .is_some_and(SessionControl::is_revoked)
+            if entry.retiring
+                || entry
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| !control.is_live())
             {
                 return Err(RegistryError::Stale(entry.lease));
             }
@@ -348,7 +404,14 @@ where
             .map_err(|_| RegistryError::Capacity)?;
         let lease = *generation;
         *generation = generation.wrapping_add(1).max(1);
-        entries.insert(key.clone(), RegistryEntry { lease, control });
+        entries.insert(
+            key.clone(),
+            RegistryEntry {
+                lease,
+                control,
+                retiring: false,
+            },
+        );
         Ok(RegistryGuard {
             entries: Arc::downgrade(&self.entries),
             key: Some(key),
@@ -368,25 +431,70 @@ where
         })
     }
 
+    fn remove_lease(&self, key: &K, lease: u64) -> Option<RegistryEntry> {
+        self.entries.lock().ok().and_then(|mut entries| {
+            if entries.get(key).is_some_and(|entry| entry.lease == lease) {
+                entries.remove(key)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Invalidates one active registration only when it still owns `lease`.
     ///
     /// The generation comparison prevents a delayed ghost request from removing a replacement
     /// session that acquired the same account after the original connection ended.
     #[must_use]
     pub fn invalidate(&self, key: &K, lease: u64) -> bool {
+        let entry = self.remove_lease(key, lease);
+        if let Some(control) = entry.as_ref().and_then(|entry| entry.control.as_ref()) {
+            control.revoke();
+        }
+        entry.is_some()
+    }
+
+    /// Revokes a stale lease and waits for its owning task to terminate before returning.
+    ///
+    /// Ghost recovery uses this stronger form so a replacement cannot race a still-running old
+    /// task. The lease is marked retiring before the await, so concurrent acquires continue to
+    /// observe the same stale generation until termination and removal complete. Delayed old guard
+    /// cleanup is harmless because it checks the replacement lease before removing anything.
+    pub async fn invalidate_and_wait(&self, key: &K, lease: u64) -> bool {
+        let control = self.entries.lock().ok().and_then(|mut entries| {
+            let entry = entries.get_mut(key)?;
+            if entry.lease != lease {
+                return None;
+            }
+            entry.retiring = true;
+            entry.control.clone()
+        });
+        let Some(control) = control else {
+            // A matching un-controlled registry entry can be removed synchronously. A missing
+            // entry is distinguishable from an entry whose control is absent by checking once.
+            let removed = self
+                .entries
+                .lock()
+                .ok()
+                .and_then(|mut entries| {
+                    entries
+                        .get(key)
+                        .is_some_and(|entry| entry.lease == lease)
+                        .then(|| entries.remove(key))
+                })
+                .is_some();
+            return removed;
+        };
+        control.revoke();
+        control.wait_terminated().await;
         self.entries
             .lock()
             .ok()
             .and_then(|mut entries| {
-                if entries.get(key).is_some_and(|entry| entry.lease == lease) {
-                    let entry = entries.remove(key)?;
-                    if let Some(control) = entry.control {
-                        control.revoke();
-                    }
-                    Some(())
-                } else {
-                    None
-                }
+                entries
+                    .get(key)
+                    .is_some_and(|entry| entry.lease == lease && entry.retiring)
+                    .then(|| entries.remove(key))
             })
             .is_some()
     }
@@ -433,7 +541,8 @@ where
     }
 }
 
-/// RAII registration removed on every normal/error/cancellation exit.
+/// RAII registration removed on normal exits; an ended controlled task remains as a stale lease
+/// until authenticated ghost recovery explicitly revokes that generation.
 #[derive(Debug)]
 pub struct RegistryGuard<K>
 where
@@ -456,9 +565,11 @@ where
             return;
         };
         if let Ok(mut entries) = entries.lock()
-            && entries
-                .get(&key)
-                .is_some_and(|entry| entry.lease == self.lease)
+            && entries.get(&key).is_some_and(|entry| {
+                entry.lease == self.lease
+                    && !entry.retiring
+                    && entry.control.as_ref().is_none_or(SessionControl::is_live)
+            })
         {
             entries.remove(&key);
         }
@@ -526,6 +637,40 @@ mod tests {
         assert!(registry.acquire(7).is_ok());
     }
 
+    #[tokio::test]
+    async fn blocked_live_owner_remains_duplicate_past_probe_window() {
+        let registry = CapacityRegistry::new(1);
+        let (control, _probes) = SessionControl::new();
+        let _task = control.start_task();
+        let _guard = registry
+            .acquire_with_control(7, control)
+            .expect("live session");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Duplicate(_))
+        ));
+    }
+
+    #[test]
+    fn ended_task_is_stale_until_explicit_ghost_invalidation() {
+        let registry = CapacityRegistry::new(1);
+        let (control, _probes) = SessionControl::new();
+        let (_guard, lease) = {
+            let _task = control.start_task();
+            let guard = registry
+                .acquire_with_control(7, control.clone())
+                .expect("session");
+            let lease = guard.lease();
+            assert!(control.is_live());
+            (guard, lease)
+        };
+        assert!(!control.is_live());
+        assert!(matches!(registry.acquire(7), Err(RegistryError::Stale(found)) if found == lease));
+        assert!(registry.invalidate(&7, lease));
+        assert!(registry.acquire(7).is_ok());
+    }
+
     #[test]
     fn revoked_session_is_stale_and_can_only_be_ghosted_by_its_lease() {
         let registry = CapacityRegistry::new(1);
@@ -557,7 +702,9 @@ mod tests {
             .acquire_with_control(7, session.clone())
             .expect("session");
         let task_session = session.clone();
+        let task_lease = session.start_task();
         let task = tokio::spawn(async move {
+            let _task_lease = task_lease;
             loop {
                 tokio::select! {
                     () = task_session.cancelled() => break true,
@@ -569,7 +716,8 @@ mod tests {
             }
         });
         assert!(session.probe(Duration::from_secs(1)).await);
-        assert!(registry.invalidate(&7, guard.lease()));
+        assert!(registry.invalidate_and_wait(&7, guard.lease()).await);
+        assert!(task.is_finished(), "replacement raced old task termination");
         assert!(task.await.expect("task join"));
         let replacement = registry.acquire(7).expect("replacement");
         drop(guard);
