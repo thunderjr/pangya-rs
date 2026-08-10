@@ -173,6 +173,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("owned equip");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(state.caddie.map(|(_, type_id)| type_id), Some(469762049));
     let version: i64 =
         sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
@@ -214,6 +218,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("consumables");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(state.consumables[0], consumable_type);
     let version = version + 1;
     let state = repository
@@ -225,6 +233,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("decoration");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(state.decoration[0], skin_type);
     let version = version + 1;
     let state = repository
@@ -236,6 +248,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("mascot");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(state.mascot.map(|(_, type_id)| type_id), Some(mascot_type));
     let version = version + 1;
     let state = repository
@@ -250,6 +266,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("cut-in");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(state.cut_in.map(|(_, data)| data), Some([7; 16]));
     let version = version + 1;
     let mut part_types = [0_u32; 24];
@@ -270,6 +290,10 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
         )
         .await
         .expect("character parts");
+    let state = match state {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("fresh operation replayed"),
+    };
     assert_eq!(
         state.character_parts.map(|(_, types, _)| types[23]),
         Some(part_type)
@@ -348,7 +372,14 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
         )
         .await
         .expect("initial update");
-    assert_eq!(committed.caddie.map(|(_, kind)| kind), Some(469762049));
+    let committed_state = match committed {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("initial update unexpectedly replayed"),
+    };
+    assert_eq!(
+        committed_state.caddie.map(|(_, kind)| kind),
+        Some(469762049)
+    );
     let version_after_commit: i64 =
         sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
             .bind(account_id.get())
@@ -364,7 +395,11 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
         )
         .await
         .expect("exact replay");
-    assert_eq!(replayed, committed);
+    let replayed_state = match replayed {
+        EconomyCommit::Replayed(state) => state,
+        EconomyCommit::Committed(_) => panic!("exact retry unexpectedly committed"),
+    };
+    assert_eq!(replayed_state, committed_state);
     assert_eq!(version_after_commit, i64::from(initial_version) + 1);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -398,7 +433,11 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
         )
         .await
         .expect("replay after mutation");
-    assert_eq!(replay_after_mutation, intervening);
+    let replay_after_mutation_state = match replay_after_mutation {
+        EconomyCommit::Replayed(state) => state,
+        EconomyCommit::Committed(_) => panic!("replay after mutation unexpectedly committed"),
+    };
+    assert_eq!(replay_after_mutation_state, committed_state);
     assert!(
         restarted
             .update_retail_equipment(
@@ -419,13 +458,17 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
             .expect("version after replay"),
         version_after_commit + 1
     );
+    let intervening_state = match intervening {
+        EconomyCommit::Committed(state) => state,
+        EconomyCommit::Replayed(_) => panic!("intervening update unexpectedly replayed"),
+    };
     assert_eq!(
         repository
             .load_retail_equipment(account_id)
             .await
             .expect("projection")
             .caddie,
-        intervening.caddie
+        intervening_state.caddie
     );
 
     let concurrent_operation = EconomyOperationId::new(uuid::Uuid::new_v4());
@@ -448,7 +491,13 @@ async fn retail_equipment_replay_is_durable_and_serialized(pool: PgPool) {
     );
     let left = left.expect("left concurrent retry");
     let right = right.expect("right concurrent retry");
-    assert_eq!(left, right);
+    let left_state = match left {
+        EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+    };
+    let right_state = match right {
+        EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+    };
+    assert_eq!(left_state, right_state);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT version FROM equipment_sets WHERE account_id = $1",)
             .bind(account_id.get())

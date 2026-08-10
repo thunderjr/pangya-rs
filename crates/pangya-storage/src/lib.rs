@@ -37,9 +37,9 @@ use pangya_domain::{
     synthetic_stroke_reward_v1,
 };
 use sqlx::{
-    FromRow, PgPool, Postgres, Transaction,
+    FromRow, PgPool, Postgres, Row, Transaction,
     migrate::Migrator,
-    postgres::{PgConnectOptions, PgPoolOptions},
+    postgres::{PgConnectOptions, PgConnection, PgPoolOptions},
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -1614,124 +1614,141 @@ impl PgRepository {
         &self,
         account_id: AccountId,
     ) -> Result<RetailEquipmentState, RepositoryError> {
-        let rows = sqlx::query_as::<_, RetailEquipmentSlotRow>(
+        let mut connection = self.pool.acquire().await.map_err(repository_db_error)?;
+        load_retail_equipment_connection(&mut connection, account_id).await
+    }
+}
+
+async fn load_retail_equipment_connection(
+    connection: &mut PgConnection,
+    account_id: AccountId,
+) -> Result<RetailEquipmentState, RepositoryError> {
+    let rows = sqlx::query_as::<_, RetailEquipmentSlotRow>(
             "SELECT slot_family, slot_index, inventory_item_id, item_type_id, character_id, cut_in_opaque \
              FROM player_equipment_slots WHERE account_id = $1 ORDER BY slot_family, slot_index",
         )
         .bind(account_id.get())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(repository_db_error)?;
-        let character_hair_color = sqlx::query_scalar::<_, i16>(
+    let character_hair_color = sqlx::query_scalar::<_, i16>(
             "SELECT c.hair_color FROM characters c JOIN profiles p ON p.selected_character_id = c.id WHERE c.account_id = $1",
         )
         .bind(account_id.get())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(repository_db_error)?
         .map(|value| u8::try_from(value).map_err(|_| RepositoryError::CorruptData))
         .transpose()?
         .unwrap_or(0);
-        let mut state = RetailEquipmentState {
-            character_hair_color,
-            ..RetailEquipmentState::default()
-        };
-        let part_rows = sqlx::query!(
+    let mut state = RetailEquipmentState {
+        character_hair_color,
+        ..RetailEquipmentState::default()
+    };
+    let part_rows = sqlx::query!(
             "SELECT s.character_id, s.slot_index, s.item_type_id, s.inventory_item_id \
              FROM character_part_slots s JOIN profiles p ON p.selected_character_id = s.character_id \
              WHERE s.account_id = $1 ORDER BY s.slot_index",
             account_id.get()
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(repository_db_error)?;
-        for row in part_rows {
-            let character_id =
-                CharacterId::new(row.character_id).map_err(|_| RepositoryError::CorruptData)?;
-            let index =
-                usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
-            if index >= 24 {
-                return Err(RepositoryError::CorruptData);
-            }
-            let (current_id, mut types, mut ids) = state
-                .character_parts
-                .filter(|(id, _, _)| *id == character_id)
-                .unwrap_or((character_id, [0; 24], [0; 24]));
-            types[index] =
-                u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
-            ids[index] = u32::try_from(row.inventory_item_id.unwrap_or(0))
-                .map_err(|_| RepositoryError::CorruptData)?;
-            state.character_parts = Some((current_id, types, ids));
+    for row in part_rows {
+        let character_id =
+            CharacterId::new(row.character_id).map_err(|_| RepositoryError::CorruptData)?;
+        let index = usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
+        if index >= 24 {
+            return Err(RepositoryError::CorruptData);
         }
-        for row in rows {
-            let index =
-                usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
-            let item_type =
-                u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
-            match row.slot_family.as_str() {
-                "caddie" => {
-                    if index != 0 || state.caddie.is_some() {
-                        return Err(RepositoryError::CorruptData);
-                    }
-                    let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
-                    state.caddie = Some((
-                        InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
-                        item_type,
-                    ));
-                }
-                "consumable" if index < state.consumables.len() => {
-                    state.consumables[index] = item_type
-                }
-                "decoration" if index < state.decoration.len() => {
-                    state.decoration[index] = item_type;
-                    state.decoration_slots[index] =
-                        u32::try_from(row.inventory_item_id.unwrap_or(0))
-                            .map_err(|_| RepositoryError::CorruptData)?;
-                }
-                "mascot" => {
-                    if index != 0 || state.mascot.is_some() {
-                        return Err(RepositoryError::CorruptData);
-                    }
-                    let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
-                    state.mascot = Some((
-                        InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
-                        item_type,
-                    ));
-                }
-                "cut_in" if index == 0 => {
-                    let character_id = row.character_id.ok_or(RepositoryError::CorruptData)?;
-                    let character_id =
-                        CharacterId::new(character_id).map_err(|_| RepositoryError::CorruptData)?;
-                    let bytes = row.cut_in_opaque.ok_or(RepositoryError::CorruptData)?;
-                    let data: [u8; 16] =
-                        bytes.try_into().map_err(|_| RepositoryError::CorruptData)?;
-                    state.cut_in = Some((character_id, data));
-                }
-                "cut_in" => return Err(RepositoryError::CorruptData),
-                _ => return Err(RepositoryError::CorruptData),
-            }
-        }
-        Ok(state)
+        let (current_id, mut types, mut ids) = state
+            .character_parts
+            .filter(|(id, _, _)| *id == character_id)
+            .unwrap_or((character_id, [0; 24], [0; 24]));
+        types[index] = u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
+        ids[index] = u32::try_from(row.inventory_item_id.unwrap_or(0))
+            .map_err(|_| RepositoryError::CorruptData)?;
+        state.character_parts = Some((current_id, types, ids));
     }
+    for row in rows {
+        let index = usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
+        let item_type =
+            u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
+        match row.slot_family.as_str() {
+            "caddie" => {
+                if index != 0 || state.caddie.is_some() {
+                    return Err(RepositoryError::CorruptData);
+                }
+                let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
+                state.caddie = Some((
+                    InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
+                    item_type,
+                ));
+            }
+            "consumable" if index < state.consumables.len() => state.consumables[index] = item_type,
+            "decoration" if index < state.decoration.len() => {
+                state.decoration[index] = item_type;
+                state.decoration_slots[index] = u32::try_from(row.inventory_item_id.unwrap_or(0))
+                    .map_err(|_| RepositoryError::CorruptData)?;
+            }
+            "mascot" => {
+                if index != 0 || state.mascot.is_some() {
+                    return Err(RepositoryError::CorruptData);
+                }
+                let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
+                state.mascot = Some((
+                    InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
+                    item_type,
+                ));
+            }
+            "cut_in" if index == 0 => {
+                let character_id = row.character_id.ok_or(RepositoryError::CorruptData)?;
+                let character_id =
+                    CharacterId::new(character_id).map_err(|_| RepositoryError::CorruptData)?;
+                let bytes = row.cut_in_opaque.ok_or(RepositoryError::CorruptData)?;
+                let data: [u8; 16] = bytes.try_into().map_err(|_| RepositoryError::CorruptData)?;
+                state.cut_in = Some((character_id, data));
+            }
+            "cut_in" => return Err(RepositoryError::CorruptData),
+            _ => return Err(RepositoryError::CorruptData),
+        }
+    }
+    Ok(state)
+}
 
+impl PgRepository {
     async fn update_retail_equipment_inner(
         &self,
         account_id: AccountId,
         operation_id: EconomyOperationId,
         expected_version: u32,
         change: RetailEquipmentChange,
-    ) -> Result<RetailEquipmentState, RepositoryError> {
+    ) -> Result<EconomyCommit<RetailEquipmentState>, RepositoryError> {
         let request_payload = retail_equipment_request_payload(&change);
+        let result_character_parts = match change {
+            RetailEquipmentChange::CharacterParts {
+                character_id,
+                type_ids,
+                inventory_ids,
+                hair_color,
+            } => Some((character_id, type_ids, inventory_ids, hair_color)),
+            _ => None,
+        };
         let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
         lock_retail_equipment_operation(&mut transaction, operation_id).await?;
-        if let Some(row) = sqlx::query!(
-            "SELECT account_id, request_payload, expected_version FROM retail_equipment_operations \
+        if let Some(row) = sqlx::query(
+            "SELECT account_id, request_payload, result_projection FROM retail_equipment_operations \
              WHERE operation_id = $1 FOR UPDATE",
-            operation_id.get()
         )
+        .bind(operation_id.get())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(repository_db_error)?
+        .map(|row| RetailEquipmentOperationRow {
+            account_id: row.get("account_id"),
+            request_payload: row.get("request_payload"),
+            result_projection: row.get("result_projection"),
+        })
         {
             // An exact operation key is replayed from the durable ledger even when the current
             // equipment version has advanced since the original commit. The payload and account
@@ -1739,8 +1756,14 @@ impl PgRepository {
             if row.account_id != account_id.get() || row.request_payload != request_payload {
                 return Err(RepositoryError::CorruptData);
             }
+            let state = row
+                .result_projection
+                .as_deref()
+                .map(decode_retail_equipment_state)
+                .transpose()?
+                .ok_or(RepositoryError::CorruptData)?;
             transaction.commit().await.map_err(repository_db_error)?;
-            return self.load_retail_equipment_inner(account_id).await;
+            return Ok(EconomyCommit::Replayed(state));
         }
         let version = sqlx::query_scalar!(
             "SELECT version FROM equipment_sets WHERE account_id = $1 FOR UPDATE",
@@ -1895,21 +1918,28 @@ impl PgRepository {
         let updated = sqlx::query!("UPDATE equipment_sets SET version = version + 1, updated_at = now() WHERE account_id = $1 AND version = $2 RETURNING version", account_id.get(), i64::from(expected_version))
             .fetch_optional(&mut *transaction).await.map_err(repository_db_error)?
             .ok_or(RepositoryError::CorruptData)?;
-        sqlx::query!(
+        let mut state = load_retail_equipment_connection(&mut transaction, account_id).await?;
+        if let Some((character_id, type_ids, inventory_ids, hair_color)) = result_character_parts {
+            state.character_parts = Some((character_id, type_ids, inventory_ids));
+            state.character_hair_color = hair_color;
+        }
+        let result_projection = encode_retail_equipment_state(&state);
+        sqlx::query(
             "INSERT INTO retail_equipment_operations \
-             (operation_id, account_id, request_payload, expected_version, result_version) \
-             VALUES ($1, $2, $3, $4, $5)",
-            operation_id.get(),
-            account_id.get(),
-            &request_payload,
-            i64::from(expected_version),
-            updated.version
+             (operation_id, account_id, request_payload, expected_version, result_version, result_projection) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
+        .bind(operation_id.get())
+        .bind(account_id.get())
+        .bind(&request_payload)
+        .bind(i64::from(expected_version))
+        .bind(updated.version)
+        .bind(&result_projection)
         .execute(&mut *transaction)
         .await
         .map_err(repository_db_error)?;
         transaction.commit().await.map_err(repository_db_error)?;
-        self.load_retail_equipment_inner(account_id).await
+        Ok(EconomyCommit::Committed(state))
     }
 }
 
@@ -1971,6 +2001,182 @@ fn retail_equipment_request_payload(change: &RetailEquipmentChange) -> Vec<u8> {
         }
     }
     payload
+}
+
+fn encode_retail_equipment_state(state: &RetailEquipmentState) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(256);
+    payload.push(1);
+    fn option_item(payload: &mut Vec<u8>, value: Option<(InventoryItemId, u32)>) {
+        if let Some((id, type_id)) = value {
+            payload.push(1);
+            payload.extend_from_slice(&id.get().to_le_bytes());
+            payload.extend_from_slice(&type_id.to_le_bytes());
+        } else {
+            payload.push(0);
+        }
+    }
+    option_item(&mut payload, state.caddie);
+    for value in state.consumables {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in state.decoration {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    option_item(&mut payload, state.mascot);
+    if let Some((character_id, data)) = state.cut_in {
+        payload.push(1);
+        payload.extend_from_slice(&character_id.get().to_le_bytes());
+        payload.extend_from_slice(&data);
+    } else {
+        payload.push(0);
+    }
+    payload.push(state.character_hair_color);
+    for value in state.decoration_slots {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    if let Some((character_id, type_ids, inventory_ids)) = state.character_parts {
+        payload.push(1);
+        payload.extend_from_slice(&character_id.get().to_le_bytes());
+        for value in type_ids {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in inventory_ids {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+    } else {
+        payload.push(0);
+    }
+    payload
+}
+
+fn decode_retail_equipment_state(payload: &[u8]) -> Result<RetailEquipmentState, RepositoryError> {
+    let mut offset = 0;
+    let take = |offset: &mut usize, count: usize| {
+        let end = offset
+            .checked_add(count)
+            .ok_or(RepositoryError::CorruptData)?;
+        let bytes = payload
+            .get(*offset..end)
+            .ok_or(RepositoryError::CorruptData)?;
+        *offset = end;
+        Ok::<_, RepositoryError>(bytes)
+    };
+    let version = take(&mut offset, 1)?[0];
+    if version != 1 {
+        return Err(RepositoryError::CorruptData);
+    }
+    let item = |offset: &mut usize| -> Result<Option<(InventoryItemId, u32)>, RepositoryError> {
+        match take(offset, 1)?[0] {
+            0 => Ok(None),
+            1 => {
+                let id = i64::from_le_bytes(
+                    take(offset, 8)?
+                        .try_into()
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                );
+                let type_id = u32::from_le_bytes(
+                    take(offset, 4)?
+                        .try_into()
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                );
+                Ok(Some((
+                    InventoryItemId::new(id).map_err(|_| RepositoryError::CorruptData)?,
+                    type_id,
+                )))
+            }
+            _ => Err(RepositoryError::CorruptData),
+        }
+    };
+    let caddie = item(&mut offset)?;
+    let mut consumables = [0; 10];
+    for value in &mut consumables {
+        *value = u32::from_le_bytes(
+            take(&mut offset, 4)?
+                .try_into()
+                .map_err(|_| RepositoryError::CorruptData)?,
+        );
+    }
+    let mut decoration = [0; 6];
+    for value in &mut decoration {
+        *value = u32::from_le_bytes(
+            take(&mut offset, 4)?
+                .try_into()
+                .map_err(|_| RepositoryError::CorruptData)?,
+        );
+    }
+    let mascot = item(&mut offset)?;
+    let cut_in = match take(&mut offset, 1)?[0] {
+        0 => None,
+        1 => {
+            let id = i64::from_le_bytes(
+                take(&mut offset, 8)?
+                    .try_into()
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            );
+            let data = take(&mut offset, 16)?
+                .try_into()
+                .map_err(|_| RepositoryError::CorruptData)?;
+            Some((
+                CharacterId::new(id).map_err(|_| RepositoryError::CorruptData)?,
+                data,
+            ))
+        }
+        _ => return Err(RepositoryError::CorruptData),
+    };
+    let character_hair_color = take(&mut offset, 1)?[0];
+    let mut decoration_slots = [0; 6];
+    for value in &mut decoration_slots {
+        *value = u32::from_le_bytes(
+            take(&mut offset, 4)?
+                .try_into()
+                .map_err(|_| RepositoryError::CorruptData)?,
+        );
+    }
+    let character_parts = match take(&mut offset, 1)?[0] {
+        0 => None,
+        1 => {
+            let id = i64::from_le_bytes(
+                take(&mut offset, 8)?
+                    .try_into()
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            );
+            let mut type_ids = [0; 24];
+            for value in &mut type_ids {
+                *value = u32::from_le_bytes(
+                    take(&mut offset, 4)?
+                        .try_into()
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                );
+            }
+            let mut inventory_ids = [0; 24];
+            for value in &mut inventory_ids {
+                *value = u32::from_le_bytes(
+                    take(&mut offset, 4)?
+                        .try_into()
+                        .map_err(|_| RepositoryError::CorruptData)?,
+                );
+            }
+            Some((
+                CharacterId::new(id).map_err(|_| RepositoryError::CorruptData)?,
+                type_ids,
+                inventory_ids,
+            ))
+        }
+        _ => return Err(RepositoryError::CorruptData),
+    };
+    if offset != payload.len() {
+        return Err(RepositoryError::CorruptData);
+    }
+    Ok(RetailEquipmentState {
+        caddie,
+        consumables,
+        decoration,
+        mascot,
+        cut_in,
+        character_hair_color,
+        decoration_slots,
+        character_parts,
+    })
 }
 
 async fn ensure_owned_character(
@@ -2036,7 +2242,7 @@ impl PlayerRepository for PgRepository {
         operation_id: EconomyOperationId,
         expected_version: u32,
         change: RetailEquipmentChange,
-    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<RetailEquipmentState>, RepositoryError>> {
         Box::pin(self.observed(self.update_retail_equipment_inner(
             account_id,
             operation_id,
@@ -2156,6 +2362,12 @@ struct AccountRow {
     username_display: String,
     username_normalized: String,
     status: String,
+}
+
+struct RetailEquipmentOperationRow {
+    account_id: i64,
+    request_payload: Vec<u8>,
+    result_projection: Option<Vec<u8>>,
 }
 
 #[derive(FromRow)]

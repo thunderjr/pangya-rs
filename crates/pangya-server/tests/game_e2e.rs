@@ -6087,6 +6087,34 @@ async fn game_retail_bulk_equipment_is_acknowledged_owned_and_restart_safe(pool:
         1
     );
 
+    // Subtype 9 acknowledgements come from the durable projection, including after B intervenes.
+    let mut cut_in_a = vec![9];
+    cut_in_a.extend_from_slice(
+        &u32::try_from(character_id)
+            .expect("character")
+            .to_le_bytes(),
+    );
+    cut_in_a.extend_from_slice(&(1_u8..=16).collect::<Vec<_>>());
+    send_packet(&mut stream, key, 5, 0x0020, &cut_in_a).await;
+    let cut_in_ack_a = {
+        let mut body = vec![4, 9];
+        body.extend_from_slice(&cut_in_a[1..]);
+        body
+    };
+    assert_eq!(
+        receive_packet(&mut stream, key).await,
+        (0x006b, cut_in_ack_a.clone())
+    );
+    let mut cut_in_b = cut_in_a.clone();
+    cut_in_b[5..21].copy_from_slice(&(17_u8..=32).collect::<Vec<_>>());
+    send_packet(&mut stream, key, 6, 0x0020, &cut_in_b).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x006b);
+    send_packet(&mut stream, key, 7, 0x0020, &cut_in_a).await;
+    assert_eq!(
+        receive_packet(&mut stream, key).await,
+        (0x006b, cut_in_ack_a)
+    );
+
     // Ownership refusal is a status-1 0x006b response, not a protocol disconnect. A later valid
     // command proves the encrypted connection remains usable.
     let mut invalid = vec![5];
@@ -6158,6 +6186,14 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
     .fetch_one(&pool)
     .await
     .expect("supported alternate character");
+    let owner_third_character: i64 = sqlx::query_scalar(
+        "INSERT INTO characters (account_id, item_type_id, starter_key) \
+         VALUES ($1, 0x04000000, 'e2e.room.third') RETURNING id",
+    )
+    .bind(owner.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("third character");
     let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
     let (address, shutdown, task) = start_service(service).await;
 
@@ -6243,7 +6279,8 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
     let mut join = PacketWriter::default();
     join.u16_le(room_id);
     join.pstring(b"", 64).expect("password");
-    send_packet(&mut visitor, visitor_key, 3, 0x0009, &join.into_inner()).await;
+    let join_payload = join.into_inner();
+    send_packet(&mut visitor, visitor_key, 3, 0x0009, &join_payload).await;
     assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0049);
     let _ = receive_packet(&mut visitor, visitor_key).await;
     let _ = drain_frames(&mut host, host_key, Duration::from_millis(100)).await;
@@ -6276,8 +6313,33 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
         (0x004b, expected.clone())
     );
 
-    // The exact retry is durable replay, not a second room-wide announcement.
-    send_packet(&mut host, host_key, 6, 0x000c, &room_change).await;
+    // An intervening B mutation must not turn an exact A retry into a second announcement.
+    let mut intervening_change = vec![4];
+    intervening_change.extend_from_slice(
+        &u32::try_from(owner_third_character)
+            .expect("third character")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 6, 0x000c, &intervening_change).await;
+    let intervening_expected = encode_packet_payload(
+        &RetailEquipmentAnnounce::Character {
+            connection_id: host_connection,
+            character_type_id: 0x0400_0000,
+            character_uid: u32::try_from(owner_third_character).expect("third character"),
+        },
+        &CompatibilityProfile::US_852,
+    )
+    .expect("004b payload")
+    .to_vec();
+    assert_eq!(
+        receive_packet(&mut host, host_key).await,
+        (0x004b, intervening_expected.clone())
+    );
+    assert_eq!(
+        receive_packet(&mut visitor, visitor_key).await,
+        (0x004b, intervening_expected)
+    );
+    send_packet(&mut host, host_key, 7, 0x000c, &room_change).await;
     assert!(
         drain_frames(&mut host, host_key, Duration::from_millis(150))
             .await
@@ -6294,7 +6356,7 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
             .fetch_one(&pool)
             .await
             .expect("room replay version"),
-        2
+        3
     );
     drop(visitor);
     drop(host);

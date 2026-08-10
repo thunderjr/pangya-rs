@@ -5424,15 +5424,7 @@ where
         let scope = uuid::Uuid::from_bytes(scope_bytes);
         let announce = match update {
             RetailRoomEquipmentUpdate::Caddie(item_id) => {
-                let current = self
-                    .repository
-                    .load_retail_equipment(identity.account_id)
-                    .await
-                    .map_err(|_| GameRuntimeError::Snapshot)?;
-                should_announce = current
-                    .caddie
-                    .is_none_or(|(id, _)| id.get() != i64::from(item_id));
-                let state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         identity.account_id,
@@ -5449,6 +5441,11 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let (state, announce) = match result {
+                    EconomyCommit::Committed(state) => (state, true),
+                    EconomyCommit::Replayed(state) => (state, false),
+                };
+                should_announce = announce;
                 let (uid, type_id) = state
                     .caddie
                     .map(|(id, type_id)| (u32::try_from(id.get()).unwrap_or(0), type_id))
@@ -5460,13 +5457,6 @@ where
                 }
             }
             RetailRoomEquipmentUpdate::Ball(ball_type_id) => {
-                let current_ball_type = snapshot
-                    .equipment
-                    .ball_item_id
-                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
-                    .map(|item| item.item_type_id.get())
-                    .unwrap_or(0);
-                should_announce = current_ball_type != ball_type_id;
                 let ball = snapshot
                     .inventory
                     .iter()
@@ -5496,7 +5486,8 @@ where
                 if ball_type_id != 0 && ball.is_none() {
                     return Err(GameRuntimeError::EconomyPersistence);
                 }
-                self.repository
+                let result = self
+                    .repository
                     .equip(EquipmentChange {
                         account_id: identity.account_id,
                         operation_id: retail_equipment_operation_id(
@@ -5521,16 +5512,13 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = matches!(result, EconomyCommit::Committed(_));
                 RetailEquipmentAnnounce::Ball {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     ball_type_id,
                 }
             }
             RetailRoomEquipmentUpdate::ClubSet(club_item_id) => {
-                should_announce = snapshot
-                    .equipment
-                    .club_item_id
-                    .is_none_or(|id| id.get() != i64::from(club_item_id));
                 let club = snapshot
                     .inventory
                     .iter()
@@ -5560,7 +5548,8 @@ where
                 let club_type_id = club
                     .map(|v| v.definition.type_id.get())
                     .ok_or(GameRuntimeError::EconomyPersistence)?;
-                self.repository
+                let result = self
+                    .repository
                     .equip(EquipmentChange {
                         account_id: identity.account_id,
                         operation_id: retail_equipment_operation_id(
@@ -5585,6 +5574,7 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = matches!(result, EconomyCommit::Committed(_));
                 RetailEquipmentAnnounce::ClubSet {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     club_item_id,
@@ -5594,7 +5584,6 @@ where
             RetailRoomEquipmentUpdate::Character(character_uid) => {
                 let character_id = CharacterId::new(i64::from(character_uid))
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
-                should_announce = snapshot.equipment.character_id != character_id;
                 let character = snapshot
                     .characters
                     .iter()
@@ -5626,7 +5615,8 @@ where
                                 definition: *definition,
                             })
                     });
-                self.repository
+                let result = self
+                    .repository
                     .equip(EquipmentChange {
                         account_id: identity.account_id,
                         operation_id: retail_equipment_operation_id(
@@ -5646,6 +5636,7 @@ where
                     })
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = matches!(result, EconomyCommit::Committed(_));
                 RetailEquipmentAnnounce::Character {
                     connection_id: u32::try_from(identity.connection_id.get()).unwrap_or(0),
                     character_type_id: character.item_type_id.get(),
@@ -5715,7 +5706,7 @@ where
                 if character.item_type_id.get() != parts.character_type_id {
                     return Err(GameRuntimeError::EconomyPersistence);
                 }
-                let _state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         account_id,
@@ -5730,12 +5721,19 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let state = match result {
+                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+                };
+                let (durable_id, durable_types, durable_uids) = state
+                    .character_parts
+                    .filter(|(id, _, _)| *id == character_id)
+                    .ok_or(GameRuntimeError::EconomyPersistence)?;
                 Some(RetailEquipmentUpdated::CharacterFull(RetailCharacter {
-                    iff_id: parts.character_type_id,
-                    uid: parts.character_id,
-                    hair_color: u32::from(parts.hair_color),
-                    part_iff_ids: parts.part_type_ids,
-                    part_uids: parts.part_uids,
+                    iff_id: character.item_type_id.get(),
+                    uid: u32::try_from(durable_id.get()).unwrap_or(0),
+                    hair_color: u32::from(state.character_hair_color),
+                    part_iff_ids: durable_types,
+                    part_uids: durable_uids,
                     stats: [0; CHARACTER_STATS],
                     mastery: 0,
                 }))
@@ -5746,7 +5744,7 @@ where
                     .load_player_snapshot(account_id)
                     .await
                     .map_err(|_| GameRuntimeError::Snapshot)?;
-                let state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         account_id,
@@ -5756,6 +5754,9 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let state = match result {
+                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+                };
                 Some(RetailEquipmentUpdated::Caddie {
                     caddie_id: state
                         .caddie
@@ -5769,7 +5770,7 @@ where
                     .load_player_snapshot(account_id)
                     .await
                     .map_err(|_| GameRuntimeError::Snapshot)?;
-                let state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         account_id,
@@ -5779,6 +5780,9 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let state = match result {
+                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+                };
                 Some(RetailEquipmentUpdated::Consumables {
                     item_type_ids: state.consumables,
                 })
@@ -5789,7 +5793,7 @@ where
                     .load_player_snapshot(account_id)
                     .await
                     .map_err(|_| GameRuntimeError::Snapshot)?;
-                let state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         account_id,
@@ -5799,6 +5803,9 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let state = match result {
+                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+                };
                 Some(RetailEquipmentUpdated::Decoration {
                     type_ids: state.decoration,
                 })
@@ -5836,7 +5843,7 @@ where
                 {
                     return Err(GameRuntimeError::EconomyPersistence);
                 }
-                let _state = self
+                let result = self
                     .repository
                     .update_retail_equipment(
                         account_id,
@@ -5846,9 +5853,14 @@ where
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                let state = match result {
+                    EconomyCommit::Committed(state) | EconomyCommit::Replayed(state) => state,
+                };
+                let (durable_character_id, durable_data) =
+                    state.cut_in.ok_or(GameRuntimeError::EconomyPersistence)?;
                 Some(RetailEquipmentUpdated::CutIn {
-                    character_id: u32::try_from(character_id.get()).unwrap_or(0),
-                    data,
+                    character_id: u32::try_from(durable_character_id.get()).unwrap_or(0),
+                    data: durable_data,
                 })
             }
             _ => None,

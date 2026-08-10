@@ -4044,7 +4044,7 @@ pub trait PlayerRepository: Send + Sync {
         _operation_id: EconomyOperationId,
         _expected_version: u32,
         _change: RetailEquipmentChange,
-    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+    ) -> RepositoryFuture<'_, Result<EconomyCommit<RetailEquipmentState>, RepositoryError>> {
         Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
     }
 }
