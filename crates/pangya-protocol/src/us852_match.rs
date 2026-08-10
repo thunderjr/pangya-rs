@@ -1320,6 +1320,88 @@ mod tests {
     // `pangbox/server` `game/room/room.go:580-621` broadcasts these five projections. The
     // request layouts and closed enums are the paired PacketDoc client definitions.
     #[test]
+    fn uncovered_retail_match_requests_follow_reference_layouts() {
+        let meter = decode_packet_payload::<RetailShotMeterInputRequest>(
+            &[0x02, 0, 0, 250, 0x43],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("meter input");
+        assert_eq!(meter.sequence, 2);
+        assert_eq!(meter.value, 140.0);
+        assert!(decode_packet_payload::<RetailShotMeterInputRequest>(
+            &[0x04, 0, 0, 0, 0],
+            &profile(),
+            ServiceKind::Game
+        )
+        .is_err());
+
+        let mut hole = vec![3];
+        hole.extend_from_slice(&0_u32.to_le_bytes());
+        hole.extend_from_slice(&0_u32.to_le_bytes());
+        hole.push(3);
+        hole.extend_from_slice(&1.0_f32.to_le_bytes());
+        hole.extend_from_slice(&2.0_f32.to_le_bytes());
+        hole.extend_from_slice(&3.0_f32.to_le_bytes());
+        hole.extend_from_slice(&4.0_f32.to_le_bytes());
+        let info = decode_packet_payload::<RetailHoleInfoRequest>(
+            &hole,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("hole info");
+        assert_eq!(info.number, 3);
+        assert_eq!(info.par, 3);
+        assert!(decode_packet_payload::<RetailActiveUserAcknowledge>(
+            &[],
+            &profile(),
+            ServiceKind::Game
+        )
+        .is_ok());
+        assert!(decode_packet_payload::<RetailPauseRequest>(
+            &[1],
+            &profile(),
+            ServiceKind::Game
+        )
+        .is_ok());
+        assert!(decode_packet_payload::<RetailMatchStatisticsSubmit>(
+            &[0; 239],
+            &profile(),
+            ServiceKind::Game
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn lounge_actions_validate_payload_and_preserve_reference_projection() {
+        let mut payload = vec![0x07];
+        payload.extend_from_slice(&4_u16.to_le_bytes());
+        payload.extend_from_slice(b"wave");
+        let action = decode_packet_payload::<RetailLoungeActionRequest>(
+            &payload,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("lounge action");
+        let announcement = encode_packet_payload(
+            &RetailLoungeAction {
+                connection_id: 77,
+                action,
+            },
+            &profile(),
+        )
+        .expect("announcement");
+        assert_eq!(&announcement[..5], &[77, 0, 0, 0, 7]);
+        assert_eq!(&announcement[5..], &payload[1..]);
+        assert!(decode_packet_payload::<RetailLoungeActionRequest>(
+            &[0x07, 1, 0, b'x'],
+            &profile(),
+            ServiceKind::Game
+        )
+        .is_err());
+    }
+
+    #[test]
     fn preview_requests_decode_only_the_documented_complete_values() {
         let aim = decode_packet_payload::<RetailAimRotateRequest>(
             &1.25_f32.to_le_bytes(),
