@@ -236,6 +236,7 @@ opcode is handled, client-safely refused, or deliberately ignored with a documen
 |---|---|---|
 | [`protocol/US852_RETAIL_BOOTSTRAP.md`](protocol/US852_RETAIL_BOOTSTRAP.md) | Hello, auth, the 116-byte equipment block, the 513-byte character block, containers `0x0070`–`0x0073`, lobby/room opcode table | 2026-08-08 |
 | [`protocol/US852_SUBSYSTEM_GAPS.md`](protocol/US852_SUBSYSTEM_GAPS.md) | Every unhandled client opcode by subsystem, the traps, and the ranked order reproduced in §4 above | 2026-08-08 |
+| [`protocol/US852_GM_COMMANDS.md`](protocol/US852_GM_COMMANDS.md) | GM opcode layouts, server-side capability gate, accepted minimum, and evidence-blocked refusals | 2026-08-10 |
 | [`protocol/US852_SOCIAL.md`](protocol/US852_SOCIAL.md) | Issue #12 lobby/social packet layouts, delivery scope, macro persistence, and safe no-reply outcomes | 2026-08-10 |
 | [`protocol/US852_TOURNAMENT_MODE.md`](protocol/US852_TOURNAMENT_MODE.md) | Tournament/Grand Prix mode specification | 2026-08-08 |
 | [`protocol/US852_MESSAGE_SERVICE.md`](protocol/US852_MESSAGE_SERVICE.md) | MessageService namespace, handshake, social state, and advertisements | 2026-08-10 |

@@ -1,7 +1,10 @@
 //! PostgreSQL implementation of the M7 local synthetic economy boundary.
 
 use super::*;
-use pangya_domain::{EconomyItemSelector, ItemDefinition};
+use pangya_domain::{
+    AdminItemGrant, AdminMutationError, AdminRepository, EconomyItemSelector, InventoryItem,
+    ItemDefinition,
+};
 
 #[derive(FromRow)]
 struct OperationRow {
@@ -608,6 +611,13 @@ impl EconomyRepository for PgRepository {
         request: RepairItem,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>> {
         Box::pin(self.observed(self.repair_economy(request)))
+    }
+
+    fn gm_grant_item(
+        &self,
+        request: AdminItemGrant,
+    ) -> RepositoryFuture<'_, Result<InventoryItem, AdminMutationError>> {
+        AdminRepository::grant_item(self, request)
     }
 }
 

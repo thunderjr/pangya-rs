@@ -279,6 +279,7 @@ pub(crate) async fn matches(
 pub(crate) struct PatchAccount {
     status: Option<String>,
     role: Option<String>,
+    game_master: Option<bool>,
     nickname: Option<String>,
 }
 
@@ -290,7 +291,11 @@ pub(crate) async fn patch(
     Json(body): Json<PatchAccount>,
 ) -> Result<Response, AdminError> {
     let account_id = account_id(id)?;
-    if body.status.is_none() && body.role.is_none() && body.nickname.is_none() {
+    if body.status.is_none()
+        && body.role.is_none()
+        && body.game_master.is_none()
+        && body.nickname.is_none()
+    {
         return Err(AdminError::BadRequest("empty_patch"));
     }
     let now = std::time::SystemTime::now();
@@ -336,6 +341,21 @@ pub(crate) async fn patch(
             "account.role.set",
             Some(account_id),
             &serde_json::json!({ "role": role.as_str() }),
+        )
+        .await?;
+    }
+
+    if let Some(game_master) = body.game_master {
+        state
+            .repository
+            .set_game_master(account_id, game_master, now)
+            .await?;
+        audit(
+            &state,
+            session.account_id,
+            "account.game_master.set",
+            Some(account_id),
+            &serde_json::json!({ "enabled": game_master }),
         )
         .await?;
     }

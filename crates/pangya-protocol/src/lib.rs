@@ -8,6 +8,7 @@
 mod codec;
 mod error;
 mod game;
+mod gm;
 mod login;
 mod m4_room;
 mod m5_solo;
@@ -40,6 +41,10 @@ pub use game::{
     RetailSubServerEntry, SelectChannel, is_retail_accepted_match_opcode,
     is_retail_accepted_session_opcode, is_retail_explicit_social_refusal, synthetic_game_hello,
     us852_game_hello,
+};
+pub use gm::{
+    GM_COMMAND, GM_DESTROY_ROOM, GM_DISCONNECT_USER, GM_ENTER_ROOM, GM_IDENTITY, GM_NOTICE,
+    GmRequest, GmRequestError, GmSubcommand, authorize_gm_request, decode_gm_request,
 };
 pub use login::{
     ChatMacros, CheckNickname, EmptyMessageServerList, GameServerEntry, GameServerList, GhostLogin,

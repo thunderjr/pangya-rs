@@ -322,7 +322,16 @@ impl PgRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(repository_db_error)?;
-        row.map(AuthenticationRow::into_domain).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let game_master =
+            sqlx::query_scalar::<_, bool>("SELECT game_master FROM accounts WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(repository_db_error)?;
+        row.into_domain(game_master).map(Some)
     }
 
     async fn set_nickname_inner(
@@ -640,6 +649,12 @@ impl PgRepository {
         .await
         .map_err(repository_db_error)?
         .ok_or(RepositoryError::NotFound)?;
+        let game_master =
+            sqlx::query_scalar::<_, bool>("SELECT game_master FROM accounts WHERE id = $1")
+                .bind(account.id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(repository_db_error)?;
         // The first SELECT establishes PostgreSQL's repeatable-read snapshot. Tests pause
         // here so a committed mutation can be placed deterministically before later projections.
         after_snapshot_begins.await;
@@ -689,7 +704,13 @@ impl PgRepository {
         .map_err(repository_db_error)?
         .ok_or(RepositoryError::CorruptData)?;
         let snapshot = player_snapshot_from_rows(
-            account_id, account, profile, characters, inventory, equipment,
+            account_id,
+            account,
+            game_master,
+            profile,
+            characters,
+            inventory,
+            equipment,
         )?;
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(snapshot)
@@ -2978,7 +2999,7 @@ struct AuthenticationRow {
 }
 
 impl AuthenticationRow {
-    fn into_domain(self) -> Result<AuthenticationRecord, RepositoryError> {
+    fn into_domain(self, game_master: bool) -> Result<AuthenticationRecord, RepositoryError> {
         Ok(AuthenticationRecord {
             account: Account {
                 id: AccountId::new(self.id).map_err(|_| RepositoryError::CorruptData)?,
@@ -2986,6 +3007,7 @@ impl AuthenticationRow {
                 username_normalized: NormalizedUsername::parse(&self.username_normalized)
                     .map_err(|_| RepositoryError::CorruptData)?,
                 status: parse_account_status(&self.status)?,
+                game_master,
             },
             nickname: self.nickname_display,
             credential_hash: CredentialHash::new(self.password_hash),
@@ -3807,6 +3829,7 @@ fn configured_equipment_id(
 fn player_snapshot_from_rows(
     requested: AccountId,
     account: AccountRow,
+    game_master: bool,
     profile: PlayerProfileRow,
     character_rows: Vec<CharacterRow>,
     inventory_rows: Vec<InventoryRow>,
@@ -3893,6 +3916,7 @@ fn player_snapshot_from_rows(
             username_normalized: NormalizedUsername::parse(&account.username_normalized)
                 .map_err(|_| RepositoryError::CorruptData)?,
             status,
+            game_master,
         },
         profile: Profile {
             account_id: requested,
@@ -3928,6 +3952,12 @@ async fn load_aggregate_in_transaction(
     .await
     .map_err(repository_db_error)?
     .ok_or(RepositoryError::NotFound)?;
+    let game_master =
+        sqlx::query_scalar::<_, bool>("SELECT game_master FROM accounts WHERE id = $1")
+            .bind(account_id.get())
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(repository_db_error)?;
     let profile = sqlx::query_as!(
         ProfileRow,
         "SELECT account_id, nickname_display, setup_state, pang, points, experience \
@@ -3974,6 +4004,7 @@ async fn load_aggregate_in_transaction(
             username_normalized: NormalizedUsername::parse(&account.username_normalized)
                 .map_err(|_| RepositoryError::CorruptData)?,
             status: parse_account_status(&account.status)?,
+            game_master,
         },
         profile: Profile {
             account_id: AccountId::new(profile.account_id)

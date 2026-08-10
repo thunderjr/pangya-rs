@@ -55,6 +55,8 @@ pub struct RoomIdentity {
     pub connection_id: PlayerConnectionId,
     /// Durable authenticated account identity.
     pub account_id: AccountId,
+    /// Server-side capability loaded from the account row.
+    pub game_master: bool,
     /// Validated display nickname.
     pub nickname: Nickname,
     /// The account's selected character, so a room roster can render it.
@@ -117,6 +119,13 @@ pub enum RoomEvent {
         inviter_nickname: Vec<u8>,
         /// Invited account.
         invitee_id: AccountId,
+    },
+    /// GM-updated weather/wind is broadcast to every member of this room.
+    Atmosphere {
+        /// Optional weather value.
+        weather: Option<u8>,
+        /// Optional `(strength, direction)` wind value.
+        wind: Option<(u8, u8)>,
     },
     /// A validated chat message was broadcast.
     Chat {
@@ -734,6 +743,10 @@ struct RoomState {
     name: RoomName,
     password: Option<PasswordDigest>,
     settings: RoomSettings,
+    /// Current GM-selected room weather, if any.
+    weather: Option<u8>,
+    /// Current GM-selected room wind, if any.
+    wind: Option<(u8, u8)>,
     members: Vec<Member>,
     next_join_order: u64,
     solo: SoloMatchState,
@@ -775,6 +788,8 @@ impl RoomState {
             name,
             password: password.as_ref().map(PasswordDigest::new),
             settings,
+            weather: None,
+            wind: None,
             members: vec![Member {
                 identity: owner,
                 owner: true,
@@ -1969,6 +1984,18 @@ impl RoomState {
         }
     }
 
+    fn atmosphere(&mut self, weather: Option<u8>, wind: Option<(u8, u8)>) {
+        if weather.is_some() {
+            self.weather = weather;
+        }
+        if wind.is_some() {
+            self.wind = wind;
+        }
+        for member in &self.members {
+            let _delivered = self.deliver(member, RoomEvent::Atmosphere { weather, wind });
+        }
+    }
+
     fn broadcast_snapshot(&self, snapshot: &RoomSnapshot) {
         for member in &self.members {
             let _delivered = self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
@@ -2018,6 +2045,11 @@ enum RoomCommand {
     },
     EquipmentAnnounce {
         announce: pangya_protocol::RetailEquipmentAnnounce,
+        reply: oneshot::Sender<Result<(), RoomError>>,
+    },
+    Atmosphere {
+        weather: Option<u8>,
+        wind: Option<(u8, u8)>,
         reply: oneshot::Sender<Result<(), RoomError>>,
     },
     UpdateMemberProjection {
@@ -2402,6 +2434,21 @@ impl RoomHandle {
         self.send_normal(RoomCommand::Ready {
             caller,
             ready,
+            reply,
+        })?;
+        receive.await.map_err(|_| RoomError::Closed)?
+    }
+
+    /// Broadcasts an authoritative GM atmosphere change to all current room members.
+    pub async fn atmosphere(
+        &self,
+        weather: Option<u8>,
+        wind: Option<(u8, u8)>,
+    ) -> Result<(), RoomError> {
+        let (reply, receive) = oneshot::channel();
+        self.send_normal(RoomCommand::Atmosphere {
+            weather,
+            wind,
             reply,
         })?;
         receive.await.map_err(|_| RoomError::Closed)?
@@ -3193,6 +3240,15 @@ async fn handle_normal(
             let _ignored = reply.send(Ok(()));
             true
         }
+        RoomCommand::Atmosphere {
+            weather,
+            wind,
+            reply,
+        } => {
+            state.atmosphere(weather, wind);
+            let _ignored = reply.send(Ok(()));
+            true
+        }
         RoomCommand::UpdateMemberProjection {
             caller,
             card,
@@ -3446,6 +3502,7 @@ mod tests {
             connection_id: id(value),
             account_id: AccountId::new(i64::try_from(value).unwrap_or(1))
                 .unwrap_or_else(|_| unreachable!()),
+            game_master: false,
             nickname: Nickname::parse(&format!("Player{value}")).unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
