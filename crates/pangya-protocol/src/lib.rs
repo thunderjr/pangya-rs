@@ -16,6 +16,7 @@ mod m7_economy;
 mod profile;
 mod reader;
 mod registry;
+mod social;
 mod us852_bootstrap;
 mod us852_match;
 mod us852_room;
@@ -94,6 +95,12 @@ pub use profile::{
 };
 pub use reader::PacketReader;
 pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
+pub use social::{
+    GameChat, GameChatResponse, LoungeAction, LoungeActionResponse, LoungeEnterRequest,
+    LoungeEnterResponse, MacroUpdate, TypingIndicator, TypingIndicatorResponse,
+    UserCharacterInfoResponse, UserEquipmentInfoResponse, UserInfoRequest, UserInfoResponse,
+    UserNameInfoResponse, UserStatisticsInfoResponse, Whisper, WhisperResponse,
+};
 pub use us852_bootstrap::{
     CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_BLOCK_BYTES, CHARACTER_CARDS,
     CHARACTER_PARTS, CHARACTER_STATS, EQUIPPED_ITEM_SLOTS, HISTORY_COURSES, HISTORY_SEASONS,

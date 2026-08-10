@@ -1,0 +1,613 @@
+//! U.S. 852 lobby/social packet contracts derived from PacketDoc and K4T.
+#![allow(missing_docs)]
+
+use crate::{
+    CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError, PacketEncodeError,
+    PacketReader, PacketWriter,
+};
+
+const MAX_TEXT: usize = 128;
+const MAX_NAME: usize = 64;
+const MAX_ACTION: usize = 512;
+
+fn profile_decode(
+    profile: &CompatibilityProfile,
+    reader: &PacketReader<'_>,
+) -> Result<(), PacketDecodeError> {
+    profile
+        .require_us852()
+        .map_err(|error| reader.invalid(error.to_string()))
+}
+fn profile_encode(profile: &CompatibilityProfile) -> Result<(), PacketEncodeError> {
+    profile.require_us852().map_err(Into::into)
+}
+fn end(reader: &PacketReader<'_>) -> Result<(), PacketDecodeError> {
+    if reader.remaining() == 0 {
+        Ok(())
+    } else {
+        Err(reader.invalid("social packet has trailing bytes"))
+    }
+}
+fn pstring(
+    reader: &mut PacketReader<'_>,
+    maximum: usize,
+    field: &'static str,
+) -> Result<Vec<u8>, PacketDecodeError> {
+    let bytes = reader.pstring(maximum)?;
+    if bytes.contains(&0) {
+        return Err(reader.invalid(format!("{field} contains NUL")));
+    }
+    Ok(bytes.to_vec())
+}
+fn write_string(
+    writer: &mut PacketWriter,
+    bytes: &[u8],
+    maximum: usize,
+    field: &'static str,
+) -> Result<(), PacketEncodeError> {
+    if bytes.contains(&0) {
+        return Err(PacketEncodeError::Invalid { field });
+    }
+    writer.pstring(bytes, maximum)
+}
+
+/// Retail lobby/room chat request, client opcode `0x0003`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameChat {
+    pub nickname: Vec<u8>,
+    pub message: Vec<u8>,
+}
+impl GameChat {
+    pub fn new(nickname: Vec<u8>, message: Vec<u8>) -> Self {
+        Self { nickname, message }
+    }
+}
+impl DecodePacket for GameChat {
+    const OPCODE: u16 = 0x0003;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        reader.array::<4>()?;
+        let nickname = pstring(reader, MAX_NAME, "nickname")?;
+        let message = pstring(reader, MAX_TEXT, "message")?;
+        end(reader)?;
+        Ok(Self { nickname, message })
+    }
+}
+impl EncodePacket for GameChat {
+    const OPCODE: u16 = 0x0003;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.bytes(&[0; 4]);
+        write_string(writer, &self.nickname, MAX_NAME, "nickname")?;
+        write_string(writer, &self.message, MAX_TEXT, "message")
+    }
+}
+/// Retail global chat response, server opcode `0x0040`, subtype `0x00`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameChatResponse {
+    pub nickname: Vec<u8>,
+    pub message: Vec<u8>,
+}
+impl EncodePacket for GameChatResponse {
+    const OPCODE: u16 = 0x0040;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u8(0);
+        write_string(writer, &self.nickname, MAX_NAME, "nickname")?;
+        write_string(writer, &self.message, MAX_TEXT, "message")
+    }
+}
+/// Retail whisper request, client opcode `0x002A`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Whisper {
+    pub nickname: Vec<u8>,
+    pub message: Vec<u8>,
+}
+impl Whisper {
+    pub fn new(nickname: Vec<u8>, message: Vec<u8>) -> Self {
+        Self { nickname, message }
+    }
+}
+impl DecodePacket for Whisper {
+    const OPCODE: u16 = 0x002a;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let nickname = pstring(reader, MAX_NAME, "nickname")?;
+        let message = pstring(reader, MAX_TEXT, "message")?;
+        end(reader)?;
+        Ok(Self { nickname, message })
+    }
+}
+impl EncodePacket for Whisper {
+    const OPCODE: u16 = 0x002a;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        write_string(writer, &self.nickname, MAX_NAME, "nickname")?;
+        write_string(writer, &self.message, MAX_TEXT, "message")
+    }
+}
+/// Retail whisper response, server opcode `0x0084`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhisperResponse {
+    pub status: u8,
+    pub nickname: Vec<u8>,
+    pub message: Vec<u8>,
+}
+impl EncodePacket for WhisperResponse {
+    const OPCODE: u16 = 0x0084;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if self.status > 1 {
+            return Err(PacketEncodeError::Invalid {
+                field: "whisper status",
+            });
+        }
+        writer.u8(self.status);
+        write_string(writer, &self.nickname, MAX_NAME, "nickname")?;
+        write_string(writer, &self.message, MAX_TEXT, "message")
+    }
+}
+/// Retail typing indicator, client opcode `0x0018`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypingIndicator {
+    pub typing: bool,
+}
+impl DecodePacket for TypingIndicator {
+    const OPCODE: u16 = 0x0018;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let value = reader.i16_le()?;
+        end(reader)?;
+        match value {
+            1 => Ok(Self { typing: true }),
+            -1 => Ok(Self { typing: false }),
+            _ => Err(reader.invalid("typing indicator is not 1 or -1")),
+        }
+    }
+}
+impl EncodePacket for TypingIndicator {
+    const OPCODE: u16 = 0x0018;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.i16_le(if self.typing { 1 } else { -1 });
+        Ok(())
+    }
+}
+/// Retail typing response, server opcode `0x005D`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypingIndicatorResponse {
+    pub connection_id: u32,
+    pub typing: bool,
+}
+impl EncodePacket for TypingIndicatorResponse {
+    const OPCODE: u16 = 0x005d;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.i16_le(if self.typing { 1 } else { -1 });
+        Ok(())
+    }
+}
+/// Retail lounge action request, client opcode `0x0063`. Payload is retained opaque so all
+/// K4T action subtypes (rotation, appear, posture, move, animation, effects) relay exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoungeAction {
+    pub action_type: u8,
+    pub action_payload: Vec<u8>,
+}
+impl LoungeAction {
+    pub fn emote(value: Vec<u8>) -> Self {
+        Self {
+            action_type: 7,
+            action_payload: value,
+        }
+    }
+}
+impl DecodePacket for LoungeAction {
+    const OPCODE: u16 = 0x0063;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let action_type = reader.u8()?;
+        if reader.remaining() > MAX_ACTION {
+            return Err(reader.invalid("lounge action exceeds bound"));
+        }
+        let action_payload = reader.unknown_tail().to_vec();
+        Ok(Self {
+            action_type,
+            action_payload,
+        })
+    }
+}
+impl EncodePacket for LoungeAction {
+    const OPCODE: u16 = 0x0063;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if self.action_payload.len() > MAX_ACTION {
+            return Err(PacketEncodeError::Limit {
+                field: "lounge action",
+                actual: self.action_payload.len(),
+                maximum: MAX_ACTION,
+            });
+        }
+        writer.u8(self.action_type);
+        writer.bytes(&self.action_payload);
+        Ok(())
+    }
+}
+/// Retail lounge action announcement, server opcode `0x00C4`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoungeActionResponse {
+    pub connection_id: u32,
+    pub action: LoungeAction,
+}
+impl LoungeActionResponse {
+    pub fn new(connection_id: u32, payload: Vec<u8>) -> Self {
+        let action_type = payload.first().copied().unwrap_or(0);
+        Self {
+            connection_id,
+            action: LoungeAction {
+                action_type,
+                action_payload: payload.get(1..).unwrap_or_default().to_vec(),
+            },
+        }
+    }
+}
+impl DecodePacket for LoungeActionResponse {
+    const OPCODE: u16 = 0x00c4;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let connection_id = reader.u32_le()?;
+        let action_type = reader.u8()?;
+        if reader.remaining() > MAX_ACTION {
+            return Err(reader.invalid("lounge action exceeds bound"));
+        }
+        let action_payload = reader.unknown_tail().to_vec();
+        Ok(Self {
+            connection_id,
+            action: LoungeAction {
+                action_type,
+                action_payload,
+            },
+        })
+    }
+}
+impl EncodePacket for LoungeActionResponse {
+    const OPCODE: u16 = 0x00c4;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u32_le(self.connection_id);
+        writer.u8(self.action.action_type);
+        writer.bytes(&self.action.action_payload);
+        Ok(())
+    }
+}
+/// Retail chat macro update, client opcode `0x0069`; nine fixed 64-byte slots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MacroUpdate {
+    pub values: [Vec<u8>; 9],
+}
+impl MacroUpdate {
+    pub fn new(values: [Vec<u8>; 9]) -> Self {
+        Self { values }
+    }
+}
+impl DecodePacket for MacroUpdate {
+    const OPCODE: u16 = 0x0069;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let values: [Result<Vec<u8>, PacketDecodeError>; 9] =
+            std::array::from_fn(|_| reader.fixed_nul(64).map(<[u8]>::to_vec));
+        let values: [Vec<u8>; 9] = values
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| reader.invalid("macro count"))?;
+        end(reader)?;
+        Ok(Self { values })
+    }
+}
+impl EncodePacket for MacroUpdate {
+    const OPCODE: u16 = 0x0069;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        for value in &self.values {
+            writer.fixed_nul(value, 64)?;
+        }
+        Ok(())
+    }
+}
+/// Retail lounge-enter request, client opcode `0x00EB`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoungeEnterRequest {
+    pub connection_id: u32,
+}
+impl DecodePacket for LoungeEnterRequest {
+    const OPCODE: u16 = 0x00eb;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let connection_id = reader.u32_le()?;
+        end(reader)?;
+        Ok(Self { connection_id })
+    }
+}
+/// Retail lounge-enter response, server opcode `0x0196`; packetdoc documents five `1.0` values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoungeEnterResponse {
+    pub connection_id: u32,
+}
+impl EncodePacket for LoungeEnterResponse {
+    const OPCODE: u16 = 0x0196;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u32_le(self.connection_id);
+        for _ in 0..5 {
+            writer.f32_le(1.0);
+        }
+        Ok(())
+    }
+}
+/// Retail user information request, client opcode `0x002F`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserInfoRequest {
+    pub user_id: u32,
+    pub request_type: u8,
+}
+impl DecodePacket for UserInfoRequest {
+    const OPCODE: u16 = 0x002f;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        profile_decode(profile, reader)?;
+        let user_id = reader.u32_le()?;
+        let request_type = reader.u8()?;
+        if !matches!(request_type, 0 | 5) {
+            return Err(reader.invalid("user info request type"));
+        }
+        end(reader)?;
+        Ok(Self {
+            user_id,
+            request_type,
+        })
+    }
+}
+impl EncodePacket for UserInfoRequest {
+    const OPCODE: u16 = 0x002f;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u32_le(self.user_id);
+        writer.u8(self.request_type);
+        Ok(())
+    }
+}
+/// Retail user-name fan-out response, server opcode `0x0157`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserNameInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+    pub username: Vec<u8>,
+    pub nickname: Vec<u8>,
+}
+impl EncodePacket for UserNameInfoResponse {
+    const OPCODE: u16 = 0x0157;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if self.request_type != 5 {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        writer.u16_le(0xffff);
+        writer.fixed_nul(&self.username, 22)?;
+        writer.fixed_nul(&self.nickname, 22)?;
+        writer.fixed_nul(&[], 21)?;
+        writer.fixed_nul(&[], 24)?;
+        writer.u32_le(0);
+        writer.bytes(&[0; 12]);
+        writer.u32_le(0);
+        writer.bytes(&[0; 4]);
+        writer.u16_le(0);
+        writer.bytes(&[0xff; 6]);
+        writer.bytes(&[0; 16]);
+        writer.fixed_nul(&[], 128)?;
+        writer.u32_le(self.user_id);
+        writer.bytes(&[0; 4]);
+        Ok(())
+    }
+}
+/// Retail statistics fan-out response, server opcode `0x0158`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserStatisticsInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+    pub experience: u32,
+    pub pang: u64,
+}
+impl EncodePacket for UserStatisticsInfoResponse {
+    const OPCODE: u16 = 0x0158;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if self.request_type != 5 {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        crate::RetailPlayerStatistics {
+            experience: self.experience,
+            pang: self.pang,
+            ..crate::RetailPlayerStatistics::default()
+        }
+        .encode_data(writer);
+        Ok(())
+    }
+}
+/// Retail equipment fan-out response, server opcode `0x0156`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserEquipmentInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+    pub character_uid: u32,
+    pub comet_iff_id: u32,
+}
+impl EncodePacket for UserEquipmentInfoResponse {
+    const OPCODE: u16 = 0x0156;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if self.request_type != 5 {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        for index in 0..29 {
+            writer.u32_le(match index {
+                1 => self.character_uid,
+                3 => self.comet_iff_id,
+                _ => 0,
+            });
+        }
+        Ok(())
+    }
+}
+/// Retail character fan-out response, server opcode `0x015E`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserCharacterInfoResponse {
+    pub user_id: u32,
+    pub character_iff_id: u32,
+    pub character_uid: u32,
+}
+impl EncodePacket for UserCharacterInfoResponse {
+    const OPCODE: u16 = 0x015e;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u32_le(self.user_id);
+        crate::RetailCharacter {
+            iff_id: self.character_iff_id,
+            uid: self.character_uid,
+            hair_color: 0,
+            part_iff_ids: [0; crate::CHARACTER_PARTS],
+            part_uids: [0; crate::CHARACTER_PARTS],
+            stats: [0; crate::CHARACTER_STATS],
+            mastery: 0,
+        }
+        .encode_body(writer);
+        Ok(())
+    }
+}
+/// Retail user information acknowledgement, server opcode `0x0089`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserInfoResponse {
+    pub status: u32,
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserInfoResponse {
+    const OPCODE: u16 = 0x0089;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.status, 1 | 2) || !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info response",
+            });
+        }
+        writer.u32_le(self.status);
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        Ok(())
+    }
+}

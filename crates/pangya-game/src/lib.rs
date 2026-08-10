@@ -64,10 +64,12 @@ use pangya_protocol::{
     CharacterInfo, CodecLimits, CompatibilityProfile, ConsumeOneRequest, DecodePacket,
     EQUIPPED_ITEM_SLOTS, EconomyCommand, EconomyCommandResult, EconomyItemKind, EconomyOutcome,
     EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo, FinishHole, FrameCodec,
-    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, HandoverControl, HandoverReply, HoleResult,
-    IffContainerChunk, IffContainerKind, InventoryBootstrap, InventoryChanged, InventorySegment,
-    Lie, LoadingComplete, MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase,
-    MatchStarted, OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
+    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, GameChat, GameChatResponse, HandoverControl,
+    HandoverReply, HoleResult, IffContainerChunk, IffContainerKind, InventoryBootstrap,
+    InventoryChanged, InventorySegment, Lie, LoadingComplete, LoungeAction, LoungeActionResponse,
+    LoungeEnterRequest, LoungeEnterResponse, MacroUpdate,
+    MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
+    OutboundFrame, PacketEncodeError, PacketWriter, PlayerInfo, PurchaseCommitted,
     PurchaseRequestPacket, RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest,
     RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
     RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
@@ -108,9 +110,11 @@ use pangya_protocol::{
     StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, Weather as ProtocolWeather, Wind, decode_packet_payload,
-    encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
-    packed_system_time, synthetic_game_hello, us852_game_hello,
+    StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UserCharacterInfoResponse,
+    UserEquipmentInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserStatisticsInfoResponse, Weather as ProtocolWeather, Whisper, WhisperResponse, Wind,
+    decode_packet_payload, encode_packet_payload, is_retail_accepted_match_opcode,
+    is_retail_accepted_session_opcode, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -712,7 +716,196 @@ struct Admission {
     _source: KeyedCapacityGuard<SourceAddressPrefix>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+enum SocialEvent {
+    Chat {
+        targets: Vec<PlayerConnectionId>,
+        nickname: Vec<u8>,
+        message: Vec<u8>,
+    },
+    Whisper {
+        target: PlayerConnectionId,
+        status: u8,
+        nickname: Vec<u8>,
+        message: Vec<u8>,
+    },
+    Typing {
+        targets: Vec<PlayerConnectionId>,
+        connection_id: u32,
+        typing: bool,
+    },
+    Lounge {
+        targets: Vec<PlayerConnectionId>,
+        connection_id: u32,
+        action: Vec<u8>,
+    },
+    UserInfo {
+        target: PlayerConnectionId,
+        user_id: u32,
+        nickname: Vec<u8>,
+        card: MemberCard,
+    },
+}
+
+#[derive(Clone)]
+struct SocialMember {
+    account_id: AccountId,
+    nickname: Vec<u8>,
+    card: MemberCard,
+    room: Option<RoomId>,
+    whisper_accept: bool,
+}
+
+#[derive(Clone)]
+struct SocialHub {
+    members: Arc<Mutex<std::collections::BTreeMap<PlayerConnectionId, SocialMember>>>,
+    events: broadcast::Sender<SocialEvent>,
+}
+
+impl SocialHub {
+    fn new(capacity: usize) -> Self {
+        let (events, _) = broadcast::channel(capacity.max(1));
+        Self {
+            members: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            events,
+        }
+    }
+    fn subscribe(&self) -> broadcast::Receiver<SocialEvent> {
+        self.events.subscribe()
+    }
+    fn register(
+        &self,
+        id: PlayerConnectionId,
+        account_id: AccountId,
+        nickname: Vec<u8>,
+        card: MemberCard,
+    ) {
+        if let Ok(mut members) = self.members.lock() {
+            members.insert(
+                id,
+                SocialMember {
+                    account_id,
+                    nickname,
+                    card,
+                    room: None,
+                    whisper_accept: true,
+                },
+            );
+        }
+    }
+    fn remove(&self, id: PlayerConnectionId) {
+        if let Ok(mut members) = self.members.lock() {
+            members.remove(&id);
+        }
+    }
+    fn set_room(&self, id: PlayerConnectionId, room: Option<RoomId>) {
+        if let Ok(mut members) = self.members.lock()
+            && let Some(member) = members.get_mut(&id)
+        {
+            member.room = room;
+        }
+    }
+    fn set_whisper_accept(&self, id: PlayerConnectionId, accept: bool) {
+        if let Ok(mut members) = self.members.lock()
+            && let Some(member) = members.get_mut(&id)
+        {
+            member.whisper_accept = accept;
+        }
+    }
+    fn scoped_targets(&self, id: PlayerConnectionId) -> Vec<PlayerConnectionId> {
+        let Ok(members) = self.members.lock() else {
+            return Vec::new();
+        };
+        let room = members.get(&id).and_then(|member| member.room);
+        members
+            .iter()
+            .filter_map(|(target, member)| (member.room == room).then_some(*target))
+            .collect()
+    }
+    fn chat(&self, id: PlayerConnectionId, nickname: Vec<u8>, message: Vec<u8>) {
+        let targets = self.scoped_targets(id);
+        let _ = self.events.send(SocialEvent::Chat {
+            targets,
+            nickname,
+            message,
+        });
+    }
+    fn typing(&self, id: PlayerConnectionId, typing: bool) {
+        let targets = self.scoped_targets(id);
+        let _ = self.events.send(SocialEvent::Typing {
+            targets,
+            connection_id: u32::try_from(id.get()).unwrap_or(u32::MAX),
+            typing,
+        });
+    }
+    fn lounge(&self, id: PlayerConnectionId, action: Vec<u8>) {
+        let targets = self.scoped_targets(id);
+        let _ = self.events.send(SocialEvent::Lounge {
+            targets,
+            connection_id: u32::try_from(id.get()).unwrap_or(u32::MAX),
+            action,
+        });
+    }
+    fn whisper(&self, id: PlayerConnectionId, target_name: &[u8], message: Vec<u8>) {
+        let Ok(members) = self.members.lock() else {
+            return;
+        };
+        let sender = members.get(&id);
+        let Some(sender) = sender else { return };
+        let target = members
+            .iter()
+            .find(|(_, member)| member.nickname.as_slice() == target_name)
+            .map(|(id, member)| (*id, member));
+        let Some((target_id, target)) = target else {
+            let _ = self.events.send(SocialEvent::Whisper {
+                target: id,
+                status: 5,
+                nickname: target_name.to_vec(),
+                message: Vec::new(),
+            });
+            return;
+        };
+        if !target.whisper_accept {
+            let _ = self.events.send(SocialEvent::Whisper {
+                target: id,
+                status: 4,
+                nickname: target_name.to_vec(),
+                message: Vec::new(),
+            });
+            return;
+        }
+        let _ = self.events.send(SocialEvent::Whisper {
+            target: target_id,
+            status: 0,
+            nickname: sender.nickname.clone(),
+            message: message.clone(),
+        });
+        let _ = self.events.send(SocialEvent::Whisper {
+            target: id,
+            status: 1,
+            nickname: target.nickname.clone(),
+            message,
+        });
+    }
+    fn user_info(&self, requester: PlayerConnectionId, target_id: u32, card: MemberCard) {
+        let Ok(members) = self.members.lock() else {
+            return;
+        };
+        let target = members
+            .values()
+            .find(|m| u32::try_from(m.account_id.get()).ok() == Some(target_id));
+        let (nickname, card) = target.map_or((Vec::new(), card), |member| {
+            (member.nickname.clone(), member.card.clone())
+        });
+        let _ = self.events.send(SocialEvent::UserInfo {
+            target: requester,
+            user_id: target_id,
+            nickname,
+            card,
+        });
+    }
+}
+
 struct CaptureSink {
     capacity: usize,
     entries: Mutex<VecDeque<UnknownOpcodeCapture>>,
@@ -778,6 +971,7 @@ where
     global_bytes: FixedWindowLimiter<()>,
     source_bytes: FixedWindowLimiter<SourceAddressPrefix>,
     active_accounts: CapacityRegistry<AccountId>,
+    social: SocialHub,
 }
 
 impl<R> std::fmt::Debug for GameService<R>
@@ -1035,6 +1229,7 @@ where
                 limits.rate_window,
             ),
             active_accounts: CapacityRegistry::new(limits.global_connections),
+            social: SocialHub::new(limits.outbound_room_event_capacity),
             captures: CaptureSink::new(limits.unknown_capture_capacity),
             config,
             observer,
@@ -1269,6 +1464,7 @@ where
         let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
         let mut match_context = ConnectionMatchContext::default();
+        let mut social_events = self.social.subscribe();
 
         let result = loop {
             let deadline = if matches!(state, GameState::AwaitHandover | GameState::AwaitChannel) {
@@ -1284,6 +1480,10 @@ where
                 () = room_cancellation.cancelled() => {
                     self.observer.queue(GameQueueObservation::OutboundDropped);
                     break Err(GameRuntimeError::Limited);
+                }
+                social_event = social_events.recv(), if !matches!(state, GameState::AwaitHandover | GameState::AwaitChannel | GameState::Closed) => {
+                    let Ok(event) = social_event else { continue; };
+                    if let Err(error) = self.handle_social_event(&mut framed, connection_id, event).await { break Err(error); }
                 }
                 event = room_events.recv(), if matches!(state, GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
@@ -1343,6 +1543,7 @@ where
                             };
                             match authenticated {
                                 Ok((guard, established)) => {
+                                    self.social.register(connection_id, established.account_id, established.nickname.display().as_bytes().to_vec(), established.card.clone());
                                     presence = Some(guard);
                                     identity = Some(established);
                                     state = GameState::AwaitChannel;
@@ -1508,6 +1709,39 @@ where
                                     }
                                     Err(error) => break Err(error),
                                 }
+                            } else if self.config.retail_bootstrap && frame.opcode == <GameChat as DecodePacket>::OPCODE {
+                                let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
+                                let chat = decode_packet_payload::<GameChat>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                if chat.nickname != established.nickname.display().as_bytes() { break Err(GameRuntimeError::Protocol); }
+                                if !chats.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
+                                self.social.chat(connection_id, chat.nickname, chat.message);
+                            } else if self.config.retail_bootstrap && frame.opcode == <Whisper as DecodePacket>::OPCODE {
+                                let whisper = decode_packet_payload::<Whisper>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                self.social.whisper(connection_id, &whisper.nickname, whisper.message);
+                            } else if self.config.retail_bootstrap && frame.opcode == <TypingIndicator as DecodePacket>::OPCODE {
+                                let typing = decode_packet_payload::<TypingIndicator>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                self.social.typing(connection_id, typing.typing);
+                            } else if self.config.retail_bootstrap && frame.opcode == <MacroUpdate as DecodePacket>::OPCODE {
+                                let macros = decode_packet_payload::<MacroUpdate>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
+                                self.repository.save_chat_macros(established.account_id, macros.values).await.map_err(|_| GameRuntimeError::Snapshot)?;
+                            } else if self.config.retail_bootstrap && frame.opcode == <UserInfoRequest as DecodePacket>::OPCODE {
+                                let request = decode_packet_payload::<UserInfoRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                if let Some(target) = self.social.members.lock().ok().and_then(|members| members.iter().find(|(_, member)| u32::try_from(member.account_id.get()).ok() == Some(request.user_id)).map(|(_, member)| member.clone())) {
+                                    self.social.user_info(connection_id, request.user_id, MemberCard { username: String::new(), character_iff_id: 0, character_uid: 0, caddie_uid: 0, club_set_uid: 0, club_set_iff_id: 0, comet_iff_id: 0, experience: 0, pang: 0 });
+                                    let _ = target;
+                                } else { let _ = self.social.events.send(SocialEvent::UserInfo { target: connection_id, user_id: request.user_id, nickname: Vec::new(), card: MemberCard::default() }); }
+                            } else if self.config.retail_bootstrap && frame.opcode == 0x0055 {
+                                if frame.payload.len() != 1 || frame.payload[0] > 1 { break Err(GameRuntimeError::Protocol); }
+                                self.social.set_whisper_accept(connection_id, frame.payload[0] == 1);
+                            } else if self.config.retail_bootstrap && frame.opcode == <LoungeEnterRequest as DecodePacket>::OPCODE {
+                                let request = decode_packet_payload::<LoungeEnterRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                self.send(&mut framed, &LoungeEnterResponse { connection_id: request.connection_id }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == <LoungeAction as DecodePacket>::OPCODE {
+                                let action = decode_packet_payload::<LoungeAction>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                let mut payload = Vec::with_capacity(action.action_payload.len() + 1);
+                                payload.push(action.action_type); payload.extend_from_slice(&action.action_payload);
+                                self.social.lounge(connection_id, payload);
                             } else if self.config.retail_bootstrap
                                 && frame.opcode == RetailPurchaseRequest::OPCODE
                             {
@@ -1765,6 +1999,7 @@ where
                 Ok(())
             }
         };
+        self.social.remove(connection_id);
         drop(presence);
         let _terminal_state = state;
         match cleanup_result {
@@ -3547,6 +3782,122 @@ where
             }
             Ok(LobbyRouteResult::ChatAccepted) => return Err(GameRuntimeError::Protocol),
             Err(error) => self.send_result(framed, command, Err(error)).await?,
+        }
+        Ok(())
+    }
+
+    async fn handle_social_event(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        connection_id: PlayerConnectionId,
+        event: SocialEvent,
+    ) -> Result<(), GameRuntimeError> {
+        match event {
+            SocialEvent::Chat {
+                targets,
+                nickname,
+                message,
+            } if targets.contains(&connection_id) => {
+                self.send(framed, &GameChatResponse { nickname, message })
+                    .await?;
+            }
+            SocialEvent::Whisper {
+                target,
+                status,
+                nickname,
+                message,
+            } if target == connection_id => {
+                self.send(
+                    framed,
+                    &WhisperResponse {
+                        status,
+                        nickname,
+                        message,
+                    },
+                )
+                .await?;
+            }
+            SocialEvent::Typing {
+                targets,
+                connection_id: sender,
+                typing,
+            } if targets.contains(&connection_id) => {
+                self.send(
+                    framed,
+                    &TypingIndicatorResponse {
+                        connection_id: sender,
+                        typing,
+                    },
+                )
+                .await?;
+            }
+            SocialEvent::Lounge {
+                targets,
+                connection_id: sender,
+                action,
+            } if targets.contains(&connection_id) => {
+                self.send(framed, &LoungeActionResponse::new(sender, action))
+                    .await?;
+            }
+            SocialEvent::UserInfo {
+                target,
+                user_id,
+                nickname,
+                card,
+            } if target == connection_id => {
+                let status = u32::from(!nickname.is_empty());
+                self.send(
+                    framed,
+                    &UserInfoResponse {
+                        status: if status == 1 { 1 } else { 2 },
+                        request_type: 5,
+                        user_id,
+                    },
+                )
+                .await?;
+                if status == 1 {
+                    self.send(
+                        framed,
+                        &UserNameInfoResponse {
+                            request_type: 5,
+                            user_id,
+                            username: card.username.as_bytes().to_vec(),
+                            nickname,
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        framed,
+                        &UserCharacterInfoResponse {
+                            user_id,
+                            character_iff_id: card.character_iff_id,
+                            character_uid: card.character_uid,
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        framed,
+                        &UserEquipmentInfoResponse {
+                            request_type: 5,
+                            user_id,
+                            character_uid: card.character_uid,
+                            comet_iff_id: card.comet_iff_id,
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        framed,
+                        &UserStatisticsInfoResponse {
+                            request_type: 5,
+                            user_id,
+                            experience: card.experience,
+                            pang: card.pang,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -6347,6 +6698,8 @@ where
                 match created {
                     Ok(summary) => {
                         *room_id = Some(summary.id());
+                        self.social
+                            .set_room(identity.connection_id, Some(summary.id()));
                         self.observer.room(GameRoomObservation::Created);
                         // The number is on the room's own header in the client, and an
                         // operator driving a second seat into it has otherwise no way to learn
@@ -6395,6 +6748,8 @@ where
                 match joined {
                     Ok(snapshot) => {
                         *room_id = Some(snapshot.summary().id());
+                        self.social
+                            .set_room(identity.connection_id, Some(snapshot.summary().id()));
                         self.observer.room(GameRoomObservation::Joined);
                         self.send(
                             framed,
@@ -6468,6 +6823,7 @@ where
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
                 *room_id = None;
+                self.social.set_room(identity.connection_id, None);
                 self.observer.room(GameRoomObservation::Left);
                 self.send(framed, &RetailRoomLeave::to_lobby()).await?;
                 self.send_retail_room_list(framed).await?;
@@ -7792,6 +8148,82 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn issue12_social_hub_scopes_ordered_chat_typing_and_lounge_to_room_members() {
+        let hub = SocialHub::new(16);
+        let first = PlayerConnectionId::new(1).unwrap_or(PlayerConnectionId::new(2).unwrap());
+        let second = PlayerConnectionId::new(2).unwrap_or(PlayerConnectionId::new(3).unwrap());
+        let outsider = PlayerConnectionId::new(3).unwrap_or(PlayerConnectionId::new(4).unwrap());
+        let room = RoomId::new(9).unwrap_or(RoomId::new(10).unwrap());
+        for (id, account, name) in [
+            (first, 11, b"one".to_vec()),
+            (second, 12, b"two".to_vec()),
+            (outsider, 13, b"three".to_vec()),
+        ] {
+            hub.register(
+                id,
+                AccountId::new(account).unwrap_or(AccountId::new(1).unwrap()),
+                name,
+                MemberCard::default(),
+            );
+        }
+        hub.set_room(first, Some(room));
+        hub.set_room(second, Some(room));
+        let mut first_events = hub.subscribe();
+        let mut outsider_events = hub.subscribe();
+        hub.chat(first, b"one".to_vec(), b"hello".to_vec());
+        assert!(
+            matches!(first_events.try_recv(), Ok(SocialEvent::Chat { ref targets, .. }) if targets.contains(&second) && !targets.contains(&outsider))
+        );
+        assert!(
+            matches!(outsider_events.try_recv(), Ok(SocialEvent::Chat { ref targets, .. }) if !targets.contains(&outsider))
+        );
+        hub.typing(first, true);
+        assert!(matches!(
+            first_events.try_recv(),
+            Ok(SocialEvent::Typing { typing: true, .. })
+        ));
+        hub.lounge(second, vec![7, 1, 2]);
+        assert!(
+            matches!(first_events.try_recv(), Ok(SocialEvent::Lounge { action, .. }) if action == vec![7, 1, 2])
+        );
+    }
+
+    #[test]
+    fn issue12_whisper_accept_state_refuses_blocked_and_offline_targets() {
+        let hub = SocialHub::new(16);
+        let sender = PlayerConnectionId::new(1).unwrap_or(PlayerConnectionId::new(2).unwrap());
+        let target = PlayerConnectionId::new(2).unwrap_or(PlayerConnectionId::new(3).unwrap());
+        hub.register(
+            sender,
+            AccountId::new(1).unwrap(),
+            b"sender".to_vec(),
+            MemberCard::default(),
+        );
+        hub.register(
+            target,
+            AccountId::new(2).unwrap(),
+            b"target".to_vec(),
+            MemberCard::default(),
+        );
+        let mut sender_events = hub.subscribe();
+        let mut target_events = hub.subscribe();
+        hub.set_whisper_accept(target, false);
+        hub.whisper(sender, b"target", b"blocked".to_vec());
+        assert!(matches!(
+            sender_events.try_recv(),
+            Ok(SocialEvent::Whisper { status: 4, .. })
+        ));
+        assert!(
+            matches!(target_events.try_recv(), Ok(SocialEvent::Whisper { target: recipient, status: 4, .. }) if recipient == sender)
+        );
+        hub.whisper(sender, b"missing", b"offline".to_vec());
+        assert!(matches!(
+            sender_events.try_recv(),
+            Ok(SocialEvent::Whisper { status: 5, .. })
+        ));
+    }
 
     #[test]
     fn retail_purchase_replay_window_reuses_only_exact_bounded_wire_keys() {

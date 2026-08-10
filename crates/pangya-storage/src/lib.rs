@@ -432,6 +432,45 @@ impl PgRepository {
         Ok(())
     }
 
+    async fn load_chat_macros_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<[Vec<u8>; 9], RepositoryError> {
+        let row = sqlx::query("SELECT chat_macros FROM profiles WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        let values: Vec<Vec<u8>> = row.try_get("chat_macros").map_err(repository_db_error)?;
+        if values.len() != 9 || values.iter().any(|value| value.len() >= 64) {
+            return Err(RepositoryError::CorruptData);
+        }
+        values.try_into().map_err(|_| RepositoryError::CorruptData)
+    }
+
+    async fn save_chat_macros_inner(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> Result<(), RepositoryError> {
+        if macros
+            .iter()
+            .any(|value| value.len() >= 64 || value.contains(&0))
+        {
+            return Err(RepositoryError::CorruptData);
+        }
+        sqlx::query(
+            "UPDATE profiles SET chat_macros = $2, updated_at = now() WHERE account_id = $1",
+        )
+        .bind(account_id.get())
+        .bind(macros.to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        Ok(())
+    }
+
     async fn load_player_snapshot_inner(
         &self,
         account_id: AccountId,
@@ -1546,6 +1585,21 @@ impl PgRepository {
 }
 
 impl AccountRepository for PgRepository {
+    fn load_chat_macros(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<[Vec<u8>; 9], RepositoryError>> {
+        Box::pin(self.observed(self.load_chat_macros_inner(account_id)))
+    }
+
+    fn save_chat_macros(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.save_chat_macros_inner(account_id, macros)))
+    }
+
     fn create_account(
         &self,
         request: NewAccount,
@@ -2222,6 +2276,14 @@ async fn owned_by_type_any(
 }
 
 impl PlayerRepository for PgRepository {
+    fn save_chat_macros(
+        &self,
+        account_id: AccountId,
+        macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.save_chat_macros_inner(account_id, macros)))
+    }
+
     fn load_player_snapshot(
         &self,
         account_id: AccountId,

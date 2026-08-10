@@ -3183,6 +3183,23 @@ pub trait AccountRepository: Send + Sync {
         account_id: AccountId,
         grant: BalanceGrant,
     ) -> RepositoryFuture<'_, Result<AccountBalances, RepositoryError>>;
+
+    /// Loads the nine persisted lobby chat macros for LoginService.
+    fn load_chat_macros(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<[Vec<u8>; 9], RepositoryError>> {
+        Box::pin(std::future::ready(Ok(std::array::from_fn(|_| Vec::new()))))
+    }
+
+    /// Persists the nine bounded lobby chat macros.
+    fn save_chat_macros(
+        &self,
+        _account_id: AccountId,
+        _macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
+    }
 }
 
 /// Technology-neutral operator admin surface repository contract.
@@ -4063,6 +4080,16 @@ pub trait PlayerRepository: Send + Sync {
         _change: RetailEquipmentChange,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RetailEquipmentState>, RepositoryError>> {
         Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
+    }
+
+    /// Persists the nine bounded lobby chat macros for the authenticated player.
+    fn save_chat_macros(
+        &self,
+        _account_id: AccountId,
+        _macros: [Vec<u8>; 9],
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
+    }
     }
 }
 

@@ -1309,13 +1309,11 @@ where
             },
         )
         .await?;
-        self.send(
-            framed,
-            &ChatMacros {
-                values: std::array::from_fn(|_| Vec::new()),
-            },
-        )
-        .await?;
+        let macros = self
+            .repository_call(self.repository.load_chat_macros(account.account.id))
+            .await
+            .map_err(|_| LoginRuntimeError::Repository)?;
+        self.send(framed, &ChatMacros { values: macros }).await?;
         self.send(framed, &EmptyMessageServerList).await?;
         self.send(framed, &self.server_list()).await?;
         Ok(bearer)
