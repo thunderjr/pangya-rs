@@ -10,6 +10,7 @@ pub mod match_state;
 pub mod room;
 pub mod stroke_state;
 
+use crate::room::{TerminalDelivery, TerminalMailboxSender, terminal_mailbox};
 pub use lobby::{
     LobbyHandle, LobbyLimits, LobbyRoomCommand, LobbyRouteResult, LobbyShutdownError,
     LobbyShutdownOutcome, LobbySoloCommand, LobbySoloRouteResult, LobbyStrokeCommand,
@@ -1613,9 +1614,13 @@ where
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             mpsc::channel(self.config.limits.outbound_room_event_capacity);
+        let (terminal_outbound, mut terminal_mailbox) = terminal_mailbox();
+        let mut terminal_mailbox_open = true;
         let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
         let mut match_context = ConnectionMatchContext::default();
+        let mut terminal_generation = 0_u64;
+        let mut terminal_identity: Option<(MatchId, MatchResultKey)> = None;
         let mut social_events = self.social.subscribe();
 
         let result = loop {
@@ -1646,6 +1651,36 @@ where
                         Err(broadcast::error::RecvError::Closed) => break Err(GameRuntimeError::Limited),
                     };
                     if let Err(error) = self.handle_social_event(&mut framed, connection_id, event).await { break Err(error); }
+                }
+                terminal = terminal_mailbox.recv(), if identity.is_some() && terminal_mailbox_open => {
+                    let Some(delivery) = terminal else {
+                        terminal_mailbox_open = false;
+                        continue;
+                    };
+                    let handled = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
+                        handled = self.handle_terminal_delivery(
+                            &mut framed,
+                            state,
+                            delivery,
+                            room_id,
+                            connection_id,
+                            &mut match_context,
+                            &mut terminal_generation,
+                            &mut terminal_identity,
+                        ) => handled,
+                    };
+                    match handled {
+                        Ok(RoomEventEffect::Remain) => {}
+                        Ok(RoomEventEffect::EnterChannel) => { state = GameState::InChannel; room_id = None; }
+                        Ok(RoomEventEffect::EnterRoom) => { state = GameState::InRoom; match_context = ConnectionMatchContext::default(); }
+                        Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
+                        Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
+                        Ok(RoomEventEffect::EnterStrokeLoading) => state = GameState::InStrokeLoading,
+                        Ok(RoomEventEffect::EnterStrokeMatch) => state = GameState::InStrokeMatch,
+                        Err(error) => break Err(error),
+                    }
                 }
                 event = room_events.recv(), if matches!(state, GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
@@ -2270,6 +2305,7 @@ where
                                         state,
                                         established,
                                         outbound.clone(),
+                                        terminal_outbound.clone(),
                                         room_cancellation.clone(),
                                         frame.opcode,
                                         &frame.payload,
@@ -2325,6 +2361,7 @@ where
                                         state,
                                         established,
                                         outbound.clone(),
+                                        terminal_outbound.clone(),
                                         room_cancellation.clone(),
                                         current_channel.ok_or(GameRuntimeError::Protocol)?,
                                         frame.opcode,
@@ -2352,6 +2389,7 @@ where
                                         state,
                                         established,
                                         outbound.clone(),
+                                        terminal_outbound.clone(),
                                         room_cancellation.clone(),
                                         &mut chats,
                                         frame.opcode,
@@ -3090,6 +3128,7 @@ where
         state: GameState,
         identity: &RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_outbound: TerminalMailboxSender,
         room_cancellation: CancellationToken,
         chats: &mut LocalRateWindow,
         opcode: u16,
@@ -3119,12 +3158,13 @@ where
                         .map_err(|_| GameRuntimeError::Protocol)?;
                 let result = self
                     .lobby
-                    .create(
+                    .create_with_terminal_mailbox(
                         request.name,
                         request.password,
                         request.settings,
                         identity.clone(),
                         outbound,
+                        terminal_outbound.clone(),
                         room_cancellation.clone(),
                     )
                     .await;
@@ -3175,11 +3215,12 @@ where
                 let requested_room = request.room_id;
                 let result = self
                     .lobby
-                    .join(
+                    .join_with_terminal_mailbox(
                         requested_room,
                         identity.clone(),
                         request.password,
                         outbound,
+                        terminal_outbound.clone(),
                         room_cancellation,
                     )
                     .await;
@@ -4464,6 +4505,48 @@ where
             _ => {}
         }
         Ok(())
+    }
+
+    fn accepts_terminal_generation(generation: u64, last_generation: u64) -> bool {
+        generation != 0 && generation >= last_generation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_terminal_delivery(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        state: GameState,
+        delivery: TerminalDelivery,
+        room_id: Option<RoomId>,
+        connection_id: PlayerConnectionId,
+        match_context: &mut ConnectionMatchContext,
+        terminal_generation: &mut u64,
+        terminal_identity: &mut Option<(MatchId, MatchResultKey)>,
+    ) -> Result<RoomEventEffect, GameRuntimeError> {
+        let Some(context) = match_context.stroke else {
+            return Ok(RoomEventEffect::Remain);
+        };
+        // A terminal mailbox is session-local, but a late item must still be rejected when the
+        // connection has already advanced to another card. Match ID, durable settlement key, and
+        // generation are all checked before any wire frame is emitted.
+        let identity = (delivery.result.match_id(), delivery.result.result_key());
+        if context.match_id != delivery.result.match_id()
+            || !Self::accepts_terminal_generation(delivery.generation, *terminal_generation)
+            || terminal_identity.is_some_and(|current| current == identity)
+        {
+            return Ok(RoomEventEffect::Remain);
+        }
+        *terminal_generation = delivery.generation;
+        *terminal_identity = Some(identity);
+        self.handle_room_event(
+            framed,
+            state,
+            RoomEvent::StrokeCommitted(delivery.result),
+            room_id,
+            connection_id,
+            match_context,
+        )
+        .await
     }
 
     async fn handle_room_event(
@@ -7676,6 +7759,7 @@ where
         state: GameState,
         identity: &RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_outbound: TerminalMailboxSender,
         room_cancellation: CancellationToken,
         channel: u8,
         opcode: u16,
@@ -7764,13 +7848,14 @@ where
                 });
                 let created = self
                     .lobby
-                    .create_on_channel(
+                    .create_on_channel_with_terminal_mailbox(
                         name,
                         password,
                         settings,
                         identity.clone(),
                         channel,
                         outbound,
+                        terminal_outbound.clone(),
                         room_cancellation,
                     )
                     .await;
@@ -7815,12 +7900,13 @@ where
                 };
                 let joined = self
                     .lobby
-                    .join_on_channel(
+                    .join_on_channel_with_terminal_mailbox(
                         target,
                         identity.clone(),
                         password,
                         channel,
                         outbound,
+                        terminal_outbound.clone(),
                         room_cancellation,
                     )
                     .await;
@@ -8006,7 +8092,14 @@ where
                 };
                 let snapshot = self
                     .lobby
-                    .join(target, identity.clone(), None, outbound, room_cancellation)
+                    .join_with_terminal_mailbox(
+                        target,
+                        identity.clone(),
+                        None,
+                        outbound,
+                        terminal_outbound.clone(),
+                        room_cancellation,
+                    )
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
                 *room_id = Some(target);
@@ -11659,6 +11752,22 @@ mod tests {
                 .map_or_else(|_| Vec::new(), |values| values.clone()),
             vec![GameMatchObservation::Started, GameMatchObservation::Aborted]
         );
+    }
+
+    #[test]
+    fn terminal_mailbox_rejects_stale_generation() {
+        assert!(!GameService::<FakeRepository>::accepts_terminal_generation(
+            0, 0
+        ));
+        assert!(!GameService::<FakeRepository>::accepts_terminal_generation(
+            1, 2
+        ));
+        assert!(GameService::<FakeRepository>::accepts_terminal_generation(
+            2, 2
+        ));
+        assert!(GameService::<FakeRepository>::accepts_terminal_generation(
+            3, 2
+        ));
     }
 
     #[tokio::test]

@@ -31,7 +31,8 @@ use crate::{
     match_state::{RelayDisposition, SoloMatchError, SoloStartPlan},
     room::{
         RetailMatchRelay, RoomActorEvent, RoomActorLimits, RoomCloseOutcome, RoomEvent, RoomHandle,
-        RoomIdentity, spawn_room_with_events,
+        RoomIdentity, TerminalMailboxSender, spawn_room_with_events,
+        spawn_room_with_terminal_mailbox,
     },
     stroke_state::{
         StrokeHoleOutOutcome, StrokeLoadingOutcome, StrokeMatchError, StrokeRelayOutcome,
@@ -399,6 +400,7 @@ enum LobbyCommand {
         settings: RoomSettings,
         owner: RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -409,6 +411,7 @@ enum LobbyCommand {
         owner: RoomIdentity,
         channel: u8,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
@@ -422,13 +425,13 @@ enum LobbyCommand {
     RoomInfo {
         room_id: RoomId,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
-    }
     },
     Join {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -438,6 +441,7 @@ enum LobbyCommand {
         password: Option<RoomPassword>,
         channel: u8,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
     },
@@ -592,6 +596,52 @@ impl LobbyHandle {
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
+        self.create_inner(
+            name,
+            password,
+            settings,
+            owner,
+            outbound,
+            None,
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_with_terminal_mailbox(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: TerminalMailboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        self.create_inner(
+            name,
+            password,
+            settings,
+            owner,
+            outbound,
+            Some(terminal_mailbox),
+            cancellation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send(
@@ -601,6 +651,7 @@ impl LobbyHandle {
                 settings,
                 owner,
                 outbound,
+                terminal_mailbox,
                 cancellation,
                 reply,
             },
@@ -631,6 +682,38 @@ impl LobbyHandle {
                 owner,
                 channel,
                 outbound,
+                terminal_mailbox: None,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_on_channel_with_terminal_mailbox(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        channel: u8,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: TerminalMailboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::CreateOnChannel {
+                name,
+                password,
+                settings,
+                owner,
+                channel,
+                outbound,
+                terminal_mailbox: Some(terminal_mailbox),
                 cancellation,
                 reply,
             },
@@ -665,7 +748,6 @@ impl LobbyHandle {
         self.send(LobbyCommand::RoomInfo { room_id, reply }, Arc::clone(&gate))?;
         Self::await_reply(&gate, receive, self.command_timeout).await?
     }
-    }
 
     /// Atomically admits a connection to one room only.
     pub async fn join(
@@ -676,6 +758,39 @@ impl LobbyHandle {
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(room_id, identity, password, outbound, None, cancellation)
+            .await
+    }
+
+    pub(crate) async fn join_with_terminal_mailbox(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: TerminalMailboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        self.join_inner(
+            room_id,
+            identity,
+            password,
+            outbound,
+            Some(terminal_mailbox),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn join_inner(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send(
@@ -684,6 +799,7 @@ impl LobbyHandle {
                 identity,
                 password,
                 outbound,
+                terminal_mailbox,
                 cancellation,
                 reply,
             },
@@ -711,6 +827,36 @@ impl LobbyHandle {
                 password,
                 channel,
                 outbound,
+                terminal_mailbox: None,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn join_on_channel_with_terminal_mailbox(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        channel: u8,
+        outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: TerminalMailboxSender,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::JoinOnChannel {
+                room_id,
+                identity,
+                password,
+                channel,
+                outbound,
+                terminal_mailbox: Some(terminal_mailbox),
                 cancellation,
                 reply,
             },
@@ -1144,6 +1290,7 @@ impl LobbyRegistry {
         owner: RoomIdentity,
         channel: Option<u8>,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
         if self.connections.contains_key(&owner.connection_id) {
@@ -1154,17 +1301,31 @@ impl LobbyRegistry {
         }
         let id = self.allocate_room_id()?;
         let connection_id = owner.connection_id;
-        let (handle, summary) = spawn_room_with_events(
-            id,
-            name,
-            password,
-            settings,
-            owner,
-            outbound,
-            cancellation.clone(),
-            self.limits.room,
-            Some(self.events.clone()),
-        );
+        let (handle, summary) = match terminal_mailbox {
+            Some(mailbox) => spawn_room_with_terminal_mailbox(
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                mailbox,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
+            ),
+            None => spawn_room_with_events(
+                id,
+                name,
+                password,
+                settings,
+                owner,
+                outbound,
+                cancellation.clone(),
+                self.limits.room,
+                Some(self.events.clone()),
+            ),
+        };
         let summary = match channel {
             Some(channel) => summary.with_channel(channel),
             None => summary,
@@ -1195,6 +1356,7 @@ impl LobbyRegistry {
         password: Option<RoomPassword>,
         channel: Option<u8>,
         outbound: mpsc::Sender<RoomEvent>,
+        terminal_mailbox: Option<TerminalMailboxSender>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
         if self.connections.contains_key(&identity.connection_id) {
@@ -1210,10 +1372,24 @@ impl LobbyRegistry {
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
         let connection_id = identity.connection_id;
-        match handle
-            .join_with_cancellation(identity, password, outbound, cancellation.clone())
-            .await
-        {
+        match match terminal_mailbox {
+            Some(mailbox) => {
+                handle
+                    .join_with_terminal_mailbox(
+                        identity,
+                        password,
+                        outbound,
+                        mailbox,
+                        cancellation.clone(),
+                    )
+                    .await
+            }
+            None => {
+                handle
+                    .join_with_cancellation(identity, password, outbound, cancellation.clone())
+                    .await
+            }
+        } {
             Ok(snapshot) => {
                 self.connections.insert(
                     connection_id,
@@ -1844,12 +2020,12 @@ async fn run_lobby(
                 }
             }
             command = commands.recv() => match command.and_then(begin) {
-                Some(LobbyCommand::Create { name, password, settings, owner, outbound, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, cancellation).await;
+                Some(LobbyCommand::Create { name, password, settings, owner, outbound, terminal_mailbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, terminal_mailbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, cancellation, reply }) => {
-                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, cancellation).await;
+                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, terminal_mailbox, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, terminal_mailbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::List { reply }) => {
@@ -1875,13 +2051,12 @@ async fn run_lobby(
                     };
                     let _ignored = reply.send(result);
                 }
-                }
-                Some(LobbyCommand::Join { room_id, identity, password, outbound, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, cancellation).await;
+                Some(LobbyCommand::Join { room_id, identity, password, outbound, terminal_mailbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, terminal_mailbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
-                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, cancellation, reply }) => {
-                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, cancellation).await;
+                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, terminal_mailbox, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, terminal_mailbox, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
@@ -1928,7 +2103,9 @@ async fn run_lobby(
                 Some(LobbyCommand::CreateAfterRelease { name, settings, owner, outbound, cancellation, started, release, reply }) => {
                     let _ignored = started.send(());
                     let result = if release.await.is_ok() {
-                        registry.create_with_channel(name, None, settings, owner, None, outbound, cancellation).await
+                        registry
+                            .create_with_channel(name, None, settings, owner, None, outbound, None, cancellation)
+                            .await
                     } else {
                         Err(RoomError::Closed)
                     };
