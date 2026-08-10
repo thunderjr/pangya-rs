@@ -2401,6 +2401,65 @@ mod tests {
     }
 
     #[test]
+    fn room_management_requests_follow_packetdoc_layouts() {
+        let team = decode_packet_payload::<RetailTeamChange>(&[1], &profile(), ServiceKind::Game)
+            .expect("team change");
+        assert_eq!(team.team, RetailTeam::Blue);
+        let resync = decode_packet_payload::<RetailRoomResync>(
+            &[0, 1, 0, 0x78, 0x56, 0x34, 0x12],
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("resync");
+        assert_eq!(resync.entries, vec![(0, 0x1234_5678)]);
+        let info = decode_packet_payload::<RetailRoomInformationRequest>(&[9, 0], &profile(), ServiceKind::Game)
+            .expect("room info");
+        assert_eq!(info.room_number, 9);
+        let kick = decode_packet_payload::<RetailRoomKick>(&[7, 0, 0, 0], &profile(), ServiceKind::Game)
+            .expect("kick");
+        assert_eq!(kick.connection_id, 7);
+        let invite = decode_packet_payload::<RetailRoomInviteInfo>(&[42, 0, 0, 0], &profile(), ServiceKind::Game)
+            .expect("legacy invite");
+        assert_eq!(invite.account_id, 42);
+        let mut newer = vec![3, 0, b'B', b'o', b'b'];
+        newer.extend_from_slice(&42_u32.to_le_bytes());
+        let invite = decode_packet_payload::<RetailRoomInvite>(&newer, &profile(), ServiceKind::Game)
+            .expect("new invite");
+        assert_eq!(invite.nickname, b"Bob");
+        assert_eq!(invite.account_id, 42);
+    }
+
+    #[test]
+    fn room_management_responses_keep_reference_opcodes_and_widths() {
+        let announce = encode_packet_payload(
+            &RetailTeamChangeAnnounce { connection_id: 7, team: RetailTeam::Blue },
+            &profile(),
+        )
+        .expect("announce");
+        assert_eq!(announce.as_slice(), [7, 0, 0, 0, 1]);
+        let response = encode_packet_payload(
+            &RetailRoomInviteInfoResponse { account_id: 42 },
+            &profile(),
+        )
+        .expect("legacy response");
+        assert_eq!(response.as_slice(), [42, 0, 0, 0]);
+        let response = encode_packet_payload(
+            &RetailRoomInviteResponse {
+                server_id: 1,
+                channel_id: 2,
+                room_id: 3,
+                inviter_id: 4,
+                inviter_nickname: b"Host".to_vec(),
+                invitee_id: 5,
+            },
+            &profile(),
+        )
+        .expect("new response");
+        assert_eq!(&response[..9], &[255, 255, 1, 0, 0, 0, 2, 3, 0]);
+        assert_eq!(&response[response.len() - 4..], &[5, 0, 0, 0]);
+    }
+
+    #[test]
     fn room_join_decodes_number_and_password() {
         let mut writer = PacketWriter::default();
         writer.u16_le(9);
