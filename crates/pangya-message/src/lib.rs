@@ -825,9 +825,12 @@ struct StoreData {
     messages: HashMap<u32, VecDeque<OfflineMessage>>,
     live_messages: HashMap<u32, VecDeque<OfflineMessage>>,
     inflight_messages: HashMap<u32, VecDeque<OfflineMessage>>,
+    inflight_until: HashMap<u32, Instant>,
+    next_delivery_id: i64,
     online: HashMap<u32, (Presence, ChannelInfo)>,
+    presence_generation: HashMap<u32, u64>,
     presence_expiry: HashMap<u32, Instant>,
-    presence_events: HashMap<u32, VecDeque<(u32, Presence, ChannelInfo)>>,
+    presence_events: HashMap<u32, VecDeque<(u32, u64, Presence, ChannelInfo)>>,
 }
 #[async_trait::async_trait]
 pub trait MessageStore: Send + Sync {
@@ -1187,8 +1190,31 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence(account_id,status,room_number,room_type,server_id,channel_id,channel_name) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET status=excluded.status,room_number=excluded.room_number,room_type=excluded.room_type,server_id=excluded.server_id,channel_id=excluded.channel_id,channel_name=excluded.channel_name").bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(&channel_name).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,$2,$3,$4,$5,$6,$7 FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $8").bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(channel.channel_name).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        let generation: i64 = sqlx::query_scalar("INSERT INTO message_presence_generations(account_id,generation) VALUES($1,1) ON CONFLICT(account_id) DO UPDATE SET generation=message_presence_generations.generation + 1 RETURNING generation")
+            .bind(Self::id(id)).fetch_one(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_presence(account_id,status,room_number,room_type,server_id,channel_id,channel_name,expires_at,generation) VALUES($1,$2,$3,$4,$5,$6,$7,now() + interval '90 seconds',$8) ON CONFLICT(account_id) DO UPDATE SET status=excluded.status,room_number=excluded.room_number,room_type=excluded.room_type,server_id=excluded.server_id,channel_id=excluded.channel_id,channel_name=excluded.channel_name,expires_at=now() + interval '90 seconds',generation=excluded.generation")
+            .bind(Self::id(id)).bind(status as i16).bind(channel.room_number).bind(channel.room_type)
+            .bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id)).bind(&channel_name).bind(generation)
+            .execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("DELETE FROM message_presence_events WHERE sender_account_id=$1 AND sender_generation <> $2")
+            .bind(Self::id(id)).bind(generation).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        let page_size = i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?;
+        let mut offset = 0_i64;
+        loop {
+            let inserted = sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,sender_generation,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,$2,$3,$4,$5,$6,$7,$8 FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $9 OFFSET $10")
+                .bind(Self::id(id)).bind(generation).bind(status as i16).bind(channel.room_number)
+                .bind(channel.room_type).bind(i64::from(channel.server_id)).bind(i16::from(channel.channel_id))
+                .bind(&channel_name).bind(page_size).bind(offset).execute(&mut *tx).await
+                .map_err(|_| MessageError::Rejected)?;
+            let count = inserted.rows_affected() as i64;
+            if count == 0 {
+                break;
+            }
+            offset = offset.saturating_add(count);
+            if count < page_size {
+                break;
+            }
+        }
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn set_offline(&self, id: u32) -> Result<(), MessageError> {
@@ -1197,12 +1223,39 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM message_presence_generations WHERE account_id=$1",
+        )
+        .bind(Self::id(id))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| MessageError::Rejected)?
+        .unwrap_or(0);
         sqlx::query("DELETE FROM message_presence WHERE account_id=$1")
             .bind(Self::id(id))
             .execute(&mut *tx)
             .await
             .map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,5,-1,-1,-1,-1,''::bytea FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $2").bind(Self::id(id)).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("DELETE FROM message_presence_events WHERE sender_account_id=$1")
+            .bind(Self::id(id))
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        let page_size = i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?;
+        let mut offset = 0_i64;
+        loop {
+            let inserted = sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,sender_generation,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,$1,$2,5,-1,-1,-1,-1,''::bytea FROM message_friends f WHERE f.friend_account_id=$1 AND f.pending=false AND NOT f.blocked ORDER BY f.owner_account_id LIMIT $3 OFFSET $4")
+                .bind(Self::id(id)).bind(generation).bind(page_size).bind(offset).execute(&mut *tx).await
+                .map_err(|_| MessageError::Rejected)?;
+            let count = inserted.rows_affected() as i64;
+            if count == 0 {
+                break;
+            }
+            offset = offset.saturating_add(count);
+            if count < page_size {
+                break;
+            }
+        }
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn heartbeat(&self, id: u32) -> Result<(), MessageError> {
@@ -1214,18 +1267,20 @@ impl MessageStore for PostgresStore {
         &self,
         id: u32,
     ) -> Result<Vec<(u32, Presence, ChannelInfo)>, MessageError> {
-        sqlx::query("DELETE FROM message_presence_events WHERE id IN (SELECT e.id FROM message_presence_events e WHERE e.recipient_account_id=$1 AND e.status <> 5 AND NOT EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.expires_at > now()) ORDER BY e.id LIMIT $2)")
-            .bind(Self::id(id))
-            .bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
+        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,sender_generation,status,room_number,room_type,server_id,channel_id,channel_name) SELECT $1,p.account_id,p.generation,5,-1,-1,-1,-1,''::bytea FROM message_presence p JOIN message_friends f ON f.owner_account_id=$1 AND f.friend_account_id=p.account_id AND f.pending=false AND NOT f.blocked WHERE p.expires_at <= now() AND NOT EXISTS (SELECT 1 FROM message_presence_events old WHERE old.recipient_account_id=$1 AND old.sender_account_id=p.account_id AND old.sender_generation=p.generation AND old.status=5) ORDER BY p.account_id LIMIT $2")
+            .bind(Self::id(id)).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+            .execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        sqlx::query("DELETE FROM message_presence_events e WHERE e.recipient_account_id=$1 AND ((e.status <> 5 AND NOT EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.generation=e.sender_generation AND p.expires_at > now())) OR (e.status=5 AND EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.generation <> e.sender_generation)))")
+            .bind(Self::id(id)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         let rows=sqlx::query("DELETE FROM message_presence_events WHERE id IN (SELECT id FROM message_presence_events WHERE recipient_account_id=$1 ORDER BY id LIMIT $2) RETURNING sender_account_id,status,room_number,room_type,server_id,channel_id,channel_name")
-            .bind(Self::id(id))
-            .bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|_| MessageError::Rejected)?;
+            .bind(Self::id(id)).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+            .fetch_all(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        tx.commit().await.map_err(|_| MessageError::Rejected)?;
         rows.into_iter()
             .map(|r| {
                 Ok((
@@ -1383,6 +1438,17 @@ struct FriendState {
     requested_by: Option<u32>,
 }
 impl MemoryStore {
+    fn reclaim_expired_locked(d: &mut StoreData, id: u32) {
+        if d.inflight_until
+            .get(&id)
+            .is_some_and(|until| *until <= Instant::now())
+        {
+            if let Some(messages) = d.inflight_messages.remove(&id) {
+                d.messages.entry(id).or_default().extend(messages);
+            }
+            d.inflight_until.remove(&id);
+        }
+    }
     pub fn register_user(&self, user: User) {
         if let Ok(mut d) = self.0.lock() {
             d.users.insert(user.id, user);
@@ -1391,17 +1457,8 @@ impl MemoryStore {
     pub fn friends(&self, id: u32) -> Vec<FriendEntry> {
         self.0.lock().map_or_else(
             |_| Vec::new(),
-            |mut d| {
+            |d| {
                 let now = Instant::now();
-                let expired: Vec<u32> = d
-                    .presence_expiry
-                    .iter()
-                    .filter_map(|(&user, &until)| (until <= now).then_some(user))
-                    .collect();
-                for user in expired {
-                    d.online.remove(&user);
-                    d.presence_expiry.remove(&user);
-                }
                 d.friends
                     .iter()
                     .filter_map(|(&(owner, target), f)| {
@@ -1414,10 +1471,17 @@ impl MemoryStore {
                             alias: f.alias.clone(),
                             user_id: target,
                             channel: d
-                                .online
+                                .presence_expiry
                                 .get(&target)
+                                .filter(|until| **until > now)
+                                .and_then(|_| d.online.get(&target))
                                 .map_or_else(ChannelInfo::offline, |(_, c)| c.clone()),
-                            state: d.online.get(&target).map_or(Presence::Offline, |(s, _)| *s),
+                            state: d
+                                .presence_expiry
+                                .get(&target)
+                                .filter(|until| **until > now)
+                                .and_then(|_| d.online.get(&target))
+                                .map_or(Presence::Offline, |(s, _)| *s),
                             relationship: Relationship::Friend,
                             blocked: f.blocked,
                         })
@@ -1500,9 +1564,19 @@ impl MemoryStore {
     }
     pub fn set_online(&self, id: u32, status: Presence, channel: ChannelInfo) {
         if let Ok(mut d) = self.0.lock() {
+            let generation = d.presence_generation.entry(id).or_default();
+            *generation = generation.saturating_add(1);
+            let generation = *generation;
             d.online.insert(id, (status, channel.clone()));
             d.presence_expiry
                 .insert(id, Instant::now() + Duration::from_secs(90));
+            // A reconnect fences every queued event from the previous connection, including an
+            // offline event that was waiting behind a slow friend's poll.
+            for events in d.presence_events.values_mut() {
+                events.retain(|(sender, event_generation, _, _)| {
+                    *sender != id || *event_generation == generation
+                });
+            }
             let recipients: Vec<u32> = d
                 .friends
                 .iter()
@@ -1512,11 +1586,12 @@ impl MemoryStore {
                 })
                 .collect();
             for recipient in recipients {
-                let events = d.presence_events.entry(recipient).or_default();
-                if events.len() >= MAX_DELIVERY_BATCH {
-                    events.pop_front();
-                }
-                events.push_back((id, status, channel.clone()));
+                d.presence_events.entry(recipient).or_default().push_back((
+                    id,
+                    generation,
+                    status,
+                    channel.clone(),
+                ));
             }
         }
     }
@@ -1532,14 +1607,19 @@ impl MemoryStore {
     }
     pub fn set_offline(&self, id: u32) {
         if let Ok(mut d) = self.0.lock() {
+            Self::reclaim_expired_locked(&mut d, id);
             if let Some(messages) = d.live_messages.remove(&id) {
                 d.messages.entry(id).or_default().extend(messages);
             }
-            if let Some(messages) = d.inflight_messages.remove(&id) {
-                d.messages.entry(id).or_default().extend(messages);
-            }
+            // Claimed messages remain leased, just as in PostgreSQL. They are requeued by
+            // reclaim_expired_locked after the 30-second lease rather than being duplicated
+            // immediately on a disconnect.
             d.online.remove(&id);
             d.presence_expiry.remove(&id);
+            let generation = *d.presence_generation.entry(id).or_default();
+            for events in d.presence_events.values_mut() {
+                events.retain(|(sender, _, _, _)| *sender != id);
+            }
             let recipients: Vec<u32> = d
                 .friends
                 .iter()
@@ -1549,11 +1629,12 @@ impl MemoryStore {
                 })
                 .collect();
             for recipient in recipients {
-                let events = d.presence_events.entry(recipient).or_default();
-                if events.len() >= MAX_DELIVERY_BATCH {
-                    events.pop_front();
-                }
-                events.push_back((id, Presence::Offline, ChannelInfo::offline()));
+                d.presence_events.entry(recipient).or_default().push_back((
+                    id,
+                    generation,
+                    Presence::Offline,
+                    ChannelInfo::offline(),
+                ));
             }
         }
     }
@@ -1562,20 +1643,63 @@ impl MemoryStore {
             |_| Vec::new(),
             |mut d| {
                 let now = Instant::now();
-                d.presence_events
-                    .remove(&id)
-                    .map_or_else(Vec::new, |events| {
-                        events
-                            .into_iter()
-                            .filter(|(sender, status, _)| {
-                                *status == Presence::Offline
-                                    || d.presence_expiry
-                                        .get(sender)
-                                        .is_some_and(|until| *until > now)
-                            })
-                            .take(MAX_DELIVERY_BATCH)
-                            .collect()
+                // Materialize each expiry once and fan it out to every confirmed friend. Keeping
+                // the generation in the queue prevents an old offline event from winning a
+                // reconnect race, while polling one friend still wakes all of the others.
+                let expired: Vec<(u32, u64)> = d
+                    .presence_expiry
+                    .iter()
+                    .filter_map(|(&target, &until)| {
+                        (until <= now).then_some((
+                            target,
+                            d.presence_generation.get(&target).copied().unwrap_or(0),
+                        ))
                     })
+                    .collect();
+                for (sender, generation) in expired {
+                    d.online.remove(&sender);
+                    d.presence_expiry.remove(&sender);
+                    let recipients: Vec<u32> = d
+                        .friends
+                        .iter()
+                        .filter_map(|(&(owner, target), state)| {
+                            (target == sender && !state.blocked && !state.pending).then_some(owner)
+                        })
+                        .collect();
+                    for recipient in recipients {
+                        let events = d.presence_events.entry(recipient).or_default();
+                        if !events.iter().any(|(s, g, status, _)| {
+                            *s == sender && *g == generation && *status == Presence::Offline
+                        }) {
+                            events.push_back((
+                                sender,
+                                generation,
+                                Presence::Offline,
+                                ChannelInfo::offline(),
+                            ));
+                        }
+                    }
+                }
+                let mut out = Vec::with_capacity(MAX_DELIVERY_BATCH);
+                while out.len() < MAX_DELIVERY_BATCH {
+                    let next = d.presence_events.get_mut(&id).and_then(VecDeque::pop_front);
+                    let Some((sender, generation, status, channel)) = next else {
+                        break;
+                    };
+                    let current_generation =
+                        d.presence_generation.get(&sender).copied().unwrap_or(0);
+                    let current_online = d
+                        .presence_expiry
+                        .get(&sender)
+                        .is_some_and(|until| *until > now);
+                    if generation != current_generation
+                        || (status != Presence::Offline && !current_online)
+                    {
+                        continue;
+                    }
+                    out.push((sender, status, channel));
+                }
+                out
             },
         )
     }
@@ -1601,6 +1725,7 @@ impl MemoryStore {
             return Err(MessageError::Rejected);
         };
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
+        Self::reclaim_expired_locked(&mut d, recipient);
         let queued = d.messages.get(&recipient).map_or(0, VecDeque::len)
             + d.live_messages.get(&recipient).map_or(0, VecDeque::len)
             + d.inflight_messages.get(&recipient).map_or(0, VecDeque::len);
@@ -1611,13 +1736,14 @@ impl MemoryStore {
             .users
             .get(&sender)
             .map_or_else(Vec::new, |u| u.nickname.clone());
+        d.next_delivery_id = d.next_delivery_id.saturating_add(1);
         let message = OfflineMessage {
             sender_id: sender,
             recipient_id: recipient,
             nickname,
             body,
-            delivery_id: 0,
-            lease_token: [0; 16],
+            delivery_id: d.next_delivery_id,
+            lease_token: rand::random(),
         };
         if d.online.contains_key(&recipient) {
             d.live_messages
@@ -1648,19 +1774,21 @@ impl MemoryStore {
         if sender_user.guild_id.is_none() || sender_user.guild_id != recipient_user.guild_id {
             return Err(MessageError::Rejected);
         }
+        Self::reclaim_expired_locked(&mut d, recipient);
         let queued = d.messages.get(&recipient).map_or(0, VecDeque::len)
             + d.live_messages.get(&recipient).map_or(0, VecDeque::len)
             + d.inflight_messages.get(&recipient).map_or(0, VecDeque::len);
         if queued >= MAX_QUEUED_MESSAGES {
             return Err(MessageError::Limit);
         }
+        d.next_delivery_id = d.next_delivery_id.saturating_add(1);
         let message = OfflineMessage {
             sender_id: sender,
             recipient_id: recipient,
             nickname: sender_user.nickname,
             body,
-            delivery_id: 0,
-            lease_token: [0; 16],
+            delivery_id: d.next_delivery_id,
+            lease_token: rand::random(),
         };
         if d.online.contains_key(&recipient) {
             d.live_messages
@@ -1673,31 +1801,40 @@ impl MemoryStore {
         Ok(())
     }
     pub fn take_live_messages(&self, id: u32) -> Result<Vec<OfflineMessage>, MessageError> {
-        let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let messages: Vec<_> = d.live_messages.get_mut(&id).map_or_else(Vec::new, |q| {
-            q.drain(..q.len().min(MAX_DELIVERY_BATCH)).collect()
-        });
-        if d.live_messages.get(&id).is_some_and(VecDeque::is_empty) {
-            d.live_messages.remove(&id);
-        }
-        d.inflight_messages
-            .entry(id)
-            .or_default()
-            .extend(messages.iter().cloned());
-        Ok(messages)
+        self.take_queued_messages(id, true)
     }
     pub fn take_messages(&self, id: u32) -> Result<Vec<OfflineMessage>, MessageError> {
+        self.take_queued_messages(id, false)
+    }
+    fn take_queued_messages(
+        &self,
+        id: u32,
+        live: bool,
+    ) -> Result<Vec<OfflineMessage>, MessageError> {
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let messages: Vec<_> = d.messages.get_mut(&id).map_or_else(Vec::new, |q| {
+        Self::reclaim_expired_locked(&mut d, id);
+        let queue = if live {
+            &mut d.live_messages
+        } else {
+            &mut d.messages
+        };
+        let mut messages: Vec<_> = queue.get_mut(&id).map_or_else(Vec::new, |q| {
             q.drain(..q.len().min(MAX_DELIVERY_BATCH)).collect()
         });
-        if d.messages.get(&id).is_some_and(VecDeque::is_empty) {
-            d.messages.remove(&id);
+        for message in &mut messages {
+            message.lease_token = rand::random();
         }
-        d.inflight_messages
-            .entry(id)
-            .or_default()
-            .extend(messages.iter().cloned());
+        if queue.get(&id).is_some_and(VecDeque::is_empty) {
+            queue.remove(&id);
+        }
+        if !messages.is_empty() {
+            d.inflight_messages
+                .entry(id)
+                .or_default()
+                .extend(messages.iter().cloned());
+            d.inflight_until
+                .insert(id, Instant::now() + Duration::from_secs(30));
+        }
         Ok(messages)
     }
     pub fn ack_messages(&self, messages: &[OfflineMessage]) -> Result<(), MessageError> {
@@ -1705,11 +1842,14 @@ impl MemoryStore {
         for message in messages {
             if let Some(queue) = d.inflight_messages.get_mut(&message.recipient_id) {
                 queue.retain(|candidate| {
-                    candidate.sender_id != message.sender_id || candidate.body != message.body
+                    candidate.delivery_id != message.delivery_id
+                        || candidate.lease_token != message.lease_token
                 });
             }
         }
         d.inflight_messages.retain(|_, q| !q.is_empty());
+        let active: Vec<u32> = d.inflight_messages.keys().copied().collect();
+        d.inflight_until.retain(|id, _| active.contains(id));
         Ok(())
     }
 }

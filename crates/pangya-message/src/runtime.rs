@@ -8,6 +8,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
+    task::JoinSet,
     time::{Duration, interval, timeout},
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
@@ -58,10 +59,23 @@ impl MessageService {
         listener: TcpListener,
         shutdown: CancellationToken,
     ) -> Result<(), MessageRuntimeError> {
+        let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => {
+                    // Cancellation only requests connection teardown. Join every spawned task so
+                    // presence cleanup and delivery-lease return paths have actually completed
+                    // before the listener reports a clean shutdown.
+                    shutdown.cancel();
+                    while connections.join_next().await.is_some() {}
+                    return Ok(());
+                },
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    // Connection errors are isolated to their socket, as they were before task
+                    // tracking was added. The important contract here is that the task is drained.
+                    let _ = completed;
+                },
                 accepted = listener.accept() => {
                     let (stream, peer) = accepted.map_err(|_| MessageRuntimeError::Accept)?;
                     let Ok(permit) = self.connections.clone().try_acquire_owned() else {
@@ -70,7 +84,7 @@ impl MessageService {
                     };
                     let service = self.clone();
                     let token = shutdown.child_token();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _permit = permit;
                         let _ = service.connection(stream, peer.ip(), token).await;
                     });
@@ -176,11 +190,15 @@ impl MessageService {
                             return Err(MessageRuntimeError::Rejected);
                         }
                     };
-                    match session.poll().await {
-                        Ok(polled) => responses.extend(polled),
-                        Err(_) => {
-                            let _ = session.disconnect().await;
-                            return Err(MessageRuntimeError::Rejected);
+                    // Goodbye disconnects the state machine and therefore cannot be polled again.
+                    // The old unconditional poll turned a clean client close into a rejection.
+                    if !goodbye {
+                        match session.poll().await {
+                            Ok(polled) => responses.extend(polled),
+                            Err(_) => {
+                                let _ = session.disconnect().await;
+                                return Err(MessageRuntimeError::Rejected);
+                            }
                         }
                     }
                     if let Err(error) = Self::send_responses(&mut framed, responses, response_salt).await {

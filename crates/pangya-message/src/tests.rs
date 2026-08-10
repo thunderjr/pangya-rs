@@ -380,6 +380,94 @@ fn offline_messages_survive_store_restart_and_are_delivered_once() {
 }
 
 #[test]
+fn memory_lease_expiry_requeues_unacknowledged_delivery() {
+    let store = MemoryStore::default();
+    for (id, nickname) in [(1, b"Alice".to_vec()), (2, b"Bob".to_vec())] {
+        store.register_user(User {
+            id,
+            nickname,
+            guild_id: None,
+            guild_name: vec![],
+        });
+    }
+    store.add_friend(1, 2).expect("friend request");
+    store.add_friend(2, 1).expect("friend confirmation");
+    store
+        .queue_message(1, 2, b"leased".to_vec())
+        .expect("queue");
+    assert_eq!(store.take_messages(2).expect("claim").len(), 1);
+    store
+        .0
+        .lock()
+        .expect("store lock")
+        .inflight_until
+        .insert(2, Instant::now() - Duration::from_secs(1));
+    assert_eq!(store.take_messages(2).expect("expired claim").len(), 1);
+}
+
+#[test]
+fn memory_presence_expiry_fanout_and_reconnect_generation_are_safe() {
+    let store = MemoryStore::default();
+    for id in 1..=36 {
+        store.register_user(User {
+            id,
+            nickname: id.to_string().into_bytes(),
+            guild_id: None,
+            guild_name: vec![],
+        });
+    }
+    for id in 2..=36 {
+        store.add_friend(1, id).expect("friend request");
+        store.confirm_friend(id, 1).expect("friend confirmation");
+    }
+    store.set_online(1, Presence::Online, ChannelInfo::offline());
+    for id in 2..=36 {
+        assert_eq!(store.take_presence_events(id).len(), 1);
+    }
+    store.set_offline(1);
+    store.set_online(1, Presence::Online, ChannelInfo::offline());
+    assert!(
+        store
+            .take_presence_events(2)
+            .iter()
+            .all(|(_, status, _)| *status != Presence::Offline)
+    );
+    store
+        .0
+        .lock()
+        .expect("store lock")
+        .presence_expiry
+        .insert(1, Instant::now() - Duration::from_secs(1));
+    assert!(
+        store
+            .take_presence_events(2)
+            .iter()
+            .any(|(_, status, _)| *status == Presence::Offline)
+    );
+}
+
+#[test]
+fn memory_guild_chat_fanout_uses_authoritative_membership() {
+    let store = MemoryStore::default();
+    for id in 1..=3 {
+        store.register_user(User {
+            id,
+            nickname: id.to_string().into_bytes(),
+            guild_id: Some(7),
+            guild_name: b"Guild".to_vec(),
+        });
+    }
+    store
+        .queue_guild_message(1, 2, b"guild".to_vec())
+        .expect("guild queue");
+    store
+        .queue_guild_message(1, 3, b"guild".to_vec())
+        .expect("guild queue");
+    assert_eq!(store.take_messages(2).expect("member 2").len(), 1);
+    assert_eq!(store.take_messages(3).expect("member 3").len(), 1);
+}
+
+#[test]
 fn rate_limit_and_replay_guard_are_bounded() {
     let mut guard = ReplayGuard::new(2);
     assert!(guard.admit(1));
