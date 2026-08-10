@@ -632,12 +632,22 @@ where
             let framed = Framed::new(stream, codec);
             let connection_shutdown = shutdown.clone();
             let (session_control, probes) = SessionControl::new();
+            // Keep a control handle outside the timed future. If the outer total deadline wins,
+            // Tokio drops `run_connection` before this branch returns; retaining first makes the
+            // authoritative stale bit visible to the RAII presence guard during that drop.
+            let stale_control = session_control.clone();
             tokio::select! {
                 biased;
                 result = timeout(
                     self.config.limits.login_timeout,
                     self.run_connection(framed, prefix, connection_shutdown, session_control, probes),
-                ) => result.map_err(|_| LoginRuntimeError::Timeout)?,
+                ) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stale_control.retain_stale();
+                        Err(LoginRuntimeError::Timeout)
+                    }
+                },
                 () = shutdown.cancelled() => Ok(ConnectionTermination::Cancelled),
             }
         }

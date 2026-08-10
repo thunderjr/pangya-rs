@@ -197,12 +197,20 @@ async fn start_with_executor(
 }
 
 async fn connect(address: std::net::SocketAddr) -> (TcpStream, u8) {
-    let mut stream = TcpStream::connect(address).await.expect("connect");
+    try_connect(address).await.expect("connect")
+}
+
+async fn try_connect(address: std::net::SocketAddr) -> Option<(TcpStream, u8)> {
+    let mut stream = TcpStream::connect(address).await.ok()?;
     let mut hello = [0_u8; 14];
-    stream.read_exact(&mut hello).await.expect("hello");
-    assert_eq!(&hello[..6], &[0, 0x0b, 0, 0, 0, 0]);
-    assert!(hello[6] <= 0x0f);
-    (stream, hello[6])
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut hello))
+        .await
+        .ok()?
+        .ok()?;
+    if hello[..6] != [0, 0x0b, 0, 0, 0, 0] || hello[6] > 0x0f {
+        return None;
+    }
+    Some((stream, hello[6]))
 }
 
 async fn send_packet(stream: &mut TcpStream, key: u8, salt: u8, opcode: u16, payload: &[u8]) {
@@ -214,19 +222,27 @@ async fn send_packet(stream: &mut TcpStream, key: u8, salt: u8, opcode: u16, pay
 }
 
 async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
+    try_receive_packet(stream, key)
+        .await
+        .expect("server packet")
+}
+
+async fn try_receive_packet(stream: &mut TcpStream, key: u8) -> Option<(u16, Vec<u8>)> {
     let mut header = [0_u8; 3];
-    stream.read_exact(&mut header).await.expect("server header");
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut header))
+        .await
+        .ok()?
+        .ok()?;
     let total = usize::from(u16::from_le_bytes([header[1], header[2]])) + 3;
     let mut frame = vec![0_u8; total];
     frame[..3].copy_from_slice(&header);
-    stream
-        .read_exact(&mut frame[3..])
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut frame[3..]))
         .await
-        .expect("server frame");
-    let plain =
-        pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).expect("decrypt server");
+        .ok()?
+        .ok()?;
+    let plain = pangya_crypto::server_decrypt(&frame, key, 8 * 1024 * 1024, 128).ok()?;
     let opcode = u16::from_le_bytes([plain[0], plain[1]]);
-    (opcode, plain[2..].to_vec())
+    Some((opcode, plain[2..].to_vec()))
 }
 
 fn pstring(value: &[u8]) -> Vec<u8> {
@@ -610,13 +626,17 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
 async fn stale_duplicate_ghosts_old_connection_and_retries_over_encrypted_tcp(pool: PgPool) {
     create_ready_account(&pool, "StaleUser").await;
     let limits = LoginRuntimeLimits {
-        login_timeout: Duration::from_secs(10),
-        // Let the authenticated owner become stale through its total idle deadline instead of
-        // treating a normal protocol rejection as an unexpected task exit.
-        idle_timeout: Duration::from_millis(100),
+        // The outer total deadline must retain the authenticated owner before cancelling the
+        // inner connection future; an idle timeout would exercise a different path.
+        login_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(10),
+        // Polling must not turn the deterministic stale check into a login-rate-limit test.
+        global_logins_per_window: 100,
+        logins_per_window: 100,
+        username_logins_per_window: 100,
         ..LoginRuntimeLimits::default()
     };
-    let (address, shutdown, task, _) = start(pool, limits).await;
+    let (address, shutdown, task, metrics) = start(pool, limits).await;
 
     // Finish enough of the first encrypted login to install its account lease, then leave the
     // authenticated owner idle. Its bounded deadline is an authoritative stale transition while
@@ -626,28 +646,47 @@ async fn stale_duplicate_ghosts_old_connection_and_retries_over_encrypted_tcp(po
     for expected in [1, 0x10, 6, 9, 2] {
         assert_eq!(receive_packet(&mut old, old_key).await.0, expected);
     }
-    let (mut replacement, replacement_key) = loop {
-        let (mut candidate, candidate_key) = connect(address).await;
-        send_packet(
-            &mut candidate,
-            candidate_key,
-            2,
-            1,
-            &login_payload("StaleUser", SECRET),
-        )
-        .await;
-        let (opcode, body) = receive_packet(&mut candidate, candidate_key).await;
-        assert_eq!(opcode, 1);
-        let code = u32::from_le_bytes(body[1..5].try_into().expect("stale code"));
-        if code == pangya_protocol::LOGIN_ERROR_ALREADY_LOGGED_IN {
-            break (candidate, candidate_key);
+    let (mut replacement, replacement_key) = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let Some((mut candidate, candidate_key)) = try_connect(address).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let mut plain = Vec::new();
+            plain.extend_from_slice(&1_u16.to_le_bytes());
+            plain.extend_from_slice(&login_payload("StaleUser", SECRET));
+            let encrypted =
+                pangya_crypto::client_encrypt(&plain, candidate_key, 2).expect("candidate frame");
+            if candidate.write_all(&encrypted).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let Some((opcode, body)) = try_receive_packet(&mut candidate, candidate_key).await
+            else {
+                // A candidate can be closed by its own bounded deadline while the old owner is
+                // still transitioning. Treat that as another poll attempt, not an unbounded read.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            assert_eq!(opcode, 1);
+            let Some(code_bytes) = body.get(1..5) else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let code = u32::from_le_bytes(code_bytes.try_into().expect("stale code"));
+            if code == pangya_protocol::LOGIN_ERROR_ALREADY_LOGGED_IN {
+                break (candidate, candidate_key);
+            }
+            assert_eq!(code, LOGIN_ERROR_DUPLICATE_CONNECTION);
+            // The outer deadline may win while the old task is still unwinding. A fresh
+            // connection is required after each live duplicate refusal; once liveness is stale
+            // the typed 5100019 is stable.
+            drop(candidate);
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(code, LOGIN_ERROR_DUPLICATE_CONNECTION);
-        // The old task may still be unwinding its EOF branch. A fresh connection is required
-        // after a live duplicate refusal; once liveness is stale the typed 5100019 is stable.
-        drop(candidate);
-        tokio::task::yield_now().await;
-    };
+    })
+    .await
+    .unwrap_or_else(|_| panic!("stale duplicate polling deadline: {}", metrics.render()));
 
     // The empty ghost packet revokes/removes exactly the stale generation before this connection
     // retries. The former task has terminated and its socket is no longer usable.
