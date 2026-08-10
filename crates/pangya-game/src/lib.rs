@@ -470,6 +470,17 @@ pub trait GameObserver: Send + Sync + 'static {
     fn commit(&self, _outcome: GameCommitObservation) {}
     /// Fixed persistence outcome for stroke two.
     fn stroke_commit(&self, _outcome: GameCommitObservation) {}
+    /// Identity of a durable stroke settlement commit, for correlation without payload bodies.
+    fn stroke_commit_identity(&self, _match_id: MatchId, _result_key: MatchResultKey) {}
+    /// Identity of a terminal payload marker consumed by a connection.
+    fn stroke_terminal_payload(
+        &self,
+        _connection_id: GameConnectionId,
+        _match_id: MatchId,
+        _result_key: MatchResultKey,
+        _generation: u64,
+    ) {
+    }
     /// Fixed solo shot outcome.
     fn shot(&self, _outcome: GameShotObservation) {}
     /// Fixed stroke-two shot outcome.
@@ -1621,6 +1632,7 @@ where
         let (outbound, mut room_events) =
             RoomOutbound::ordered(self.config.limits.outbound_room_event_capacity);
         let terminal_outbound = outbound.clone();
+        let mut persistence_events = outbound.take_persistence_receiver();
         let room_cancellation = CancellationToken::new();
         let mut room_id: Option<RoomId> = None;
         let mut match_context = ConnectionMatchContext::default();
@@ -1657,13 +1669,33 @@ where
                     };
                     if let Err(error) = self.handle_social_event(&mut framed, connection_id, event).await { break Err(error); }
                 }
-                event = room_events.recv(), if matches!(state, GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
+                event = async {
+                    tokio::select! {
+                        biased;
+                        event = async {
+                            match persistence_events.as_mut() {
+                                Some(receiver) => receiver.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => event,
+                        event = room_events.recv() => event,
+                    }
+                }, if matches!(state, GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
                     let handled = tokio::select! {
                         biased;
                         () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
                         handled = async {
                             match event {
+                                RoomEvent::StrokeSettlementRequested(commit) => {
+                                    terminal_outbound.begin_persistence_delivery();
+                                    self.persist_stroke_commit_by_room(
+                                        room_id.ok_or(GameRuntimeError::Protocol)?,
+                                        commit,
+                                    )
+                                    .await
+                                    .map(|()| RoomEventEffect::Remain)
+                                }
                                 RoomEvent::StrokeCommittedWithGeneration { result, generation } => {
                                     terminal_outbound.begin_terminal_delivery(generation);
                                     self.handle_terminal_delivery(
@@ -4038,6 +4070,8 @@ where
         };
         self.observer
             .stroke_commit(GameCommitObservation::Committed);
+        self.observer
+            .stroke_commit_identity(committed.match_id(), committed.result_key());
         self.lobby
             .apply_stroke_commit_by_room(room_id, committed)
             .await
@@ -4524,6 +4558,12 @@ where
         // connection has already advanced to another card. Match ID, durable settlement key, and
         // generation are all checked before any wire frame is emitted.
         let identity = (delivery.result.match_id(), delivery.result.result_key());
+        self.observer.stroke_terminal_payload(
+            GameConnectionId(connection_id.get()),
+            identity.0,
+            identity.1,
+            delivery.generation,
+        );
         if context.match_id != delivery.result.match_id()
             || !Self::accepts_terminal_generation(delivery.generation, *terminal_generation)
             || terminal_identity.is_some_and(|current| current == identity)

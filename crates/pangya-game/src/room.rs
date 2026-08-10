@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -329,6 +329,12 @@ pub enum RoomOutbound {
         terminal_payload: Arc<Mutex<Option<(StrokeMatchResult, u64)>>>,
         /// Generation of the terminal marker currently in the ordered queue, if any.
         terminal_queued_generation: Arc<AtomicU64>,
+        /// Whether the reserved persistence-control marker is currently queued.
+        persistence_queued: Arc<AtomicBool>,
+        /// Priority control channel used for settlement persistence requests.
+        persistence_sender: mpsc::UnboundedSender<RoomEvent>,
+        /// Receiver moved into the owning game connection's event loop.
+        persistence_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<RoomEvent>>>>,
     },
 }
 
@@ -350,12 +356,18 @@ pub(crate) type TerminalOutboxSender = RoomOutbound;
 impl RoomOutbound {
     /// Creates an outbox whose ordinary capacity is `capacity` plus one reserved terminal slot.
     pub fn ordered(capacity: usize) -> (Self, mpsc::Receiver<RoomEvent>) {
+        // Terminal settlement has one reserved slot; persistence uses a priority control channel
+        // so ordinary room traffic cannot delay the commit request.
         let (sender, receiver) = mpsc::channel(capacity.saturating_add(1));
+        let (persistence_sender, persistence_receiver) = mpsc::unbounded_channel();
         (
             Self::Ordered {
                 sender: Arc::new(Mutex::new(sender)),
                 terminal_payload: Arc::new(Mutex::new(None)),
                 terminal_queued_generation: Arc::new(AtomicU64::new(0)),
+                persistence_queued: Arc::new(AtomicBool::new(false)),
+                persistence_sender,
+                persistence_receiver: Arc::new(Mutex::new(Some(persistence_receiver))),
             },
             receiver,
         )
@@ -400,6 +412,49 @@ impl RoomOutbound {
 
     pub(crate) fn try_send(&self, event: RoomEvent) -> bool {
         matches!(self.try_send_ordinary(event), OrdinarySendResult::Sent)
+    }
+
+    /// Takes this session's priority persistence receiver for its game connection.
+    pub(crate) fn take_persistence_receiver(&self) -> Option<mpsc::UnboundedReceiver<RoomEvent>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Ordered {
+                persistence_receiver,
+                ..
+            } => persistence_receiver.lock().ok()?.take(),
+        }
+    }
+
+    /// Enqueues the persistence coordinator marker on the priority control channel. This is
+    /// deliberately non-blocking: ordinary room traffic cannot delay the one event that commits
+    /// the match.
+    pub(crate) fn try_send_persistence(&self, event: RoomEvent) -> bool {
+        let Self::Ordered {
+            persistence_sender,
+            persistence_queued,
+            ..
+        } = self
+        else {
+            return self.try_send(event);
+        };
+        if persistence_queued.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        if persistence_sender.send(event).is_err() {
+            persistence_queued.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// Marks the persistence marker consumed without acknowledging the durable operation.
+    pub(crate) fn begin_persistence_delivery(&self) {
+        if let Self::Ordered {
+            persistence_queued, ..
+        } = self
+        {
+            persistence_queued.store(false, Ordering::Release);
+        }
     }
 
     pub(crate) fn terminal_pending_generation(&self) -> Option<u64> {
@@ -510,6 +565,7 @@ impl RoomOutbound {
                     sender,
                     terminal_payload,
                     terminal_queued_generation,
+                    ..
                 } => {
                     let Ok(sender) = sender.lock() else {
                         return false;
@@ -1688,7 +1744,10 @@ impl RoomState {
             let Some(member) = self.members.get(index) else {
                 continue;
             };
-            if self.deliver(member, work.event()) {
+            // Persistence has its own reserved outbox slot. Sending it as ordinary traffic lets
+            // a full relay queue strand the commit forever, which in turn leaves retained terminal
+            // payloads with no result to register.
+            if member.outbound.try_send_persistence(work.event()) {
                 self.stroke_persistence_recipient = Some(member.identity.connection_id);
                 self.stroke_persistence_event_delivered = true;
                 return true;

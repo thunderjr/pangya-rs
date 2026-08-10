@@ -57,6 +57,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::MakeWriter;
+use uuid::Uuid;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 /// Generous packet deadline for ordinary E2E assertions. Timeout-path tests use their own short
@@ -871,7 +872,9 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
 /// Reads whatever the server has already sent, as (opcode, body) pairs.
 async fn drain_frames(stream: &mut TcpStream, key: u8, budget: Duration) -> Vec<(u16, Vec<u8>)> {
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + budget;
+    // Local encrypted frames arrive well within this bound; cap long drain windows so the full
+    // eighteen-hole regression remains bounded even when a peer has no further frames.
+    let deadline = tokio::time::Instant::now() + budget.min(Duration::from_millis(400));
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
         match tokio::time::timeout(remaining.min(Duration::from_millis(400)), async {
@@ -8637,7 +8640,36 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
+    // The database commit key and both player payload keys prove that the settlement identity
+    // reaching the terminal outbox is the same durable match, not a retained stale payload.
+    let (match_id, commit_key): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, result_commit_key FROM matches")
+            .fetch_one(&pool)
+            .await
+            .expect("settlement identity");
+    let player_keys: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT player_result_key FROM match_players WHERE match_id = $1 ORDER BY participant_order",
+    )
+    .bind(match_id)
+    .fetch_all(&pool)
+    .await
+    .expect("player settlement identities");
+    assert_eq!(player_keys.len(), 2);
+    assert!(player_keys.iter().all(|key| *key != commit_key));
+
     let logged = String::from_utf8_lossy(&traces.lock().expect("traces").clone()).into_owned();
+    assert!(
+        logged.contains(&format!("match_id={match_id}"))
+            && logged.contains(&format!("result_key={commit_key}")),
+        "observer records the committed settlement identity"
+    );
+    assert_eq!(
+        logged.matches("stroke terminal payload registered").count(),
+        2,
+        "observer records one registered terminal payload per seat"
+    );
+
+    // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
     for token in &tokens {
         assert!(
             !logged.contains(token.as_str()),
