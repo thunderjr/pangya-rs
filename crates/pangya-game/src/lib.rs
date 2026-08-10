@@ -73,13 +73,13 @@ use pangya_protocol::{
     MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
     MessageServerList, MessageServerListRequest, NoteSend, OutboundFrame, PacketEncodeError,
     PacketWriter, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
-    RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailClientException,
-    RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment,
-    RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
-    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
-    RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
+    RETAIL_C2S_FIRST_SHOT_READY, RETAIL_RECENT_PLAYERS, RepairCommitted, RepairRequest,
+    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
+    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
+    RetailEquipment, RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
+    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
+    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
@@ -1898,7 +1898,7 @@ where
                                         } else {
                                             let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
                                             let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
-                                            let entries = recent.into_iter().take(pangya_domain::MAX_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
+                                            let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
                                                 let account_id = u32::try_from(player.account_id.get()).ok()?;
                                                 let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
                                                 Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })

@@ -8563,6 +8563,70 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn game_issue41_recent_player_history_caps_storage_rows_on_wire(pool: PgPool) {
+    let owner = create_account(&pool, "Issue41Owner", 1, 0x1000_0000).await;
+    let mut recent = Vec::new();
+    for index in 0..7 {
+        recent.push(create_account(&pool, &format!("Issue41Recent{index}"), 1, 0x1000_0000).await);
+    }
+
+    // The repository intentionally retains more rows than the retail packet can carry. The
+    // response must preserve newest-first storage order while emitting exactly five fixed slots.
+    for (index, player) in recent.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO retail_recent_players (account_id, recent_account_id, nickname, seen_at) \
+             VALUES ($1, $2, $3, now() - ($4::double precision * interval '1 second'))",
+        )
+        .bind(owner.account.id.get())
+        .bind(player.account.id.get())
+        .bind(format!("NIssue41Recent{index}"))
+        .bind(index as f64)
+        .execute(&pool)
+        .await
+        .expect("recent-player fixture");
+    }
+
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut stream, key, _) =
+        connect_retail_social_client(&pool, address, owner.account.id, "Issue41Owner").await;
+
+    send_packet(&mut stream, key, 3, 0x009c, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x010e);
+    let mut expected = vec![
+        0_u8;
+        pangya_protocol::RETAIL_RECENT_PLAYERS
+            * pangya_protocol::RETAIL_RECENT_PLAYER_BYTES
+    ];
+    for (slot, player) in recent
+        .iter()
+        .take(pangya_protocol::RETAIL_RECENT_PLAYERS)
+        .enumerate()
+    {
+        let offset = slot * pangya_protocol::RETAIL_RECENT_PLAYER_BYTES;
+        let nickname = format!("NIssue41Recent{slot}");
+        expected[offset + 4..offset + 4 + nickname.len()].copy_from_slice(nickname.as_bytes());
+        expected[offset + 26..offset + 26 + nickname.len()].copy_from_slice(nickname.as_bytes());
+        expected[offset + 48..offset + 52].copy_from_slice(
+            &u32::try_from(player.account.id.get())
+                .expect("wire recent-player id")
+                .to_le_bytes(),
+        );
+    }
+    assert_eq!(body, expected, "newest five rows in exact 010e wire layout");
+
+    // A response that tried to encode all seven rows used to return an encoding error and close
+    // the session. Prove the connection remains usable after the capped response.
+    send_packet(&mut stream, key, 4, 0x005c, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00ba);
+
+    drop(stream);
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgPool) {
     let account = create_account(&pool, "Issue23Owner", 1, 0x1000_0000).await;
     // Recent-player history is asserted by the completed authenticated versus match below; this
