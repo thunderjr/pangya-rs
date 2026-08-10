@@ -996,16 +996,10 @@ impl MessageStore for MemoryStore {
         f.alias = alias;
         Ok(())
     }
-    async fn guild_members(&self, id: u32) -> Result<Vec<u32>, MessageError> {
-        let d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let guild = d.users.get(&id).and_then(|u| u.guild_id);
-        Ok(guild.map_or_else(Vec::new, |guild| {
-            d.users
-                .values()
-                .filter(|u| u.guild_id == Some(guild))
-                .map(|u| u.id)
-                .collect()
-        }))
+    async fn guild_members(&self, _id: u32) -> Result<Vec<u32>, MessageError> {
+        // Guild lifecycle and guild-message membership are dependency #15. Do not infer
+        // membership from the test-only User projection or emit partial guild fanout.
+        Ok(Vec::new())
     }
 }
 
@@ -1259,7 +1253,9 @@ impl MessageStore for PostgresStore {
         tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn heartbeat(&self, id: u32) -> Result<(), MessageError> {
-        sqlx::query("UPDATE message_presence SET expires_at=now() + interval '90 seconds' WHERE account_id=$1")
+        // An expired lease must not be resurrected by a late poll. The next presence-event poll
+        // materializes its offline transition; only a still-live projection is extended.
+        sqlx::query("UPDATE message_presence SET expires_at=now() + interval '90 seconds' WHERE account_id=$1 AND expires_at > now()")
             .bind(Self::id(id)).execute(&self.pool).await.map_err(|_| MessageError::Rejected)?;
         Ok(())
     }
@@ -1444,7 +1440,15 @@ impl MemoryStore {
             .is_some_and(|until| *until <= Instant::now())
         {
             if let Some(messages) = d.inflight_messages.remove(&id) {
-                d.messages.entry(id).or_default().extend(messages);
+                // Preserve the live/offline delivery path. A connected recipient polls the live
+                // queue; moving an expired live lease to the offline queue would strand it until
+                // the next Hello packet.
+                let queue = if d.online.contains_key(&id) {
+                    &mut d.live_messages
+                } else {
+                    &mut d.messages
+                };
+                queue.entry(id).or_default().extend(messages);
             }
             d.inflight_until.remove(&id);
         }
@@ -1597,13 +1601,16 @@ impl MemoryStore {
     }
     pub fn heartbeat(&self, id: u32) -> Result<(), MessageError> {
         let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        if d.online.contains_key(&id) {
-            d.presence_expiry
-                .insert(id, Instant::now() + Duration::from_secs(90));
-            Ok(())
-        } else {
-            Err(MessageError::Rejected)
+        let now = Instant::now();
+        if d.online.contains_key(&id)
+            && d.presence_expiry.get(&id).is_some_and(|until| *until > now)
+        {
+            d.presence_expiry.insert(id, now + Duration::from_secs(90));
         }
+        // Authentication precedes the first status declaration. Matching PostgreSQL's
+        // row-count-independent refresh keeps that normal interval a no-op rather than a
+        // disconnect, while an existing presence lease is refreshed above.
+        Ok(())
     }
     pub fn set_offline(&self, id: u32) {
         if let Ok(mut d) = self.0.lock() {
@@ -1757,47 +1764,13 @@ impl MemoryStore {
     }
     pub fn queue_guild_message(
         &self,
-        sender: u32,
-        recipient: u32,
-        body: Vec<u8>,
+        _sender: u32,
+        _recipient: u32,
+        _body: Vec<u8>,
     ) -> Result<(), MessageError> {
-        if body.len() > MAX_TEXT_BYTES {
-            return Err(MessageError::Limit);
-        }
-        let mut d = self.0.lock().map_err(|_| MessageError::Rejected)?;
-        let Some(sender_user) = d.users.get(&sender).cloned() else {
-            return Err(MessageError::Rejected);
-        };
-        let Some(recipient_user) = d.users.get(&recipient) else {
-            return Err(MessageError::Rejected);
-        };
-        if sender_user.guild_id.is_none() || sender_user.guild_id != recipient_user.guild_id {
-            return Err(MessageError::Rejected);
-        }
-        Self::reclaim_expired_locked(&mut d, recipient);
-        let queued = d.messages.get(&recipient).map_or(0, VecDeque::len)
-            + d.live_messages.get(&recipient).map_or(0, VecDeque::len)
-            + d.inflight_messages.get(&recipient).map_or(0, VecDeque::len);
-        if queued >= MAX_QUEUED_MESSAGES {
-            return Err(MessageError::Limit);
-        }
-        d.next_delivery_id = d.next_delivery_id.saturating_add(1);
-        let message = OfflineMessage {
-            sender_id: sender,
-            recipient_id: recipient,
-            nickname: sender_user.nickname,
-            body,
-            delivery_id: d.next_delivery_id,
-            lease_token: rand::random(),
-        };
-        if d.online.contains_key(&recipient) {
-            d.live_messages
-                .entry(recipient)
-                .or_default()
-                .push_back(message);
-        } else {
-            d.messages.entry(recipient).or_default().push_back(message);
-        }
+        // Guild lifecycle and guild-message fanout belong to dependency #15. Returning success
+        // is an explicit safe no-op: the opcode is consumed without an invented membership
+        // query, partial delivery, or connection stall.
         Ok(())
     }
     pub fn take_live_messages(&self, id: u32) -> Result<Vec<OfflineMessage>, MessageError> {
@@ -2197,26 +2170,12 @@ impl MessageSession {
                     alias,
                 }])
             }
-            ClientPacket::GuildChat { message } => {
-                let me = self.user_id.ok_or(MessageError::Unauthorized)?;
-                let ids = self.store.guild_members(me).await?;
-                if ids.is_empty() {
-                    return Ok(Vec::new());
-                }
-                for id in ids {
-                    if id != me {
-                        let _ = self
-                            .store
-                            .queue_guild_message(me, id, message.clone())
-                            .await;
-                    }
-                }
-                Ok(vec![ServerPacket::Chat {
-                    user_id: me,
-                    nickname: self.nickname.clone(),
-                    message,
-                    guild: true,
-                }])
+            ClientPacket::GuildChat { .. } => {
+                let _ = self.user_id.ok_or(MessageError::Unauthorized)?;
+                // Guild lifecycle and guild-message operations are dependency #15. Consume the
+                // known opcode as a safe no-op rather than guessing membership or stalling the
+                // authenticated connection.
+                Ok(Vec::new())
             }
             ClientPacket::RoomInvite { .. }
             | ClientPacket::GuildBattleInvite { .. }

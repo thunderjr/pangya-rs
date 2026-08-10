@@ -405,6 +405,39 @@ fn memory_lease_expiry_requeues_unacknowledged_delivery() {
     assert_eq!(store.take_messages(2).expect("expired claim").len(), 1);
 }
 
+#[tokio::test]
+async fn memory_live_lease_expiry_requeues_to_live_poll_path() {
+    let store = MemoryStore::default();
+    for (id, nickname) in [(1, b"Alice".to_vec()), (2, b"Bob".to_vec())] {
+        store.register_user(User {
+            id,
+            nickname,
+            guild_id: None,
+            guild_name: vec![],
+        });
+    }
+    store.add_friend(1, 2).expect("friend request");
+    store.add_friend(2, 1).expect("friend confirmation");
+    store.set_online(2, Presence::Online, ChannelInfo::offline());
+    store
+        .queue_message(1, 2, b"live lease".to_vec())
+        .expect("queue");
+    assert_eq!(store.take_live_messages(2).expect("claim").len(), 1);
+    store
+        .0
+        .lock()
+        .expect("store lock")
+        .inflight_until
+        .insert(2, Instant::now() - Duration::from_secs(1));
+    assert_eq!(
+        store
+            .take_live_messages(2)
+            .expect("expired live claim")
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn memory_presence_expiry_fanout_and_reconnect_generation_are_safe() {
     let store = MemoryStore::default();
@@ -446,8 +479,8 @@ fn memory_presence_expiry_fanout_and_reconnect_generation_are_safe() {
     );
 }
 
-#[test]
-fn memory_guild_chat_fanout_uses_authoritative_membership() {
+#[tokio::test]
+async fn memory_guild_operations_are_explicit_safe_noops() {
     let store = MemoryStore::default();
     for id in 1..=3 {
         store.register_user(User {
@@ -459,12 +492,15 @@ fn memory_guild_chat_fanout_uses_authoritative_membership() {
     }
     store
         .queue_guild_message(1, 2, b"guild".to_vec())
-        .expect("guild queue");
-    store
-        .queue_guild_message(1, 3, b"guild".to_vec())
-        .expect("guild queue");
-    assert_eq!(store.take_messages(2).expect("member 2").len(), 1);
-    assert_eq!(store.take_messages(3).expect("member 3").len(), 1);
+        .expect("deferred guild operation");
+    assert!(
+        store
+            .guild_members(1)
+            .await
+            .expect("deferred membership")
+            .is_empty()
+    );
+    assert!(store.take_messages(2).expect("member 2").is_empty());
 }
 
 #[test]

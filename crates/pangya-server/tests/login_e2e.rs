@@ -19,6 +19,7 @@ use pangya_login::{
     CredentialPolicy, LoginRuntimeConfig, LoginRuntimeError, LoginRuntimeLimits, LoginService,
     parse_handover,
 };
+use pangya_message::{ClientPacket, MessageService, PostgresStore, ServerPacket};
 use pangya_observability::M2Metrics;
 use pangya_protocol::{
     CodecLimits, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, PacketWriter,
@@ -164,6 +165,21 @@ async fn start_with_executor(
     tokio::task::JoinHandle<()>,
     Arc<M2Metrics>,
 ) {
+    start_with_executor_and_message(pool, limits, game_name, executor, None).await
+}
+
+async fn start_with_executor_and_message(
+    pool: PgPool,
+    limits: LoginRuntimeLimits,
+    game_name: &str,
+    executor: BoundedCredentialExecutor,
+    message_server: Option<pangya_protocol::MessageServerEntry>,
+) -> (
+    std::net::SocketAddr,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+    Arc<M2Metrics>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let metrics = Arc::new(M2Metrics::default());
@@ -176,7 +192,7 @@ async fn start_with_executor(
                 starter: starter(),
                 allowed_character_types: vec![0x0400_0000],
                 game_server: AdvertisedGameServer {
-                    message_server: None,
+                    message_server,
                     id: 7,
                     name: game_name.to_owned(),
                     ipv4: "127.0.0.1".to_owned(),
@@ -334,6 +350,108 @@ async fn assert_second_packet_limited(
     );
     shutdown.cancel();
     task.await.expect("join");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn login_socket_handover_authenticates_message_socket_over_tcp(pool: PgPool) {
+    create_ready_account(&pool, "Socket_Message").await;
+    let message_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("message bind");
+    let message_address = message_listener.local_addr().expect("message address");
+    let message_server = pangya_protocol::MessageServerEntry {
+        name: b"Message".to_vec(),
+        id: 1,
+        max_users: 20,
+        num_users: 0,
+        ip_address: b"127.0.0.1".to_vec(),
+        port: message_address.port(),
+        unknown2: pangya_protocol::UnknownBytes([0; 2]),
+        flags: pangya_protocol::UnknownBytes([0; 2]),
+        unknown3: pangya_protocol::UnknownBytes([0; 14]),
+        char_icon: 0,
+    };
+    let message_shutdown = CancellationToken::new();
+    let message_task = tokio::spawn({
+        let shutdown = message_shutdown.clone();
+        let store = PostgresStore::new(pool.clone());
+        async move {
+            MessageService::with_store(Arc::new(store), 7, CodecLimits::default())
+                .serve(message_listener, shutdown)
+                .await
+                .expect("message serve");
+        }
+    });
+    let policy = Arc::new(CredentialPolicy::new().expect("policy"));
+    let executor =
+        BoundedCredentialExecutor::new(policy, 2, Duration::from_secs(2), Duration::from_secs(5))
+            .expect("executor");
+    let limits = LoginRuntimeLimits {
+        login_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(10),
+        codec: CodecLimits::default(),
+        ..LoginRuntimeLimits::default()
+    };
+    let (login_address, login_shutdown, login_task, _) = start_with_executor_and_message(
+        pool.clone(),
+        limits,
+        "Socket Message",
+        executor,
+        Some(message_server),
+    )
+    .await;
+    let (mut login, key) = connect(login_address).await;
+    send_packet(
+        &mut login,
+        key,
+        1,
+        1,
+        &login_payload("Socket_Message", SECRET),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut login, key).await.0, 1);
+    assert_eq!(receive_packet(&mut login, key).await.0, 0x10);
+    assert_eq!(receive_packet(&mut login, key).await.0, 6);
+    assert_eq!(receive_packet(&mut login, key).await.0, 9);
+    assert_eq!(receive_packet(&mut login, key).await.0, 2);
+
+    let user_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username_normalized='socket_message'")
+            .fetch_one(&pool)
+            .await
+            .expect("account id");
+    let mut message = TcpStream::connect(message_address)
+        .await
+        .expect("message connect");
+    let mut hello = [0_u8; 9];
+    message.read_exact(&mut hello).await.expect("message hello");
+    let packet = ClientPacket::CredentialDeclaration {
+        user_id: u32::try_from(user_id).expect("user id"),
+        user_nickname: b"NSocket_Message".to_vec(),
+    };
+    let mut payload = packet.opcode().to_le_bytes().to_vec();
+    payload.extend(packet.encode_payload().expect("message payload"));
+    message
+        .write_all(&pangya_crypto::client_encrypt(&payload, 7, 1).expect("message frame"))
+        .await
+        .expect("message write");
+    let (opcode, payload) = receive_packet(&mut message, 7).await;
+    assert_eq!(
+        opcode, 0x2f,
+        "LoginService-issued eligibility authenticates MessageService"
+    );
+    assert_eq!(
+        ServerPacket::decode(opcode, &payload).expect("message response"),
+        ServerPacket::CredentialResponse {
+            user_id: u32::try_from(user_id).expect("user id"),
+        }
+    );
+
+    login_shutdown.cancel();
+    message_shutdown.cancel();
+    drop((login, message));
+    login_task.await.expect("login join");
+    message_task.await.expect("message join");
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

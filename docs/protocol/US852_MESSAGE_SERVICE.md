@@ -20,11 +20,10 @@ cannot deliver a stale offline event. The PostgreSQL migration owns the durable 
 process-local store is used by isolated protocol tests and can be shared between listener
 generations.
 
-Guild chat is real for the process-local authoritative `User.guild_id` projection used by protocol
-and unit tests. The durable account schema does not yet contain guild membership, so PostgreSQL
-explicitly returns an empty member set rather than guessing a join or claiming delivery. Durable
-guild membership is dependency #15; until that migration lands, MessageService accepts no durable
-guild fanout (the sender-side no-op is intentional and documented for #21).
+Guild lifecycle and guild-message operations are explicitly deferred to dependency #15. Every known
+GuildService opcode is consumed as a safe no-op: no guessed membership, partial fanout, or stalled
+connection is introduced while the durable guild schema and message operations remain out of scope
+for #21.
 
 LoginService `0x0009` and GameService `0x00fc` advertise the same endpoint record. A game
 `0x008b` request receives the `0x00fc` response rather than being silently ignored.
@@ -32,7 +31,7 @@ LoginService `0x0009` and GameService `0x00fc` advertise the same endpoint recor
 ## Migration safety
 
 Pending friend rows created before request direction was recorded cannot be assigned an owner
-without inventing friendship state. Migration `0026_message_presence_generation.sql` deletes
+without inventing friendship state. Migration `0027_message_presence_generation.sql` deletes
 only those unresolved pending rows; confirmed rows remain intact and new requests are directional.
 
 ## Evidence
