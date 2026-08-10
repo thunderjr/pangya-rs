@@ -911,6 +911,24 @@ fn wire<T: EncodePacket>(packet: &T, profile: &CompatibilityProfile) -> Result<V
         .map_err(|error| error.to_string())
 }
 
+/// A hole transition is a new introduction, not a continuation of the previous turn. Keep this
+/// assertion on the ordered wire trace so a stale 0x0063 cannot be hidden by a set-membership
+/// check.
+fn assert_retail_hole_intro_order(frames: &[(u16, Vec<u8>)], label: &str) {
+    let intro_positions: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (opcode, _))| (*opcode == 0x0053).then_some(index))
+        .collect();
+    assert_eq!(intro_positions.len(), 1, "{label} has one hole introduction");
+    if let Some(finish) = frames.iter().position(|(opcode, _)| *opcode == 0x0065) {
+        assert!(finish < intro_positions[0], "{label} finishes before introduction: {frames:04x?}");
+        assert!(!frames[finish + 1..intro_positions[0]].iter().any(|(opcode, _)| *opcode == 0x0063), "{label} has no stale handover after finish: {frames:04x?}");
+    } else if let Some(turn) = frames.iter().position(|(opcode, _)| *opcode == 0x0063) {
+        assert!(intro_positions[0] < turn, "{label} introduces before handover: {frames:04x?}");
+    }
+}
+
 async fn send_typed<T: EncodePacket>(stream: &mut TcpStream, key: u8, salt: u8, packet: &T) {
     let payload = encode_packet_payload(packet, &CompatibilityProfile::US_852).expect("encode");
     send_packet(stream, key, salt, T::OPCODE, &payload).await;
@@ -7389,9 +7407,6 @@ async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgP
 
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
-=======
-async fn game_retail_room_management_over_tcp(pool: PgPool) {
->>>>>>> 4a4c5e4 (fix(retail): close room management and progression gaps)
     let owner = create_account(&pool, "RetailOwner", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "RetailGuest", 1, 0x1000_0000).await;
     let service = Arc::new(
@@ -7545,6 +7560,18 @@ async fn game_retail_room_management_over_tcp(pool: PgPool) {
         census.len(),
         4 + 2 * pangya_protocol::ROOM_PLAYER_RECORD_BYTES + 1
     );
+    // Joining broadcasts the new roster to the existing member. Drain that delivery before the
+    // next mutation so the team-change assertion cannot mistake a stale join census for a second
+    // team census.
+    let host_join_frames = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        host_join_frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "host receives one census for the visitor join"
+    );
 
     // Team changes are broadcast once as 0x007d plus one authoritative census; the requester
     // must not receive a direct duplicate of either frame.
@@ -7618,6 +7645,15 @@ async fn game_retail_room_management_over_tcp(pool: PgPool) {
     // the retail 0x004c leave acknowledgement only to the removed connection.
     send_packet(&mut visitor, visitor_key, 9, 0x00b4, &[]).await;
     assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0049);
+    let rejoin_frames = drain_frames(&mut visitor, visitor_key, Duration::from_millis(700)).await;
+    assert_eq!(
+        rejoin_frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "rejoin census is drained before the kick acknowledgement"
+    );
     let _ = drain_available(&mut host, host_key, Duration::from_millis(700)).await;
     send_packet(
         &mut host,
@@ -8237,7 +8273,9 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         (&mut host, host_key, "host"),
         (&mut visitor, visitor_key, "visitor"),
     ] {
-        let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+        let loaded_frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+        assert_retail_hole_intro_order(&loaded_frames, who);
+        let frames: Vec<u16> = loaded_frames.iter().map(|(opcode, _)| *opcode).collect();
         assert!(
             frames.contains(&0x009e) && frames.contains(&0x005b),
             "{who} is told the weather and wind once loaded: {frames:04x?}"
@@ -8342,24 +8380,30 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     // only hole 18 settles the two-player match.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
+    // The first finisher hands the remaining player the current-hole turn. Drain that valid
+    // 0x0063 before asking the second player to finish; otherwise it is a stale queued frame
+    // relative to the next-hole 0x0053 assertion below.
+    let waiting_finish = drain_frames(&mut visitor, visitor_key, Duration::from_millis(900)).await;
+    assert!(
+        waiting_finish.iter().any(|(opcode, _)| *opcode == 0x0063),
+        "remaining player receives the current-hole handover: {waiting_finish:04x?}"
+    );
+    assert!(
+        !waiting_finish.iter().any(|(opcode, _)| *opcode == 0x0053),
+        "next-hole introduction waits for both finishes: {waiting_finish:04x?}"
+    );
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
-    let first_next = drain_available(&mut host, host_key, Duration::from_millis(1200)).await;
-    let second_next = drain_available(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+    let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    assert_retail_hole_intro_order(&first_next, "hole 2 host");
+    assert_retail_hole_intro_order(&second_next, "hole 2 visitor");
     assert!(
-        first_next.contains(&0x0053),
-        "hole 2 starts for host: {first_next:04x?}"
+        !first_next.iter().any(|(opcode, _)| *opcode == 0x0063),
+        "hole 2 uses introduction, not turn handover: {first_next:04x?}"
     );
     assert!(
-        second_next.contains(&0x0053),
-        "hole 2 starts for visitor: {second_next:04x?}"
-    );
-    assert!(
-        !first_next.contains(&0x0063),
-        "hole 2 uses introduction, not turn handover"
-    );
-    assert!(
-        !second_next.contains(&0x0063),
-        "hole 2 uses introduction, not turn handover"
+        !second_next.iter().any(|(opcode, _)| *opcode == 0x0063),
+        "hole 2 uses introduction, not turn handover: {second_next:04x?}"
     );
 
     for hole in 2..=18 {
@@ -8373,10 +8417,6 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                 assert!(
                     frames.contains(&0x0053),
                     "hole {hole} starts for {who}: {frames:04x?}"
-                );
-                assert!(
-                    !frames.contains(&0x0063),
-                    "hole {hole} does not use a stale turn frame"
                 );
             }
         }

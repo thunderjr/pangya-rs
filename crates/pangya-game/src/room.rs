@@ -1161,6 +1161,11 @@ impl RoomState {
     ) -> Result<StrokeHoleOutOutcome, StrokeMatchError> {
         self.stroke_participant(caller)?;
         let active_before = active_participant(self.stroke.phase());
+        let hole_before = match self.stroke.phase() {
+            StrokeMatchPhase::AwaitAction { hole, .. }
+            | StrokeMatchPhase::AwaitResult { hole, .. } => Some(hole),
+            _ => None,
+        };
         let outcome = self.stroke.hole_out(caller)?;
         match outcome {
             StrokeHoleOutOutcome::Settlement(commit) => {
@@ -1171,10 +1176,16 @@ impl RoomState {
                 });
                 let _delivered = self.request_stroke_settlement(commit, None);
             }
-            // Only a changed turn is announced. Finishing out of turn leaves the other
-            // participant mid-shot, and re-announcing their turn would restart it.
+            // A changed turn is announced, as is a changed hole. On a hole transition the
+            // opening player is reset to seat one, so the connection ID can remain unchanged
+            // even though the client must receive a fresh 0x0053 introduction rather than a
+            // stale 0x0063 handover.
             StrokeHoleOutOutcome::Waiting => {
-                if active_participant(self.stroke.phase()) != active_before {
+                let hole_changed = match (hole_before, self.stroke.phase()) {
+                    (Some(before), StrokeMatchPhase::AwaitAction { hole, .. }) => hole != before,
+                    _ => false,
+                };
+                if active_participant(self.stroke.phase()) != active_before || hole_changed {
                     let plan = self
                         .stroke
                         .start_plan()
@@ -3036,6 +3047,43 @@ mod tests {
         .unwrap_or_else(|_| unreachable!())
     }
 
+    fn multi_hole_stroke_plan(first: &RoomIdentity, second: &RoomIdentity) -> StrokeStartPlan {
+        let seed = MatchSeed::new([0; 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        let begin = BeginStrokeMatch::new(
+            MatchId::new(Uuid::from_u128(205)),
+            MatchResultKey::new(Uuid::from_u128(206)),
+            [
+                StrokeParticipant::new(
+                    first.account_id,
+                    StrokeRosterOrder::First,
+                    MatchResultKey::new(Uuid::from_u128(207)),
+                ),
+                StrokeParticipant::new(
+                    second.account_id,
+                    StrokeRosterOrder::Second,
+                    MatchResultKey::new(Uuid::from_u128(208)),
+                ),
+            ],
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 2, 0, 4)
+                .unwrap_or_else(|_| unreachable!()),
+            CatalogFingerprint::new([3; 32]),
+            seed,
+            weather,
+            wind,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        StrokeStartPlan::new(
+            begin,
+            [first.connection_id, second.connection_id],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
     fn persisted_stroke(commit: CommitStrokeMatch) -> StrokeMatchResult {
         let players = [0_usize, 1_usize].map(|index| {
             let input = commit.players()[index];
@@ -3089,6 +3137,68 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn advancing_to_next_hole_broadcasts_a_turn_event_even_when_the_opening_player_is_unchanged() {
+        let first = identity(1);
+        let second = identity(2);
+        let (mut state, mut events) = state(2, None);
+        let (second_tx, _second_events) = mpsc::channel(64);
+        assert!(state.join(second.clone(), None, second_tx).is_ok());
+        assert!(state.set_ready(first.connection_id, true).is_ok());
+        assert!(state.set_ready(second.connection_id, true).is_ok());
+        let plan = multi_hole_stroke_plan(&first, &second);
+        playing_stroke_room(&mut state, &plan);
+        while events.try_recv().is_ok() {}
+
+        let action = |sequence| {
+            StrokeShotAction::new(sequence, 1, 10.0, 0.0, 0.0, 0.0)
+                .unwrap_or_else(|_| unreachable!())
+        };
+        let result = |sequence| {
+            StrokeShotResult::new(sequence, 0.0, 0.0, 0.0, Lie::Fairway, false)
+                .unwrap_or_else(|_| unreachable!())
+        };
+        assert_eq!(
+            state.stroke_action(first.connection_id, action(1)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .stroke_result(first.connection_id, result(1))
+                .map(|outcome| (outcome.disposition(), outcome.settlement())),
+            Ok((RelayDisposition::Accepted, None))
+        );
+        assert_eq!(
+            state.stroke_action(second.connection_id, action(1)),
+            Ok(RelayDisposition::Accepted)
+        );
+        assert_eq!(
+            state
+                .stroke_result(second.connection_id, result(1))
+                .map(|outcome| (outcome.disposition(), outcome.settlement())),
+            Ok((RelayDisposition::Accepted, None))
+        );
+        assert_eq!(
+            state.stroke_hole_out(first.connection_id),
+            Ok(StrokeHoleOutOutcome::Waiting)
+        );
+        assert_eq!(
+            state.stroke_hole_out(second.connection_id),
+            Ok(StrokeHoleOutOutcome::Waiting)
+        );
+
+        let turns: Vec<_> =
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter_map(|event| match event {
+                    RoomEvent::StrokeTurn(StrokeMatchPhase::AwaitAction {
+                        hole, active, ..
+                    }) if hole == 2 => Some((hole, active)),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(turns, vec![(2, first.connection_id)]);
     }
 
     #[test]
