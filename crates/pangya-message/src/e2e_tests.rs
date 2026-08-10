@@ -4,6 +4,7 @@ use pangya_protocol::CodecLimits;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
+    time::{Duration, sleep},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,60 @@ async fn receive_packet(stream: &mut TcpStream, key: u8) -> (u16, Vec<u8>) {
         u16::from_le_bytes([plain[0], plain[1]]),
         plain[2..].to_vec(),
     )
+}
+
+fn social_store() -> MemoryStore {
+    let store = MemoryStore::default();
+    store.register_user(User {
+        id: 1,
+        nickname: b"Alice".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    store.register_user(User {
+        id: 2,
+        nickname: b"Bob".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    store.add_friend(1, 2).expect("friends");
+    store.confirm_friend(1, 2).expect("friend confirmation");
+    store
+}
+
+async fn authenticate(stream: &mut TcpStream) {
+    let mut hello = [0; 9];
+    stream.read_exact(&mut hello).await.expect("hello");
+    send_packet(
+        stream,
+        7,
+        1,
+        ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        },
+    )
+    .await;
+    let (opcode, payload) = receive_packet(stream, 7).await;
+    assert_eq!(opcode, server_opcode::CREDENTIAL_RESPONSE);
+    assert_eq!(
+        ServerPacket::decode(opcode, &payload).expect("decode"),
+        ServerPacket::CredentialResponse { user_id: 1 }
+    );
+}
+
+async fn wait_for_friend_state(store: &MemoryStore, expected: Presence) {
+    for _ in 0..100 {
+        if store
+            .friends(2)
+            .iter()
+            .any(|friend| friend.user_id == 1 && friend.state == expected)
+        {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("friend state did not become {expected:?}");
 }
 
 #[tokio::test]
@@ -69,6 +124,139 @@ async fn encrypted_listener_authenticates_and_closes_on_goodbye() {
     send_packet(&mut stream, 7, 2, ClientPacket::Goodbye).await;
     drop(stream);
     shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[tokio::test]
+async fn malformed_frame_disconnects_and_cleans_up_presence() {
+    let store = social_store();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let shutdown = CancellationToken::new();
+    let service = MessageService::new(store.clone(), 7, CodecLimits::default());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { service.serve(listener, server_shutdown).await });
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    authenticate(&mut stream).await;
+    send_packet(
+        &mut stream,
+        7,
+        2,
+        ClientPacket::Status {
+            status: Presence::Online,
+        },
+    )
+    .await;
+    wait_for_friend_state(&store, Presence::Online).await;
+    // An encrypted frame with a four-byte total is independently malformed at the transport
+    // boundary; it must not leave the authenticated session online.
+    stream
+        .write_all(&[0, 0, 0, 0])
+        .await
+        .expect("malformed write");
+    wait_for_friend_state(&store, Presence::Offline).await;
+    drop(stream);
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[tokio::test]
+async fn truncated_eof_disconnects_and_cleans_up_presence() {
+    let store = social_store();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let shutdown = CancellationToken::new();
+    let service = MessageService::new(store.clone(), 7, CodecLimits::default());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { service.serve(listener, server_shutdown).await });
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    authenticate(&mut stream).await;
+    send_packet(
+        &mut stream,
+        7,
+        2,
+        ClientPacket::Status {
+            status: Presence::Online,
+        },
+    )
+    .await;
+    wait_for_friend_state(&store, Presence::Online).await;
+    // This is a literal partial frame: FrameCodec::decode_eof must reject it and still run the
+    // connection cleanup path.
+    stream
+        .write_all(&[1, 5, 0, 0])
+        .await
+        .expect("partial write");
+    drop(stream);
+    wait_for_friend_state(&store, Presence::Offline).await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[tokio::test]
+async fn failed_response_send_disconnects_and_cleans_up_presence() {
+    let store = social_store();
+    // Enough friend rows force Hello to emit multiple independent response frames. Closing the
+    // peer immediately after the request exercises the runtime's send-error cleanup branch.
+    for id in 3..=100 {
+        store.register_user(User {
+            id,
+            nickname: format!("Friend{id}").into_bytes(),
+            guild_id: None,
+            guild_name: vec![],
+        });
+        store.add_friend(1, id).expect("friend request");
+        store.confirm_friend(1, id).expect("friend confirmation");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let shutdown = CancellationToken::new();
+    let service = MessageService::new(store.clone(), 7, CodecLimits::default());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { service.serve(listener, server_shutdown).await });
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    authenticate(&mut stream).await;
+    send_packet(
+        &mut stream,
+        7,
+        2,
+        ClientPacket::Status {
+            status: Presence::Online,
+        },
+    )
+    .await;
+    wait_for_friend_state(&store, Presence::Online).await;
+    send_packet(&mut stream, 7, 3, ClientPacket::Hello).await;
+    drop(stream);
+    wait_for_friend_state(&store, Presence::Offline).await;
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[tokio::test]
+async fn cancellation_disconnects_and_cleans_up_presence() {
+    let store = social_store();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let shutdown = CancellationToken::new();
+    let service = MessageService::new(store.clone(), 7, CodecLimits::default());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { service.serve(listener, server_shutdown).await });
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    authenticate(&mut stream).await;
+    send_packet(
+        &mut stream,
+        7,
+        2,
+        ClientPacket::Status {
+            status: Presence::Online,
+        },
+    )
+    .await;
+    wait_for_friend_state(&store, Presence::Online).await;
+    shutdown.cancel();
+    wait_for_friend_state(&store, Presence::Offline).await;
+    drop(stream);
     task.await.expect("join").expect("serve");
 }
 
