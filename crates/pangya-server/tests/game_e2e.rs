@@ -452,6 +452,7 @@ fn retail_economy_service(pool: PgPool, metrics: Arc<M2Metrics>) -> Arc<GameServ
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -488,6 +489,7 @@ fn economy_service_with(
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -604,6 +606,7 @@ fn solo_service(
             catalog.clone(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits,
                 solo_practice: Some(SoloRuntimeConfig {
@@ -659,6 +662,7 @@ fn stroke_service_with_deadlines(
             catalog.clone(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits,
                 solo_practice: None,
@@ -695,6 +699,7 @@ fn game_service_with_policy(
             catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy,
                 limits,
                 solo_practice: None,
@@ -1578,6 +1583,7 @@ async fn login_bearer_to_game_snapshot_catalog_segments_and_channel_is_real_db(p
             catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits::default(),
                 solo_practice: None,
@@ -4460,6 +4466,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
             catalog.clone(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     global_connections: 4,
@@ -6062,6 +6069,7 @@ async fn game_m7_economy_command_deadline_reports_timeout_without_persisting(poo
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -6122,6 +6130,7 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -6749,6 +6758,7 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits::default(),
                 solo_practice: None,
@@ -6866,6 +6876,7 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -7331,6 +7342,7 @@ async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgP
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -7385,6 +7397,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -7567,6 +7580,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
             catalog.clone(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -7832,6 +7846,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             catalog.clone(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 400,
@@ -8263,12 +8278,6 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         );
     }
 
-    // SPEC 19.6 step 11: replaying the finish packet must not pay twice. Both clients resend
-    // theirs, which is what a client does when it is unsure the server heard it.
-    send_packet(&mut host, host_key, salt.wrapping_add(1), 0x0031, &[]).await;
-    send_packet(&mut visitor, visitor_key, salt.wrapping_add(1), 0x0031, &[]).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
     // Both accounts are participants of the same match, and both were paid exactly once.
     let (matches, players): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM matches), (SELECT count(*) FROM match_players)",
@@ -8298,6 +8307,42 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         progression_rows, 2,
         "one immutable EXP ledger row per player"
     );
+
+    // Recent-player history is produced by the completed authenticated match, not by a fixture
+    // insert. Both durable rows and the reference 260-byte response are pinned.
+    let recent_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retail_recent_players WHERE account_id = $1 AND recent_account_id = $2",
+    )
+    .bind(owner.account.id.get())
+    .bind(guest.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("owner recent-player row");
+    assert_eq!(recent_rows, 1, "completed match records its peer");
+    let reverse_recent_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retail_recent_players WHERE account_id = $1 AND recent_account_id = $2",
+    )
+    .bind(guest.account.id.get())
+    .bind(owner.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("guest recent-player row");
+    assert_eq!(reverse_recent_rows, 1, "history is reciprocal");
+    send_packet(&mut host, host_key, salt.wrapping_add(2), 0x009c, &[]).await;
+    let (history_opcode, history_body) = receive_packet(&mut host, host_key).await;
+    assert_eq!(history_opcode, 0x010e);
+    assert_eq!(history_body.len(), 260);
+    assert_eq!(&history_body[4..15], b"NPartyGuest");
+    assert_eq!(
+        u32::from_le_bytes(history_body[48..52].try_into().expect("recent peer id")),
+        u32::try_from(guest.account.id.get()).expect("recent peer id")
+    );
+
+    // SPEC 19.6 step 11: replaying the finish packet must not pay twice. Both clients resend
+    // theirs, which is what a client does when it is unsure the server heard it.
+    send_packet(&mut host, host_key, salt.wrapping_add(1), 0x0031, &[]).await;
+    send_packet(&mut visitor, visitor_key, salt.wrapping_add(1), 0x0031, &[]).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
     // SPEC 19.6 step 12: neither client's handover bearer may reach a log line.
     let logged = String::from_utf8_lossy(&traces.lock().expect("traces").clone()).into_owned();
@@ -8434,6 +8479,7 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -8495,6 +8541,7 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
             economy_catalog(),
             GameRuntimeConfig {
                 channel_id: 1,
+                advertised_channel_ids: vec![1],
                 unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
                 limits: GameRuntimeLimits {
                     packets_per_window: 200,
@@ -8513,4 +8560,175 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
     visit(&pool, address, &visitor, &owner).await;
     shutdown.cancel();
     task.await.expect("restarted service").expect("serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_issue41_recent_player_history_caps_storage_rows_on_wire(pool: PgPool) {
+    let owner = create_account(&pool, "Issue41Owner", 1, 0x1000_0000).await;
+    let mut recent = Vec::new();
+    for index in 0..7 {
+        recent.push(create_account(&pool, &format!("Issue41Recent{index}"), 1, 0x1000_0000).await);
+    }
+
+    // The repository intentionally retains more rows than the retail packet can carry. The
+    // response must preserve newest-first storage order while emitting exactly five fixed slots.
+    for (index, player) in recent.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO retail_recent_players (account_id, recent_account_id, nickname, seen_at) \
+             VALUES ($1, $2, $3, now() - ($4::double precision * interval '1 second'))",
+        )
+        .bind(owner.account.id.get())
+        .bind(player.account.id.get())
+        .bind(format!("NIssue41Recent{index}"))
+        .bind(index as f64)
+        .execute(&pool)
+        .await
+        .expect("recent-player fixture");
+    }
+
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    let (mut stream, key, _) =
+        connect_retail_social_client(&pool, address, owner.account.id, "Issue41Owner").await;
+
+    send_packet(&mut stream, key, 3, 0x009c, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x010e);
+    let mut expected = vec![
+        0_u8;
+        pangya_protocol::RETAIL_RECENT_PLAYERS
+            * pangya_protocol::RETAIL_RECENT_PLAYER_BYTES
+    ];
+    for (slot, player) in recent
+        .iter()
+        .take(pangya_protocol::RETAIL_RECENT_PLAYERS)
+        .enumerate()
+    {
+        let offset = slot * pangya_protocol::RETAIL_RECENT_PLAYER_BYTES;
+        let nickname = format!("NIssue41Recent{slot}");
+        expected[offset + 4..offset + 4 + nickname.len()].copy_from_slice(nickname.as_bytes());
+        expected[offset + 26..offset + 26 + nickname.len()].copy_from_slice(nickname.as_bytes());
+        expected[offset + 48..offset + 52].copy_from_slice(
+            &u32::try_from(player.account.id.get())
+                .expect("wire recent-player id")
+                .to_le_bytes(),
+        );
+    }
+    assert_eq!(body, expected, "newest five rows in exact 010e wire layout");
+
+    // A response that tried to encode all seven rows used to return an encoding error and close
+    // the session. Prove the connection remains usable after the capped response.
+    send_packet(&mut stream, key, 4, 0x005c, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00ba);
+
+    drop(stream);
+    shutdown.cancel();
+    task.await.expect("join").expect("serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgPool) {
+    let account = create_account(&pool, "Issue23Owner", 1, 0x1000_0000).await;
+    // Recent-player history is asserted by the completed authenticated versus match below; this
+    // topology test deliberately does not seed its durable table directly.
+
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                advertised_channel_ids: vec![1, 2],
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"Issue23Owner".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let _ = receive_packet(&mut stream, key).await;
+    }
+    // The client starts in channel A, selected from the two advertised sub-servers.
+    send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // Refresh, server time, and channel transition all answer on the encrypted wire.
+    send_packet(&mut stream, key, 3, 0x0043, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x009f);
+    assert_eq!(body.len(), 248, "one server and two advertised channels");
+    assert_eq!(body[93], 2, "both channels are advertised");
+    send_packet(&mut stream, key, 4, 0x005c, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!((opcode, body.len()), (0x00ba, 16));
+    // 0x0083 is a real transition: the client leaves A and moves to the distinct valid B.
+    send_packet(&mut stream, key, 5, 0x0083, &[2]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // History is requested on the transitioned session; match-backed history is covered by the
+    // completed authenticated versus E2E, not by a direct table fixture here.
+
+    // Every issue-listed utility request is consumed without an unknown-opcode disconnect.
+    // 0x0065 has conflicting reference bodies (item ID versus velocity). Send a bounded inert
+    // exercise over encrypted TCP; the session must remain live without inventing a mutation.
+    send_packet(&mut stream, key, 0x0065, 0x0065, &[0; 4]).await;
+    for (salt, opcode) in [
+        (0x0047, 0x0047),
+        (0x0088, 0x0088),
+        (0x00a1, 0x00a1),
+        (0x00a2, 0x00a2),
+        (0x00f4, 0x00f4),
+        (0x00fb, 0x00fb),
+        (0x00fe, 0x00fe),
+    ] {
+        send_packet(&mut stream, key, salt, opcode, &[]).await;
+    }
+    // The message-server request is handled, not inert: this deployment truthfully answers with
+    // the zero-count `0x00fc` list.
+    send_packet(&mut stream, key, 6, 0x008b, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00fc);
+    send_packet(&mut stream, key, 7, 0x005c, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00ba);
+
+    // A destination key is generated only for this configured topology.
+    send_packet(&mut stream, key, 8, 0x0119, &1_u32.to_le_bytes()).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x01d4);
+    assert!(body.len() > 4);
+
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
 }

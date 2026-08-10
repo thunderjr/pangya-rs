@@ -508,7 +508,19 @@ Three sources against one, including both 852-targeting servers, say
 confusion survived: upstream's blob happens to be a valid-looking `0x004b` and
 the client does not visibly complain.
 
-### 5.2 `0x0088` — three incompatible meanings
+### 5.2 `0x0065` — time booster body conflict (deferred)
+
+The vendored PacketDoc `gameservice/client/0065.ksy` defines a `u4 item_id` and pairs it
+with `0x00c7` fields `(item_id, connection_id)`. The U.S.-targeting SuperSS-Dev
+`GAME/versus_base.cpp:2069-2118` instead reads an `f32 velocidade`, validates a
+server-side passive-item counter, and broadcasts `0x00c7` as `(f32, connection_id)`.
+K4T Py_Source_US `GameBase.cs:979-989` consumes neither packet field and emits
+`0x00c7` with `f32 3.0`. Without a live U.S. 852 capture these are irreconcilable
+claims; the GameService therefore accepts `0x0065` inertly (no strike, response, or
+economy mutation) rather than guessing a body or consuming an item. Authoritative
+consumption/effect remains deferred to issue #26/live capture.
+
+### 5.3 `0x0088` — three incompatible meanings
 
 - PacketDoc `client/0088.ksy`: the response to server `0x00d7` authentication
   keep-alive challenge.
@@ -520,7 +532,14 @@ never sends `0x00d7`**. If a keep-alive challenge is ever added, the accept must
 become a real handler. If the PacketDoc reading is wrong and it is genuinely a
 tutorial message, the silent accept is hiding a subsystem.
 
-### 5.3 Club workshop opcode numbering disagrees between the two 852 sources
+### 5.4 Rank-up request is refusal-only
+
+`0x0167` is the one club-workshop rank opcode shared by the conflicting 852
+numbering tables, but the surrounding operation meanings disagree (see below).
+It is therefore admitted as an explicit no-mutation refusal: no rank, inventory,
+or Pang state changes and no unknown-opcode strike.
+
+### 5.5 Club workshop opcode numbering disagrees between the two 852 sources
 
 `alter-pangya:93-95` uses `0x0167`/`0x0168`/`0x0169` for rank-up / decline /
 accept. `Py_Source_US:672-675` uses `0x0164` upgrade, `0x0165` accept, `0x0166`

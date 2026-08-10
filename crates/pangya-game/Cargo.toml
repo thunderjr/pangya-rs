@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 futures-util.workspace = true
 pangya-data = { version = "0.1.0", path = "../pangya-data" }
 pangya-domain = { version = "0.1.0", path = "../pangya-domain" }

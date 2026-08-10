@@ -391,13 +391,36 @@ enum LobbyCommand {
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
     },
+    CreateOnChannel {
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        channel: u8,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
+        reply: oneshot::Sender<Result<RoomSummary, RoomError>>,
+    },
     List {
+        reply: oneshot::Sender<Vec<RoomSummary>>,
+    },
+    ListOnChannel {
+        channel: u8,
         reply: oneshot::Sender<Vec<RoomSummary>>,
     },
     Join {
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
+        reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
+    },
+    JoinOnChannel {
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        channel: u8,
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<RoomSnapshot, RoomError>>,
@@ -570,11 +593,52 @@ impl LobbyHandle {
         Self::await_reply(&gate, receive, self.command_timeout).await?
     }
 
+    /// Creates a room owned by the selected retail channel.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_on_channel(
+        &self,
+        name: RoomName,
+        password: Option<RoomPassword>,
+        settings: RoomSettings,
+        owner: RoomIdentity,
+        channel: u8,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSummary, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::CreateOnChannel {
+                name,
+                password,
+                settings,
+                owner,
+                channel,
+                outbound,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
     /// Lists immutable summaries in ascending room-ID order.
     pub async fn list(&self) -> Result<Vec<RoomSummary>, RoomError> {
         let (reply, receive) = oneshot::channel();
         let gate = Self::new_gate();
         self.send(LobbyCommand::List { reply }, Arc::clone(&gate))?;
+        Self::await_reply(&gate, receive, self.command_timeout).await
+    }
+
+    /// Lists only rooms owned by one retail channel.
+    pub async fn list_on_channel(&self, channel: u8) -> Result<Vec<RoomSummary>, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::ListOnChannel { channel, reply },
+            Arc::clone(&gate),
+        )?;
         Self::await_reply(&gate, receive, self.command_timeout).await
     }
 
@@ -594,6 +658,33 @@ impl LobbyHandle {
                 room_id,
                 identity,
                 password,
+                outbound,
+                cancellation,
+                reply,
+            },
+            Arc::clone(&gate),
+        )?;
+        Self::await_reply(&gate, receive, self.command_timeout).await?
+    }
+
+    /// Atomically admits a connection to one room owned by the selected retail channel.
+    pub async fn join_on_channel(
+        &self,
+        room_id: RoomId,
+        identity: RoomIdentity,
+        password: Option<RoomPassword>,
+        channel: u8,
+        outbound: mpsc::Sender<RoomEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<RoomSnapshot, RoomError> {
+        let (reply, receive) = oneshot::channel();
+        let gate = Self::new_gate();
+        self.send(
+            LobbyCommand::JoinOnChannel {
+                room_id,
+                identity,
+                password,
+                channel,
                 outbound,
                 cancellation,
                 reply,
@@ -1004,7 +1095,11 @@ impl LobbyRegistry {
 
     fn update_snapshot(&mut self, room_id: RoomId, snapshot: &RoomSnapshot) {
         if let Some(record) = self.rooms.get_mut(&room_id) {
-            record.summary = snapshot.summary().clone();
+            let channel = record.summary.channel();
+            record.summary = channel.map_or_else(
+                || snapshot.summary().clone(),
+                |channel| snapshot.summary().clone().with_channel(channel),
+            );
         }
     }
 
@@ -1015,12 +1110,14 @@ impl LobbyRegistry {
             .ok_or(RoomError::NotMember)
     }
 
-    async fn create(
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_channel(
         &mut self,
         name: RoomName,
         password: Option<RoomPassword>,
         settings: RoomSettings,
         owner: RoomIdentity,
+        channel: Option<u8>,
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
     ) -> Result<RoomSummary, RoomError> {
@@ -1043,6 +1140,10 @@ impl LobbyRegistry {
             self.limits.room,
             Some(self.events.clone()),
         );
+        let summary = match channel {
+            Some(channel) => summary.with_channel(channel),
+            None => summary,
+        };
         self.rooms.insert(
             id,
             RoomRecord {
@@ -1062,11 +1163,12 @@ impl LobbyRegistry {
         Ok(summary)
     }
 
-    async fn join(
+    async fn join_with_channel(
         &mut self,
         room_id: RoomId,
         identity: RoomIdentity,
         password: Option<RoomPassword>,
+        channel: Option<u8>,
         outbound: mpsc::Sender<RoomEvent>,
         cancellation: CancellationToken,
     ) -> Result<RoomSnapshot, RoomError> {
@@ -1077,6 +1179,9 @@ impl LobbyRegistry {
             .rooms
             .get(&room_id)
             .filter(|record| !record.retain_for_persistence)
+            .filter(|record| {
+                channel.is_none_or(|channel| record.summary.channel() == Some(channel))
+            })
             .map(|record| record.handle.clone())
             .ok_or(RoomError::RoomNotFound)?;
         let connection_id = identity.connection_id;
@@ -1525,7 +1630,11 @@ impl LobbyRegistry {
         match event {
             RoomActorEvent::Summary(summary) => {
                 if let Some(record) = self.rooms.get_mut(&summary.id()) {
-                    record.summary = summary;
+                    let channel = record.summary.channel();
+                    record.summary = channel.map_or_else(
+                        || summary.clone(),
+                        |channel| summary.clone().with_channel(channel),
+                    );
                 }
             }
             RoomActorEvent::Closed(room_id) => {
@@ -1697,7 +1806,11 @@ async fn run_lobby(
             }
             command = commands.recv() => match command.and_then(begin) {
                 Some(LobbyCommand::Create { name, password, settings, owner, outbound, cancellation, reply }) => {
-                    let result = registry.create(name, password, settings, owner, outbound, cancellation).await;
+                    let result = registry.create_with_channel(name, password, settings, owner, None, outbound, cancellation).await;
+                    let _ignored = reply.send(result);
+                }
+                Some(LobbyCommand::CreateOnChannel { name, password, settings, owner, channel, outbound, cancellation, reply }) => {
+                    let result = registry.create_with_channel(name, password, settings, owner, Some(channel), outbound, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::List { reply }) => {
@@ -1707,8 +1820,20 @@ async fn run_lobby(
                         .collect();
                     let _ignored = reply.send(summaries);
                 }
+                Some(LobbyCommand::ListOnChannel { channel, reply }) => {
+                    let summaries = registry.rooms.values()
+                        .filter(|record| !record.retain_for_persistence)
+                        .filter(|record| record.summary.channel() == Some(channel))
+                        .map(|record| record.summary.clone())
+                        .collect();
+                    let _ignored = reply.send(summaries);
+                }
                 Some(LobbyCommand::Join { room_id, identity, password, outbound, cancellation, reply }) => {
-                    let result = registry.join(room_id, identity, password, outbound, cancellation).await;
+                    let result = registry.join_with_channel(room_id, identity, password, None, outbound, cancellation).await;
+                    let _ignored = reply.send(result);
+                }
+                Some(LobbyCommand::JoinOnChannel { room_id, identity, password, channel, outbound, cancellation, reply }) => {
+                    let result = registry.join_with_channel(room_id, identity, password, Some(channel), outbound, cancellation).await;
                     let _ignored = reply.send(result);
                 }
                 Some(LobbyCommand::Leave { connection_id, reply }) => {
@@ -1755,7 +1880,7 @@ async fn run_lobby(
                 Some(LobbyCommand::CreateAfterRelease { name, settings, owner, outbound, cancellation, started, release, reply }) => {
                     let _ignored = started.send(());
                     let result = if release.await.is_ok() {
-                        registry.create(name, None, settings, owner, outbound, cancellation).await
+                        registry.create_with_channel(name, None, settings, owner, None, outbound, cancellation).await
                     } else {
                         Err(RoomError::Closed)
                     };
@@ -1888,6 +2013,53 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[tokio::test]
+    async fn channel_scoped_rooms_are_not_listed_or_joinable_across_channels() {
+        let lobby = spawn_lobby(limits(8));
+        let first = lobby
+            .create_on_channel(
+                RoomName::parse("channel-one").unwrap_or_else(|_| unreachable!()),
+                None,
+                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                identity(1),
+                1,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("create channel one");
+        assert_eq!(first.channel(), Some(1));
+        assert_eq!(lobby.list_on_channel(1).await.expect("list one").len(), 1);
+        assert!(lobby.list_on_channel(2).await.expect("list two").is_empty());
+        assert_eq!(
+            lobby
+                .join_on_channel(
+                    first.id(),
+                    identity(2),
+                    None,
+                    2,
+                    mpsc::channel(8).0,
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(RoomError::RoomNotFound)
+        );
+        lobby
+            .join_on_channel(
+                first.id(),
+                identity(2),
+                None,
+                1,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("join same channel");
+        let listed = lobby.list_on_channel(1).await.expect("list after join");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].channel(), Some(1));
     }
 
     #[tokio::test]

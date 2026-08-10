@@ -139,6 +139,7 @@ section_default!(GameSection {
     name: String = "PangYa-RS Local".to_owned(),
     capacity: u32 = 200,
     channel_id: u32 = 1,
+    channels: Vec<u8> = vec![1],
     max_rooms: usize = 1_024,
     lobby_command_capacity: usize = 256,
     lobby_event_capacity: usize = 256,
@@ -336,8 +337,10 @@ pub struct AppConfig {
     pub game_name: String,
     /// Game server capacity.
     pub game_capacity: u32,
-    /// Sole synthetic channel ID.
+    /// Initial synthetic channel ID.
     pub game_channel_id: u32,
+    /// Retail sub-server IDs advertised and accepted for channel transitions.
+    pub game_channel_ids: Vec<u8>,
     /// Maximum concurrently registered rooms.
     pub game_max_rooms: usize,
     /// Lobby command queue capacity.
@@ -876,6 +879,21 @@ fn validate(
         (
             "game.channel_id",
             raw.game.enabled && raw.game.channel_id == 0,
+        ),
+        (
+            "game.channels",
+            raw.game.enabled
+                && (raw.game.channels.is_empty()
+                    || raw.game.channels.len() > 255
+                    || u8::try_from(raw.game.channel_id)
+                        .ok()
+                        .is_none_or(|id| !raw.game.channels.contains(&id))
+                    || raw
+                        .game
+                        .channels
+                        .iter()
+                        .enumerate()
+                        .any(|(index, id)| raw.game.channels[index + 1..].contains(id))),
         ),
         (
             "database.max_connections",
@@ -1653,6 +1671,7 @@ fn validate(
         game_name: raw.game.name,
         game_capacity: raw.game.capacity,
         game_channel_id: raw.game.channel_id,
+        game_channel_ids: raw.game.channels,
         game_max_rooms: raw.game.max_rooms,
         game_lobby_command_capacity: raw.game.lobby_command_capacity,
         game_lobby_event_capacity: raw.game.lobby_event_capacity,

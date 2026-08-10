@@ -38,6 +38,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use chrono::{Datelike as _, Timelike as _};
 use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_data::Catalog;
 use pangya_domain::{
@@ -49,16 +50,16 @@ use pangya_domain::{
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
     MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
-    RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId, RoomName,
-    RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer,
+    RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId,
+    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
     ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
     StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
     StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
-    RegistryError, RegistryGuard, parse_handover,
+    RegistryError, RegistryGuard, generate_handover, parse_handover,
 };
 use pangya_protocol::{
     BalanceUpdate, CHARACTER_PARTS, CHARACTER_STATS, ChannelJoined, CharacterBootstrap,
@@ -72,28 +73,31 @@ use pangya_protocol::{
     MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
     MessageServerList, MessageServerListRequest, NoteSend, OutboundFrame, PacketEncodeError,
     PacketWriter, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
-    RETAIL_C2S_FIRST_SHOT_READY, RepairCommitted, RepairRequest, RetailCaddie, RetailChannel,
-    RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter, RetailClientException,
-    RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipment,
-    RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate,
-    RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady, RetailGameAuth, RetailHole,
-    RetailHoleProgression, RetailHoleWeather, RetailHoleWind, RetailInventoryClass,
-    RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
+    RETAIL_C2S_FIRST_SHOT_READY, RETAIL_RECENT_PLAYERS, RepairCommitted, RepairRequest,
+    RetailCaddie, RetailChannel, RetailChannelJoinNotice, RetailChannelJoined, RetailCharacter,
+    RetailClientException, RetailDailyQuestDelta, RetailDailyQuestRequest, RetailDailyQuestState,
+    RetailEquipment, RetailEquipmentAnnounce, RetailEquipmentRequested, RetailEquipmentSlot,
+    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailFinishHole, RetailFirstShotReady,
+    RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
+    RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
     RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance,
-    RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
-    RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem,
-    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
-    RetailRoomCreate, RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
+    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
+    RetailNewSessionKeyRequest, RetailPangBalance, RetailPangRate, RetailPangSpent,
+    RetailPlayerData, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
+    RetailPointBalance, RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart,
+    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable,
+    RetailRecentPlayerSlot, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
     RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
-    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailServerEntry, RetailServerList,
+    RetailServerListRequest, RetailServerTime, RetailServerTimeRequest, RetailShopJoin,
+    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
+    RetailSubServerConnect, RetailSubServerEntry, RetailTurnEnd, RetailTurnStart,
     RetailUccUploadKeyRefusal, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
     RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
     RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
@@ -113,14 +117,15 @@ use pangya_protocol::{
     StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UserCharacterInfoResponse,
-    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
-    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
-    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
-    UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather,
-    Whisper, WhisperRefusalResponse, WhisperResponse, Wind, decode_packet_payload,
-    encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
-    is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
+    StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
+    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
+    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
+    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
+    UserStatisticsInfoResponse, UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse,
+    Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse, Wind,
+    decode_packet_payload, encode_packet_payload, is_retail_accepted_match_opcode,
+    is_retail_accepted_session_opcode, is_retail_explicit_social_refusal, packed_system_time,
+    synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -607,8 +612,13 @@ pub struct EconomyRuntimeConfig {
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
-    /// Sole locally configured channel ID.
+    /// Sole locally configured channel ID used by the listener's initial channel.
     pub channel_id: u32,
+    /// Every retail sub-server ID this service advertises and accepts for transitions.
+    ///
+    /// The initial channel must be present. Keeping this topology explicit prevents `0x0083`
+    /// from treating an arbitrary byte (or the current channel) as a successful move.
+    pub advertised_channel_ids: Vec<u8>,
     /// Post-channel handling policy for truly unknown opcodes.
     pub unknown_opcode_policy: UnknownOpcodePolicy,
     /// Resource, rate, actor, and deadline limits.
@@ -630,6 +640,7 @@ impl Default for GameRuntimeConfig {
     fn default() -> Self {
         Self {
             channel_id: 1,
+            advertised_channel_ids: vec![1],
             unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
             limits: GameRuntimeLimits::default(),
             solo_practice: None,
@@ -766,6 +777,8 @@ struct SocialMember {
     nickname: Vec<u8>,
     card: MemberCard,
     room: Option<RoomId>,
+    /// Retail sub-server presence; absent until the initial channel selection succeeds.
+    channel: Option<u8>,
     whisper_accept: bool,
 }
 
@@ -801,6 +814,7 @@ impl SocialHub {
                     nickname,
                     card,
                     room: None,
+                    channel: None,
                     whisper_accept: true,
                 },
             );
@@ -809,6 +823,13 @@ impl SocialHub {
     fn remove(&self, id: PlayerConnectionId) {
         if let Ok(mut members) = self.members.lock() {
             members.remove(&id);
+        }
+    }
+    fn set_channel(&self, id: PlayerConnectionId, channel: Option<u8>) {
+        if let Ok(mut members) = self.members.lock()
+            && let Some(member) = members.get_mut(&id)
+        {
+            member.channel = channel;
         }
     }
     fn set_room(&self, id: PlayerConnectionId, room: Option<RoomId>) {
@@ -882,10 +903,16 @@ impl SocialHub {
         let Ok(members) = self.members.lock() else {
             return Vec::new();
         };
-        let room = members.get(&id).and_then(|member| member.room);
+        let Some(requester) = members.get(&id) else {
+            return Vec::new();
+        };
+        let room = requester.room;
+        let channel = requester.channel;
         members
             .iter()
-            .filter_map(|(target, member)| (member.room == room).then_some(*target))
+            .filter_map(|(target, member)| {
+                (member.channel == channel && member.room == room).then_some(*target)
+            })
             .collect()
     }
     fn chat(&self, id: PlayerConnectionId, nickname: Vec<u8>, message: Vec<u8>) {
@@ -1111,6 +1138,16 @@ where
     ) -> Result<Self, GameRuntimeError> {
         let limits = &config.limits;
         let invalid = config.channel_id == 0
+            || config.advertised_channel_ids.is_empty()
+            || config.advertised_channel_ids.len() > 255
+            || !config
+                .advertised_channel_ids
+                .contains(&u8::try_from(config.channel_id).unwrap_or(0))
+            || config
+                .advertised_channel_ids
+                .iter()
+                .enumerate()
+                .any(|(index, id)| config.advertised_channel_ids[index + 1..].contains(id))
             || limits.global_connections == 0
             || limits.global_connections > 10_000
             || limits.connections_per_source == 0
@@ -1519,6 +1556,9 @@ where
         let mut state = GameState::AwaitHandover;
         let mut presence: Option<RegistryGuard<AccountId>> = None;
         let mut identity: Option<RoomIdentity> = None;
+        // Distinct from the authenticated account lease: this is the current retail sub-server
+        // and is changed only after a valid transition has completed its room cleanup.
+        let mut current_channel: Option<u8> = None;
         // Target account selected by the last 0x00b5 My Room open. It is connection-local and
         // never trusted as authorization for mutable state; every projection is loaded from DB.
         let mut my_room_target: Option<AccountId> = None;
@@ -1701,9 +1741,13 @@ where
                                     Err(_) => break Err(GameRuntimeError::Protocol),
                                 }
                             };
-                            if channel_id != self.config.channel_id
+                            let Some(channel) = u8::try_from(channel_id).ok() else {
+                                break Err(GameRuntimeError::Protocol);
+                            };
+                            if !self.config.advertised_channel_ids.contains(&channel)
                                 || identity.is_none()
                                 || presence.is_none()
+                                || current_channel.is_some()
                             {
                                 break Err(GameRuntimeError::Protocol);
                             }
@@ -1724,6 +1768,8 @@ where
                             if let Err(error) = sent {
                                 break Err(error);
                             }
+                            current_channel = Some(channel);
+                            self.social.set_channel(connection_id, current_channel);
                             state = GameState::InChannel;
                         }
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
@@ -1734,6 +1780,80 @@ where
                                 // after the bounded frame has been consumed: a client diagnostic
                                 // must never turn into a second disconnect or stall the session.
                                 observe_retail_client_exception(&frame.payload);
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailServerListRequest::OPCODE {
+                                if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
+                                let server = RetailServerEntry {
+                                    name: b"PangYa-RS".to_vec(), id: self.config.channel_id,
+                                    user_max: 200, user_count: 0, ip: Vec::new(), port: 0,
+                                    unknown_c: UnknownBytes([0; 2]), flags: UnknownBytes([0; 2]),
+                                    unknown_d: UnknownBytes([0; 14]), icon: 1,
+                                };
+                                let channels = self
+                                    .config
+                                    .advertised_channel_ids
+                                    .iter()
+                                    .map(|&id| RetailSubServerEntry {
+                                        name: format!("Channel {id}").into_bytes(),
+                                        unknown_a: UnknownBytes([0; 47]),
+                                        id,
+                                        unknown_b: UnknownBytes([0; 8]),
+                                    })
+                                    .collect();
+                                self.send(&mut framed, &RetailServerList { servers: vec![server], sub_servers: channels }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailServerTimeRequest::OPCODE {
+                                if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
+                                let now = chrono::Local::now();
+                                self.send(&mut framed, &RetailServerTime {
+                                    year: u16::try_from(now.year()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    month: u16::try_from(now.month()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    weekday: u16::try_from(now.weekday().num_days_from_sunday()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    day: u16::try_from(now.day()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    hour: u16::try_from(now.hour()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    minute: u16::try_from(now.minute()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    second: u16::try_from(now.second()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    millisecond: u16::try_from(now.nanosecond() / 1_000_000).map_err(|_| GameRuntimeError::Protocol)?,
+                                }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailSubServerConnect::OPCODE {
+                                let request = decode_packet_payload::<RetailSubServerConnect>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                let Some(previous) = current_channel else { break Err(GameRuntimeError::Protocol); };
+                                // 0x0083 is a real move, not an idempotent re-join. Validate the
+                                // destination before touching the room actor or presence map so
+                                // malformed/unknown requests cannot strand a player half-moved.
+                                if !matches!(state, GameState::InChannel | GameState::InRoom)
+                                    || request.sub_server_id == previous
+                                    || !self.config.advertised_channel_ids.contains(&request.sub_server_id)
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                if state == GameState::InRoom {
+                                    match self.lobby.disconnect(connection_id).await {
+                                        Ok(_) | Err(RoomError::NotMember | RoomError::RoomNotFound) => {}
+                                        Err(_) => break Err(GameRuntimeError::Protocol),
+                                    }
+                                    room_id = None;
+                                    self.social.set_room(connection_id, None);
+                                    // The room actor may have queued its final census before the
+                                    // leave reply. It must not leak into a later room entered on
+                                    // the destination channel.
+                                    while room_events.try_recv().is_ok() {}
+                                }
+                                // Reference 0x004e/0x01f6 carries no destination ID. Commit the
+                                // session/lobby presence only after both response frames are sent.
+                                self.send(&mut framed, &RetailChannelJoined).await?;
+                                self.send(&mut framed, &RetailChannelJoinNotice).await?;
+                                current_channel = Some(request.sub_server_id);
+                                self.social.set_channel(connection_id, current_channel);
+                                state = GameState::InChannel;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailNewSessionKeyRequest::OPCODE {
+                                let request = decode_packet_payload::<RetailNewSessionKeyRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
+                                // A destination that is not this configured service is refused;
+                                // issuing a key for an unknown topology would create an unusable
+                                // bearer and, worse, widen the handover trust boundary.
+                                if request.server_id != self.config.channel_id { continue; }
+                                let generated = generate_handover(established.account_id, DomainServiceKind::Game, source.clone(), SystemTime::now()).map_err(|_| GameRuntimeError::Authentication)?;
+                                self.repository.issue(generated.record).await.map_err(|_| GameRuntimeError::Authentication)?;
+                                self.send(&mut framed, &RetailNewSessionKey { unknown: UnknownBytes([0; 4]), session_key: generated.token.expose_secret().as_bytes().to_vec().into() }).await?;
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -1754,7 +1874,14 @@ where
                                         if frame.opcode == RetailLoginBonusRequest::OPCODE {
                                             self.send(&mut framed, &RetailLoginBonusStatus).await
                                         } else {
-                                            self.send(&mut framed, &RetailPlayerHistory).await
+                                            let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
+                                            let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
+                                            let entries = recent.into_iter().take(RETAIL_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
+                                                let account_id = u32::try_from(player.account_id.get()).ok()?;
+                                                let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
+                                                Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
+                                            }).collect::<Vec<_>>();
+                                            self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
                                         }
                                     } => sent,
                                 };
@@ -2136,6 +2263,7 @@ where
                                         established,
                                         outbound.clone(),
                                         room_cancellation.clone(),
+                                        current_channel.ok_or(GameRuntimeError::Protocol)?,
                                         frame.opcode,
                                         &frame.payload,
                                         &mut room_id,
@@ -4524,7 +4652,12 @@ where
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::StrokeCommitted(result) => {
-                    self.send_retail_stroke_committed(framed, *result, match_context.stroke)
+                    let context = match_context.stroke;
+                    // The actor emitted this only after durable settlement. Recording before the
+                    // completion frames keeps a client-visible completed match and its history
+                    // atomic from an observer's point of view.
+                    self.record_retail_match_history(result).await?;
+                    self.send_retail_stroke_committed(framed, *result, context)
                         .await?;
                     match_context.stroke = None;
                     return Ok(RoomEventEffect::EnterRoom);
@@ -5062,6 +5195,50 @@ where
     ///
     /// Every figure here is the committed server-side result. A forfeit has no golf score, so
     /// its line reports zero rather than inventing one.
+    /// Records only players in the durable completed-match result. The result carries account
+    /// identity from `match_players`, so a disconnect between settlement and this frame cannot
+    /// remove a participant from history; nicknames are loaded from durable player projections.
+    async fn record_retail_match_history(
+        &self,
+        result: &StrokeMatchResult,
+    ) -> Result<(), GameRuntimeError> {
+        let participants = result
+            .players()
+            .map(|player| player.participant().account_id());
+        let mut snapshots = Vec::with_capacity(participants.len());
+        for account_id in participants {
+            let snapshot = self
+                .repository
+                .load_player_snapshot(account_id)
+                .await
+                .map_err(|_| GameRuntimeError::Snapshot)?;
+            let nickname = snapshot
+                .profile
+                .nickname
+                .ok_or(GameRuntimeError::Snapshot)?;
+            snapshots.push((account_id, nickname));
+        }
+        for (owner, _) in &snapshots {
+            for (recent, nickname) in &snapshots {
+                if owner == recent {
+                    continue;
+                }
+                self.repository
+                    .record_recent_player(
+                        *owner,
+                        RecentPlayer {
+                            account_id: *recent,
+                            nickname: nickname.clone(),
+                            seen_at: SystemTime::now(),
+                        },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn send_retail_stroke_committed(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -7109,10 +7286,10 @@ where
     }
 
     /// Current rooms as retail list records, bounded by what one list frame can carry.
-    async fn retail_room_list(&self) -> Result<Vec<RetailRoom>, GameRuntimeError> {
+    async fn retail_room_list(&self, channel: u8) -> Result<Vec<RetailRoom>, GameRuntimeError> {
         let summaries = self
             .lobby
-            .list()
+            .list_on_channel(channel)
             .await
             .map_err(|_| GameRuntimeError::Protocol)?;
         Ok(summaries
@@ -7133,6 +7310,7 @@ where
         identity: &RoomIdentity,
         outbound: mpsc::Sender<RoomEvent>,
         room_cancellation: CancellationToken,
+        channel: u8,
         opcode: u16,
         payload: &[u8],
         room_id: &mut Option<RoomId>,
@@ -7145,7 +7323,7 @@ where
                 if !payload.is_empty() {
                     return Err(GameRuntimeError::Protocol);
                 }
-                let rooms = self.retail_room_list().await?;
+                let rooms = self.retail_room_list(channel).await?;
                 self.send(
                     framed,
                     &RetailRoomList {
@@ -7203,11 +7381,12 @@ where
                 });
                 let created = self
                     .lobby
-                    .create(
+                    .create_on_channel(
                         name,
                         password,
                         settings,
                         identity.clone(),
+                        channel,
                         outbound,
                         room_cancellation,
                     )
@@ -7254,10 +7433,11 @@ where
                 };
                 let joined = self
                     .lobby
-                    .join(
+                    .join_on_channel(
                         target,
                         identity.clone(),
                         password,
+                        channel,
                         outbound,
                         room_cancellation,
                     )
@@ -7343,7 +7523,7 @@ where
                 self.social.set_room(identity.connection_id, None);
                 self.observer.room(GameRoomObservation::Left);
                 self.send(framed, &RetailRoomLeave::to_lobby()).await?;
-                self.send_retail_room_list(framed).await?;
+                self.send_retail_room_list(framed, channel).await?;
                 Ok(GameState::InChannel)
             }
             // A room opcode in the wrong state is a protocol violation, matching the
@@ -7388,10 +7568,11 @@ where
     async fn send_retail_room_list(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
+        channel: u8,
     ) -> Result<(), GameRuntimeError> {
         let rooms = self
             .lobby
-            .list()
+            .list_on_channel(channel)
             .await
             .map_err(|_| GameRuntimeError::Protocol)?;
         let rooms = rooms.iter().map(retail_room_from_summary_only).collect();
@@ -7576,14 +7757,18 @@ where
         self.send(
             framed,
             &ServerChannelList {
-                channels: vec![RetailChannel {
-                    name: b"pangya-rs".to_vec(),
-                    capacity: 200,
-                    player_count: 0,
-                    id: u16::try_from(self.config.channel_id)
-                        .map_err(|_| GameRuntimeError::InvalidConfig)?,
-                    restrictions: 0,
-                }],
+                channels: self
+                    .config
+                    .advertised_channel_ids
+                    .iter()
+                    .map(|&id| RetailChannel {
+                        name: b"pangya-rs".to_vec(),
+                        capacity: 200,
+                        player_count: 0,
+                        id: u16::from(id),
+                        restrictions: 0,
+                    })
+                    .collect(),
             },
         )
         .await?;

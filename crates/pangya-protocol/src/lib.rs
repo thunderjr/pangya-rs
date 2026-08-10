@@ -31,7 +31,10 @@ pub use game::{
     RETAIL_ACCEPTED_SESSION_OPCODES, RETAIL_C2S_FIRST_SHOT_READY, RETAIL_EXPLICIT_SOCIAL_REFUSALS,
     RETAIL_RECENT_PLAYER_BYTES, RETAIL_RECENT_PLAYERS, RetailChannelJoinNotice,
     RetailChannelJoined, RetailClientException, RetailFirstShotReady, RetailLoginBonusRequest,
-    RetailLoginBonusStatus, RetailPlayerHistory, RetailPlayerHistoryRequest, RetailSelectChannel,
+    RetailLoginBonusStatus, RetailNewSessionKey, RetailNewSessionKeyRequest, RetailPlayerHistory,
+    RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailRecentPlayerSlot,
+    RetailSelectChannel, RetailServerEntry, RetailServerList, RetailServerListRequest,
+    RetailServerTime, RetailServerTimeRequest, RetailSubServerConnect, RetailSubServerEntry,
     SelectChannel, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     is_retail_explicit_social_refusal, synthetic_game_hello, us852_game_hello,
 };

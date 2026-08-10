@@ -1,8 +1,12 @@
+#![allow(missing_docs)]
+
 use crate::{
     CompatibilityProfile, DecodePacket, EncodePacket, PacketDecodeError, PacketEncodeError,
-    PacketReader, PacketWriter,
+    PacketReader, PacketWriter, UnknownBytes,
 };
 use zeroize::Zeroizing;
+
+use std::fmt;
 
 /// Maximum handover bearer bytes accepted by the synthetic GameService auth packet.
 pub const MAX_GAME_HANDOVER_BYTES: usize = 128;
@@ -181,6 +185,220 @@ impl EncodePacket for RetailChannelJoined {
     }
 }
 
+/// Empty U.S. 852 retail server-list request, client opcode `0x0043`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailServerListRequest;
+
+impl DecodePacket for RetailServerListRequest {
+    const OPCODE: u16 = 0x0043;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// A server advertised by retail GameService `0x009f`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailServerEntry {
+    pub name: Vec<u8>,
+    pub id: u32,
+    pub user_max: u32,
+    pub user_count: u32,
+    pub ip: Vec<u8>,
+    pub port: u16,
+    pub unknown_c: UnknownBytes<2>,
+    pub flags: UnknownBytes<2>,
+    pub unknown_d: UnknownBytes<14>,
+    pub icon: u16,
+}
+
+/// A sub-server advertised by retail GameService `0x009f`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailSubServerEntry {
+    pub name: Vec<u8>,
+    pub unknown_a: UnknownBytes<47>,
+    pub id: u8,
+    pub unknown_b: UnknownBytes<8>,
+}
+
+/// U.S. 852 GameService server and sub-server list, server opcode `0x009f`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailServerList {
+    pub servers: Vec<RetailServerEntry>,
+    pub sub_servers: Vec<RetailSubServerEntry>,
+}
+
+impl EncodePacket for RetailServerList {
+    const OPCODE: u16 = 0x009f;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        if self.servers.len() > 255 || self.sub_servers.len() > 255 {
+            return Err(PacketEncodeError::Limit {
+                field: "server list count",
+                actual: self.servers.len().max(self.sub_servers.len()),
+                maximum: 255,
+            });
+        }
+        writer.u8(self.servers.len() as u8);
+        for server in &self.servers {
+            writer.fixed_nul(&server.name, 40)?;
+            writer.u32_le(server.id);
+            writer.u32_le(server.user_max);
+            writer.u32_le(server.user_count);
+            writer.fixed_nul(&server.ip, 18)?;
+            writer.u16_le(server.port);
+            writer.bytes(&server.unknown_c.0);
+            writer.bytes(&server.flags.0);
+            writer.bytes(&server.unknown_d.0);
+            writer.u16_le(server.icon);
+        }
+        writer.u8(self.sub_servers.len() as u8);
+        for server in &self.sub_servers {
+            writer.fixed_nul(&server.name, 21)?;
+            writer.bytes(&server.unknown_a.0);
+            writer.u8(server.id);
+            writer.bytes(&server.unknown_b.0);
+        }
+        Ok(())
+    }
+}
+
+/// Retail client `0x0083` channel transition request used while already in a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailSubServerConnect {
+    pub sub_server_id: u8,
+}
+
+impl DecodePacket for RetailSubServerConnect {
+    const OPCODE: u16 = 0x0083;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let sub_server_id = reader.u8()?;
+        require_end(reader)?;
+        Ok(Self { sub_server_id })
+    }
+}
+
+/// Retail client `0x0119` request for a destination-server session key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailNewSessionKeyRequest {
+    pub server_id: u32,
+}
+
+impl DecodePacket for RetailNewSessionKeyRequest {
+    const OPCODE: u16 = 0x0119;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let server_id = reader.u32_le()?;
+        require_end(reader)?;
+        Ok(Self { server_id })
+    }
+}
+
+/// Retail GameService `0x01d4` response. The bearer is redacted in diagnostics and zeroized on drop.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RetailNewSessionKey {
+    pub unknown: UnknownBytes<4>,
+    pub session_key: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for RetailNewSessionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetailNewSessionKey")
+            .field("unknown", &self.unknown)
+            .field("session_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl EncodePacket for RetailNewSessionKey {
+    const OPCODE: u16 = 0x01d4;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&self.unknown.0);
+        writer.pstring(&self.session_key, MAX_GAME_HANDOVER_BYTES)
+    }
+}
+
+/// Empty retail client request for server time, opcode `0x005c`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailServerTimeRequest;
+
+impl DecodePacket for RetailServerTimeRequest {
+    const OPCODE: u16 = 0x005c;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// Retail server-time response (`0x00ba`) to client request `0x005c`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailServerTime {
+    pub year: u16,
+    pub month: u16,
+    pub weekday: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub millisecond: u16,
+}
+
+impl EncodePacket for RetailServerTime {
+    const OPCODE: u16 = 0x00ba;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        for value in [
+            self.year,
+            self.month,
+            self.weekday,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+            self.millisecond,
+        ] {
+            writer.u16_le(value);
+        }
+        Ok(())
+    }
+}
+
 /// U.S. 852 retail login-bonus status request, client opcode `0x016e`.
 ///
 /// # Provenance
@@ -282,12 +500,20 @@ pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
     0x0055, // whisper accept state (decoded by GameService)
     0x0066, // ticker notice
     0x0067, // ticker cookie check
-    0x0069, // chat macro set (decoded and persisted by GameService)
-    0x0088, // unclassified
+    // 0x0065 is deliberately inert: PacketDoc says item_id, while SuperSS/K4T 852 sources
+    // disagree with f32 velocity. No economy mutation or guessed 0x00c7 body is safe yet.
+    0x0065, 0x0069, // chat macro set (decoded and persisted by GameService)
+    0x0088, // unclassified / keep-alive reply collision
     0x008b, // messenger list request
+    0x00a1, // enter web-link request; no safe response layout
+    0x00a2, // leave web-link request; no safe response layout
+    0x00f4, // keep-alive in the alternate 852 reference
     0x00c1, // unclassified
     0x00eb, // lounge enter request
-    0x00fe, // unclassified
+    0x00fb, // web-key authentication; no safe response layout
+    0x00fe, // documented by US852_SOCIAL as client-safe no-reply refusal
+    0x0167, // rank-up conflict; explicit safe refusal
+    0x0047, // rank-server address request; rank service is intentionally absent
 ];
 
 /// Returns whether `opcode` is a session-level opcode this server accepts without replying.
@@ -306,8 +532,13 @@ pub const RETAIL_EXPLICIT_SOCIAL_REFUSALS: &[u16] = &[
     0x0054, // team chat
     0x0066, // ticker notice
     0x0067, // ticker cookie
+    0x00a1, // enter web-link request; no safe response layout
+    0x00a2, // leave web-link request; no safe response layout
     0x00c1, // conflicting web-cookie/my-room request
-    0x00fe, // unclassified
+    0x00fb, // web-key authentication; no safe response layout
+    0x00fe, // unclassified / documented safe refusal
+    0x0167, // club rank-up numbering conflicts; safe refusal until US852 capture
+    0x0047, // rank service is out of scope; refuse without inventing an address
 ];
 
 /// Returns whether an opcode is handled as a client-safe, explicit social refusal.
@@ -384,7 +615,7 @@ pub const RETAIL_C2S_FIRST_SHOT_READY: u16 = 0x0034;
 
 /// Recent-player slots in a [`RetailPlayerHistory`].
 pub const RETAIL_RECENT_PLAYERS: usize = 5;
-/// Bytes in one recent-player record: `u32`, two 22-byte names, `u32`.
+/// Bytes in one recent-player record: unknown `u32`, two 22-byte names, account `u32`.
 pub const RETAIL_RECENT_PLAYER_BYTES: usize = 52;
 
 /// Client-reported exception, client opcode `0x0033`.
@@ -494,6 +725,55 @@ impl EncodePacket for RetailPlayerHistory {
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
         writer.bytes(&[0; RETAIL_RECENT_PLAYERS * RETAIL_RECENT_PLAYER_BYTES]);
+        Ok(())
+    }
+}
+
+/// One populated retail recent-player slot. PacketDoc orders this as unknown, two fixed names,
+/// then account id; the two names are retained separately because the reference labels are
+/// unresolved, and this implementation repeats the authoritative nickname.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRecentPlayerSlot {
+    pub account_id: u32,
+    pub nickname: Vec<u8>,
+    pub secondary_name: Vec<u8>,
+    pub unknown: u32,
+}
+
+/// Retail recent-player history with bounded fixed slots, server opcode `0x010e`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailPlayerHistoryEntries {
+    pub entries: Vec<RetailRecentPlayerSlot>,
+}
+
+impl EncodePacket for RetailPlayerHistoryEntries {
+    const OPCODE: u16 = 0x010e;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        if self.entries.len() > RETAIL_RECENT_PLAYERS {
+            return Err(PacketEncodeError::Limit {
+                field: "recent players",
+                actual: self.entries.len(),
+                maximum: RETAIL_RECENT_PLAYERS,
+            });
+        }
+        for entry in &self.entries {
+            // PacketDoc's 010e record is unknown, nickname, secondary nickname, user id.
+            writer.u32_le(entry.unknown);
+            writer.fixed_nul(&entry.nickname, 22)?;
+            writer.fixed_nul(&entry.secondary_name, 22)?;
+            writer.u32_le(entry.account_id);
+        }
+        writer.bytes(&vec![
+            0;
+            (RETAIL_RECENT_PLAYERS - self.entries.len())
+                * RETAIL_RECENT_PLAYER_BYTES
+        ]);
         Ok(())
     }
 }

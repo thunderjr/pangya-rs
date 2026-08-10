@@ -475,6 +475,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
             catalog,
             GameRuntimeConfig {
                 channel_id: config.game_channel_id,
+                advertised_channel_ids: config.game_channel_ids.clone(),
                 unknown_opcode_policy: config.unknown_opcode_policy,
                 limits: game_runtime_limits(&config)?,
                 solo_practice,

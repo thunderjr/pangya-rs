@@ -24,18 +24,19 @@ use pangya_domain::{
     EquipmentChange, EquipmentChangeResult, EquipmentSet, EquipmentSetId, HandoverDigest,
     HandoverError, HandoverRepository, IncompleteMatchAbortLimit, InventoryClass,
     InventoryDurability, InventoryItem, InventoryItemId, ItemDurability, ItemKind, ItemSale,
-    ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_STARTER_ITEMS,
-    MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
-    MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, MyRoomFurniture, MyRoomProjection, NewAccount, NewHandover, Nickname,
-    NoopStorageObserver, NormalizedNickname, NormalizedUsername, OfflineNote, OfflineNoteClaim,
-    OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
-    PurchaseRequest, PurchaseResult, RepairItem, RepairItemResult, RepositoryError,
-    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
-    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
-    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
-    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_RECENT_PLAYERS,
+    MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
+    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
+    MatchRepositoryError, MatchResultKey, MyRoomFurniture, MyRoomProjection, NewAccount,
+    NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
+    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
+    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem,
+    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
+    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
+    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
+    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
+    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
+    synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -2498,7 +2499,88 @@ impl PgRepository {
     }
 }
 
+impl PgRepository {
+    async fn load_recent_players_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<RecentPlayer>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT recent_account_id, nickname, seen_at FROM retail_recent_players WHERE account_id = $1 ORDER BY seen_at DESC LIMIT $2",
+        )
+        .bind(account_id.get())
+        .bind(i64::try_from(MAX_RECENT_PLAYERS).map_err(|_| RepositoryError::CorruptData)? )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let id = AccountId::new(
+                    row.try_get::<i64, _>("recent_account_id")
+                        .map_err(repository_db_error)?,
+                )
+                .map_err(|_| RepositoryError::CorruptData)?;
+                Ok(RecentPlayer {
+                    account_id: id,
+                    nickname: row.try_get("nickname").map_err(repository_db_error)?,
+                    seen_at: row
+                        .try_get::<DateTime<Utc>, _>("seen_at")
+                        .map_err(repository_db_error)?
+                        .into(),
+                })
+            })
+            .collect()
+    }
+
+    async fn record_recent_player_inner(
+        &self,
+        account_id: AccountId,
+        recent: RecentPlayer,
+    ) -> Result<(), RepositoryError> {
+        if recent.nickname.is_empty()
+            || recent.nickname.len() > 21
+            || recent.nickname.as_bytes().contains(&0)
+        {
+            return Err(RepositoryError::CorruptData);
+        }
+        let mut tx = self.pool.begin().await.map_err(repository_db_error)?;
+        sqlx::query(
+            "INSERT INTO retail_recent_players (account_id, recent_account_id, nickname, seen_at) VALUES ($1, $2, $3, $4) ON CONFLICT (account_id, recent_account_id) DO UPDATE SET nickname = EXCLUDED.nickname, seen_at = EXCLUDED.seen_at",
+        )
+        .bind(account_id.get())
+        .bind(recent.account_id.get())
+        .bind(recent.nickname)
+        .bind(system_time(recent.seen_at))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        sqlx::query(
+            "DELETE FROM retail_recent_players WHERE account_id = $1 AND recent_account_id NOT IN (SELECT recent_account_id FROM retail_recent_players WHERE account_id = $1 ORDER BY seen_at DESC LIMIT $2)",
+        )
+        .bind(account_id.get())
+        .bind(i64::try_from(MAX_RECENT_PLAYERS).map_err(|_| RepositoryError::CorruptData)? )
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        tx.commit().await.map_err(repository_db_error)
+    }
+}
+
 impl PlayerRepository for PgRepository {
+    fn load_recent_players(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<Vec<RecentPlayer>, RepositoryError>> {
+        Box::pin(self.observed(self.load_recent_players_inner(account_id)))
+    }
+
+    fn record_recent_player(
+        &self,
+        account_id: AccountId,
+        recent: RecentPlayer,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.record_recent_player_inner(account_id, recent)))
+    }
+
     fn claim_offline_notes(
         &self,
         recipient_id: AccountId,
