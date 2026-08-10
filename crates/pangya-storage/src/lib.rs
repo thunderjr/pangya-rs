@@ -29,11 +29,12 @@ use pangya_domain::{
     MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError, MatchResultKey, NewAccount,
     NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
     PlayerRepository, PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RepairItem,
-    RepairItemResult, RepositoryError, RepositoryFuture, ServerBalances, ServiceKind, SetupState,
-    SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted, StorageObserver,
-    StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace, StrokePlayerCommit,
-    StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather, WindConditions,
-    synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
+    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
+    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
+    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
+    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
+    synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Transaction,
@@ -1608,12 +1609,311 @@ impl AccountRepository for PgRepository {
     }
 }
 
+impl PgRepository {
+    async fn load_retail_equipment_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<RetailEquipmentState, RepositoryError> {
+        let rows = sqlx::query!(
+            "SELECT slot_family, slot_index, inventory_item_id, item_type_id, character_id \
+             FROM player_equipment_slots WHERE account_id = $1 ORDER BY slot_family, slot_index",
+            account_id.get()
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        let mut state = RetailEquipmentState::default();
+        let part_rows = sqlx::query!(
+            "SELECT s.character_id, s.slot_index, s.item_type_id, s.inventory_item_id \
+             FROM character_part_slots s JOIN profiles p ON p.selected_character_id = s.character_id \
+             WHERE s.account_id = $1 ORDER BY s.slot_index",
+            account_id.get()
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        for row in part_rows {
+            let character_id =
+                CharacterId::new(row.character_id).map_err(|_| RepositoryError::CorruptData)?;
+            let index =
+                usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
+            if index >= 24 {
+                return Err(RepositoryError::CorruptData);
+            }
+            let (current_id, mut types, mut ids) = state
+                .character_parts
+                .filter(|(id, _, _)| *id == character_id)
+                .unwrap_or((character_id, [0; 24], [0; 24]));
+            types[index] =
+                u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
+            ids[index] = u32::try_from(row.inventory_item_id.unwrap_or(0))
+                .map_err(|_| RepositoryError::CorruptData)?;
+            state.character_parts = Some((current_id, types, ids));
+        }
+        for row in rows {
+            let index =
+                usize::try_from(row.slot_index).map_err(|_| RepositoryError::CorruptData)?;
+            let item_type =
+                u32::try_from(row.item_type_id).map_err(|_| RepositoryError::CorruptData)?;
+            match row.slot_family.as_str() {
+                "caddie" => {
+                    if index != 0 || state.caddie.is_some() {
+                        return Err(RepositoryError::CorruptData);
+                    }
+                    let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
+                    state.caddie = Some((
+                        InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
+                        item_type,
+                    ));
+                }
+                "consumable" if index < state.consumables.len() => {
+                    state.consumables[index] = item_type
+                }
+                "decoration" if index < state.decoration.len() => {
+                    state.decoration[index] = item_type
+                }
+                "mascot" => {
+                    if index != 0 || state.mascot.is_some() {
+                        return Err(RepositoryError::CorruptData);
+                    }
+                    let item_id = row.inventory_item_id.ok_or(RepositoryError::CorruptData)?;
+                    state.mascot = Some((
+                        InventoryItemId::new(item_id).map_err(|_| RepositoryError::CorruptData)?,
+                        item_type,
+                    ));
+                }
+                "cut_in" if index < 4 => {
+                    let character_id = row.character_id.ok_or(RepositoryError::CorruptData)?;
+                    let character_id =
+                        CharacterId::new(character_id).map_err(|_| RepositoryError::CorruptData)?;
+                    if state.cut_in.is_some_and(|(id, _)| id != character_id) {
+                        return Err(RepositoryError::CorruptData);
+                    }
+                    let mut values = state.cut_in.map(|(_, values)| values).unwrap_or([0; 4]);
+                    values[index] = item_type;
+                    state.cut_in = Some((character_id, values));
+                }
+                _ => return Err(RepositoryError::CorruptData),
+            }
+        }
+        Ok(state)
+    }
+
+    async fn update_retail_equipment_inner(
+        &self,
+        account_id: AccountId,
+        expected_version: u32,
+        change: RetailEquipmentChange,
+    ) -> Result<RetailEquipmentState, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let version = sqlx::query_scalar!(
+            "SELECT version FROM equipment_sets WHERE account_id = $1 FOR UPDATE",
+            account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?
+        .ok_or(RepositoryError::NotFound)?;
+        if version != i64::from(expected_version) {
+            return Err(RepositoryError::CorruptData);
+        }
+
+        async fn owned(
+            transaction: &mut Transaction<'_, Postgres>,
+            account_id: AccountId,
+            item_id: u32,
+            classes: &[&str],
+        ) -> Result<Option<(i64, i64)>, RepositoryError> {
+            if item_id == 0 {
+                return Ok(None);
+            }
+            let row = sqlx::query!(
+                "SELECT id, item_type_id, inventory_class FROM inventory_items \
+                 WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                account_id.get(),
+                i64::from(item_id)
+            )
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+            if !classes.iter().any(|class| *class == row.inventory_class) {
+                return Err(RepositoryError::CorruptData);
+            }
+            Ok(Some((row.id, row.item_type_id)))
+        }
+
+        match change {
+            RetailEquipmentChange::Caddie(item_id) => {
+                let value = owned(&mut transaction, account_id, item_id, &["caddie"]).await?;
+                sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'caddie'", account_id.get())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                if let Some((id, item_type_id)) = value {
+                    sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id) VALUES ($1, 'caddie', 0, $2, $3)", account_id.get(), id, item_type_id)
+                        .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                }
+            }
+            RetailEquipmentChange::Mascot(item_id) => {
+                let value = owned(&mut transaction, account_id, item_id, &["mascot"]).await?;
+                sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'mascot'", account_id.get())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                if let Some((id, item_type_id)) = value {
+                    sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id) VALUES ($1, 'mascot', 0, $2, $3)", account_id.get(), id, item_type_id)
+                        .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                }
+            }
+            RetailEquipmentChange::Consumables(values) => {
+                let mut owned_values = Vec::with_capacity(values.len());
+                for value in values {
+                    owned_values.push(
+                        owned_by_type(&mut transaction, account_id, value, "consumable").await?,
+                    );
+                }
+                sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'consumable'", account_id.get())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                for (index, value) in owned_values.into_iter().enumerate() {
+                    if let Some((id, item_type_id)) = value {
+                        sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id) VALUES ($1, 'consumable', $2, $3, $4)", account_id.get(), i16::try_from(index).map_err(|_| RepositoryError::CorruptData)?, id, item_type_id)
+                            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                    }
+                }
+            }
+            RetailEquipmentChange::Decoration(values) => {
+                let mut owned_values = Vec::with_capacity(values.len());
+                for value in values {
+                    owned_values.push(
+                        owned_by_type_any(&mut transaction, account_id, value, &["skin", "legacy"])
+                            .await?,
+                    );
+                }
+                sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'decoration'", account_id.get())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                for (index, value) in owned_values.into_iter().enumerate() {
+                    if let Some((id, item_type_id)) = value {
+                        sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id) VALUES ($1, 'decoration', $2, $3, $4)", account_id.get(), i16::try_from(index).map_err(|_| RepositoryError::CorruptData)?, id, item_type_id)
+                            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                    }
+                }
+            }
+            RetailEquipmentChange::CutIn {
+                character_id,
+                values,
+            } => {
+                let mut owned_values = Vec::with_capacity(values.len());
+                for value in values {
+                    owned_values.push(
+                        owned_by_type_any(&mut transaction, account_id, value, &["skin", "legacy"])
+                            .await?,
+                    );
+                }
+                sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'cut_in'", account_id.get())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                for (index, value) in owned_values.into_iter().enumerate() {
+                    if let Some((id, item_type_id)) = value {
+                        sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id, character_id) VALUES ($1, 'cut_in', $2, $3, $4, $5)", account_id.get(), i16::try_from(index).map_err(|_| RepositoryError::CorruptData)?, id, item_type_id, character_id.get())
+                            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                    }
+                }
+            }
+            RetailEquipmentChange::CharacterParts {
+                character_id,
+                type_ids,
+                inventory_ids,
+            } => {
+                for (type_id, inventory_id) in type_ids.into_iter().zip(inventory_ids) {
+                    if (type_id == 0) != (inventory_id == 0) {
+                        return Err(RepositoryError::CorruptData);
+                    }
+                    if inventory_id != 0 {
+                        let row = owned(
+                            &mut transaction,
+                            account_id,
+                            inventory_id,
+                            &["character_part"],
+                        )
+                        .await?
+                        .ok_or(RepositoryError::NotFound)?;
+                        if row.1 != i64::from(type_id) {
+                            return Err(RepositoryError::CorruptData);
+                        }
+                    }
+                }
+                sqlx::query!(
+                    "DELETE FROM character_part_slots WHERE account_id = $1 AND character_id = $2",
+                    account_id.get(),
+                    character_id.get()
+                )
+                .execute(&mut *transaction)
+                .await
+                .map_err(repository_db_error)?;
+                for (index, (type_id, inventory_id)) in
+                    type_ids.into_iter().zip(inventory_ids).enumerate()
+                {
+                    if type_id != 0 {
+                        sqlx::query!("INSERT INTO character_part_slots (account_id, character_id, slot_index, inventory_item_id, item_type_id) VALUES ($1, $2, $3, $4, $5)", account_id.get(), character_id.get(), i16::try_from(index).map_err(|_| RepositoryError::CorruptData)?, i64::from(inventory_id), i64::from(type_id))
+                            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+                    }
+                }
+            }
+        }
+        sqlx::query!("UPDATE equipment_sets SET version = version + 1, updated_at = now() WHERE account_id = $1 AND version = $2", account_id.get(), i64::from(expected_version))
+            .execute(&mut *transaction).await.map_err(repository_db_error)?;
+        transaction.commit().await.map_err(repository_db_error)?;
+        self.load_retail_equipment_inner(account_id).await
+    }
+}
+
+async fn owned_by_type(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+    item_type_id: u32,
+    class: &str,
+) -> Result<Option<(i64, i64)>, RepositoryError> {
+    owned_by_type_any(transaction, account_id, item_type_id, &[class]).await
+}
+
+async fn owned_by_type_any(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+    item_type_id: u32,
+    classes: &[&str],
+) -> Result<Option<(i64, i64)>, RepositoryError> {
+    if item_type_id == 0 {
+        return Ok(None);
+    }
+    let classes: Vec<String> = classes.iter().map(|class| (*class).to_owned()).collect();
+    let rows = sqlx::query!("SELECT id, item_type_id, inventory_class FROM inventory_items WHERE account_id = $1 AND item_type_id = $2 AND inventory_class = ANY($3) ORDER BY id FOR UPDATE", account_id.get(), i64::from(item_type_id), &classes)
+        .fetch_all(&mut **transaction).await.map_err(repository_db_error)?;
+    let row = rows.into_iter().next().ok_or(RepositoryError::NotFound)?;
+    Ok(Some((row.id, row.item_type_id)))
+}
+
 impl PlayerRepository for PgRepository {
     fn load_player_snapshot(
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>> {
         Box::pin(self.observed(self.load_player_snapshot_inner(account_id)))
+    }
+
+    fn load_retail_equipment(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+        Box::pin(self.observed(self.load_retail_equipment_inner(account_id)))
+    }
+
+    fn update_retail_equipment(
+        &self,
+        account_id: AccountId,
+        expected_version: u32,
+        change: RetailEquipmentChange,
+    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+        Box::pin(self.observed(self.update_retail_equipment_inner(
+            account_id,
+            expected_version,
+            change,
+        )))
     }
 }
 

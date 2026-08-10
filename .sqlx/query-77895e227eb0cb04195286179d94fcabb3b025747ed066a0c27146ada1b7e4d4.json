@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, item_type_id, inventory_class FROM inventory_items WHERE account_id = $1 AND item_type_id = $2 AND inventory_class = ANY($3) ORDER BY id FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "inventory_class",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "77895e227eb0cb04195286179d94fcabb3b025747ed066a0c27146ada1b7e4d4"
+}

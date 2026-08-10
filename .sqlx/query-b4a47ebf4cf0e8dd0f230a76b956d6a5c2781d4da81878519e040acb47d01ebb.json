@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE equipment_sets SET version = version + 1, updated_at = now() WHERE account_id = $1 AND version = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4a47ebf4cf0e8dd0f230a76b956d6a5c2781d4da81878519e040acb47d01ebb"
+}

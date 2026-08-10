@@ -3963,6 +3963,55 @@ pub trait EconomyRepository: Send + Sync {
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>>;
 }
 
+/// Durable retail equipment selection beyond the minimum character/club/ball aggregate.
+///
+/// The values are catalog ids on the wire; storage resolves each nonzero value to an owned
+/// inventory row in the same transaction before writing the projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentChange {
+    /// Replace the equipped caddie, or clear it with zero.
+    Caddie(u32),
+    /// Replace all ten equipped consumable catalog ids.
+    Consumables([u32; 10]),
+    /// Replace all six profile decoration catalog ids.
+    Decoration([u32; 6]),
+    /// Replace the equipped mascot, or clear it with zero.
+    Mascot(u32),
+    /// Replace the four-word cut-in projection for an owned character.
+    CutIn {
+        /// Character roster/inventory id.
+        character_id: CharacterId,
+        /// Cut-in catalog ids (zero means empty).
+        values: [u32; 4],
+    },
+    /// Replace all 24 worn character parts for an owned character.
+    CharacterParts {
+        /// Character roster/inventory id.
+        character_id: CharacterId,
+        /// Catalog ids, zero means empty.
+        type_ids: [u32; 24],
+        /// Owned inventory row ids, zero means empty.
+        inventory_ids: [u32; 24],
+    },
+}
+
+/// Public projection of durable retail equipment selections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailEquipmentState {
+    /// Caddie inventory row and catalog id.
+    pub caddie: Option<(InventoryItemId, u32)>,
+    /// Ten consumable catalog ids.
+    pub consumables: [u32; 10],
+    /// Six decoration catalog ids.
+    pub decoration: [u32; 6],
+    /// Mascot inventory row and catalog id.
+    pub mascot: Option<(InventoryItemId, u32)>,
+    /// Cut-in character and four catalog ids.
+    pub cut_in: Option<(CharacterId, [u32; 4])>,
+    /// Worn character part catalog ids and owned row ids.
+    pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
+}
+
 /// Technology-neutral coherent player-bootstrap repository contract.
 pub trait PlayerRepository: Send + Sync {
     /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
@@ -3970,6 +4019,26 @@ pub trait PlayerRepository: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>>;
+
+    /// Loads the durable retail equipment projection. Legacy/test repositories return the empty
+    /// projection by default so retail equipment remains additive to the minimum contract.
+    fn load_retail_equipment(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+        Box::pin(async { Ok(RetailEquipmentState::default()) })
+    }
+
+    /// Validates ownership and atomically persists one retail equipment update against the same
+    /// optimistic equipment version used by the minimum aggregate.
+    fn update_retail_equipment(
+        &self,
+        _account_id: AccountId,
+        _expected_version: u32,
+        _change: RetailEquipmentChange,
+    ) -> RepositoryFuture<'_, Result<RetailEquipmentState, RepositoryError>> {
+        Box::pin(async { Err(RepositoryError::Storage(StorageFault::Other)) })
+    }
 }
 
 /// Technology-neutral single-use handover repository contract.

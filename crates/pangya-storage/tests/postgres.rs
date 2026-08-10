@@ -17,9 +17,9 @@ use pangya_domain::{
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
     MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
-    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, ServiceKind,
-    SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey, StorageFault,
-    StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
+    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange,
+    ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey,
+    StorageFault, StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
     StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
@@ -145,6 +145,57 @@ fn account(username: &str, nickname: Option<&str>) -> NewAccount {
         nickname: nickname.map(|value| Nickname::parse(value).expect("test nickname")),
         starter: starter(),
     }
+}
+
+#[sqlx::test]
+async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
+    migrate(&pool).await.expect("migration");
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_operator_account(account("retailslots", Some("RetailSlots")))
+        .await
+        .expect("account");
+    let account_id = aggregate.account.id;
+    let caddie_id: i64 = sqlx::query_scalar(
+        "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) \
+         VALUES ($1, 469762049, 'test.caddie', 1, 'caddie') RETURNING id",
+    )
+    .bind(account_id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("owned caddie");
+    let state = repository
+        .update_retail_equipment(
+            account_id,
+            aggregate.equipment.version,
+            RetailEquipmentChange::Caddie(u32::try_from(caddie_id).expect("caddie id")),
+        )
+        .await
+        .expect("owned equip");
+    assert_eq!(state.caddie.map(|(_, type_id)| type_id), Some(469762049));
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM equipment_sets WHERE account_id = $1")
+            .bind(account_id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("version");
+    assert_eq!(version, i64::from(aggregate.equipment.version) + 1);
+    assert!(
+        repository
+            .update_retail_equipment(
+                account_id,
+                u32::try_from(version).expect("version"),
+                RetailEquipmentChange::Caddie(999_999)
+            )
+            .await
+            .is_err()
+    );
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'caddie'")
+        .bind(account_id.get()).fetch_one(&pool).await.expect("slot");
+    assert_eq!(
+        retained, 1,
+        "rejected ownership must not clear the prior selection"
+    );
 }
 
 #[sqlx::test]

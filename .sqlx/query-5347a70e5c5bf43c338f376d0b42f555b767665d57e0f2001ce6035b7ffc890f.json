@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id) VALUES ($1, 'decoration', $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int2",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5347a70e5c5bf43c338f376d0b42f555b767665d57e0f2001ce6035b7ffc890f"
+}

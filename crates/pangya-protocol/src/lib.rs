@@ -112,16 +112,18 @@ pub use us852_match::{
 pub use us852_room::{
     MAX_RETAIL_PURCHASE_ITEMS, MAX_ROOM_PLAYERS, MAX_ROOMS_PER_LIST, RETAIL_CONSUMABLE_SLOTS,
     ROOM_NAME_BYTES, ROOM_PLAYER_RECORD_BYTES, ROOM_RECORD_BYTES, RetailDailyQuestDelta,
-    RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipmentRequested, RetailEquipmentSlot,
-    RetailEquipmentUpdate, RetailEquipmentUpdated, RetailHoleProgression,
-    RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailMultiplayerJoined, RetailMultiplayerLeft,
-    RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomInventoryRequest, RetailMyRoomLayout,
-    RetailPangSpent, RetailPlayerInfo, RetailPracticeStart, RetailPurchaseItem,
-    RetailPurchaseRequest, RetailPurchaseResponse, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer,
-    RetailRoomState, RetailRoomStatus, RetailRoomType, RetailShopJoin, RetailShopJoined,
-    RoomCensusKind, RoomJoinRejection, RoomListKind, RoomPlayerFlags,
+    RetailDailyQuestRequest, RetailDailyQuestState, RetailEquipmentAnnounce,
+    RetailEquipmentRequested, RetailEquipmentSlot, RetailEquipmentUpdate, RetailEquipmentUpdated,
+    RetailHoleProgression, RetailLobbyEquipmentUpdate, RetailLockerCombinationAttempt,
+    RetailLockerCombinationResponse, RetailLockerInventoryRequest, RetailLockerInventoryResponse,
+    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
+    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangSpent, RetailPlayerInfo,
+    RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse,
+    RetailRoom, RetailRoomCensus, RetailRoomCreate, RetailRoomEquipmentUpdate,
+    RetailRoomEquipmentUpdatePacket, RetailRoomJoin, RetailRoomJoinResult, RetailRoomLeave,
+    RetailRoomList, RetailRoomPlayer, RetailRoomState, RetailRoomStatus, RetailRoomType,
+    RetailShopJoin, RetailShopJoined, RoomCensusKind, RoomJoinRejection, RoomListKind,
+    RoomPlayerFlags,
 };
 pub use writer::PacketWriter;
 

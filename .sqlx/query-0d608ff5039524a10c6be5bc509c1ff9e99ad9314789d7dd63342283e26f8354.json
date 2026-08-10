@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'mascot'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d608ff5039524a10c6be5bc509c1ff9e99ad9314789d7dd63342283e26f8354"
+}

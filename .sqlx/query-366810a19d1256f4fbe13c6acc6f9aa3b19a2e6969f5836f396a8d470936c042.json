@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT slot_family, slot_index, inventory_item_id, item_type_id, character_id FROM player_equipment_slots WHERE account_id = $1 ORDER BY slot_family, slot_index",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slot_family",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "slot_index",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "inventory_item_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_type_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "366810a19d1256f4fbe13c6acc6f9aa3b19a2e6969f5836f396a8d470936c042"
+}

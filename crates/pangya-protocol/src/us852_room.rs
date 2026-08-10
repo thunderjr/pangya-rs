@@ -500,10 +500,10 @@ pub enum RetailEquipmentSlot {
     Decoration,
     /// Selected character.
     Character,
-    /// Unclassified update carrying one `u4`.
-    UnknownEight,
-    /// Unclassified update carrying a character id and four `u4`s.
-    UnknownNine,
+    /// Equipped mascot roster slot.
+    Mascot,
+    /// Equipped cut-in data for a character.
+    CutIn,
 }
 
 impl RetailEquipmentSlot {
@@ -517,8 +517,8 @@ impl RetailEquipmentSlot {
             Self::Ball => 3,
             Self::Decoration => 4,
             Self::Character => 5,
-            Self::UnknownEight => 8,
-            Self::UnknownNine => 9,
+            Self::Mascot => 8,
+            Self::CutIn => 9,
         }
     }
 
@@ -532,8 +532,8 @@ impl RetailEquipmentSlot {
             3 => Some(Self::Ball),
             4 => Some(Self::Decoration),
             5 => Some(Self::Character),
-            8 => Some(Self::UnknownEight),
-            9 => Some(Self::UnknownNine),
+            8 => Some(Self::Mascot),
+            9 => Some(Self::CutIn),
             _ => None,
         }
     }
@@ -578,13 +578,13 @@ pub enum RetailEquipmentRequested {
     Decoration([u32; 6]),
     /// Owned character id.
     Character(u32),
-    /// Unclassified four-byte body.
-    UnknownEight(u32),
-    /// Unclassified character id plus four words.
-    UnknownNine {
+    /// Owned mascot roster slot.
+    Mascot(u32),
+    /// Cut-in selections associated with a character.
+    CutIn {
         /// Owned character id.
         character_id: u32,
-        /// Unclassified body words.
+        /// Cut-in body words.
         values: [u32; 4],
     },
 }
@@ -646,6 +646,86 @@ impl RetailCharacterParts {
     }
 }
 
+/// Equipment changes sent by the lobby/room opcodes `0x000b` and `0x000c`.
+///
+/// The two packetdoc definitions share the leading byte and little-endian scalar bodies, but
+/// their accepted discriminants differ: `0x000b` admits only character (`4`), while `0x000c`
+/// admits caddie, ball, club set, character, and the four-word `7` form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetailRoomEquipmentUpdate {
+    /// Equipped caddie roster slot.
+    Caddie(u32),
+    /// Equipped ball catalog id.
+    Ball(u32),
+    /// Equipped club-set inventory slot.
+    ClubSet(u32),
+    /// Equipped character roster slot.
+    Character(u32),
+    /// Reference-defined but unclassified combined form.
+    UnknownSeven {
+        /// Character roster slot.
+        character: u32,
+        /// Caddie roster slot.
+        caddie: u32,
+        /// Club-set inventory slot.
+        club_set: u32,
+        /// Ball catalog id.
+        ball: u32,
+    },
+}
+
+impl RetailRoomEquipmentUpdate {
+    fn decode_body(reader: &mut PacketReader<'_>, lobby: bool) -> Result<Self, PacketDecodeError> {
+        let tag = reader.u8()?;
+        let value = match tag {
+            1 if !lobby => Self::Caddie(reader.u32_le()?),
+            2 if !lobby => Self::Ball(reader.u32_le()?),
+            3 if !lobby => Self::ClubSet(reader.u32_le()?),
+            4 => Self::Character(reader.u32_le()?),
+            7 if !lobby => Self::UnknownSeven {
+                character: reader.u32_le()?,
+                caddie: reader.u32_le()?,
+                club_set: reader.u32_le()?,
+                ball: reader.u32_le()?,
+            },
+            _ => return Err(reader.invalid("unsupported lobby/room equipment type")),
+        };
+        Ok(value)
+    }
+}
+
+/// Equipment change in the channel/lobby, client opcode `0x000b`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLobbyEquipmentUpdate(pub RetailRoomEquipmentUpdate);
+
+impl DecodePacket for RetailLobbyEquipmentUpdate {
+    const OPCODE: u16 = 0x000b;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self(RetailRoomEquipmentUpdate::decode_body(reader, true)?))
+    }
+}
+
+/// Equipment change in a room, client opcode `0x000c`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailRoomEquipmentUpdatePacket(pub RetailRoomEquipmentUpdate);
+
+impl DecodePacket for RetailRoomEquipmentUpdatePacket {
+    const OPCODE: u16 = 0x000c;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        Ok(Self(RetailRoomEquipmentUpdate::decode_body(reader, false)?))
+    }
+}
+
 /// Equipment change, client opcode `0x0020`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetailEquipmentUpdate {
@@ -690,16 +770,14 @@ impl DecodePacket for RetailEquipmentUpdate {
                 RetailEquipmentRequested::Decoration(values)
             }
             RetailEquipmentSlot::Character => RetailEquipmentRequested::Character(reader.u32_le()?),
-            RetailEquipmentSlot::UnknownEight => {
-                RetailEquipmentRequested::UnknownEight(reader.u32_le()?)
-            }
-            RetailEquipmentSlot::UnknownNine => {
+            RetailEquipmentSlot::Mascot => RetailEquipmentRequested::Mascot(reader.u32_le()?),
+            RetailEquipmentSlot::CutIn => {
                 let character_id = reader.u32_le()?;
                 let mut values = [0_u32; 4];
                 for value in &mut values {
                     *value = reader.u32_le()?;
                 }
-                RetailEquipmentRequested::UnknownNine {
+                RetailEquipmentRequested::CutIn {
                     character_id,
                     values,
                 }
@@ -717,6 +795,8 @@ impl DecodePacket for RetailEquipmentUpdate {
 /// per-slot bodies), ISC licensed, including the status value it sends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailEquipmentUpdated {
+    /// Full equipped-character body returned for subtype zero.
+    CharacterFull(RetailCharacter),
     /// The caddie in use; zero when none is.
     Caddie {
         /// Caddie identifier.
@@ -744,6 +824,18 @@ pub enum RetailEquipmentUpdated {
         /// Owned character row.
         character_id: u32,
     },
+    /// Mascot response body reserved by packetdoc (62 bytes).
+    Mascot {
+        /// Preserved mascot response bytes.
+        data: [u8; 62],
+    },
+    /// Cut-in response body from packetdoc.
+    CutIn {
+        /// Character roster slot.
+        character_id: u32,
+        /// Preserved response bytes.
+        data: [u8; 16],
+    },
 }
 
 impl RetailEquipmentUpdated {
@@ -754,11 +846,14 @@ impl RetailEquipmentUpdated {
     #[must_use]
     pub const fn slot(&self) -> RetailEquipmentSlot {
         match self {
+            Self::CharacterFull(_) => RetailEquipmentSlot::CharacterParts,
             Self::Caddie { .. } => RetailEquipmentSlot::Caddie,
             Self::Consumables { .. } => RetailEquipmentSlot::Consumables,
             Self::BallAndClub { .. } => RetailEquipmentSlot::Ball,
             Self::Decoration { .. } => RetailEquipmentSlot::Decoration,
             Self::Character { .. } => RetailEquipmentSlot::Character,
+            Self::Mascot { .. } => RetailEquipmentSlot::Mascot,
+            Self::CutIn { .. } => RetailEquipmentSlot::CutIn,
         }
     }
 }
@@ -775,6 +870,7 @@ impl EncodePacket for RetailEquipmentUpdated {
         writer.u8(Self::STATUS_APPLIED);
         writer.u8(self.slot().tag());
         match self {
+            Self::CharacterFull(character) => character.encode_body(writer),
             Self::Caddie { caddie_id } => writer.u32_le(*caddie_id),
             Self::Consumables { item_type_ids } => {
                 for type_id in item_type_ids {
@@ -794,6 +890,121 @@ impl EncodePacket for RetailEquipmentUpdated {
                 }
             }
             Self::Character { character_id } => writer.u32_le(*character_id),
+            Self::Mascot { data } => writer.bytes(data),
+            Self::CutIn { character_id, data } => {
+                writer.u32_le(*character_id);
+                writer.bytes(data);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Room-wide user equipment announcement, server opcode `0x004b`.
+///
+/// The four-byte zero prefix and connection id are part of packetdoc's layout. Unlike the
+/// self-acknowledgement `0x006b`, this frame is addressed to every room member and carries the
+/// selected user's public equipment projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetailEquipmentAnnounce {
+    /// Caddie roster slot and catalog id.
+    Caddie {
+        /// Connection whose loadout changed.
+        connection_id: u32,
+        /// Roster/inventory slot.
+        caddie_uid: u32,
+        /// Caddie catalog id.
+        caddie_type_id: u32,
+    },
+    /// Ball catalog id.
+    Ball {
+        /// Connection whose loadout changed.
+        connection_id: u32,
+        /// Ball catalog id.
+        ball_type_id: u32,
+    },
+    /// Club-set inventory slot and catalog id.
+    ClubSet {
+        /// Connection whose loadout changed.
+        connection_id: u32,
+        /// Inventory slot.
+        club_item_id: u32,
+        /// Club-set catalog id.
+        club_type_id: u32,
+    },
+    /// Equipped character data.
+    Character {
+        /// Connection whose loadout changed.
+        connection_id: u32,
+        /// Character catalog id.
+        character_type_id: u32,
+        /// Character roster slot.
+        character_uid: u32,
+    },
+}
+
+impl EncodePacket for RetailEquipmentAnnounce {
+    const OPCODE: u16 = 0x004b;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&[0; 4]);
+        match self {
+            Self::Caddie {
+                connection_id,
+                caddie_uid,
+                caddie_type_id,
+            } => {
+                writer.u8(1);
+                writer.u32_le(*connection_id);
+                writer.u32_le(*caddie_uid);
+                writer.u32_le(*caddie_type_id);
+                writer.bytes(&[0; 4]);
+                writer.u8(0);
+                writer.u32_le(0);
+                writer.bytes(&[0; 8]);
+            }
+            Self::Ball {
+                connection_id,
+                ball_type_id,
+            } => {
+                writer.u8(2);
+                writer.u32_le(*connection_id);
+                writer.u32_le(*ball_type_id);
+            }
+            Self::ClubSet {
+                connection_id,
+                club_item_id,
+                club_type_id,
+            } => {
+                writer.u8(3);
+                writer.u32_le(*connection_id);
+                writer.u32_le(*club_item_id);
+                writer.u32_le(*club_type_id);
+                writer.bytes(&[0; 20]);
+            }
+            Self::Character {
+                connection_id,
+                character_type_id,
+                character_uid,
+            } => {
+                writer.u8(4);
+                writer.u32_le(*connection_id);
+                RetailCharacter {
+                    iff_id: *character_type_id,
+                    uid: *character_uid,
+                    hair_color: 0,
+                    part_iff_ids: [0; CHARACTER_PARTS],
+                    part_uids: [0; CHARACTER_PARTS],
+                    stats: [0; crate::CHARACTER_STATS],
+                    mastery: 0,
+                }
+                .encode_body(writer);
+            }
         }
         Ok(())
     }
@@ -1565,7 +1776,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn packetdoc_000b_and_000c_equipment_bodies_are_distinct_and_little_endian() {
         let lobby = decode_packet_payload::<RetailLobbyEquipmentUpdate>(
             &[4, 0x2a, 0, 0, 0],
@@ -1573,15 +1783,15 @@ mod tests {
             ServiceKind::Game,
         )
         .expect("decode lobby equipment");
-        assert_eq!(lobby, RetailLobbyEquipmentUpdate::Character(42));
+        assert_eq!(lobby.0, RetailRoomEquipmentUpdate::Character(42));
 
-        let room = decode_packet_payload::<RetailRoomEquipmentUpdate>(
+        let room = decode_packet_payload::<RetailRoomEquipmentUpdatePacket>(
             &[3, 0x37, 0, 0, 0],
             &profile(),
             ServiceKind::Game,
         )
         .expect("decode room equipment");
-        assert_eq!(room, RetailRoomEquipmentUpdate::ClubSet(55));
+        assert_eq!(room.0, RetailRoomEquipmentUpdate::ClubSet(55));
     }
 
     #[test]
