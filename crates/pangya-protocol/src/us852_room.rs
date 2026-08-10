@@ -165,7 +165,7 @@ impl DecodePacket for RetailRoomSettingsUpdate {
                 }
                 4 => {
                     let hole_count = reader.u8()?;
-                    if !matches!(hole_count, 3 | 6 | 9 | 18) {
+                    if !matches!(hole_count, 1 | 3 | 6 | 9 | 18) {
                         return Err(reader.invalid("invalid room hole count"));
                     }
                     RetailRoomSettingChange::HoleCount(hole_count)
@@ -702,8 +702,7 @@ impl RetailRoom {
 ///
 /// Sent when a room is joined and whenever its settings change. It is the answer to a client
 /// room edit (`0x000a`): the client asks for a change and learns from this what the room
-/// actually is now, which for this server is what it already was — one hole on the configured
-/// course.
+/// actually is now, including the configured whole-card course shape.
 ///
 /// The two constants are pinned by captures rather than derived: the leading `u16` is `0xffff`
 /// in every recorded example, and the `u16` after the capacity is `30`. `pangbox/server` writes
@@ -2689,6 +2688,18 @@ mod tests {
     }
 
     /// PacketDoc `000a.ksy` limits the setting enum and natural-wind to `0` or `1`.
+    #[test]
+    fn room_settings_update_accepts_generic_one_hole_cards() {
+        let payload = [0xff, 0xff, 1, 4, 1];
+        let decoded = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &payload,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("one-hole setting");
+        assert_eq!(decoded.changes, vec![RetailRoomSettingChange::HoleCount(1)]);
+    }
+
     #[test]
     fn room_settings_update_refuses_unknown_or_out_of_range_values() {
         let unknown = [0xff, 0xff, 1, 10];

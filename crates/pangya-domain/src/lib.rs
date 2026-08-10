@@ -1508,7 +1508,7 @@ impl fmt::Debug for MatchSeed {
     }
 }
 
-/// Immutable request to begin one synthetic solo match.
+/// Immutable request to begin one synthetic solo card.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeginSoloMatch {
     match_id: MatchId,
@@ -1707,7 +1707,7 @@ impl AbortMatch {
     }
 }
 
-/// Request to commit one completed solo hole. Rewards and balances are intentionally absent.
+/// Request to commit one completed solo card. Rewards and balances are intentionally absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitSoloHole {
     match_id: MatchId,
@@ -1750,7 +1750,7 @@ impl CommitSoloHole {
     pub const fn account_id(self) -> AccountId {
         self.account_id
     }
-    /// Authoritative one-hole configuration.
+    /// Authoritative whole-card configuration.
     #[must_use]
     pub const fn config(self) -> MatchPlan {
         self.config
@@ -1762,7 +1762,7 @@ impl CommitSoloHole {
     }
 }
 
-/// Checked score and server-computed rewards for one synthetic hole.
+/// Checked score and server-computed rewards for one synthetic card.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoloReward {
     score: i16,
@@ -1917,7 +1917,9 @@ pub fn synthetic_solo_reward_v1(
     strokes: StrokeCount,
 ) -> Result<SoloReward, MatchValueError> {
     let strokes_i32 = i32::from(strokes.get());
-    let par_i32 = i32::from(config.par());
+    let par_i32 = i32::from(config.par())
+        .checked_mul(i32::from(config.hole_count()))
+        .ok_or(MatchValueError::ArithmeticOverflow)?;
     let score = strokes_i32
         .checked_sub(par_i32)
         .and_then(|value| i16::try_from(value).ok())
@@ -2406,7 +2408,7 @@ impl CommitStrokeMatch {
     pub const fn result_key(self) -> MatchResultKey {
         self.result_key
     }
-    /// Authoritative one-hole configuration.
+    /// Authoritative whole-card configuration.
     #[must_use]
     pub const fn config(self) -> MatchPlan {
         self.config

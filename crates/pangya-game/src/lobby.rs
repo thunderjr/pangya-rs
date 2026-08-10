@@ -1442,10 +1442,12 @@ impl LobbyRegistry {
                 .solo_hole_out(connection_id)
                 .await
                 .map(LobbySoloRouteResult::Relay),
-            LobbySoloCommand::PrepareFinish => handle
-                .prepare_solo_finish(connection_id)
-                .await
-                .map(LobbySoloRouteResult::Commit),
+            LobbySoloCommand::PrepareFinish => {
+                match handle.prepare_solo_finish(connection_id).await? {
+                    Some(commit) => Ok(LobbySoloRouteResult::Commit(commit)),
+                    None => Ok(LobbySoloRouteResult::Applied),
+                }
+            }
             LobbySoloCommand::ApplyCommit(result) => {
                 let applied = handle.apply_solo_commit(connection_id, result).await;
                 if let Ok(committed) = applied {

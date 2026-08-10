@@ -322,6 +322,8 @@ enum ActivePhase {
 #[derive(Clone, Debug, PartialEq)]
 struct ActiveMatch {
     plan: StrokeStartPlan,
+    /// One-based hole currently being played.
+    current_hole: u8,
     players: [PlayerState; 2],
     phase: ActivePhase,
     active: usize,
@@ -462,6 +464,7 @@ impl StrokeMatchState {
                     last_result: None,
                 },
             ],
+            current_hole: 1,
             plan,
             phase: ActivePhase::Starting,
             active: 0,
@@ -650,6 +653,25 @@ impl StrokeMatchState {
             .iter()
             .all(|player| player.completion.is_some())
         {
+            if active.current_hole < active.plan.begin().config().hole_count() {
+                active.current_hole = active
+                    .current_hole
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                for player in &mut active.players {
+                    player.completion = None;
+                    player.sequence = 1;
+                    player.last_action = None;
+                    player.last_result = None;
+                }
+                active.active = 0;
+                active.turn_generation = next_generation;
+                active.phase = ActivePhase::AwaitAction;
+                return Ok(StrokeRelayOutcome {
+                    disposition: RelayDisposition::Accepted,
+                    settlement: None,
+                });
+            }
             let commit = build_commit(active)?;
             active.phase = ActivePhase::ResultsPending(commit);
             return Ok(StrokeRelayOutcome {
@@ -698,6 +720,24 @@ impl StrokeMatchState {
             .iter()
             .all(|player| player.completion.is_some())
         {
+            if active.current_hole < active.plan.begin().config().hole_count() {
+                active.current_hole = active
+                    .current_hole
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                for player in &mut active.players {
+                    player.completion = None;
+                    player.sequence = 1;
+                    player.last_action = None;
+                    player.last_result = None;
+                }
+                active.active = 0;
+                active.turn_generation = active
+                    .turn_generation
+                    .checked_add(1)
+                    .ok_or(StrokeMatchError::Invariant)?;
+                return Ok(StrokeHoleOutOutcome::Waiting);
+            }
             let commit = build_commit(active)?;
             active.phase = ActivePhase::ResultsPending(commit);
             return Ok(StrokeHoleOutOutcome::Settlement(commit));
@@ -1068,6 +1108,10 @@ mod tests {
     }
 
     fn plan(max_strokes: u8) -> StrokeStartPlan {
+        plan_with_holes(max_strokes, 1)
+    }
+
+    fn plan_with_holes(max_strokes: u8, hole_count: u8) -> StrokeStartPlan {
         let seed = MatchSeed::new([0; 32]);
         let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
         let participants = [
@@ -1086,8 +1130,13 @@ mod tests {
             MatchId::new(Uuid::from_u128(1)),
             MatchResultKey::new(Uuid::from_u128(2)),
             participants,
-            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
-                .unwrap_or_else(|_| unreachable!()),
+            MatchPlan::with_holes(
+                CourseId::new(1).unwrap_or_else(|_| unreachable!()),
+                hole_count,
+                0,
+                4,
+            )
+            .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([7; 32]),
             seed,
             weather,
@@ -1151,6 +1200,48 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(state.confirm_in_game(mark).is_ok());
+    }
+
+    #[test]
+    fn full_course_advances_both_players_and_settles_once() {
+        let plan = plan_with_holes(30, 18);
+        let mut state = StrokeMatchState::new();
+        playing(&mut state, &plan, false);
+        for hole in 1..=18 {
+            assert!(matches!(
+                state.phase(),
+                StrokeMatchPhase::AwaitAction { sequence: 1, .. }
+            ));
+            assert_eq!(
+                state.accept_action(connection(1), action(1, 1.0)),
+                Ok(RelayDisposition::Accepted)
+            );
+            let first = state.accept_result(connection(1), result(1, 0.0, true));
+            assert_eq!(first.as_ref().map(|outcome| outcome.settlement()), Ok(None));
+            assert_eq!(
+                state.accept_action(connection(2), action(1, 1.0)),
+                Ok(RelayDisposition::Accepted)
+            );
+            let second = state.accept_result(connection(2), result(1, 0.0, true));
+            if hole < 18 {
+                assert_eq!(
+                    second.as_ref().map(|outcome| outcome.settlement()),
+                    Ok(None)
+                );
+                assert!(
+                    matches!(state.phase(), StrokeMatchPhase::AwaitAction { active, sequence: 1, .. } if active == connection(1))
+                );
+            } else {
+                let commit = second
+                    .unwrap_or_else(|_| unreachable!())
+                    .settlement()
+                    .unwrap_or_else(|| unreachable!());
+                assert_eq!(commit.players()[0].strokes(), 18);
+                assert_eq!(commit.players()[1].strokes(), 18);
+                assert_eq!(state.phase(), StrokeMatchPhase::ResultsPending);
+                assert_eq!(state.prepare_settlement(), Ok(commit));
+            }
+        }
     }
 
     /// A retail client plays the holing shot through the ordinary action/result pair and only

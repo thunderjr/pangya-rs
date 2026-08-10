@@ -885,12 +885,14 @@ impl PgRepository {
         let seed = request.seed();
         let inserted = sqlx::query!(
             "INSERT INTO matches \
-             (id, result_commit_key, course_id, hole, par, catalog_sha256, seed, weather, \
+             (id, result_commit_key, course_id, hole, hole_mode, par, catalog_sha256, seed, weather, \
               wind_speed_tenths, wind_angle_degrees) \
-             VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT DO NOTHING",
             request.match_id().get(),
             request.result_key().get(),
             i64::from(request.config().course_id().get()),
+            i16::from(request.config().hole_count()),
+            i16::from(request.config().hole_mode()),
             i16::from(request.config().par()),
             catalog_fingerprint.as_bytes().as_slice(),
             seed.as_bytes().as_slice(),
@@ -932,7 +934,7 @@ impl PgRepository {
         let rows = sqlx::query_as!(
             MatchPersistenceRow,
             r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
-                      m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
+                      m.course_id AS "course_id!", m.hole AS "hole!", m.hole_mode AS "hole_mode!", m.par AS "par!",
                       m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
                       m.weather AS "weather!",
                       m.wind_speed_tenths AS "wind_speed_tenths!",
@@ -1060,7 +1062,7 @@ impl PgRepository {
         let row = lock_match(&mut transaction, request.match_id()).await?;
         validate_authority(&row, request.account_id(), request.result_key())?;
         if row.course_id != i64::from(request.config().course_id().get())
-            || row.hole != 1
+            || row.hole != i16::from(request.config().hole_count())
             || row.par != i16::from(request.config().par())
         {
             return Err(MatchRepositoryError::WrongConfig);
@@ -1249,13 +1251,15 @@ impl PgRepository {
         let seed = request.seed();
         let inserted = sqlx::query!(
             "INSERT INTO matches \
-             (id, result_commit_key, mode, course_id, hole, par, catalog_sha256, seed, weather, \
+             (id, result_commit_key, mode, course_id, hole, hole_mode, par, catalog_sha256, seed, weather, \
               wind_speed_tenths, wind_angle_degrees, reward_formula) \
-             VALUES ($1, $2, 'stroke_two', $3, 1, $4, $5, $6, $7, $8, $9, 'stroke-two-v1') \
+             VALUES ($1, $2, 'stroke_two', $3, $4, $5, $6, $7, $8, $9, $10, $11, 'stroke-two-v1') \
              ON CONFLICT DO NOTHING",
             request.match_id().get(),
             request.result_key().get(),
             i64::from(request.config().course_id().get()),
+            i16::from(request.config().hole_count()),
+            i16::from(request.config().hole_mode()),
             i16::from(request.config().par()),
             fingerprint.as_bytes().as_slice(),
             seed.as_bytes().as_slice(),
@@ -2853,6 +2857,7 @@ struct MatchPersistenceRow {
     mode: String,
     course_id: i64,
     hole: i16,
+    hole_mode: i16,
     par: i16,
     catalog_sha256: Vec<u8>,
     seed: Vec<u8>,
@@ -2877,7 +2882,7 @@ impl MatchPersistenceRow {
         if self.mode != "solo_practice" || self.reward_formula != "solo-v1" {
             return Err(MatchRepositoryError::WrongMode);
         }
-        if self.hole != 1
+        if !(1..=18).contains(&self.hole)
             || self.participant_order != 0
             || self.player_result_key != self.result_commit_key
         {
@@ -2898,6 +2903,8 @@ impl MatchPersistenceRow {
             && self.result_commit_key == request.result_key().get()
             && self.account_id == request.account_id().get()
             && self.course_id == i64::from(request.config().course_id().get())
+            && self.hole == i16::from(request.config().hole_count())
+            && self.hole_mode == i16::from(request.config().hole_mode())
             && self.par == i16::from(request.config().par())
             && fingerprint == request.catalog_fingerprint()
             && seed == request.seed()
@@ -2908,7 +2915,7 @@ impl MatchPersistenceRow {
     fn persisted_result(&self) -> Result<SoloMatchResult, MatchRepositoryError> {
         if self.status != "committed"
             || self.mode != "solo_practice"
-            || self.hole != 1
+            || !(1..=18).contains(&self.hole)
             || self.reward_formula != "solo-v1"
             || self.participant_order != 0
             || self.player_result_key != self.result_commit_key
@@ -2958,6 +2965,7 @@ struct StrokeMatchPersistenceRow {
     mode: String,
     course_id: i64,
     hole: i16,
+    hole_mode: i16,
     par: i16,
     catalog_sha256: Vec<u8>,
     seed: Vec<u8>,
@@ -3003,6 +3011,8 @@ impl StrokeMatchPersistenceRow {
         .map_err(|_| MatchRepositoryError::CorruptData)?;
         Ok(self.id == request.match_id().get()
             && self.course_id == i64::from(request.config().course_id().get())
+            && self.hole == i16::from(request.config().hole_count())
+            && self.hole_mode == i16::from(request.config().hole_mode())
             && self.par == i16::from(request.config().par())
             && fingerprint == request.catalog_fingerprint()
             && seed == request.seed()
@@ -3026,7 +3036,7 @@ async fn lock_stroke_match(
     let row = sqlx::query_as!(
         StrokeMatchPersistenceRow,
         r#"SELECT id AS "id!", result_commit_key AS "result_commit_key!", mode AS "mode!",
-                  course_id AS "course_id!", hole AS "hole!", par AS "par!",
+                  course_id AS "course_id!", hole AS "hole!", hole_mode AS "hole_mode!", par AS "par!",
                   catalog_sha256 AS "catalog_sha256!", seed AS "seed!", weather AS "weather!",
                   wind_speed_tenths AS "wind_speed_tenths!",
                   wind_angle_degrees AS "wind_angle_degrees!",
@@ -3069,7 +3079,7 @@ fn validate_stroke_aggregate(
     };
     if row.mode != "stroke_two"
         || row.reward_formula != "stroke-two-v1"
-        || row.hole != 1
+        || !(1..=18).contains(&row.hole)
         || first.participant_order != 0
         || second.participant_order != 1
         || first.account_id == second.account_id
@@ -3089,6 +3099,7 @@ fn validate_stroke_commit(
 ) -> Result<(), MatchRepositoryError> {
     validate_stroke_aggregate(row, persisted, request.result_key())?;
     if row.course_id != i64::from(request.config().course_id().get())
+        || row.hole != i16::from(request.config().hole_count())
         || row.par != i16::from(request.config().par())
     {
         return Err(MatchRepositoryError::WrongConfig);
@@ -3111,9 +3122,11 @@ fn persisted_stroke_result(
     if row.status != "committed" {
         return Err(MatchRepositoryError::CorruptData);
     }
-    let config = pangya_domain::MatchPlan::new(
+    let config = pangya_domain::MatchPlan::with_holes(
         pangya_domain::CourseId::try_from(row.course_id)
             .map_err(|_| MatchRepositoryError::CorruptData)?,
+        u8::try_from(row.hole).map_err(|_| MatchRepositoryError::CorruptData)?,
+        u8::try_from(row.hole_mode).map_err(|_| MatchRepositoryError::CorruptData)?,
         u8::try_from(row.par).map_err(|_| MatchRepositoryError::CorruptData)?,
     )
     .map_err(|_| MatchRepositoryError::CorruptData)?;
@@ -3217,7 +3230,7 @@ async fn lock_match(
     sqlx::query_as!(
         MatchPersistenceRow,
         r#"SELECT m.id AS "id!", m.result_commit_key AS "result_commit_key!",
-                  m.course_id AS "course_id!", m.hole AS "hole!", m.par AS "par!",
+                  m.course_id AS "course_id!", m.hole AS "hole!", m.hole_mode AS "hole_mode!", m.par AS "par!",
                   m.catalog_sha256 AS "catalog_sha256!", m.seed AS "seed!",
                   m.weather AS "weather!",
                   m.wind_speed_tenths AS "wind_speed_tenths!",

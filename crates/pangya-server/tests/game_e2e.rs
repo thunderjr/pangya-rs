@@ -7997,14 +7997,13 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         0,
         "the room was created"
     );
-    // The record reports the hole this server will actually settle rather than the request: one
-    // hole, on the configured course. A room promising more would be contradicted by the match
-    // plan a moment later.
+    // The room record preserves the client's requested card shape and course.
+    // The fixed room record includes the maximum-player byte before the card shape.
     assert_eq!(joined[2 + 64 + 5 + 17 + 1], 1, "the room runs one hole");
     assert_eq!(
         joined[2 + 64 + 5 + 17 + 6],
-        7,
-        "on the course the server settles, not the one the request asked for"
+        0,
+        "the room reports the requested course"
     );
     // The room number sits after the status, the name, the settings block and the identity
     // fields; the same offset the room create/join test reads it from.

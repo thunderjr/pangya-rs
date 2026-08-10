@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id!\", result_commit_key AS \"result_commit_key!\", mode AS \"mode!\",\n                  course_id AS \"course_id!\", hole AS \"hole!\", par AS \"par!\",\n                  catalog_sha256 AS \"catalog_sha256!\", seed AS \"seed!\", weather AS \"weather!\",\n                  wind_speed_tenths AS \"wind_speed_tenths!\",\n                  wind_angle_degrees AS \"wind_angle_degrees!\",\n                  reward_formula AS \"reward_formula!\", status AS \"status!\"\n           FROM matches WHERE id = $1 FOR UPDATE",
+  "query": "SELECT id AS \"id!\", result_commit_key AS \"result_commit_key!\", mode AS \"mode!\",\n                  course_id AS \"course_id!\", hole AS \"hole!\", hole_mode AS \"hole_mode!\", par AS \"par!\",\n                  catalog_sha256 AS \"catalog_sha256!\", seed AS \"seed!\", weather AS \"weather!\",\n                  wind_speed_tenths AS \"wind_speed_tenths!\",\n                  wind_angle_degrees AS \"wind_angle_degrees!\",\n                  reward_formula AS \"reward_formula!\", status AS \"status!\"\n           FROM matches WHERE id = $1 FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -30,41 +30,46 @@
       },
       {
         "ordinal": 5,
-        "name": "par!",
+        "name": "hole_mode!",
         "type_info": "Int2"
       },
       {
         "ordinal": 6,
+        "name": "par!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
         "name": "catalog_sha256!",
         "type_info": "Bytea"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "seed!",
         "type_info": "Bytea"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "weather!",
         "type_info": "Text"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "wind_speed_tenths!",
         "type_info": "Int2"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "wind_angle_degrees!",
         "type_info": "Int2"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "reward_formula!",
         "type_info": "Text"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "status!",
         "type_info": "Text"
       }
@@ -87,8 +92,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "779ba96432be712dd37439a62b768795076adf46ef97fdc7c11f52914b07a921"
+  "hash": "19c5d0c2cf10f9cb088b9f86c0a05c0050bb280c67a541d4a79971277b9333ba"
 }

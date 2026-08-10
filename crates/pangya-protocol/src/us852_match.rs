@@ -29,7 +29,7 @@ pub enum RetailWeather {
     Raining = 2,
 }
 
-/// One hole in the match plan.
+/// One entry in the match's whole-card plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetailHole {
     /// Per-hole randomiser the client mirrors.

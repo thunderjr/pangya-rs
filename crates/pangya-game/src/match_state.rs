@@ -1,4 +1,4 @@
-//! Pure, deterministic state for the local synthetic one-hole solo match.
+//! Pure, deterministic state for the local synthetic solo card.
 //!
 //! A room actor is the sole owner of this value. It contains no clock, I/O, repository,
 //! synchronization, or client-provided reward/score state.
@@ -209,7 +209,12 @@ struct ActiveMatch {
     plan: SoloStartPlan,
     phase: ActivePhase,
     expected_sequence: u32,
+    /// Strokes in the currently active hole.
     strokes: u8,
+    /// Strokes accumulated across every completed and current hole.
+    total_strokes: u16,
+    /// One-based hole currently being played.
+    current_hole: u8,
     last_action: Option<ShotAction>,
     last_result: Option<ShotResult>,
 }
@@ -290,6 +295,8 @@ impl SoloMatchState {
             phase: ActivePhase::Starting,
             expected_sequence: 1,
             strokes: 0,
+            total_strokes: 0,
+            current_hole: 1,
             last_action: None,
             last_result: None,
         });
@@ -402,6 +409,10 @@ impl SoloMatchState {
             .filter(|value| *value <= active.plan.max_strokes())
             .ok_or(SoloMatchError::InvalidStrokes)?;
         active.strokes = next_strokes;
+        active.total_strokes = active
+            .total_strokes
+            .checked_add(1)
+            .ok_or(SoloMatchError::InvalidStrokes)?;
         active.last_result = Some(result);
         if result.holed() || next_strokes == active.plan.max_strokes() {
             active.phase = ActivePhase::HoleComplete;
@@ -432,24 +443,57 @@ impl SoloMatchState {
         Ok(RelayDisposition::Accepted)
     }
 
-    /// Builds the server-owned commit request only after authoritative hole completion.
-    pub fn prepare_finish(&mut self) -> Result<CommitSoloHole, SoloMatchError> {
+    /// Advances a completed hole without committing the card.
+    ///
+    /// The returned request is present only for the final configured hole, making the aggregate's
+    /// durable settlement boundary the whole card rather than one row per hole.
+    pub fn finish_hole(&mut self) -> Result<Option<CommitSoloHole>, SoloMatchError> {
         let active = self.active.as_mut().ok_or(SoloMatchError::InvalidPhase)?;
         if active.phase != ActivePhase::HoleComplete {
             return Err(SoloMatchError::InvalidPhase);
         }
-        let strokes = StrokeCount::new(u16::from(active.strokes))
-            .map_err(|_| SoloMatchError::InvalidStrokes)?;
-        let begin = active.plan.begin();
-        let commit = CommitSoloHole::new(
-            begin.match_id(),
-            begin.result_key(),
-            begin.account_id(),
-            begin.config(),
-            strokes,
-        );
-        active.phase = ActivePhase::ResultsPendingCommit;
-        Ok(commit)
+        if active.current_hole < active.plan.begin().config().hole_count() {
+            active.current_hole = active
+                .current_hole
+                .checked_add(1)
+                .ok_or(SoloMatchError::InvalidPhase)?;
+            active.strokes = 0;
+            active.expected_sequence = 1;
+            active.last_action = None;
+            active.last_result = None;
+            active.phase = ActivePhase::AwaitAction;
+            Ok(None)
+        } else {
+            let strokes = StrokeCount::new(active.total_strokes)
+                .map_err(|_| SoloMatchError::InvalidStrokes)?;
+            let begin = active.plan.begin();
+            let commit = CommitSoloHole::new(
+                begin.match_id(),
+                begin.result_key(),
+                begin.account_id(),
+                begin.config(),
+                strokes,
+            );
+            active.phase = ActivePhase::ResultsPendingCommit;
+            Ok(Some(commit))
+        }
+    }
+
+    /// Builds the whole-card commit request for callers that only invoke this at card end.
+    pub fn prepare_finish(&mut self) -> Result<CommitSoloHole, SoloMatchError> {
+        self.finish_hole()?.ok_or(SoloMatchError::InvalidPhase)
+    }
+
+    /// One-based hole currently being played.
+    #[must_use]
+    pub fn current_hole(&self) -> Option<u8> {
+        self.active.as_ref().map(|active| active.current_hole)
+    }
+
+    /// Whole-card stroke total accumulated so far.
+    #[must_use]
+    pub fn total_strokes(&self) -> Option<u16> {
+        self.active.as_ref().map(|active| active.total_strokes)
     }
 
     /// Applies only the exact trusted repository result, then clears the match to Open.
@@ -478,7 +522,7 @@ impl SoloMatchState {
         if result.account_id() != begin.account_id() {
             return Err(SoloMatchError::AccountMismatch);
         }
-        if result.strokes().get() != u16::from(active.strokes) {
+        if result.strokes().get() != active.total_strokes {
             return Err(SoloMatchError::InvalidStrokes);
         }
         self.active = None;
@@ -610,6 +654,49 @@ mod tests {
                 .is_ok()
         );
         assert!(state.loading_complete(100).is_ok());
+    }
+
+    #[test]
+    fn full_course_progresses_each_hole_and_commits_once_after_the_card() {
+        let seed = MatchSeed::new([0; 32]);
+        let (weather, wind) = deterministic_conditions(seed).unwrap_or_else(|_| unreachable!());
+        let begin = BeginSoloMatch::new(
+            MatchId::new(Uuid::from_u128(11)),
+            MatchResultKey::new(Uuid::from_u128(12)),
+            account(),
+            MatchPlan::with_holes(
+                CourseId::new(1).unwrap_or_else(|_| unreachable!()),
+                18,
+                1,
+                4,
+            )
+            .unwrap_or_else(|_| unreachable!()),
+            CatalogFingerprint::new([3; 32]),
+            seed,
+            weather,
+            wind,
+        );
+        let plan = SoloStartPlan::new(begin, Duration::from_secs(5), 10)
+            .unwrap_or_else(|_| unreachable!());
+        let mut state = SoloMatchState::new();
+        begin_playing(&mut state, &plan);
+        for hole in 1..=18 {
+            assert_eq!(state.current_hole(), Some(hole));
+            assert!(state.accept_action(action(1, 10.0)).is_ok());
+            assert!(state.accept_result(result(1, 0.0, true)).is_ok());
+            let commit = state.finish_hole().unwrap_or_else(|_| unreachable!());
+            if hole < 18 {
+                assert!(commit.is_none());
+                assert_eq!(state.phase(), SoloMatchPhase::AwaitAction { sequence: 1 });
+            } else {
+                let commit = commit.unwrap_or_else(|| unreachable!());
+                assert_eq!(commit.strokes().get(), 18);
+                assert_eq!(commit.config().hole_count(), 18);
+                assert_eq!(state.total_strokes(), Some(18));
+                assert_eq!(state.phase(), SoloMatchPhase::ResultsPendingCommit);
+            }
+        }
+        assert_eq!(state.finish_hole(), Err(SoloMatchError::InvalidPhase));
     }
 
     #[test]

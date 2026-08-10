@@ -96,6 +96,21 @@ pub enum RoomEvent {
     Snapshot(RoomSnapshot),
     /// A validated retail equipment change is broadcast to every room member.
     EquipmentAnnounce(pangya_protocol::RetailEquipmentAnnounce),
+    /// Accepted owner settings edit, including the retail status announcement.
+    SettingsChanged(RoomSnapshot),
+    /// Direct invitation for an authenticated channel connection.
+    Invite {
+        /// Server/channel identity.
+        channel_id: u8,
+        /// Room number.
+        room_id: RoomId,
+        /// Inviter account.
+        inviter_id: AccountId,
+        /// Inviter display name.
+        inviter_nickname: Vec<u8>,
+        /// Invited account.
+        invitee_id: AccountId,
+    },
     /// A validated chat message was broadcast.
     Chat {
         /// Authoritative sender projection.
@@ -852,14 +867,18 @@ impl RoomState {
     fn prepare_solo_finish(
         &mut self,
         caller: PlayerConnectionId,
-    ) -> Result<CommitSoloHole, SoloMatchError> {
+    ) -> Result<Option<CommitSoloHole>, SoloMatchError> {
         self.solo_owner(caller)?;
-        let commit = self.solo.prepare_finish()?;
-        self.deliver_solo(RoomEvent::SoloPhase {
-            match_id: commit.match_id(),
-            phase: self.solo.phase(),
-        });
-        Ok(commit)
+        let commit = self.solo.finish_hole()?;
+        if let Some(commit) = commit {
+            self.deliver_solo(RoomEvent::SoloPhase {
+                match_id: commit.match_id(),
+                phase: self.solo.phase(),
+            });
+            Ok(Some(commit))
+        } else {
+            Ok(None)
+        }
     }
 
     fn apply_solo_commit(
@@ -1525,6 +1544,12 @@ impl RoomState {
             let _delivered = self.deliver(member, RoomEvent::Snapshot(snapshot.clone()));
         }
     }
+
+    fn broadcast_settings_changed(&self, snapshot: &RoomSnapshot) {
+        for member in &self.members {
+            let _delivered = self.deliver(member, RoomEvent::SettingsChanged(snapshot.clone()));
+        }
+    }
 }
 
 enum RoomCommand {
@@ -1623,7 +1648,7 @@ enum RoomCommand {
     },
     PrepareSoloFinish {
         caller: PlayerConnectionId,
-        reply: oneshot::Sender<Result<CommitSoloHole, SoloMatchError>>,
+        reply: oneshot::Sender<Result<Option<CommitSoloHole>, SoloMatchError>>,
     },
     ApplySoloCommit {
         caller: PlayerConnectionId,
@@ -2098,7 +2123,7 @@ impl RoomHandle {
     pub async fn prepare_solo_finish(
         &self,
         caller: PlayerConnectionId,
-    ) -> Result<CommitSoloHole, SoloMatchError> {
+    ) -> Result<Option<CommitSoloHole>, SoloMatchError> {
         let (reply, receive) = oneshot::channel();
         self.send_solo(RoomCommand::PrepareSoloFinish { caller, reply })?;
         receive.await.map_err(|_| SoloMatchError::Closed)?
@@ -2620,6 +2645,7 @@ fn handle_normal(
             let result = state.update_room(caller, settings, name, password);
             if let Ok(snapshot) = &result {
                 after_mutation(state, Some(snapshot), events);
+                state.broadcast_settings_changed(snapshot);
             }
             let _ignored = reply.send(result);
             true
@@ -3386,7 +3412,8 @@ mod tests {
         let commit = handle
             .prepare_solo_finish(id(1))
             .await
-            .unwrap_or_else(|_| unreachable!());
+            .unwrap_or_else(|_| unreachable!())
+            .unwrap_or_else(|| unreachable!());
         let committed = SoloMatchResult::new(
             commit.match_id(),
             commit.result_key(),

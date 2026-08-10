@@ -29,7 +29,7 @@ pub use stroke_state::{
 };
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -126,7 +126,7 @@ use pangya_protocol::{
     decode_packet_payload, RetailRoomInformationRequest, RetailRoomInformationResponse,
     RetailRoomInvite, RetailRoomInviteInfo, RetailRoomInviteInfoResponse, RetailRoomInviteResponse,
     RetailRoomKick, RetailRoomResync, RetailRoomSettingChange, RetailRoomSettingsUpdate,
-    RetailTeamChange, RetailTeamChangeAnnounce, encode_packet_payload,
+    RetailTeamChange, RetailTeamChangeAnnounce, RetailRoomInviteNotification, encode_packet_payload,
     is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
     is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
 };
@@ -560,7 +560,7 @@ impl Default for GameRuntimeLimits {
 /// Checked optional synthetic solo-practice composition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SoloRuntimeConfig {
-    /// Catalog-validated one-hole course.
+    /// Catalog-validated course and whole-card plan.
     pub course: MatchPlan,
     /// Exact fingerprint of the loaded catalog.
     pub catalog_fingerprint: CatalogFingerprint,
@@ -579,7 +579,7 @@ pub struct SoloRuntimeConfig {
 /// Checked optional synthetic exactly-two stroke composition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StrokeRuntimeConfig {
-    /// Catalog-validated one-hole course.
+    /// Catalog-validated course and whole-card plan.
     pub course: MatchPlan,
     /// Exact fingerprint of the loaded catalog.
     pub catalog_fingerprint: CatalogFingerprint,
@@ -705,6 +705,8 @@ enum AbortResolution {
 #[derive(Clone, Copy, Debug, Default)]
 struct ConnectionMatchContext {
     stroke: Option<ConnectionStrokeContext>,
+    /// One-based hole currently loading/playing in a retail card.
+    solo_hole: u8,
     /// Weather and wind for the hole being loaded, withheld until the room actor hands out
     /// the first turn.
     ///
@@ -1075,6 +1077,9 @@ where
     source_bytes: FixedWindowLimiter<SourceAddressPrefix>,
     active_accounts: CapacityRegistry<AccountId>,
     social: SocialHub,
+    /// Authenticated channel connections eligible for direct room invites.
+    invite_targets: Arc<Mutex<HashMap<AccountId, mpsc::Sender<RoomEvent>>>>,
+    pending_invites: Arc<Mutex<HashMap<AccountId, RoomId>>>,
 }
 
 impl<R> std::fmt::Debug for GameService<R>
@@ -1343,6 +1348,8 @@ where
             ),
             active_accounts: CapacityRegistry::new(limits.global_connections),
             social: SocialHub::new(limits.outbound_room_event_capacity),
+            invite_targets: Arc::new(Mutex::new(HashMap::new())),
+            pending_invites: Arc::new(Mutex::new(HashMap::new())),
             captures: CaptureSink::new(limits.unknown_capture_capacity),
             config,
             observer,
@@ -1626,7 +1633,7 @@ where
                     };
                     if let Err(error) = self.handle_social_event(&mut framed, connection_id, event).await { break Err(error); }
                 }
-                event = room_events.recv(), if matches!(state, GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
+                event = room_events.recv(), if matches!(state, GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch) => {
                     let Some(event) = event else { break Err(GameRuntimeError::Limited); };
                     let handled = tokio::select! {
                         biased;
@@ -1710,7 +1717,10 @@ where
                                         });
                                     }
                                     presence = Some(guard);
-                                    identity = Some(established);
+                                    identity = Some(established.clone());
+                                    if let Ok(mut targets) = self.invite_targets.lock() {
+                                        targets.insert(established.account_id, outbound.clone());
+                                    }
                                     state = GameState::AwaitChannel;
                                 }
                                 Err(error) => break Err(error),
@@ -2237,6 +2247,7 @@ where
                                         idle_deadline,
                                         &mut shots,
                                         &mut retail_strokes,
+                                        &mut match_context,
                                         frame.opcode,
                                         &frame.payload,
                                     )
@@ -2404,6 +2415,11 @@ where
             }
         };
         self.social.remove(connection_id);
+        if let Some(identity) = identity.as_ref()
+            && let Ok(mut targets) = self.invite_targets.lock()
+        {
+            targets.remove(&identity.account_id);
+        }
         drop(presence);
         let _terminal_state = state;
         match cleanup_result {
@@ -3403,12 +3419,21 @@ where
             (GameState::InMatch, SYNTHETIC_M5_C2S_FINISH_HOLE) => {
                 decode_packet_payload::<FinishHole>(payload, profile, ServiceKind::Game)
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                let commit = match self
+                let prepared = self
                     .lobby
                     .route_solo(identity.connection_id, LobbySoloCommand::PrepareFinish)
-                    .await
-                {
+                    .await;
+                let commit = match prepared {
                     Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+                    Ok(LobbySoloRouteResult::Applied) => {
+                        self.send_solo_result(
+                            framed,
+                            SoloCommand::FinishHole,
+                            SoloCommandOutcome::Success,
+                        )
+                        .await?;
+                        return Ok(state);
+                    }
                     Ok(_) => return Err(GameRuntimeError::Protocol),
                     Err(error) => {
                         self.send_solo_result(
@@ -4431,6 +4456,29 @@ where
         // `docs/protocol/US852_RETAIL_BOOTSTRAP.md`.
         if self.config.retail_bootstrap {
             match &event {
+                RoomEvent::Invite {
+                    channel_id,
+                    room_id,
+                    inviter_id,
+                    inviter_nickname,
+                    invitee_id,
+                } => {
+                    if state == GameState::InChannel {
+                        self.send(
+                            framed,
+                            &RetailRoomInviteNotification {
+                                server_id: 0,
+                                channel_id: *channel_id,
+                                room_id: u16::try_from(room_id.get()).unwrap_or(u16::MAX),
+                                inviter_id: u32::try_from(inviter_id.get()).unwrap_or(u32::MAX),
+                                inviter_nickname: inviter_nickname.clone(),
+                                invitee_id: u32::try_from(invitee_id.get()).unwrap_or(u32::MAX),
+                            },
+                        )
+                        .await?;
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
                 // The census is the retail form of a room snapshot, and a client sitting in a
                 // room learns of everyone else only from it: without this the roster never
                 // changes on screen, and a host waiting for a full room is never offered
@@ -4440,6 +4488,18 @@ where
                         self.send(framed, &retail_census_from_snapshot(room))
                             .await?;
                         self.observer.room(GameRoomObservation::StateSent);
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
+                RoomEvent::SettingsChanged(room) => {
+                    if state == GameState::InRoom {
+                        self.send(
+                            framed,
+                            &RetailRoomStatus {
+                                room: retail_room_from_snapshot(room),
+                            },
+                        )
+                        .await?;
                     }
                     return Ok(RoomEventEffect::Remain);
                 }
@@ -4457,6 +4517,7 @@ where
                     // A solo hole has no turn arbitration, so the client's own timers are the
                     // only ones, and it is told the same defaults it shows for practice.
                     let roster = self.retail_match_roster(connection_id).await;
+                    match_context.solo_hole = 1;
                     match_context.atmosphere = Some(
                         self.send_retail_hole_intro(
                             framed,
@@ -4464,6 +4525,8 @@ where
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
+                                hole_count: begin.config().hole_count(),
+                                hole_mode: begin.config().hole_mode(),
                                 weather: begin.weather(),
                                 wind: begin.wind(),
                                 shot_timer: RETAIL_SOLO_SHOT_TIMER,
@@ -4482,7 +4545,7 @@ where
                         && state == GameState::InMatchLoading
                     {
                         let connection = u32::try_from(connection_id.get()).unwrap_or(0);
-                        if let Some(atmosphere) = match_context.atmosphere.take() {
+                        if let Some(atmosphere) = match_context.atmosphere {
                             self.send_retail_hole_atmosphere(framed, atmosphere).await?;
                         }
                         // `0x0053` already names whose turn the hole opens on, so no
@@ -4544,6 +4607,8 @@ where
                             &roster,
                             RetailHoleIntro {
                                 course_id: begin.config().course_id().get(),
+                                hole_count: begin.config().hole_count(),
+                                hole_mode: begin.config().hole_mode(),
                                 weather: begin.weather(),
                                 wind: begin.wind(),
                                 shot_timer: plan.turn_timeout(),
@@ -4702,6 +4767,12 @@ where
                 self.send(framed, &announce).await?;
                 Ok(RoomEventEffect::Remain)
             }
+            RoomEvent::SettingsChanged(room) => {
+                self.send(framed, &RoomStateResponse { room }).await?;
+                self.observer.room(GameRoomObservation::StateSent);
+                Ok(RoomEventEffect::Remain)
+            }
+            RoomEvent::Invite { .. } => Ok(RoomEventEffect::Remain),
             RoomEvent::Chat { from, text } => {
                 let room_id = room_id.ok_or(GameRuntimeError::Protocol)?;
                 self.send(
@@ -5064,31 +5135,31 @@ where
 
     /// Derives the authoritative match plan from the room's complete profile.
     fn retail_match_plan(&self, profile: RoomProfile) -> Result<MatchPlan, GameRuntimeError> {
-        let course_id = CourseId::new(u32::from(profile.course))
+        // Retail course ordinals are zero-based on the wire; the durable domain ID is
+        // positive and therefore starts one above the wire value.
+        let course_id = CourseId::new(u32::from(profile.course).saturating_add(1))
             .map_err(|_| GameRuntimeError::InvalidConfig)?;
-        let declared = self
+        // The room's course identity is authoritative. Some local test/catalog bundles only
+        // carry one par declaration, so use that checked par as the metadata fallback while
+        // preserving the client-selected course ID rather than silently reverting the course.
+        let par = self
             .catalog
             .course_plan(course_id)
+            .map(|declared| declared.par())
+            .or_else(|_| {
+                self.config
+                    .solo_practice
+                    .map(|configured| configured.course.par())
+                    .or_else(|| {
+                        self.config
+                            .stroke_two
+                            .map(|configured| configured.course.par())
+                    })
+                    .ok_or(())
+            })
             .map_err(|_| GameRuntimeError::InvalidConfig)?;
-        MatchPlan::with_holes(
-            course_id,
-            profile.hole_count,
-            profile.hole_progression,
-            declared.par(),
-        )
-        .map_err(|_| GameRuntimeError::InvalidConfig)
-    }
-
-    /// The course ordinal the client will be told to load.
-    ///
-    /// This remains for synthetic compositions; retail starts use [`Self::retail_match_plan`].
-    fn retail_course(&self) -> u8 {
-        self.config
-            .stroke_two
-            .map(|stroke| stroke.course)
-            .or_else(|| self.config.solo_practice.map(|solo| solo.course))
-            .and_then(|course| u8::try_from(course.course_id().get()).ok())
-            .unwrap_or(0)
+        MatchPlan::with_holes(course_id, profile.hole_count, profile.hole_progression, par)
+            .map_err(|_| GameRuntimeError::InvalidConfig)
     }
 
     /// The room's members, in seat order, for a match roster.
@@ -5126,6 +5197,8 @@ where
     ) -> Result<RetailHoleAtmosphere, GameRuntimeError> {
         let RetailHoleIntro {
             course_id,
+            hole_count,
+            hole_mode,
             weather,
             wind,
             shot_timer,
@@ -5139,7 +5212,7 @@ where
             pangya_domain::Weather::Cloudy => RetailWeather::Cloudy,
             pangya_domain::Weather::Rain => RetailWeather::Raining,
         };
-        let course = u8::try_from(course_id).unwrap_or(0);
+        let course = u8::try_from(course_id.saturating_sub(1)).unwrap_or(0);
         self.send(framed, &RetailMatchOpen).await?;
         self.send(framed, &RetailMatchOpenAck).await?;
         self.send(framed, &RetailPangRate::default()).await?;
@@ -5175,16 +5248,18 @@ where
             &RetailMatchInfo {
                 course,
                 room_ui_type: 0,
-                hole_mode: 0,
-                hole_count: 1,
+                hole_mode,
+                hole_count,
                 shot_timer_ms: millis(shot_timer)?,
                 game_timer_ms: millis(game_timer)?,
-                holes: vec![RetailHole {
-                    random_id: 1,
-                    pin: 0,
-                    course,
-                    number: 1,
-                }],
+                holes: (1..=hole_count)
+                    .map(|number| RetailHole {
+                        random_id: u32::from(number),
+                        pin: 0,
+                        course,
+                        number,
+                    })
+                    .collect(),
                 random_seed: 1,
             },
         )
@@ -5666,6 +5741,7 @@ where
         idle_deadline: Instant,
         shots: &mut LocalRateWindow,
         strokes: &mut u32,
+        match_context: &mut ConnectionMatchContext,
         opcode: u16,
         payload: &[u8],
     ) -> Result<GameState, GameRuntimeError> {
@@ -5833,7 +5909,7 @@ where
                     framed,
                     &RetailPracticeShotSync {
                         connection_id: sync.connection_id,
-                        hole: 1,
+                        hole: match_context.solo_hole,
                         x: sync.x,
                         z: sync.z,
                         shot_state: sync.shot_state,
@@ -5865,12 +5941,35 @@ where
                     Ok(_) => return Err(GameRuntimeError::Protocol),
                     Err(_) => return Ok(state),
                 }
-                let commit = match self
+                let prepared = self
                     .lobby
                     .route_solo(identity.connection_id, LobbySoloCommand::PrepareFinish)
-                    .await
-                {
+                    .await;
+                self.send(framed, &RetailFinishHole).await?;
+                let commit = match prepared {
                     Ok(LobbySoloRouteResult::Commit(commit)) => commit,
+                    Ok(LobbySoloRouteResult::Applied) => {
+                        // The actor has advanced to the next hole. The wire has no new
+                        // MatchInfo frame here: 0x0053 starts the next card entry and the
+                        // atmosphere/rate frames follow it, exactly as on the first hole.
+                        match_context.solo_hole = match_context.solo_hole.saturating_add(1);
+                        // The actor's per-hole sequence restarts at one; this counter mirrors
+                        // that sequence for the retail practice adapter, not the card total.
+                        *strokes = 0;
+                        let connection = u32::try_from(identity.connection_id.get()).unwrap_or(0);
+                        if let Some(atmosphere) = match_context.atmosphere {
+                            self.send_retail_hole_atmosphere(framed, atmosphere).await?;
+                        }
+                        self.send(
+                            framed,
+                            &RetailPlayerStartHole {
+                                connection_id: connection,
+                            },
+                        )
+                        .await?;
+                        self.send_retail_hole_rate_tables(framed).await?;
+                        return Ok(state);
+                    }
                     Ok(_) => return Err(GameRuntimeError::Protocol),
                     Err(_) => return Ok(state),
                 };
@@ -5882,7 +5981,6 @@ where
                         idle_deadline,
                     )
                     .await?;
-                self.send(framed, &RetailFinishHole).await?;
                 self.send(
                     framed,
                     &RetailMatchFinish {
@@ -6110,12 +6208,17 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_HOLE_FINISH) => {
                 // The holing shot was already counted through the ordinary action/result pair,
-                // so this completes the caller's hole without charging another stroke.
+                // so this completes the caller's hole without charging another stroke. The
+                // finish frame precedes the next 0x0053/turn sequence for a multi-hole card.
                 let _routed = self
                     .lobby
                     .route_stroke(identity.connection_id, LobbyStrokeCommand::HoleOut)
                     .await;
-                let _ = framed;
+                // Each connection's counter mirrors that participant's per-hole sequence;
+                // finishing this participant's hole resets it even while another participant
+                // may still be finishing the current card entry.
+                *strokes = 0;
+                self.send(framed, &RetailFinishHole).await?;
                 Ok(Some(state))
             }
             _ => Ok(None),
@@ -6160,6 +6263,7 @@ where
         idle_deadline: Instant,
     ) -> Result<(), GameRuntimeError> {
         let stroke = self.config.stroke_two.ok_or(GameRuntimeError::Protocol)?;
+        let course = self.retail_match_plan(snapshot.summary().profile())?;
         let members = snapshot.members();
         let [first, second] = [0_usize, 1_usize].map(|index| &members[index]);
         let participants = [
@@ -6183,7 +6287,7 @@ where
             MatchId::new(uuid::Uuid::new_v4()),
             MatchResultKey::new(uuid::Uuid::new_v4()),
             participants,
-            stroke.course,
+            course,
             stroke.catalog_fingerprint,
             seed,
             weather,
@@ -6248,6 +6352,31 @@ where
             .route_solo(connection_id, LobbySoloCommand::ShotResult(result))
             .await;
         Ok(())
+    }
+
+    fn deliver_retail_invite(
+        &self,
+        room_id: RoomId,
+        inviter: &RoomIdentity,
+        invitee_id: AccountId,
+    ) {
+        let sender = self
+            .invite_targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(&invitee_id).cloned());
+        if let Ok(mut pending) = self.pending_invites.lock() {
+            pending.insert(invitee_id, room_id);
+        }
+        if let Some(sender) = sender {
+            let _ignored = sender.try_send(RoomEvent::Invite {
+                channel_id: 0,
+                room_id,
+                inviter_id: inviter.account_id,
+                inviter_nickname: inviter.nickname.display().as_bytes().to_vec(),
+                invitee_id,
+            });
+        }
     }
 
     /// Handles one retail lobby/room command.
@@ -7404,7 +7533,7 @@ where
                 self.send(framed, &RetailMultiplayerLeft).await?;
                 Ok(state)
             }
-            (GameState::InChannel, RETAIL_C2S_REJOIN_INVITED | RETAIL_C2S_GM_ENTER_ROOM) => {
+            (GameState::InChannel, RETAIL_C2S_GM_ENTER_ROOM) => {
                 if !payload.is_empty() {
                     return Err(GameRuntimeError::Protocol);
                 }
@@ -7438,7 +7567,7 @@ where
                 // Preserve the complete client-selected room shape. The match plan is derived
                 // from this profile when Start is accepted; no configured-course fallback may
                 // overwrite the requested course or hole card.
-                if !matches!(request.hole_count, 3 | 6 | 9 | 18)
+                if !matches!(request.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(request.course)
                 {
                     return self.reject_retail_join(framed, state).await;
@@ -7475,8 +7604,7 @@ where
                         // it: the room directory does not list rooms yet. It is a room number,
                         // not an identity — nothing secret travels here.
                         tracing::info!(room = summary.id().get(), "retail room created");
-                        let room =
-                            retail_room_from_summary(&summary, &request, self.retail_course());
+                        let room = retail_room_from_summary(&summary, &request);
                         self.send(framed, &RetailRoomJoinResult::Accepted(Box::new(room)))
                             .await?;
                         self.send_retail_census(framed, identity.connection_id)
@@ -7619,6 +7747,13 @@ where
                         }
                     }
                 }
+                if !matches!(profile_update.hole_count, 1 | 3 | 6 | 9 | 18)
+                    || !is_retail_course_value(profile_update.course)
+                    || profile_update.shot_timer_ms == 0
+                    || profile_update.game_timer_ms == 0
+                {
+                    return Err(GameRuntimeError::Protocol);
+                }
                 let settings = RoomSettings::new(capacity)
                     .map_err(|_| GameRuntimeError::Protocol)?
                     .with_profile(profile_update);
@@ -7637,13 +7772,6 @@ where
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                self.send(
-                    framed,
-                    &RetailRoomStatus {
-                        room: retail_room_from_snapshot(&snapshot),
-                    },
-                )
-                .await?;
                 self.send(framed, &retail_census_from_snapshot(&snapshot))
                     .await?;
                 Ok(state)
@@ -7683,6 +7811,28 @@ where
                 self.send_retail_census(framed, identity.connection_id)
                     .await?;
                 Ok(state)
+            }
+            (GameState::InChannel, RETAIL_C2S_REJOIN_INVITED) => {
+                let target = self
+                    .pending_invites
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.remove(&identity.account_id));
+                let Some(target) = target else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                let snapshot = self
+                    .lobby
+                    .join(target, identity.clone(), None, outbound, room_cancellation)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                *room_id = Some(target);
+                self.send(
+                    framed,
+                    &RetailRoomJoinResult::Accepted(Box::new(retail_room_from_snapshot(&snapshot))),
+                )
+                .await?;
+                Ok(GameState::InRoom)
             }
             (GameState::InChannel, RETAIL_C2S_ROOM_INFO) => {
                 let request = decode_packet_payload::<RetailRoomInformationRequest>(
@@ -7766,10 +7916,19 @@ where
                     ServiceKind::Game,
                 )
                 .map_err(|_| GameRuntimeError::Protocol)?;
-                self.lobby
+                let routed = self
+                    .lobby
                     .route(identity.connection_id, LobbyRoomCommand::GetState)
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
+                if let LobbyRouteResult::Snapshot(snapshot) = routed {
+                    self.deliver_retail_invite(
+                        snapshot.summary().id(),
+                        identity,
+                        AccountId::new(i64::from(request.account_id))
+                            .map_err(|_| GameRuntimeError::Protocol)?,
+                    );
+                }
                 self.send(
                     framed,
                     &RetailRoomInviteInfoResponse {
@@ -7792,6 +7951,12 @@ where
                     return Err(GameRuntimeError::Protocol);
                 };
                 let room_id = snapshot.summary().id();
+                self.deliver_retail_invite(
+                    room_id,
+                    identity,
+                    AccountId::new(i64::from(request.account_id))
+                        .map_err(|_| GameRuntimeError::Protocol)?,
+                );
                 let nickname = identity.nickname.display().as_bytes().to_vec();
                 self.send(
                     framed,
@@ -8514,6 +8679,8 @@ const fn protocol_abort_reason(reason: MatchAbortReason) -> ProtocolMatchAbortRe
 #[derive(Clone, Copy, Debug)]
 struct RetailHoleIntro {
     course_id: u32,
+    hole_count: u8,
+    hole_mode: u8,
     weather: pangya_domain::Weather,
     wind: pangya_domain::WindConditions,
     shot_timer: Duration,
@@ -8825,22 +8992,9 @@ const RETAIL_C2S_MULTIPLAYER_JOIN: u16 = 0x0081;
 /// Retail multiplayer-mode leave client opcode, sent once the client leaves the directory.
 const RETAIL_C2S_MULTIPLAYER_LEAVE: u16 = 0x0082;
 
-/// Builds a retail room record from a lobby summary plus the settings the creator asked
-/// for. The lobby model stores capacity and identity only, so course, timers, and hole
-/// count are echoed from the request rather than invented.
 /// Builds a retail room record from a lobby summary plus the settings the creator asked for.
-///
-/// Course and hole count are **not** echoed. This server settles exactly one hole on the course
-/// its configuration names, and the match plan says so when the hole starts; echoing the request
-/// would have the room header promise three holes on another course and the match contradict it
-/// a moment later. Reporting what will actually run is the honest answer, and it is the value
-/// the client will be given to load. The timers and the room type are the creator's own, because
-/// those this server does honour.
-fn retail_room_from_summary(
-    summary: &RoomSummary,
-    request: &RetailRoomCreate,
-    course: u8,
-) -> RetailRoom {
+/// The room profile is authoritative, including its course and whole-card shape.
+fn retail_room_from_summary(summary: &RoomSummary, request: &RetailRoomCreate) -> RetailRoom {
     let (mode, play_mode) = retail_room_wire_modes(request.room_type);
     RetailRoom {
         name: summary.name().as_str().as_bytes().to_vec(),
@@ -8848,12 +9002,12 @@ fn retail_room_from_summary(
         state: RetailRoomState::Lobby,
         max_players: summary.max_members(),
         player_count: summary.members(),
-        hole_count: 1,
+        hole_count: request.hole_count,
         mode,
         play_mode,
         id: u16::try_from(summary.id().get()).unwrap_or(u16::MAX),
         hole_progression: RetailHoleProgression::FrontStart,
-        course,
+        course: request.course,
         shot_timer_ms: request.shot_timer_ms,
         game_timer_ms: request.game_timer_ms,
         owner_uid: 0,
