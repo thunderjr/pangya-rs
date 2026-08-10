@@ -45,6 +45,118 @@ async fn encrypted_connect(address: std::net::SocketAddr) -> TcpStream {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn postgres_authenticated_hello_publishes_online(pool: PgPool) {
+    for (id, username, nickname) in [(1_i64, "alice", "Alice"), (2, "bob", "Bob")] {
+        sqlx::query(
+            "INSERT INTO accounts(id, username_normalized, username_display) VALUES($1,$2,$2)",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(&pool)
+        .await
+        .expect("account");
+        sqlx::query("INSERT INTO profiles(account_id,nickname_display,nickname_normalized,setup_state) VALUES($1,$2,lower($2),'complete')")
+            .bind(id)
+            .bind(nickname)
+            .execute(&pool)
+            .await
+            .expect("profile");
+    }
+    let store = PostgresStore::new(pool.clone());
+    store.add_friend(1, 2).await.expect("friend request");
+    store
+        .confirm_friend(2, 1)
+        .await
+        .expect("friend confirmation");
+    sqlx::query("INSERT INTO message_login_eligibility(account_id,nickname,peer_ip,issued_at,expires_at) VALUES(1,'Alice','127.0.0.1'::inet,now(),now()+interval '60 seconds')")
+        .execute(&pool)
+        .await
+        .expect("eligibility");
+
+    let mut session = pangya_message::MessageSession::with_store(Arc::new(store));
+    session
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+    let responses = session.handle(ClientPacket::Hello).await.expect("hello");
+    assert!(matches!(
+        responses.first(),
+        Some(ServerPacket::Presence {
+            user_id: 1,
+            unknown_f,
+            ..
+        }) if u32::from_le_bytes(unknown_f[..4].try_into().expect("state")) == Presence::Online as u32
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i16>("SELECT status FROM message_presence WHERE account_id=1")
+            .fetch_one(&pool)
+            .await
+            .expect("presence"),
+        Presence::Online as i16
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn postgres_offline_queue_cap_is_atomic_for_concurrent_senders(pool: PgPool) {
+    for (id, username, nickname) in [(1_i64, "alice", "Alice"), (2, "bob", "Bob")] {
+        sqlx::query(
+            "INSERT INTO accounts(id, username_normalized, username_display) VALUES($1,$2,$2)",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(&pool)
+        .await
+        .expect("account");
+        sqlx::query("INSERT INTO profiles(account_id,nickname_display,nickname_normalized,setup_state) VALUES($1,$2,lower($2),'complete')")
+            .bind(id)
+            .bind(nickname)
+            .execute(&pool)
+            .await
+            .expect("profile");
+    }
+    let store = PostgresStore::new(pool.clone());
+    store.add_friend(1, 2).await.expect("friend request");
+    store
+        .confirm_friend(2, 1)
+        .await
+        .expect("friend confirmation");
+
+    let mut sends = Vec::new();
+    for sequence in 0..220 {
+        let store = store.clone();
+        sends.push(tokio::spawn(async move {
+            store
+                .queue_message(1, 2, format!("message-{sequence}").into_bytes())
+                .await
+        }));
+    }
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for send in sends {
+        match send.await.expect("sender task") {
+            Ok(()) => accepted += 1,
+            Err(pangya_message::MessageError::Limit) => rejected += 1,
+            Err(error) => panic!("unexpected queue error: {error:?}"),
+        }
+    }
+    assert_eq!(
+        accepted, 200,
+        "exactly the configured queue cap is accepted"
+    );
+    assert_eq!(rejected, 20, "only cap overflow is rejected");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM message_offline_messages WHERE recipient_account_id=2 AND delivered_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("queued count"),
+        200
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn postgres_expired_presence_emits_and_deletes_one_offline_transition(pool: PgPool) {
     for (id, username, nickname) in [
         (1_i64, "alice", "Alice"),

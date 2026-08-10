@@ -1,5 +1,20 @@
 use super::*;
 
+fn social_store_for_tests() -> MemoryStore {
+    let store = MemoryStore::default();
+    for (id, nickname) in [(1, b"Alice".to_vec()), (2, b"Bob".to_vec())] {
+        store.register_user(User {
+            id,
+            nickname,
+            guild_id: None,
+            guild_name: vec![],
+        });
+    }
+    store.add_friend(1, 2).expect("friend request");
+    store.confirm_friend(2, 1).expect("friend confirmation");
+    store
+}
+
 #[test]
 fn packetdoc_handshake_uses_message_namespace_and_exact_pstrings() {
     let packet = ClientPacket::CredentialDeclaration {
@@ -180,6 +195,46 @@ fn superss_confirm_result_fixture_is_status_and_user_id() {
         .expect("SuperSS 0x0109"),
         [0x09, 0x01, 0, 0, 0, 0, 2, 0, 0, 0]
     );
+}
+
+#[tokio::test]
+async fn authenticated_hello_publishes_online_and_explicit_status_still_changes_presence() {
+    let store = social_store_for_tests();
+    let mut session = MessageSession::new(store.clone());
+    session
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+
+    let responses = session.handle(ClientPacket::Hello).await.expect("hello");
+    assert!(matches!(
+        responses.first(),
+        Some(ServerPacket::Presence {
+            user_id: 1,
+            unknown_f,
+            ..
+        }) if u32::from_le_bytes(unknown_f[..4].try_into().expect("state")) == Presence::Online as u32
+    ));
+    assert_eq!(store.friends(2)[0].state, Presence::Online);
+
+    let responses = session
+        .handle(ClientPacket::Status {
+            status: Presence::Idle,
+        })
+        .await
+        .expect("explicit status");
+    assert!(matches!(
+        responses.first(),
+        Some(ServerPacket::Presence {
+            user_id: 1,
+            unknown_f,
+            ..
+        }) if u32::from_le_bytes(unknown_f[..4].try_into().expect("state")) == Presence::Idle as u32
+    ));
+    assert_eq!(store.friends(2)[0].state, Presence::Idle);
 }
 
 #[tokio::test]
