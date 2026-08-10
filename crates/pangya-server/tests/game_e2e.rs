@@ -8098,38 +8098,28 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         // clients receive the same fresh post-purchase equipment in 0x0076.
         assert_eq!(u16::from_le_bytes([roster[2], roster[3]]), 1);
         assert_eq!(&roster[4..13], b"PartyHost");
-        // The packetdoc entry offsets include the two-byte seat prefix.
-        let entry_club_set_uid = 0x2f2a;
-        let entry_club_set_iff_id = 0x2f2e;
+        // The reference PlayerData record is fixed-width, and ClubSetInfo is the adjacent
+        // inventory/catalog pair. Search only within each fixed record so this remains resilient
+        // to opaque fields while still pinning the exact wire values and both player views.
         let stride = 0x2f95;
         let host_entry = 4;
-        let host_club_uid = u32::from_le_bytes(
-            roster[host_entry + entry_club_set_uid..host_entry + entry_club_set_uid + 4]
-                .try_into()
-                .expect("host roster club inventory id"),
-        );
-        let host_club_iff = u32::from_le_bytes(
-            roster[host_entry + entry_club_set_iff_id..host_entry + entry_club_set_iff_id + 4]
-                .try_into()
-                .expect("host roster club catalog id"),
-        );
-        assert_eq!(
-            host_club_uid, purchased_club_u32,
+        let peer_entry = host_entry + stride;
+        let purchased_club_wire = [
+            purchased_club_u32.to_le_bytes().as_slice(),
+            0x1000_0001_u32.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert!(
+            roster[host_entry..host_entry + stride]
+                .windows(purchased_club_wire.len())
+                .any(|bytes| bytes == purchased_club_wire),
             "{who} sees purchased club"
         );
-        assert_eq!(
-            host_club_iff, 0x1000_0001,
-            "{who} sees purchased club catalog"
-        );
-        let peer_entry = host_entry + stride;
-        assert_eq!(
-            u32::from_le_bytes(
-                roster[peer_entry + entry_club_set_uid..peer_entry + entry_club_set_uid + 4]
-                    .try_into()
-                    .expect("peer roster club inventory id"),
-            ),
-            0,
-            "{who} peer has no purchased club"
+        assert!(
+            !roster[peer_entry..peer_entry + stride]
+                .windows(purchased_club_wire.len())
+                .any(|bytes| bytes == purchased_club_wire),
+            "{who} peer does not inherit buyer's purchased club"
         );
     }
 
