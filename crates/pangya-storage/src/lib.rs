@@ -2635,6 +2635,17 @@ impl PgRepository {
         if server_day < 0 || calendar_day == 0 || reward.quantity == 0 {
             return Err(RepositoryError::CorruptData);
         }
+        match reward.definition.stacking {
+            ItemStacking::Unique if reward.quantity != 1 => {
+                return Err(RepositoryError::CorruptData);
+            }
+            ItemStacking::Stackable { max_stack }
+                if max_stack == 0 || reward.quantity > max_stack =>
+            {
+                return Err(RepositoryError::CorruptData);
+            }
+            ItemStacking::Unique | ItemStacking::Stackable { .. } => {}
+        }
         let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
         // The account lock serializes this reward with all other inventory mutations for the
         // account. The primary key below is still the durable exactly-once fence across sessions.
@@ -2701,6 +2712,16 @@ impl PgRepository {
             .map_err(repository_db_error)? {
                 let id = row.try_get::<i64, _>("id").map_err(|_| RepositoryError::CorruptData)?;
                 let before = row.try_get::<i64, _>("quantity").map_err(|_| RepositoryError::CorruptData)?;
+                let max_stack = match reward.definition.stacking {
+                    ItemStacking::Stackable { max_stack } => i64::from(max_stack),
+                    ItemStacking::Unique => 1,
+                };
+                if before < 0 || before > max_stack || quantity > max_stack - before {
+                    // The account lock and row lock make this cumulative check atomic with the
+                    // update and the claim ledger insert; no concurrent claim can overshoot the
+                    // canonical catalog cap.
+                    return Err(RepositoryError::CorruptData);
+                }
                 let after = before.checked_add(quantity).ok_or(RepositoryError::CorruptData)?;
                 sqlx::query("UPDATE inventory_items SET quantity = $1, updated_at = now() WHERE account_id = $2 AND id = $3")
                     .bind(after).bind(account_id.get()).bind(id).execute(&mut *transaction).await.map_err(repository_db_error)?;

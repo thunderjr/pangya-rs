@@ -4907,3 +4907,49 @@ async fn login_bonus_claim_is_exactly_once_and_crosses_server_day(pool: PgPool) 
             .expect("claim rows");
     assert_eq!(count, 2);
 }
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn login_bonus_cumulative_stack_cap_is_atomic(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let aggregate = repository
+        .create_account(account("LoginBonusCap", Some("CapNick")))
+        .await
+        .expect("account");
+    let mut reward = login_bonus_reward();
+    reward.definition.stacking = ItemStacking::Stackable { max_stack: 2 };
+    reward.quantity = 1;
+
+    let first = repository
+        .claim_login_bonus(aggregate.account.id, 30_000, 1, reward)
+        .await
+        .expect("first claim");
+    let second = repository
+        .claim_login_bonus(aggregate.account.id, 30_001, 2, reward)
+        .await
+        .expect("second claim reaches cap");
+    assert_eq!((first.quantity_after, second.quantity_after), (1, 2));
+
+    // The third server day must refuse before either the inventory or claim ledger is changed.
+    assert_eq!(
+        repository
+            .claim_login_bonus(aggregate.account.id, 30_002, 1, reward)
+            .await,
+        Err(RepositoryError::CorruptData)
+    );
+    let quantity: i64 = sqlx::query_scalar(
+        "SELECT quantity FROM inventory_items WHERE account_id = $1 AND item_type_id = $2",
+    )
+    .bind(aggregate.account.id.get())
+    .bind(i64::from(reward.definition.type_id.get()))
+    .fetch_one(&pool)
+    .await
+    .expect("inventory quantity");
+    assert_eq!(quantity, 2);
+    let claims: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM login_bonus_claims WHERE account_id = $1")
+            .bind(aggregate.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("claim count");
+    assert_eq!(claims, 2);
+}

@@ -402,6 +402,28 @@ impl EncodePacket for RetailServerTime {
 /// U.S. 852 retail login-bonus claim request, client opcode `0x016f`.
 pub const RETAIL_LOGIN_BONUS_CLAIM_OPCODE: u16 = 0x016f;
 
+/// U.S. 852 retail login-bonus claim request, client opcode `0x016f`.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/client/016f.ksy`: no payload. The client sends
+/// this only after `0x0248` advertises an unclaimed reward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoginBonusClaimRequest;
+
+impl DecodePacket for RetailLoginBonusClaimRequest {
+    const OPCODE: u16 = RETAIL_LOGIN_BONUS_CLAIM_OPCODE;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
 /// U.S. 852 retail login-bonus status request, client opcode `0x016e`.
 ///
 /// # Provenance

@@ -1,0 +1,12 @@
+source_project: pangbox/packetdoc
+upstream_revision: d61f583a3e67
+upstream_url: https://github.com/pangbox/packetdoc
+upstream_path: src/packets/gameservice/client/016f.ksy
+license: ISC
+client_version: U.S. GB.852
+service: game
+direction: client-to-server
+expected_opcode: 0x016f
+redaction_status: literal opcode-only layout fixture; no proprietary, credential, bearer, personal, or client data
+expected_behavior: zero-payload login-bonus claim request
+sha256_fixture: e37a30127ea8100176ab2b99e77e31b7b9684cf14a68762a14722f4781ed186c

@@ -2,8 +2,28 @@
 
 use pangya_protocol::{
     CompatibilityProfile, DecodePacket, Direction, EncodePacket, PacketReader,
-    RetailLoginBonusClaimResponse, RetailLoginBonusStatus, ServiceKind,
+    RetailLoginBonusClaimRequest, RetailLoginBonusClaimResponse, RetailLoginBonusStatus,
+    ServiceKind,
 };
+
+#[test]
+fn claim_request_literal_fixture_is_a_typed_zero_payload_packet() {
+    // Keep the fixture literal and independent from the encoder: this catches both opcode drift
+    // and an accidental payload field in the request layout.
+    let fixture = include_bytes!("fixtures/login-in-016f/fixture.bin");
+    assert_eq!(fixture, &[0x6f, 0x01]);
+    let mut reader = PacketReader::new(
+        &fixture[2..],
+        Direction::ClientToServer,
+        ServiceKind::Game,
+        Some(RetailLoginBonusClaimRequest::OPCODE),
+    );
+    assert_eq!(
+        RetailLoginBonusClaimRequest::decode(&mut reader, &CompatibilityProfile::US_852)
+            .expect("claim request"),
+        RetailLoginBonusClaimRequest
+    );
+}
 
 #[test]
 fn status_uncollected_branch_is_the_reference_25_byte_union() {

@@ -19,8 +19,8 @@ use pangya_domain::{
     StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
-    EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
-    GameTermination, LoginBonusRuntimeConfig, SoloRuntimeConfig, StrokeRuntimeConfig,
+    EconomyRuntimeConfig, GameClock, GameObserver, GameRuntimeConfig, GameRuntimeLimits,
+    GameService, GameTermination, LoginBonusRuntimeConfig, SoloRuntimeConfig, StrokeRuntimeConfig,
     UnknownOpcodePolicy, deterministic_conditions,
 };
 use pangya_login::{
@@ -66,6 +66,15 @@ const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const RETAIL_BOOTSTRAP_FRAMES: usize = 11;
 
 const E2E_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct FixedGameClock(SystemTime);
+
+impl GameClock for FixedGameClock {
+    fn now(&self) -> SystemTime {
+        self.0
+    }
+}
 
 struct BlockingStrokeCommitRepository {
     inner: PgRepository,
@@ -6248,7 +6257,10 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
             },
             metrics.clone(),
         )
-        .expect("retail service"),
+        .expect("retail service")
+        .with_clock(FixedGameClock(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(86_400 * 59),
+        )),
     );
     let (address, shutdown, task) = start_service(service).await;
     let token = issue_token(
@@ -6343,11 +6355,27 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
         u32::from_le_bytes(status[5..9].try_into().expect("item id")),
         reward_definition.type_id.get()
     );
+    assert_eq!(
+        u32::from_le_bytes(status[21..25].try_into().expect("calendar day")),
+        30,
+        "the injected clock is the last day of the 30-day calendar"
+    );
     send_packet(&mut stream, key, 4, 0x016f, &[]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x0216);
     let (claim_opcode, claim) = receive_packet(&mut stream, key).await;
     assert_eq!(claim_opcode, 0x0249);
     assert_eq!(claim.len(), 25);
+    assert_eq!(
+        u32::from_le_bytes(claim[21..25].try_into().expect("calendar day")),
+        30
+    );
+    let persisted_server_day: i64 =
+        sqlx::query_scalar("SELECT server_day FROM login_bonus_claims WHERE account_id = $1")
+            .bind(account.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("server day");
+    assert_eq!(persisted_server_day, 59);
     send_packet(&mut stream, key, 5, 0x016f, &[]).await;
     assert_eq!(
         receive_packet(&mut stream, key).await.0,
