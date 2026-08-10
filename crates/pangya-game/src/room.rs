@@ -1185,7 +1185,12 @@ impl RoomState {
                     (Some(before), StrokeMatchPhase::AwaitAction { hole, .. }) => hole != before,
                     _ => false,
                 };
-                if active_participant(self.stroke.phase()) != active_before || hole_changed {
+                let active_after = active_participant(self.stroke.phase());
+                let turn_changed = active_after != active_before;
+                // A hole reset is an ordered match event even when seat one already held the
+                // previous turn. Keeping this decision explicit prevents callers from collapsing
+                // the reset into a same-player 0x0063 handover.
+                if turn_changed || hole_changed {
                     let plan = self
                         .stroke
                         .start_plan()

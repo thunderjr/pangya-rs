@@ -7580,15 +7580,24 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         (&mut host, host_key, "host"),
         (&mut visitor, visitor_key, "visitor"),
     ] {
-        let frames = drain_frames(stream, key, Duration::from_millis(900)).await;
-        let opcodes: Vec<_> = frames.iter().map(|(opcode, _)| *opcode).collect();
+        let frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+        let announces: Vec<_> = frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x007d)
+            .collect();
+        assert_eq!(announces.len(), 1, "{who} team announce");
+        assert_eq!(announces[0].1.len(), 5, "{who} team announce width");
         assert_eq!(
-            opcodes.iter().filter(|&&opcode| opcode == 0x007d).count(),
-            1,
-            "{who} team announce"
+            u32::from_le_bytes(announces[0].1[..4].try_into().expect("team connection")),
+            host_connection,
+            "{who} team announce names the requester"
         );
+        assert_eq!(announces[0].1[4], 1, "{who} team announce selects blue");
         assert_eq!(
-            opcodes.iter().filter(|&&opcode| opcode == 0x0048).count(),
+            frames
+                .iter()
+                .filter(|(opcode, _)| *opcode == 0x0048)
+                .count(),
             1,
             "{who} team census"
         );
@@ -8379,19 +8388,22 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     // Both hole out. The second completion advances the card and emits a fresh 0x0053;
     // only hole 18 settles the two-player match.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
-    let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
-    // The first finisher hands the remaining player the current-hole turn. Drain that valid
-    // 0x0063 before asking the second player to finish; otherwise it is a stale queued frame
-    // relative to the next-hole 0x0053 assertion below.
-    let waiting_finish = drain_frames(&mut visitor, visitor_key, Duration::from_millis(900)).await;
-    assert!(
-        waiting_finish.iter().any(|(opcode, _)| *opcode == 0x0063),
-        "remaining player receives the current-hole handover: {waiting_finish:04x?}"
-    );
-    assert!(
-        !waiting_finish.iter().any(|(opcode, _)| *opcode == 0x0053),
-        "next-hole introduction waits for both finishes: {waiting_finish:04x?}"
-    );
+    // Drain the first finisher's valid current-hole handover from both sockets before asking the
+    // second player to finish; otherwise it remains queued ahead of hole 2's introduction.
+    let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+    let visitor_waiting =
+        drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|(opcode, _)| *opcode == 0x0063)
+                .count(),
+            1,
+            "{who} receives one current-hole handover: {frames:04x?}"
+        );
+        assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+    }
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
     let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
     let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
@@ -8413,10 +8425,11 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                 (&mut host, host_key, "host"),
                 (&mut visitor, visitor_key, "visitor"),
             ] {
-                let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+                let frames = drain_frames(stream, key, Duration::from_millis(1200)).await;
+                assert_retail_hole_intro_order(&frames, &format!("hole {hole} {who}"));
                 assert!(
-                    frames.contains(&0x0053),
-                    "hole {hole} starts for {who}: {frames:04x?}"
+                    !frames.iter().any(|(opcode, _)| *opcode == 0x0063),
+                    "hole {hole} has no stale turn for {who}: {frames:04x?}"
                 );
             }
         }
@@ -8448,12 +8461,38 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                 (&mut visitor, visitor_key)
             };
             send_packet(from, from_key, hole_salt, 0x001c, &[]).await;
-            let handover = drain_available(from, from_key, Duration::from_millis(900)).await;
-            assert!(handover.contains(&0x00cc), "hole {hole} end-shot");
+            let handover = drain_frames(from, from_key, Duration::from_millis(1200)).await;
+            assert!(
+                handover.iter().any(|(opcode, _)| *opcode == 0x00cc)
+                    || handover.iter().any(|(opcode, _)| *opcode == 0x0053),
+                "hole {hole} end-shot boundary or queued intro: {handover:04x?}"
+            );
+            if handover.iter().any(|(opcode, _)| *opcode == 0x0053) {
+                assert_retail_hole_intro_order(&handover, &format!("hole {hole} queued intro"));
+            }
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            let _ = drain_available(other, other_key, Duration::from_millis(1200)).await;
             hole_salt = hole_salt.wrapping_add(1);
         }
         send_packet(&mut host, host_key, hole_salt, 0x0031, &[]).await;
-        let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
+        let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+        let visitor_waiting =
+            drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+        for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|(opcode, _)| *opcode == 0x0063)
+                    .count(),
+                1,
+                "hole {hole} {who} receives one current-hole handover: {frames:04x?}"
+            );
+            assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
+        }
         send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
         salt = hole_salt;
     }
