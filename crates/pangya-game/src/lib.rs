@@ -1350,6 +1350,12 @@ where
                                 Err(error) => break Err(error),
                             }
                         }
+                        GameState::AwaitChannel if frame.opcode == RetailClientException::OPCODE => {
+                            // Authenticated clients may report an exception before choosing a
+                            // channel. The report is fire-and-forget and must not become an
+                            // unknown-opcode strike or a response-producing command.
+                            observe_retail_client_exception(&frame.payload);
+                        }
                         GameState::AwaitChannel if frame.opcode == SelectChannel::OPCODE => {
                             // A real client sends the one-byte sub-server ID documented for this
                             // opcode; the synthetic packet carries a `u32` channel ID.
@@ -1400,9 +1406,7 @@ where
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
                             if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
-                            } else if self.config.retail_bootstrap
-                                && frame.opcode == RetailClientException::OPCODE
-                            {
+                            } else if frame.opcode == RetailClientException::OPCODE {
                                 // This report is fire-and-forget. Decode failures are ignored
                                 // after the bounded frame has been consumed: a client diagnostic
                                 // must never turn into a second disconnect or stall the session.

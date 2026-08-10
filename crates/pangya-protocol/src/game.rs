@@ -389,9 +389,12 @@ impl DecodePacket for RetailClientException {
     ) -> Result<Self, PacketDecodeError> {
         check_decode_profile(profile, reader)?;
         let _empty = reader.u8()?;
-        Ok(Self {
-            message: reader.pstring(MAX_CLIENT_EXCEPTION_BYTES)?.to_vec(),
-        })
+        let message = reader.pstring(MAX_CLIENT_EXCEPTION_BYTES)?.to_vec();
+        // Both primary references define only the filler byte and one PString. Their tails are
+        // unspecified, so reject any bytes after the declared message rather than guessing an
+        // extension that could hide a second frame or malformed data.
+        require_end(reader)?;
+        Ok(Self { message })
     }
 }
 
