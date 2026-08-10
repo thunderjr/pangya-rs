@@ -3627,6 +3627,36 @@ async fn economy_purchase_replay_consume_repair_equip_and_audits_are_atomic(pool
         panic!("equip must commit");
     };
     assert_eq!(equipped.version, 1);
+    // A different equipment commit may advance the live version before an encrypted runtime
+    // retry returns. The exact operation must replay its durable result, not compare this current
+    // version and must not overwrite the intervening selection.
+    let intervening = EquipmentChange {
+        operation_id: EconomyOperationId::new(Uuid::new_v4()),
+        expected_version: equipped.version,
+        club: None,
+        ..equipment
+    };
+    let EconomyCommit::Committed(intervening_result) = repository
+        .equip(intervening)
+        .await
+        .expect("intervening equip")
+    else {
+        panic!("intervening equip must commit");
+    };
+    assert_eq!(intervening_result.version, 2);
+    assert_eq!(
+        repository.equip(equipment).await,
+        Ok(EconomyCommit::Replayed(equipped))
+    );
+    assert_eq!(
+        repository
+            .load_player_snapshot(account_id)
+            .await
+            .expect("intervening projection")
+            .equipment
+            .version,
+        2
+    );
     let raced = EquipmentChange {
         operation_id: EconomyOperationId::new(Uuid::new_v4()),
         ..equipment
@@ -3660,7 +3690,7 @@ async fn economy_purchase_replay_consume_repair_equip_and_audits_are_atomic(pool
     .fetch_one(&pool)
     .await
     .expect("audit counts");
-    assert_eq!(counts, (6, 3, 5, 1));
+    assert_eq!(counts, (7, 3, 5, 2));
     assert!(
         sqlx::query("UPDATE economy_operations SET command = 'repair' WHERE operation_id = $1")
             .bind(purchase.operation_id.get())

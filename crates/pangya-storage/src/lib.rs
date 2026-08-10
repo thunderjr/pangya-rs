@@ -1733,10 +1733,10 @@ impl PgRepository {
         .await
         .map_err(repository_db_error)?
         {
-            if row.account_id != account_id.get()
-                || row.expected_version != i64::from(expected_version)
-                || row.request_payload != request_payload
-            {
+            // An exact operation key is replayed from the durable ledger even when the current
+            // equipment version has advanced since the original commit. The payload and account
+            // remain part of the identity check, so key reuse with drift is still refused.
+            if row.account_id != account_id.get() || row.request_payload != request_payload {
                 return Err(RepositoryError::CorruptData);
             }
             transaction.commit().await.map_err(repository_db_error)?;
