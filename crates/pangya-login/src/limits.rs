@@ -122,6 +122,7 @@ where
 #[derive(Clone, Debug)]
 pub struct SessionControl {
     revoked: Arc<AtomicBool>,
+    retain_stale: Arc<AtomicBool>,
     task_alive: Arc<AtomicBool>,
     task_started: Arc<AtomicBool>,
     task_ended: Arc<Notify>,
@@ -156,6 +157,7 @@ impl SessionControl {
         (
             Self {
                 revoked: Arc::new(AtomicBool::new(false)),
+                retain_stale: Arc::new(AtomicBool::new(false)),
                 // A control without an attached task is conservatively live. Runtime owners
                 // attach a SessionTaskLease immediately; only that RAII lease can authoritatively
                 // transition the entry to stale.
@@ -196,6 +198,17 @@ impl SessionControl {
     #[must_use]
     pub fn is_live(&self) -> bool {
         !self.is_revoked() && self.task_alive.load(Ordering::Acquire)
+    }
+
+    /// Retains this generation for authenticated stale/ghost recovery when the task exits.
+    pub(crate) fn retain_stale(&self) {
+        self.retain_stale.store(true, Ordering::Release);
+    }
+
+    /// Returns whether normal guard cleanup must preserve this generation as stale.
+    #[must_use]
+    fn should_retain_stale(&self) -> bool {
+        self.retain_stale.load(Ordering::Acquire)
     }
 
     /// Waits until an attached owning task has dropped its liveness lease.
@@ -568,7 +581,10 @@ where
             && entries.get(&key).is_some_and(|entry| {
                 entry.lease == self.lease
                     && !entry.retiring
-                    && entry.control.as_ref().is_none_or(SessionControl::is_live)
+                    && entry
+                        .control
+                        .as_ref()
+                        .is_none_or(|control| control.is_live() && !control.should_retain_stale())
             })
         {
             entries.remove(&key);
@@ -650,6 +666,17 @@ mod tests {
             registry.acquire(7),
             Err(RegistryError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn normal_task_guard_drop_retires_generation_before_task_lease_drop() {
+        let registry = CapacityRegistry::new(1);
+        let (control, _probes) = SessionControl::new();
+        let task = control.start_task();
+        let guard = registry.acquire_with_control(7, control).expect("session");
+        drop(guard);
+        assert!(registry.acquire(7).is_ok());
+        drop(task);
     }
 
     #[test]

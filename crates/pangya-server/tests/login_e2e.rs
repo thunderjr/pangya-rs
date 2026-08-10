@@ -611,21 +611,21 @@ async fn stale_duplicate_ghosts_old_connection_and_retries_over_encrypted_tcp(po
     create_ready_account(&pool, "StaleUser").await;
     let limits = LoginRuntimeLimits {
         login_timeout: Duration::from_secs(10),
-        idle_timeout: Duration::from_secs(10),
+        // Let the authenticated owner become stale through its total idle deadline instead of
+        // treating a normal protocol rejection as an unexpected task exit.
+        idle_timeout: Duration::from_millis(100),
         ..LoginRuntimeLimits::default()
     };
     let (address, shutdown, task, _) = start(pool, limits).await;
 
-    // Finish enough of the first encrypted login to install its account lease, then send a known
-    // packet in the wrong state. The server terminates that task while the client socket remains
-    // open, leaving an authoritative stale lease behind for the authenticated ghost flow.
+    // Finish enough of the first encrypted login to install its account lease, then leave the
+    // authenticated owner idle. Its bounded deadline is an authoritative stale transition while
+    // the client socket remains open, leaving a stale lease for the authenticated ghost flow.
     let (mut old, old_key) = connect(address).await;
     send_packet(&mut old, old_key, 1, 1, &login_payload("StaleUser", SECRET)).await;
     for expected in [1, 0x10, 6, 9, 2] {
         assert_eq!(receive_packet(&mut old, old_key).await.0, expected);
     }
-    send_packet(&mut old, old_key, 2, 0x0007, &pstring(b"stale-state")).await;
-
     let (mut replacement, replacement_key) = loop {
         let (mut candidate, candidate_key) = connect(address).await;
         send_packet(

@@ -668,11 +668,11 @@ where
         let mut machine = LoginStateMachine::new(self.config.limits.max_retries)
             .map_err(|_| LoginRuntimeError::Protocol)?;
         let mut account: Option<AuthenticationRecord> = None;
-        let mut _presence: Option<RegistryGuard<AccountId>> = None;
-        // The task lease is declared after the registry guard so it is dropped first. A task
-        // that ends unexpectedly therefore leaves an explicitly stale lease for the authenticated
-        // retry/ghost flow; generation-checked cleanup still protects a replacement lease.
+        // Keep the task lease alive until after the presence guard is dropped. Normal task exits
+        // therefore retire their generation deterministically; a task that is externally ended
+        // before cleanup still leaves a stale generation for authenticated ghost recovery.
         let _task_lease = session_control.start_task();
+        let mut _presence: Option<RegistryGuard<AccountId>> = None;
         let mut handover_token: Option<Zeroizing<Vec<u8>>> = None;
         // Only an authenticated stale duplicate is held until the client explicitly requests
         // ghost recovery. The account ID is authenticated before it is stored; the 0x0004 packet
@@ -688,16 +688,31 @@ where
                 return Ok(ConnectionTermination::Rejected);
             }
             match machine.state() {
-                LoginState::Complete => return Ok(ConnectionTermination::Completed),
+                LoginState::Complete => {
+                    // A clean handover is a normal retirement, not a stale owner. Release the
+                    // generation while the task lease is still live; unexpected task exits keep
+                    // the generation as a stale ghost until authenticated recovery retires it.
+                    _presence.take();
+                    return Ok(ConnectionTermination::Completed);
+                }
                 LoginState::Closed => return Ok(ConnectionTermination::Rejected),
                 _ => {}
             }
-            let login_remaining = self
+            let login_remaining = match self
                 .config
                 .limits
                 .login_timeout
                 .checked_sub(started.elapsed())
-                .ok_or(LoginRuntimeError::Timeout)?;
+            {
+                Some(remaining) => remaining,
+                None => {
+                    // A task that reaches its total deadline is no longer servicing its
+                    // authenticated socket. Retain the generation so the next authenticated
+                    // client can perform the explicit stale/ghost handshake.
+                    session_control.retain_stale();
+                    return Err(LoginRuntimeError::Timeout);
+                }
+            };
             let wait = login_remaining.min(self.config.limits.idle_timeout);
             let frame = tokio::select! {
                 biased;
@@ -713,8 +728,12 @@ where
                     let _ = reply.send(());
                     continue;
                 }
-                result = timeout(wait, framed.next()) => {
-                    result.map_err(|_| LoginRuntimeError::Timeout)?
+                result = timeout(wait, framed.next()) => match result {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        session_control.retain_stale();
+                        return Err(LoginRuntimeError::Timeout);
+                    }
                 }
             };
             let Some(frame) = frame else {
