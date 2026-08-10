@@ -8535,6 +8535,10 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
             1,
             "{who} receives exactly one final standings frame: {frames:04x?}"
         );
+        assert!(
+            frames.windows(2).any(|pair| pair == [0x0065, 0x0066]),
+            "{who} receives the retained terminal pair in wire order: {frames:04x?}"
+        );
     }
 
     // Both accounts are participants of the same match, and both were paid exactly once.

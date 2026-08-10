@@ -487,12 +487,52 @@ impl RoomState {
         if member.cancellation.is_cancelled() {
             return false;
         }
-        if member.outbound.try_send(event).is_ok() {
-            true
-        } else {
-            member.cancellation.cancel();
-            false
+        match member.outbound.try_send(event) {
+            Ok(()) => true,
+            // Once a persistence coordinator has accepted the critical request, a full queue on
+            // another captured member is ordinary backpressure. Keep that member alive so the
+            // retained terminal result can wait for a permit; before that point, preserve the
+            // existing bounded-queue disconnect policy.
+            Err(mpsc::error::TrySendError::Full(_))
+                if self.pending_stroke_persistence.is_some()
+                    && self.stroke_persistence_event_delivered =>
+            {
+                false
+            }
+            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                member.cancellation.cancel();
+                false
+            }
         }
+    }
+
+    /// Queues a terminal result without competing with the ordinary room-event backlog.
+    ///
+    /// Terminal delivery is retained in `stroke_terminal`, so it must not be discarded merely
+    /// because a peer has not drained its preceding relays yet. Waiting for one channel permit is
+    /// safe here: the connection consumes its queue concurrently, while its cancellation token
+    /// breaks the wait when the transport has gone away.
+    async fn deliver_terminal(
+        outbound: &mpsc::Sender<RoomEvent>,
+        cancellation: &CancellationToken,
+        event: RoomEvent,
+    ) -> bool {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return false,
+            permit = outbound.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        permit.send(event);
+        true
     }
 
     fn member_index(&self, connection_id: PlayerConnectionId) -> Option<usize> {
@@ -1108,11 +1148,11 @@ impl RoomState {
             });
             if let Some(commit) = outcome.settlement() {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
             } else {
                 let plan = self
                     .stroke
@@ -1184,11 +1224,11 @@ impl RoomState {
         match outcome {
             StrokeHoleOutOutcome::Settlement(commit) => {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
             }
             // A changed turn is announced, as is a changed hole. On a hole transition the
             // opening player is reset to seat one, so the connection ID can remain unchanged
@@ -1230,15 +1270,15 @@ impl RoomState {
         self.stroke_participant(caller)?;
         let commit = self.stroke.give_up(caller)?;
         self.deadlines.clear_stroke();
+        let _delivered = self.request_stroke_settlement(commit, None);
         self.broadcast_match(RoomEvent::StrokePhase {
             match_id: commit.match_id(),
             phase: self.stroke.phase(),
         });
-        let _delivered = self.request_stroke_settlement(commit, None);
         Ok(commit)
     }
 
-    fn apply_stroke_commit(
+    async fn apply_stroke_commit(
         &mut self,
         result: StrokeMatchResult,
     ) -> Result<StrokeMatchResult, StrokeMatchError> {
@@ -1265,9 +1305,20 @@ impl RoomState {
             if delivered[index] {
                 continue;
             }
-            if let Some(member_index) = self.member_index(connection_id)
-                && let Some(member) = self.members.get(member_index)
-                && self.deliver(member, RoomEvent::StrokeCommitted(committed))
+            let Some(member_index) = self.member_index(connection_id) else {
+                continue;
+            };
+            let Some(member) = self.members.get(member_index) else {
+                continue;
+            };
+            let outbound = member.outbound.clone();
+            let cancellation = member.cancellation.clone();
+            if Self::deliver_terminal(
+                &outbound,
+                &cancellation,
+                RoomEvent::StrokeCommitted(committed),
+            )
+            .await
             {
                 delivered[index] = true;
             }
@@ -1442,13 +1493,14 @@ impl RoomState {
                 }
                 Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
                     self.deadlines.clear_stroke();
+                    let _retained = self
+                        .retain_stroke_persistence(PendingStrokePersistence::Settlement(commit));
+                    let _claimed = self.claim_stroke_persistence();
                     self.broadcast_match(RoomEvent::StrokePhase {
                         match_id: commit.match_id(),
                         phase: self.stroke.phase(),
                     });
-                    let _retained = self
-                        .retain_stroke_persistence(PendingStrokePersistence::Settlement(commit));
-                    self.claim_stroke_persistence()
+                    _claimed
                 }
                 Ok(StrokeDeadlineOutcome::Stale) | Err(_) => RoomCloseOutcome::None,
             }
@@ -1544,11 +1596,11 @@ impl RoomState {
         match self.stroke.deadline_expired(deadline) {
             Ok(StrokeDeadlineOutcome::Settlement(commit)) => {
                 self.deadlines.clear_stroke();
+                let _delivered = self.request_stroke_settlement(commit, None);
                 self.broadcast_match(RoomEvent::StrokePhase {
                     match_id: commit.match_id(),
                     phase: self.stroke.phase(),
                 });
-                let _delivered = self.request_stroke_settlement(commit, None);
                 RoomCloseOutcome::M6Settlement {
                     room_id: self.id,
                     request: commit,
@@ -2656,7 +2708,7 @@ async fn run_room(
                 }
             },
             command = normal.recv() => match command {
-                Some(command) => open = handle_normal(&mut state, command, events.as_ref()),
+                Some(command) => open = handle_normal(&mut state, command, events.as_ref()).await,
                 None => {
                     if control.is_closed() { open = false; }
                 }
@@ -2665,7 +2717,7 @@ async fn run_room(
     }
 }
 
-fn handle_normal(
+async fn handle_normal(
     state: &mut RoomState,
     command: RoomCommand,
     events: Option<&mpsc::Sender<RoomActorEvent>>,
@@ -2956,7 +3008,7 @@ fn handle_normal(
             true
         }
         RoomCommand::ApplyStrokeCommit { result, reply } => {
-            let result = state.apply_stroke_commit(result);
+            let result = state.apply_stroke_commit(result).await;
             let open = result.is_err() || !state.members.is_empty();
             let _ignored = reply.send(result);
             open
@@ -3969,8 +4021,96 @@ mod tests {
         assert!(handle.shutdown().await.is_ok());
     }
 
-    #[test]
-    fn stroke_persistence_falls_back_and_retains_work_when_all_outbounds_are_full() {
+    #[tokio::test]
+    async fn retained_terminal_waits_for_full_output_queues_and_is_emitted_once_per_roster_member()
+    {
+        let first = identity(1);
+        let second = identity(2);
+        let plan = stroke_plan(
+            &first,
+            &second,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            3,
+        );
+        let owner_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        let mut state = RoomState::new(
+            RoomId::new(40).expect("room"),
+            RoomName::parse("terminal-backpressure").expect("name"),
+            None,
+            RoomSettings::new(2).expect("settings"),
+            first.clone(),
+            owner_tx.clone(),
+            owner_cancel.clone(),
+        );
+        state
+            .join_with_cancellation(
+                second.clone(),
+                None,
+                second_tx.clone(),
+                second_cancel.clone(),
+            )
+            .expect("join");
+        state.set_ready(first.connection_id, true).expect("ready");
+        state.set_ready(second.connection_id, true).expect("ready");
+        playing_stroke_room(&mut state, &plan);
+        while owner_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        // Earlier setup broadcasts intentionally exercised the bounded normal queue. Reset the
+        // lifecycle tokens so this test isolates terminal backpressure rather than setup overflow.
+        for member in &mut state.members {
+            member.cancellation = CancellationToken::new();
+        }
+
+        // Simulate a peer that has not yet drained the preceding room traffic. The terminal
+        // result must wait for these permits instead of canceling either captured member.
+        owner_tx
+            .try_send(RoomEvent::Closed)
+            .expect("owner queue full");
+        second_tx
+            .try_send(RoomEvent::Closed)
+            .expect("second queue full");
+        let commit = state
+            .stroke
+            .give_up(first.connection_id)
+            .expect("settlement");
+        let persisted = persisted_stroke(commit);
+        let apply = tokio::spawn(async move { state.apply_stroke_commit(persisted).await });
+        // Drain one pre-terminal event from each queue. The retained terminal send either remains
+        // pending until this happens or is already queued behind it; both paths preserve order.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .expect("owner queue did not drain"),
+            Some(RoomEvent::Closed)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+                .await
+                .expect("second queue did not drain"),
+            Some(RoomEvent::Closed)
+        );
+        assert_eq!(apply.await.expect("apply task"), Ok(persisted));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), owner_rx.recv())
+                .await
+                .expect("owner terminal did not arrive"),
+            Some(RoomEvent::StrokeCommitted(persisted))
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+                .await
+                .expect("second terminal did not arrive"),
+            Some(RoomEvent::StrokeCommitted(persisted))
+        );
+    }
+
+    #[tokio::test]
+    async fn stroke_persistence_falls_back_and_retains_work_when_all_outbounds_are_full() {
         let first = identity(1);
         let second = identity(2);
         let plan = stroke_plan(
@@ -4078,7 +4218,7 @@ mod tests {
             "room authority hands retained work to priority cancellation exactly once"
         );
         let persisted = persisted_stroke(commit);
-        assert_eq!(retained.apply_stroke_commit(persisted), Ok(persisted));
+        assert_eq!(retained.apply_stroke_commit(persisted).await, Ok(persisted));
     }
 
     #[test]

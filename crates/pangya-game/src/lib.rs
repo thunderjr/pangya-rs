@@ -2436,6 +2436,11 @@ where
         };
 
         state = GameState::Closed;
+        // Release any room terminal-delivery wait before asking the lobby actor to remove this
+        // connection. A full outbound queue is ordinary backpressure, not a failed member; the
+        // room's retained terminal result will retry for surviving roster members during apply or
+        // failover.
+        room_cancellation.cancel();
         let cleanup_reason = if shutdown.is_cancelled() {
             MatchAbortReason::Shutdown
         } else {
