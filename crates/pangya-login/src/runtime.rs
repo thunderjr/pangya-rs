@@ -39,11 +39,13 @@ use tokio_util::{codec::Framed, sync::CancellationToken};
 use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
+const DUPLICATE_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+
 use crate::{
     BoundedCredentialExecutor, CanonicalTransportSecret, CapacityRegistry, CredentialError,
     CredentialExecutorError, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry,
     LoginEvent, LoginState, LoginStateMachine, RateDecision, RegistryError, RegistryGuard,
-    generate_handover,
+    SessionControl, SessionProbeReceiver, generate_handover,
 };
 
 /// Generated process-local connection identifier safe for logs and metrics.
@@ -631,11 +633,12 @@ where
             let codec = FrameCodec::new(key, ServiceKind::Login, self.config.limits.codec);
             let framed = Framed::new(stream, codec);
             let connection_shutdown = shutdown.clone();
+            let (session_control, probes) = SessionControl::new();
             tokio::select! {
                 biased;
                 result = timeout(
                     self.config.limits.login_timeout,
-                    self.run_connection(framed, prefix, connection_shutdown),
+                    self.run_connection(framed, prefix, connection_shutdown, session_control, probes),
                 ) => result.map_err(|_| LoginRuntimeError::Timeout)?,
                 () = shutdown.cancelled() => Ok(ConnectionTermination::Cancelled),
             }
@@ -659,6 +662,8 @@ where
         mut framed: Framed<TcpStream, FrameCodec>,
         source: SourceAddressPrefix,
         shutdown: CancellationToken,
+        session_control: SessionControl,
+        mut probes: SessionProbeReceiver,
     ) -> Result<ConnectionTermination, LoginRuntimeError> {
         let started = Instant::now();
         let mut packet_window = LocalRateWindow::new(self.config.limits.rate_window);
@@ -667,9 +672,9 @@ where
         let mut account: Option<AuthenticationRecord> = None;
         let mut _presence: Option<RegistryGuard<AccountId>> = None;
         let mut handover_token: Option<Zeroizing<Vec<u8>>> = None;
-        // A duplicate login is held in this connection until the client explicitly requests ghost
-        // recovery. The account ID is authenticated before it is stored; the 0x0004 packet itself
-        // has no identity fields and can never ghost an arbitrary account.
+        // Only an authenticated stale duplicate is held until the client explicitly requests
+        // ghost recovery. The account ID is authenticated before it is stored; the 0x0004 packet
+        // itself has no identity fields and can never ghost an arbitrary account.
         let mut pending_ghost: Option<(AccountId, u64)> = None;
 
         loop {
@@ -690,6 +695,14 @@ where
                 () = shutdown.cancelled() => {
                     let _ = machine.apply(LoginEvent::Disconnect);
                     return Ok(ConnectionTermination::Cancelled);
+                }
+                () = session_control.cancelled() => {
+                    let _ = machine.apply(LoginEvent::Disconnect);
+                    return Ok(ConnectionTermination::Rejected);
+                }
+                Some(reply) = probes.recv() => {
+                    let _ = reply.send(());
+                    continue;
                 }
                 result = timeout(wait, framed.next()) => {
                     result.map_err(|_| LoginRuntimeError::Timeout)?
@@ -769,15 +782,49 @@ where
                         }
                         continue;
                     };
-                    let guard = match self.active_accounts.acquire(authenticated.account.id) {
+                    let guard = match self
+                        .active_accounts
+                        .acquire_with_control(authenticated.account.id, session_control.clone())
+                    {
                         Ok(guard) => guard,
                         Err(RegistryError::Duplicate(lease)) => {
-                            self.observer.login("duplicate");
-                            // PacketDoc distinguishes a stale-session refusal (which arms 0x0004)
-                            // from a live duplicate connection. LoginService cannot observe a
-                            // crashed peer's final packet, so the authenticated retry is explicitly
-                            // armed for ghost resolution; generation-tagged registry leases make
-                            // this safe if the old task unwinds after the replacement starts.
+                            self.observer.login("duplicate_live");
+                            // PacketDoc's 5100107 is reserved for a demonstrably live socket.
+                            // Probe the owning task before refusing: a dead/stalled owner is
+                            // instead the stale 5100019 flow, which explicitly arms 0x0004.
+                            let live = match self
+                                .active_accounts
+                                .control(&authenticated.account.id, lease)
+                            {
+                                Some(control) => {
+                                    control.probe(DUPLICATE_LIVENESS_PROBE_TIMEOUT).await
+                                }
+                                // A registry entry created without a task control is used by
+                                // pure registry callers and remains conservatively live.
+                                None => true,
+                            };
+                            if live {
+                                self.send(
+                                    &mut framed,
+                                    &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
+                                )
+                                .await?;
+                                return Ok(ConnectionTermination::Rejected);
+                            }
+                            self.observer.login("duplicate_stale");
+                            self.send(
+                                &mut framed,
+                                &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
+                            )
+                            .await?;
+                            pending_ghost = Some((authenticated.account.id, lease));
+                            machine
+                                .apply(LoginEvent::AuthenticationRejected)
+                                .map_err(|_| LoginRuntimeError::Protocol)?;
+                            continue;
+                        }
+                        Err(RegistryError::Stale(lease)) => {
+                            self.observer.login("duplicate_stale");
                             self.send(
                                 &mut framed,
                                 &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
@@ -1028,6 +1075,13 @@ where
                 }
                 LoginState::AwaitServerSelect if frame.opcode == 0x0003 => {
                     let packet = self.decode_packet::<SelectServer>(&frame)?;
+                    // Ghost invalidation revokes both the task control and this generation. The
+                    // old socket must not reach server selection after a replacement wins.
+                    if session_control.is_revoked()
+                        || !_presence.as_ref().is_some_and(RegistryGuard::is_current)
+                    {
+                        return Ok(ConnectionTermination::Rejected);
+                    }
                     if packet.server_id != self.config.game_server.id {
                         self.send(
                             &mut framed,

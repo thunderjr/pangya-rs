@@ -3,11 +3,19 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
+use tokio_util::sync::CancellationToken;
 
 /// Fixed-window limiter outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +118,74 @@ where
     }
 }
 
+/// A live LoginService session's revocation and liveness control.
+#[derive(Clone, Debug)]
+pub struct SessionControl {
+    revoked: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    probes: mpsc::UnboundedSender<oneshot::Sender<()>>,
+}
+
+/// Receiver held by the connection task so a duplicate can prove it is live.
+pub struct SessionProbeReceiver {
+    probes: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+}
+
+impl SessionControl {
+    /// Creates a revocable session control and its task-side liveness receiver.
+    #[must_use]
+    pub fn new() -> (Self, SessionProbeReceiver) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                revoked: Arc::new(AtomicBool::new(false)),
+                cancellation: CancellationToken::new(),
+                probes: sender,
+            },
+            SessionProbeReceiver { probes: receiver },
+        )
+    }
+
+    /// Revokes the old connection and wakes every task waiting on it.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.cancellation.cancel();
+    }
+
+    /// Returns whether the lease has been revoked and must not proceed.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Returns a cancellation future for the owning connection task.
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    /// Proves that the owning task is still servicing its connection loop.
+    pub async fn probe(&self, maximum: Duration) -> bool {
+        if self.is_revoked() {
+            return false;
+        }
+        let (reply, response) = oneshot::channel();
+        if self.probes.send(reply).is_err() {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => false,
+            result = timeout(maximum, response) => matches!(result, Ok(Ok(()))),
+        }
+    }
+}
+
+impl SessionProbeReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<oneshot::Sender<()>> {
+        self.probes.recv().await
+    }
+}
+
 /// Bounded keyed concurrent-count registry.
 #[derive(Debug)]
 pub struct KeyedCapacityRegistry<K> {
@@ -191,9 +267,12 @@ where
 /// Registry admission failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RegistryError {
-    /// The key is already present (duplicate authenticated LoginService session).
-    #[error("duplicate active login (lease {0})")]
+    /// The key belongs to a demonstrably live authenticated LoginService session.
+    #[error("duplicate live login (lease {0})")]
     Duplicate(u64),
+    /// The key belongs to a revoked/stale session awaiting controlled ghost recovery.
+    #[error("stale login (lease {0})")]
+    Stale(u64),
     /// The bounded registry is full or unavailable.
     #[error("active registry is full")]
     Capacity,
@@ -201,8 +280,14 @@ pub enum RegistryError {
 
 /// Bounded set whose guards remove keys through RAII.
 #[derive(Debug)]
+struct RegistryEntry {
+    lease: u64,
+    control: Option<SessionControl>,
+}
+
+/// Bounded set whose guards remove keys through generation-checked RAII.
 pub struct CapacityRegistry<K> {
-    entries: Arc<Mutex<HashMap<K, u64>>>,
+    entries: Arc<Mutex<HashMap<K, RegistryEntry>>>,
     capacity: usize,
     next_generation: Arc<Mutex<u64>>,
 }
@@ -226,9 +311,33 @@ where
     /// # Errors
     /// Returns a duplicate or capacity failure without exposing the key.
     pub fn acquire(&self, key: K) -> Result<RegistryGuard<K>, RegistryError> {
+        self.acquire_inner(key, None)
+    }
+
+    /// Acquires a session lease with a task control used for live duplicate probing.
+    pub fn acquire_with_control(
+        &self,
+        key: K,
+        control: SessionControl,
+    ) -> Result<RegistryGuard<K>, RegistryError> {
+        self.acquire_inner(key, Some(control))
+    }
+
+    fn acquire_inner(
+        &self,
+        key: K,
+        control: Option<SessionControl>,
+    ) -> Result<RegistryGuard<K>, RegistryError> {
         let mut entries = self.entries.lock().map_err(|_| RegistryError::Capacity)?;
-        if let Some(&lease) = entries.get(&key) {
-            return Err(RegistryError::Duplicate(lease));
+        if let Some(entry) = entries.get(&key) {
+            if entry
+                .control
+                .as_ref()
+                .is_some_and(SessionControl::is_revoked)
+            {
+                return Err(RegistryError::Stale(entry.lease));
+            }
+            return Err(RegistryError::Duplicate(entry.lease));
         }
         if entries.len() >= self.capacity {
             return Err(RegistryError::Capacity);
@@ -239,11 +348,23 @@ where
             .map_err(|_| RegistryError::Capacity)?;
         let lease = *generation;
         *generation = generation.wrapping_add(1).max(1);
-        entries.insert(key.clone(), lease);
+        entries.insert(key.clone(), RegistryEntry { lease, control });
         Ok(RegistryGuard {
             entries: Arc::downgrade(&self.entries),
             key: Some(key),
             lease,
+        })
+    }
+
+    /// Returns the owning control for a matching lease without exposing account data.
+    #[must_use]
+    pub fn control(&self, key: &K, lease: u64) -> Option<SessionControl> {
+        self.entries.lock().ok().and_then(|entries| {
+            entries.get(key).and_then(|entry| {
+                (entry.lease == lease)
+                    .then(|| entry.control.clone())
+                    .flatten()
+            })
         })
     }
 
@@ -257,9 +378,16 @@ where
             .lock()
             .ok()
             .and_then(|mut entries| {
-                (entries.get(key).copied() == Some(lease)).then(|| entries.remove(key))
+                if entries.get(key).is_some_and(|entry| entry.lease == lease) {
+                    let entry = entries.remove(key)?;
+                    if let Some(control) = entry.control {
+                        control.revoke();
+                    }
+                    Some(())
+                } else {
+                    None
+                }
             })
-            .flatten()
             .is_some()
     }
 
@@ -287,6 +415,22 @@ where
     pub const fn lease(&self) -> u64 {
         self.lease
     }
+
+    /// Returns whether this guard still owns the current account generation.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.entries
+            .upgrade()
+            .and_then(|entries| {
+                entries.lock().ok().map(|entries| {
+                    self.key
+                        .as_ref()
+                        .and_then(|key| entries.get(key))
+                        .is_some_and(|entry| entry.lease == self.lease)
+                })
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// RAII registration removed on every normal/error/cancellation exit.
@@ -295,7 +439,7 @@ pub struct RegistryGuard<K>
 where
     K: Eq + Hash,
 {
-    entries: Weak<Mutex<HashMap<K, u64>>>,
+    entries: Weak<Mutex<HashMap<K, RegistryEntry>>>,
     key: Option<K>,
     lease: u64,
 }
@@ -312,7 +456,9 @@ where
             return;
         };
         if let Ok(mut entries) = entries.lock()
-            && entries.get(&key).copied() == Some(self.lease)
+            && entries
+                .get(&key)
+                .is_some_and(|entry| entry.lease == self.lease)
         {
             entries.remove(&key);
         }
@@ -378,5 +524,81 @@ mod tests {
         ));
         drop(current);
         assert!(registry.acquire(7).is_ok());
+    }
+
+    #[test]
+    fn revoked_session_is_stale_and_can_only_be_ghosted_by_its_lease() {
+        let registry = CapacityRegistry::new(1);
+        let (session, _probes) = SessionControl::new();
+        let guard = registry
+            .acquire_with_control(7, session.clone())
+            .expect("session");
+        let lease = guard.lease();
+        session.revoke();
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Stale(found)) if found == lease
+        ));
+        assert!(registry.invalidate(&7, lease));
+        let replacement = registry.acquire(7).expect("replacement");
+        drop(guard);
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Duplicate(_))
+        ));
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn invalidation_revokes_the_old_task_before_replacement() {
+        let registry = CapacityRegistry::new(1);
+        let (session, mut probes) = SessionControl::new();
+        let guard = registry
+            .acquire_with_control(7, session.clone())
+            .expect("session");
+        let task_session = session.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = task_session.cancelled() => break true,
+                    Some(reply) = probes.recv() => {
+                        let _ = reply.send(());
+                    }
+                    else => break false,
+                }
+            }
+        });
+        assert!(session.probe(Duration::from_secs(1)).await);
+        assert!(registry.invalidate(&7, guard.lease()));
+        assert!(task.await.expect("task join"));
+        let replacement = registry.acquire(7).expect("replacement");
+        drop(guard);
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Duplicate(_))
+        ));
+        drop(replacement);
+    }
+
+    #[test]
+    fn concurrent_duplicate_acquires_never_create_a_second_live_lease() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let registry = Arc::new(CapacityRegistry::new(1));
+        let first = registry.acquire(7).expect("first");
+        let attempts = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || registry.acquire(7).map(|guard| guard.lease()))
+            })
+            .collect::<Vec<_>>();
+        for attempt in attempts {
+            assert!(matches!(
+                attempt.join().expect("join"),
+                Err(RegistryError::Duplicate(_))
+            ));
+        }
+        drop(first);
     }
 }

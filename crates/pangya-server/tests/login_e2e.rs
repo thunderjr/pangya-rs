@@ -21,7 +21,7 @@ use pangya_login::{
 };
 use pangya_observability::M2Metrics;
 use pangya_protocol::{
-    CodecLimits, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_INVALID_CREDENTIALS, PacketWriter,
+    CodecLimits, LOGIN_ERROR_DUPLICATE_CONNECTION, LOGIN_ERROR_INVALID_CREDENTIALS, PacketWriter,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -437,8 +437,8 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     assert_eq!(counts, (1, 1, 1, 1));
     assert!(consumed.account_id.get() > 0);
 
-    // Duplicate authenticated LoginService handshake arms the reference ghost recovery flow
-    // while the first waits on select.
+    // A demonstrably live duplicate is refused with PacketDoc 5100107 and cannot arm ghost
+    // eviction; the first socket remains usable.
     let (mut first_active, first_key) = connect(address).await;
     send_packet(
         &mut first_active,
@@ -467,28 +467,17 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     assert_eq!(duplicate_body[0], 0xe3);
     assert_eq!(
         u32::from_le_bytes(duplicate_body[1..5].try_into().expect("duplicate code")),
-        LOGIN_ERROR_ALREADY_LOGGED_IN
+        LOGIN_ERROR_DUPLICATE_CONNECTION
     );
-    // 0x0004 has an empty body and no response; the retry is accepted on this same connection.
-    send_packet(&mut duplicate, duplicate_key, 7, 4, &[]).await;
-    send_packet(
-        &mut duplicate,
-        duplicate_key,
-        8,
-        1,
-        &login_payload("Synthetic_One", SECRET),
-    )
-    .await;
-    assert_eq!(receive_packet(&mut duplicate, duplicate_key).await.0, 1);
-    for expected in [0x10, 6, 9, 2] {
-        assert_eq!(
-            receive_packet(&mut duplicate, duplicate_key).await.0,
-            expected
-        );
-    }
-    send_packet(&mut duplicate, duplicate_key, 9, 3, &[7, 0, 0, 0]).await;
-    assert_eq!(receive_packet(&mut duplicate, duplicate_key).await.0, 3);
-    // The old guard may unwind after replacement; its generation cannot remove the new lease.
+    let mut duplicate_eof = [0_u8; 1];
+    assert_eq!(
+        duplicate
+            .read(&mut duplicate_eof)
+            .await
+            .expect("live duplicate close"),
+        0
+    );
+    // 0x0004 is not accepted on a live duplicate and cannot evict the first lease.
     send_packet(&mut first_active, first_key, 10, 3, &[7, 0, 0, 0]).await;
     assert_eq!(receive_packet(&mut first_active, first_key).await.0, 3);
 
