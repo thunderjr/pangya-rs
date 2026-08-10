@@ -4788,10 +4788,13 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
         receive_typed::<StrokeCommandResult>(&mut give_peer.stream, give_peer.key).await,
         StrokeCommandResult::new(StrokeCommand::GiveUp, StrokeCommandOutcome::Success)
     );
-    for (client, own_balance) in [
-        (&mut give_owner, StrokeBalanceUpdate::new(10, 5)),
-        (&mut give_peer, StrokeBalanceUpdate::new(0, 0)),
-    ] {
+    // The owner is the deterministic persistence coordinator. Dropping it immediately after the
+    // terminal command response exercises transfer of an already-enqueued settlement event to
+    // the surviving encrypted TCP connection; the peer must still receive the terminal result.
+    let give_owner_account = give_owner.account_id;
+    drop(give_owner);
+    for client in [&mut give_peer] {
+        let own_balance = StrokeBalanceUpdate::new(0, 0);
         assert_eq!(
             receive_typed::<StrokePhase>(&mut client.stream, client.key).await,
             StrokePhase::new(give_started.match_id(), StrokePhaseKind::ResultsPending)
@@ -4831,7 +4834,7 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
         give_players,
         vec![
             (
-                give_owner.account_id.get(),
+                give_owner_account.get(),
                 1,
                 "winner_by_forfeit".to_owned(),
                 10,
@@ -4854,8 +4857,8 @@ async fn game_m6_disconnect_and_nonactive_giveup_persist_once_and_return_to_room
     .fetch_all(&pool)
     .await
     .expect("give-up progression ledger");
-    assert_eq!(give_currency, vec![(give_owner.account_id.get(), 10)]);
-    assert_eq!(give_progression, vec![(give_owner.account_id.get(), 5)]);
+    assert_eq!(give_currency, vec![(give_owner_account.get(), 10)]);
+    assert_eq!(give_progression, vec![(give_owner_account.get(), 5)]);
 
     let rendered = metrics.render();
     assert!(rendered.contains(

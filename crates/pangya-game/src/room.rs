@@ -432,7 +432,19 @@ struct RoomState {
     stroke_persistence_recipient: Option<PlayerConnectionId>,
     stroke_persistence_event_delivered: bool,
     stroke_persistence_control_delivered: bool,
+    /// The durable terminal result retained until every surviving captured member has been
+    /// offered it. A coordinator may disconnect after the repository commit but before the room
+    /// actor applies the result; replaying that idempotent commit must not duplicate the terminal
+    /// wire event for members that already received it.
+    stroke_terminal: Option<StrokeTerminal>,
     deadlines: DeadlineScheduler,
+}
+
+#[derive(Clone, Copy)]
+struct StrokeTerminal {
+    result: StrokeMatchResult,
+    roster: [PlayerConnectionId; 2],
+    delivered: [bool; 2],
 }
 
 impl RoomState {
@@ -466,6 +478,7 @@ impl RoomState {
             stroke_persistence_recipient: None,
             stroke_persistence_event_delivered: false,
             stroke_persistence_control_delivered: false,
+            stroke_terminal: None,
             deadlines: DeadlineScheduler::default(),
         }
     }
@@ -980,6 +993,7 @@ impl RoomState {
         self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
+        self.stroke_terminal = None;
         Ok(begin)
     }
 
@@ -1228,18 +1242,41 @@ impl RoomState {
         &mut self,
         result: StrokeMatchResult,
     ) -> Result<StrokeMatchResult, StrokeMatchError> {
-        let roster = self
-            .stroke
-            .roster()
-            .copied()
-            .ok_or(StrokeMatchError::InvalidPhase)?;
-        let committed = self.stroke.apply_commit(result)?;
+        let (roster, committed, mut delivered) = if let Some(terminal) = self.stroke_terminal {
+            if terminal.result != result {
+                return Err(StrokeMatchError::IdentityMismatch);
+            }
+            (terminal.roster, terminal.result, terminal.delivered)
+        } else {
+            let roster = self
+                .stroke
+                .roster()
+                .copied()
+                .ok_or(StrokeMatchError::InvalidPhase)?;
+            let committed = self.stroke.apply_commit(result)?;
+            (roster, committed, [false; 2])
+        };
         self.pending_stroke_persistence = None;
         self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         self.deadlines.clear_stroke();
-        self.broadcast_connections(&roster, RoomEvent::StrokeCommitted(committed));
+        for (index, connection_id) in roster.iter().copied().enumerate() {
+            if delivered[index] {
+                continue;
+            }
+            if let Some(member_index) = self.member_index(connection_id)
+                && let Some(member) = self.members.get(member_index)
+                && self.deliver(member, RoomEvent::StrokeCommitted(committed))
+            {
+                delivered[index] = true;
+            }
+        }
+        self.stroke_terminal = Some(StrokeTerminal {
+            result: committed,
+            roster,
+            delivered,
+        });
         Ok(committed)
     }
 
@@ -3903,7 +3940,32 @@ mod tests {
             StrokePlayerResult::new(input, reward, ServerBalances::from_persisted(100, 100))
         });
         let persisted = StrokeMatchResult::new(commit.match_id(), commit.result_key(), results);
+        // The event was accepted by the owner's bounded queue, but the coordinator can
+        // disconnect before it performs repository I/O. The room must transfer that exact work
+        // to the surviving participant rather than treating the accepted enqueue as durable.
+        assert!(
+            handle
+                .disconnect_with_abort(first.connection_id, MatchAbortReason::Disconnect)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(RoomEvent::StrokeSettlementRequested(value)) if value == commit
+        ));
         assert_eq!(handle.apply_stroke_commit(persisted).await, Ok(persisted));
+        let terminal_events: Vec<_> = std::iter::from_fn(|| second_rx.try_recv().ok()).collect();
+        assert!(
+            terminal_events.iter().any(
+                |event| matches!(event, RoomEvent::StrokeCommitted(value) if *value == persisted)
+            ),
+            "terminal events: {terminal_events:?}"
+        );
+        // A coordinator can also disconnect after the idempotent repository commit and before
+        // the room actor applies its result. Replaying that outcome must not emit a second
+        // terminal frame to a member that already received it.
+        assert_eq!(handle.apply_stroke_commit(persisted).await, Ok(persisted));
+        assert!(second_rx.try_recv().is_err());
         assert!(handle.shutdown().await.is_ok());
     }
 
