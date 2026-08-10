@@ -302,16 +302,10 @@ Four details that are easy to get wrong and were pinned by tests:
 - Shots are relayed, not recomputed. The client owns trajectory; the server owns turn
   order, scoring, and persistence. The relay body is deliberately opaque.
 
-## What remains to make a hole playable
+## Current retail match scope
 
-The packets are implemented and unit-tested. They are **not routed**, and routing them is
-not merely a wire translation the way rooms were: the existing match actors
-(`stroke_state.rs`, the solo path) encode the synthetic protocol's own semantics — exactly
-one hole, exactly two ready players, a fixed reward formula. The retail flow is
-multi-hole, variable-party, and drives loading and turn order from different client
-signals.
-
-So this step needs a design decision rather than a translation: either generalize the
-existing match actor to the retail lifecycle, or introduce a retail match actor beside it
-and share the settlement layer, which is already protocol-agnostic. That decision should be
-made deliberately, not folded into a packet-porting commit.
+The retail room and match packets are routed. Versus rooms require exactly two ready players;
+the room-driven plan retains 3/6/9/18-hole cards and the selected front/back/random/shuffle
+ordering. The stroke aggregate advances each hole and settles the whole card once, while each
+hole emits its required `0x0053` opening-player introduction. Synthetic M5/M6 remain separate
+one-hole compatibility checkpoints; that limitation does not describe the retail path.

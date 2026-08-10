@@ -2095,6 +2095,58 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn stroke_commit_rejects_hole_mode_drift(pool: PgPool) {
+    let repository = PgRepository::new(pool);
+    let first = repository
+        .create_account(account("StrokeModeA", Some("StrokeModeA")))
+        .await
+        .expect("first account");
+    let second = repository
+        .create_account(account("StrokeModeB", Some("StrokeModeB")))
+        .await
+        .expect("second account");
+    let plan = MatchPlan::with_holes(CourseId::new(17).expect("course"), 18, 1, 3)
+        .expect("full-card plan");
+    let begin = stroke_begin_with_config(first.account.id, second.account.id, plan);
+    assert_eq!(
+        repository.begin_stroke(begin.clone()).await,
+        Ok(BeginStrokeMatchOutcome::Begun)
+    );
+    repository
+        .mark_stroke_in_game(MarkStrokeInGame::new(begin.match_id(), begin.result_key()))
+        .await
+        .expect("mark in game");
+    let wrong_plan =
+        MatchPlan::with_holes(begin.config().course_id(), 18, 2, 3).expect("different progression");
+    let wrong_commit = CommitStrokeMatch::new(
+        begin.match_id(),
+        begin.result_key(),
+        wrong_plan,
+        [
+            StrokePlayerCommit::new(
+                begin.participants()[0],
+                2,
+                StrokePlace::First,
+                StrokeCompletion::Holed,
+            )
+            .expect("first commit"),
+            StrokePlayerCommit::new(
+                begin.participants()[1],
+                4,
+                StrokePlace::Second,
+                StrokeCompletion::StrokeCap,
+            )
+            .expect("second commit"),
+        ],
+    )
+    .expect("wrong mode commit shape");
+    assert_eq!(
+        repository.commit_stroke_match(wrong_commit).await,
+        Err(MatchRepositoryError::WrongConfig)
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn balance_overflow_rolls_back_result_ledgers_audit_and_profile(pool: PgPool) {
     let repository = PgRepository::new(pool.clone());
     let aggregate = repository

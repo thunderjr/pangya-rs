@@ -7389,6 +7389,9 @@ async fn game_retail_social_rate_limit_closes_without_partial_delivery(pool: PgP
 
 #[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
+=======
+async fn game_retail_room_management_over_tcp(pool: PgPool) {
+>>>>>>> 4a4c5e4 (fix(retail): close room management and progression gaps)
     let owner = create_account(&pool, "RetailOwner", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "RetailGuest", 1, 0x1000_0000).await;
     let service = Arc::new(
@@ -7525,7 +7528,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
     let _ = exercise_exception_reports(&mut host, host_key, 30).await;
 
     // A second client joins the same room by number.
-    let (mut visitor, visitor_key, _) =
+    let (mut visitor, visitor_key, visitor_connection) =
         connect_retail(&pool, address, guest.account.id, "RetailGuest").await;
     let mut join = pangya_protocol::PacketWriter::default();
     join.u16_le(room_id);
@@ -7543,26 +7546,103 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         4 + 2 * pangya_protocol::ROOM_PLAYER_RECORD_BYTES + 1
     );
 
-    // Leaving returns the client to the lobby and re-lists rooms.
-    send_packet(&mut visitor, visitor_key, 4, 0x000f, &[]).await;
+    // Team changes are broadcast once as 0x007d plus one authoritative census; the requester
+    // must not receive a direct duplicate of either frame.
+    send_packet(&mut host, host_key, 4, 0x0010, &[1]).await;
+    for (stream, key, who) in [
+        (&mut host, host_key, "host"),
+        (&mut visitor, visitor_key, "visitor"),
+    ] {
+        let frames = drain_frames(stream, key, Duration::from_millis(900)).await;
+        let opcodes: Vec<_> = frames.iter().map(|(opcode, _)| *opcode).collect();
+        assert_eq!(
+            opcodes.iter().filter(|&&opcode| opcode == 0x007d).count(),
+            1,
+            "{who} team announce"
+        );
+        assert_eq!(
+            opcodes.iter().filter(|&&opcode| opcode == 0x0048).count(),
+            1,
+            "{who} team census"
+        );
+    }
+
+    // 0x001c is a room resync while in the room, not the in-match shot-end opcode. It answers
+    // with exactly one census and keeps the connection usable.
+    send_packet(&mut host, host_key, 5, 0x001c, &[0, 0]).await;
+    let resync = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        resync
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1
+    );
+
+    // The two invite requests are paired: 0x0029 is the lookup leg and receives 0x0130;
+    // 0x00ba performs the invitation, receives 0x012f, and delivers 0x0083 to the invitee.
+    send_packet(&mut visitor, visitor_key, 6, 0x000f, &[]).await;
     let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
     assert_eq!(opcode, 0x004c);
     assert_eq!(body, vec![0xff, 0xff]);
     let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
     assert_eq!(opcode, 0x0047);
     assert_eq!(body[0], 1, "the host's room is still listed");
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(500)).await;
 
-    // Joining a room number that does not exist is refused, not fatal.
-    let mut bad = pangya_protocol::PacketWriter::default();
-    bad.u16_le(4242);
-    bad.pstring(b"", 64).expect("password");
-    send_packet(&mut visitor, visitor_key, 5, 0x0009, &bad.into_inner()).await;
-    let (opcode, body) = receive_packet(&mut visitor, visitor_key).await;
-    assert_eq!(opcode, 0x0049);
-    assert_eq!(body, vec![18]);
+    send_packet(
+        &mut host,
+        host_key,
+        7,
+        0x0029,
+        &u32::try_from(guest.account.id.get())
+            .expect("guest id")
+            .to_le_bytes(),
+    )
+    .await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x0130);
+    assert!(
+        drain_available(&mut visitor, visitor_key, Duration::from_millis(300))
+            .await
+            .is_empty(),
+        "lookup does not deliver an invitation"
+    );
+    let mut invite = pangya_protocol::PacketWriter::default();
+    invite.pstring(b"RetailGuest", 64).expect("nickname");
+    invite.u32_le(u32::try_from(guest.account.id.get()).expect("guest id"));
+    send_packet(&mut host, host_key, 8, 0x00ba, &invite.into_inner()).await;
+    assert_eq!(receive_packet(&mut host, host_key).await.0, 0x012f);
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0083);
+
+    // Rejoin consumes the pending invitation, then the owner kick removes the guest and sends
+    // the retail 0x004c leave acknowledgement only to the removed connection.
+    send_packet(&mut visitor, visitor_key, 9, 0x00b4, &[]).await;
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x0049);
+    let _ = drain_available(&mut host, host_key, Duration::from_millis(700)).await;
+    send_packet(
+        &mut host,
+        host_key,
+        10,
+        0x0026,
+        &visitor_connection.to_le_bytes(),
+    )
+    .await;
+    let kicked_host = drain_available(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        kicked_host
+            .iter()
+            .filter(|&&opcode| opcode == 0x0048)
+            .count(),
+        1
+    );
+    assert_eq!(receive_packet(&mut visitor, visitor_key).await.0, 0x004c);
+
+    // A truncated settings frame is malformed and closes the stream rather than being treated
+    // as an empty edit or allowing a partial mutation.
+    send_packet(&mut host, host_key, 11, 0x000a, &[0xff]).await;
+    assert_closed(&mut host).await;
 
     drop(visitor);
-    drop(host);
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }
@@ -7984,7 +8064,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     create.u32_le(600_000);
     create.u8(2); // capacity: the smallest a versus room offers
     create.u8(0);
-    create.u8(1);
+    create.u8(18);
     create.u8(0);
     create.bytes(&[0; 5]);
     create.pstring(b"Party", 64).expect("room name");
@@ -7999,7 +8079,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     );
     // The room record preserves the client's requested card shape and course.
     // The fixed room record includes the maximum-player byte before the card shape.
-    assert_eq!(joined[2 + 64 + 5 + 17 + 1], 1, "the room runs one hole");
+    assert_eq!(joined[2 + 64 + 5 + 17 + 1], 18, "the room runs a full card");
     assert_eq!(
         joined[2 + 64 + 5 + 17 + 6],
         0,
@@ -8047,7 +8127,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         .map(|(_, body)| body.clone())
         .unwrap_or_default();
     assert_eq!(status.get(2).copied(), Some(0), "the mode it was made with");
-    assert_eq!(status.get(4).copied(), Some(1), "one hole");
+    assert_eq!(status.get(4).copied(), Some(18), "eighteen holes");
     assert_eq!(
         status.get(10).copied(),
         Some(2),
@@ -8258,10 +8338,85 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         seen.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>()
     );
 
-    // Both hole out. The second completion settles the match for both accounts at once.
+    // Both hole out. The second completion advances the card and emits a fresh 0x0053;
+    // only hole 18 settles the two-player match.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
     let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
+    let first_next = drain_available(&mut host, host_key, Duration::from_millis(1200)).await;
+    let second_next = drain_available(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    assert!(
+        first_next.contains(&0x0053),
+        "hole 2 starts for host: {first_next:04x?}"
+    );
+    assert!(
+        second_next.contains(&0x0053),
+        "hole 2 starts for visitor: {second_next:04x?}"
+    );
+    assert!(
+        !first_next.contains(&0x0063),
+        "hole 2 uses introduction, not turn handover"
+    );
+    assert!(
+        !second_next.contains(&0x0063),
+        "hole 2 uses introduction, not turn handover"
+    );
+
+    for hole in 2..=18 {
+        // Every next hole starts with the authoritative opening-player introduction.
+        if hole > 2 {
+            for (stream, key, who) in [
+                (&mut host, host_key, "host"),
+                (&mut visitor, visitor_key, "visitor"),
+            ] {
+                let frames = drain_available(stream, key, Duration::from_millis(1200)).await;
+                assert!(
+                    frames.contains(&0x0053),
+                    "hole {hole} starts for {who}: {frames:04x?}"
+                );
+                assert!(
+                    !frames.contains(&0x0063),
+                    "hole {hole} does not use a stale turn frame"
+                );
+            }
+        }
+        let mut hole_salt = salt.wrapping_add(hole as u8);
+        for host_shoots in [true, false] {
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            let mut committed_shot = vec![0, 0];
+            committed_shot.extend_from_slice(&[0xab; 62]);
+            send_packet(from, from_key, hole_salt, 0x0012, &committed_shot).await;
+            let (other, other_key) = if host_shoots {
+                (&mut visitor, visitor_key)
+            } else {
+                (&mut host, host_key)
+            };
+            assert!(
+                drain_available(other, other_key, Duration::from_millis(900))
+                    .await
+                    .contains(&0x0055),
+                "hole {hole} shot relay"
+            );
+            hole_salt = hole_salt.wrapping_add(1);
+            let (from, from_key) = if host_shoots {
+                (&mut host, host_key)
+            } else {
+                (&mut visitor, visitor_key)
+            };
+            send_packet(from, from_key, hole_salt, 0x001c, &[]).await;
+            let handover = drain_available(from, from_key, Duration::from_millis(900)).await;
+            assert!(handover.contains(&0x00cc), "hole {hole} end-shot");
+            hole_salt = hole_salt.wrapping_add(1);
+        }
+        send_packet(&mut host, host_key, hole_salt, 0x0031, &[]).await;
+        let _ = drain_available(&mut host, host_key, Duration::from_millis(400)).await;
+        send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
+        salt = hole_salt;
+    }
     for (stream, key, who) in [
         (&mut host, host_key, "host"),
         (&mut visitor, visitor_key, "visitor"),
@@ -8269,11 +8424,11 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         let frames = drain_available(stream, key, Duration::from_millis(2000)).await;
         assert!(
             frames.contains(&0x0065),
-            "{who} is told the hole finished: {frames:04x?}"
+            "{who} receives final hole finish: {frames:04x?}"
         );
         assert!(
             frames.contains(&0x0066),
-            "{who} receives the final standings: {frames:04x?}"
+            "{who} receives final standings: {frames:04x?}"
         );
     }
 

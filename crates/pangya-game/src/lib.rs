@@ -727,6 +727,8 @@ struct RetailHoleAtmosphere {
 struct ConnectionStrokeContext {
     match_id: MatchId,
     roster: [PlayerConnectionId; 2],
+    /// One-based hole whose opening frame was last emitted.
+    hole: u8,
     /// The participant this connection was last told owns the turn, so a handover can name
     /// the player whose turn ended. Retail has no phase frame that carries it.
     active: Option<PlayerConnectionId>,
@@ -2231,6 +2233,41 @@ where
                                 self.refresh_social_projection(connection_id, established.account_id)
                                     .await
                                     .map_err(|_| GameRuntimeError::Snapshot)?;
+                            } else if self.config.retail_bootstrap
+                                && state == GameState::InRoom
+                                && frame.opcode == RETAIL_C2S_ROOM_RESYNC
+                            {
+                                // 0x001c is also the in-match shot-end opcode. Room resync
+                                // must win while the connection is still in the room; routing
+                                // it through the match allowlist would reject a perfectly valid
+                                // roster refresh before the room handler can answer it.
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if !commands.admit_count(self.config.limits.room_commands_per_window)
+                                {
+                                    self.observer
+                                        .rate_limited(GameRateClass::RoomCommandsConnection);
+                                    break Err(GameRuntimeError::Limited);
+                                }
+                                let handled = tokio::select! {
+                                    biased;
+                                    () = shutdown.cancelled() => break Ok(GameTermination::Cancelled),
+                                    handled = self.handle_retail_room_command(
+                                        &mut framed,
+                                        state,
+                                        established,
+                                        outbound.clone(),
+                                        room_cancellation.clone(),
+                                        frame.opcode,
+                                        &frame.payload,
+                                        &mut room_id,
+                                    ) => handled,
+                                };
+                                match handled {
+                                    Ok(next) => state = next,
+                                    Err(error) => break Err(error),
+                                }
                             } else if self.config.retail_bootstrap
                                 && is_retail_match_opcode(frame.opcode)
                             {
@@ -4582,6 +4619,7 @@ where
                     return Ok(RoomEventEffect::Remain);
                 }
                 RoomEvent::Kicked { .. } => {
+                    self.send(framed, &RetailRoomLeave::to_lobby()).await?;
                     self.observer.room(GameRoomObservation::Kicked);
                     return Ok(RoomEventEffect::EnterChannel);
                 }
@@ -4620,6 +4658,7 @@ where
                     match_context.stroke = Some(ConnectionStrokeContext {
                         match_id: begin.match_id(),
                         roster: *plan.roster(),
+                        hole: 1,
                         active: None,
                     });
                     return Ok(RoomEventEffect::EnterStrokeLoading);
@@ -4627,69 +4666,85 @@ where
                 // Phase is carried by the turn frames a retail client actually reads.
                 RoomEvent::StrokePhase { .. } => return Ok(RoomEventEffect::Remain),
                 RoomEvent::StrokeTurn(phase) => {
-                    let StrokeMatchPhase::AwaitAction { active, .. } = *phase else {
+                    let StrokeMatchPhase::AwaitAction { active, hole, .. } = *phase else {
                         return Err(GameRuntimeError::Protocol);
                     };
                     let mut context = match_context.stroke.ok_or(GameRuntimeError::Protocol)?;
                     let connection = |id: PlayerConnectionId| u32::try_from(id.get()).unwrap_or(0);
-                    match context.active {
-                        // The first turn of the hole is introduced rather than handed over.
-                        //
-                        // `0x0053` carries the connection whose turn opens the hole, and that
-                        // is the whole announcement: no reference server sends a `0x0063`
-                        // here. Sending one is fatal rather than merely redundant. The
-                        // client's `0x0063` handler walks its per-player in-game array to
-                        // mark the active player, and while the course loading screen is
-                        // still up that array holds no scene objects yet — so it dereferences
-                        // a null model and the process exits. `0x0063` belongs only to a turn
-                        // *change*, after a full shot cycle.
-                        //
-                        // `pangbox/server` `game/room/room.go`: `startHole` sends `0x009e`,
-                        // `0x005b` and `0x0053` and no `0x0063`; `0x0063` is emitted only by
-                        // `nextTurn`, reached only from `endTurn`. `Acrisio-Filho/SuperSS-Dev`
-                        // `GAME/versus_base.cpp`: `sendReplyFinishLoadHole` sends `0x9e`,
-                        // `0x5b`, `0x53`; `0x63` lives only in `sendPlayerTurn`, called only
-                        // from `changeTurn`. `hsreina/pangya-server` `Game.pas`
-                        // `HandlePlayerLoadOk` likewise sends no `0x63`.
-                        None => {
-                            if let Some(atmosphere) = match_context.atmosphere.take() {
-                                self.send_retail_hole_atmosphere(framed, atmosphere).await?;
+                    // A completed hole resets the aggregate's active player to the first seat.
+                    // That reset is a new hole introduction, not an ordinary turn handover.
+                    // Keep this check before the active-player comparison so every subsequent
+                    // hole receives the required 0x0053 and never an early 0x0063.
+                    if context.active.is_some() && hole != context.hole {
+                        self.send(
+                            framed,
+                            &RetailPlayerStartHole {
+                                connection_id: connection(active),
+                            },
+                        )
+                        .await?;
+                        self.send_retail_hole_rate_tables(framed).await?;
+                    } else {
+                        match context.active {
+                            // The first turn of the hole is introduced rather than handed over.
+                            //
+                            // `0x0053` carries the connection whose turn opens the hole, and that
+                            // is the whole announcement: no reference server sends a `0x0063`
+                            // here. Sending one is fatal rather than merely redundant. The
+                            // client's `0x0063` handler walks its per-player in-game array to
+                            // mark the active player, and while the course loading screen is
+                            // still up that array holds no scene objects yet — so it dereferences
+                            // a null model and the process exits. `0x0063` belongs only to a turn
+                            // *change*, after a full shot cycle.
+                            //
+                            // `pangbox/server` `game/room/room.go`: `startHole` sends `0x009e`,
+                            // `0x005b` and `0x0053` and no `0x0063`; `0x0063` is emitted only by
+                            // `nextTurn`, reached only from `endTurn`. `Acrisio-Filho/SuperSS-Dev`
+                            // `GAME/versus_base.cpp`: `sendReplyFinishLoadHole` sends `0x9e`,
+                            // `0x5b`, `0x53`; `0x63` lives only in `sendPlayerTurn`, called only
+                            // from `changeTurn`. `hsreina/pangya-server` `Game.pas`
+                            // `HandlePlayerLoadOk` likewise sends no `0x63`.
+                            None => {
+                                if let Some(atmosphere) = match_context.atmosphere.take() {
+                                    self.send_retail_hole_atmosphere(framed, atmosphere).await?;
+                                }
+                                self.send(
+                                    framed,
+                                    &RetailPlayerStartHole {
+                                        connection_id: connection(active),
+                                    },
+                                )
+                                .await?;
+                                self.send_retail_hole_rate_tables(framed).await?;
                             }
-                            self.send(
-                                framed,
-                                &RetailPlayerStartHole {
-                                    connection_id: connection(active),
-                                },
-                            )
-                            .await?;
-                            self.send_retail_hole_rate_tables(framed).await?;
-                        }
-                        Some(previous) if previous != active => {
-                            self.send(
-                                framed,
-                                &RetailTurnEnd {
-                                    connection_id: connection(previous),
-                                },
-                            )
-                            .await?;
-                            self.send(
-                                framed,
-                                &RetailTurnStart {
-                                    connection_id: connection(active),
-                                },
-                            )
-                            .await?;
-                        }
-                        Some(_) => {
-                            self.send(
-                                framed,
-                                &RetailTurnStart {
-                                    connection_id: connection(active),
-                                },
-                            )
-                            .await?;
+                            Some(previous) if previous != active => {
+                                self.send(
+                                    framed,
+                                    &RetailTurnEnd {
+                                        connection_id: connection(previous),
+                                    },
+                                )
+                                .await?;
+                                self.send(
+                                    framed,
+                                    &RetailTurnStart {
+                                        connection_id: connection(active),
+                                    },
+                                )
+                                .await?;
+                            }
+                            Some(_) => {
+                                self.send(
+                                    framed,
+                                    &RetailTurnStart {
+                                        connection_id: connection(active),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                     }
+                    context.hole = hole;
                     context.active = Some(active);
                     match_context.stroke = Some(context);
                     return Ok(if state == GameState::InStrokeLoading {
@@ -4952,6 +5007,7 @@ where
                 match_context.stroke = Some(ConnectionStrokeContext {
                     match_id: begin.match_id(),
                     roster,
+                    hole: 1,
                     active: None,
                 });
                 Ok(RoomEventEffect::EnterStrokeLoading)
@@ -4986,6 +5042,7 @@ where
                     active,
                     turn,
                     sequence,
+                    hole: _,
                 } = phase
                 else {
                     return Err(GameRuntimeError::Protocol);
@@ -5162,6 +5219,43 @@ where
             .map_err(|_| GameRuntimeError::InvalidConfig)
     }
 
+    /// Builds a deterministic full-course hole order for the retail card.
+    ///
+    /// Front/back use the contiguous ranges from the retail UI. RandomStart is a deterministic
+    /// rotation (the room/course pair is its stable seed), while ShuffleAll uses a tiny local
+    /// Fisher-Yates pass. Keeping all 18 source holes available before truncating preserves the
+    /// semantics for every supported card size instead of accidentally treating a 9-hole card as
+    /// a different course.
+    fn retail_hole_order(course_id: u32, hole_count: u8, hole_mode: u8) -> Vec<u8> {
+        let mut holes: Vec<u8> = match hole_mode {
+            1 => (19_u8.saturating_sub(hole_count)..=18).collect(),
+            _ => (1..=18).collect(),
+        };
+        let count = usize::from(hole_count);
+        match hole_mode {
+            2 => {
+                let offset = (course_id
+                    .wrapping_mul(31)
+                    .wrapping_add(u32::from(hole_count).wrapping_mul(17))
+                    % 18) as usize;
+                holes.rotate_left(offset);
+            }
+            3 => {
+                let mut state = course_id
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add(u32::from(hole_count).wrapping_mul(0x85eb_ca6b));
+                for index in (1..holes.len()).rev() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let swap = (state as usize) % (index + 1);
+                    holes.swap(index, swap);
+                }
+            }
+            _ => {}
+        }
+        holes.truncate(count);
+        holes
+    }
+
     /// The room's members, in seat order, for a match roster.
     ///
     /// Read from the room rather than from the match plan: the plan names connections, and the
@@ -5252,8 +5346,11 @@ where
                 hole_count,
                 shot_timer_ms: millis(shot_timer)?,
                 game_timer_ms: millis(game_timer)?,
-                holes: (1..=hole_count)
+                holes: Self::retail_hole_order(course_id, hole_count, hole_mode)
+                    .into_iter()
                     .map(|number| RetailHole {
+                        // The seed is fixed for this deterministic room plan; the hole
+                        // sequence itself is authoritative and is retained in the card.
                         random_id: u32::from(number),
                         pin: 0,
                         course,
@@ -7676,8 +7773,8 @@ where
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                self.send(framed, &retail_census_from_snapshot(&snapshot))
-                    .await?;
+                // The room actor broadcasts the post-ready census to every member.
+                let _ = snapshot;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_EDIT) => {
@@ -7742,8 +7839,10 @@ where
                         RetailRoomSettingChange::RepeatHole(_)
                         | RetailRoomSettingChange::FixedRepeatHole(_)
                         | RetailRoomSettingChange::Artifact(_) => {
-                            // The reference carries these tags, but this server has no repeat-hole
-                            // or artifact state. Keep the frame client-safe without inventing it.
+                            // These settings affect hole selection/rewards. Until their
+                            // authoritative aggregates exist, refuse them rather than silently
+                            // acknowledging a value the match will discard.
+                            return Err(GameRuntimeError::Protocol);
                         }
                     }
                 }
@@ -7772,8 +7871,8 @@ where
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                self.send(framed, &retail_census_from_snapshot(&snapshot))
-                    .await?;
+                // The room actor broadcasts the post-settings census to every member.
+                let _ = snapshot;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_TEAM_CHANGE) => {
@@ -7791,17 +7890,9 @@ where
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                self.send(
-                    framed,
-                    &RetailTeamChangeAnnounce {
-                        connection_id: u32::try_from(identity.connection_id.get())
-                            .unwrap_or(u32::MAX),
-                        team: request.team,
-                    },
-                )
-                .await?;
-                self.send(framed, &retail_census_from_snapshot(&snapshot))
-                    .await?;
+                // TeamChanged and the resulting census are both broadcast by the room actor;
+                // do not echo either frame directly to the requester.
+                let _ = snapshot;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_RESYNC) => {
@@ -7898,15 +7989,10 @@ where
                 let LobbyRouteResult::Snapshot(snapshot) = routed else {
                     return Err(GameRuntimeError::Protocol);
                 };
-                self.send(
-                    framed,
-                    &RetailRoomStatus {
-                        room: retail_room_from_snapshot(&snapshot),
-                    },
-                )
-                .await?;
-                self.send(framed, &retail_census_from_snapshot(&snapshot))
-                    .await?;
+                // The room actor broadcasts the post-kick census to the surviving members;
+                // the removed member receives the 0x004c leave acknowledgement from its own
+                // Kicked event. Do not echo a second status/census from the requester path.
+                let _ = snapshot;
                 Ok(state)
             }
             (GameState::InRoom, RETAIL_C2S_ROOM_INVITE_INFO) => {
@@ -7916,19 +8002,12 @@ where
                     ServiceKind::Game,
                 )
                 .map_err(|_| GameRuntimeError::Protocol)?;
-                let routed = self
-                    .lobby
+                self.lobby
                     .route(identity.connection_id, LobbyRoomCommand::GetState)
                     .await
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                if let LobbyRouteResult::Snapshot(snapshot) = routed {
-                    self.deliver_retail_invite(
-                        snapshot.summary().id(),
-                        identity,
-                        AccountId::new(i64::from(request.account_id))
-                            .map_err(|_| GameRuntimeError::Protocol)?,
-                    );
-                }
+                // 0x0029 is the invitee lookup leg. It only receives the 0x0130
+                // acknowledgement; the actual invitation is sent by the paired 0x00ba frame.
                 self.send(
                     framed,
                     &RetailRoomInviteInfoResponse {
@@ -9410,6 +9489,26 @@ mod tests {
         hub.lounge(second, vec![7, 1, 2]);
         assert!(
             matches!(first_events.try_recv(), Ok(SocialEvent::Lounge { action, .. }) if action == vec![7, 1, 2])
+        );
+    }
+
+    #[test]
+    fn retail_hole_orders_are_deterministic_and_cover_requested_card() {
+        assert_eq!(
+            GameService::<FakeRepository>::retail_hole_order(1, 3, 0),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            GameService::<FakeRepository>::retail_hole_order(1, 9, 1),
+            vec![10, 11, 12, 13, 14, 15, 16, 17, 18]
+        );
+        let random = GameService::<FakeRepository>::retail_hole_order(7, 18, 2);
+        assert_eq!(random, GameService::<FakeRepository>::retail_hole_order(7, 18, 2));
+        assert_eq!(random.len(), 18);
+        assert_eq!(random.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 18);
+        let shuffle = GameService::<FakeRepository>::retail_hole_order(7, 18, 3);
+        assert_eq!(shuffle, GameService::<FakeRepository>::retail_hole_order(7, 18, 3));
+        assert_eq!(shuffle.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 18);
         );
     }
 

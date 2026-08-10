@@ -1207,7 +1207,7 @@ pub struct AdminAuditEvent {
     pub occurred_at: SystemTime,
 }
 
-/// Validation failure for synthetic one-hole match values.
+/// Validation failure for checked match values, including retail whole-card plans.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum MatchValueError {
     /// Course zero is reserved and cannot identify a configured course.
@@ -1216,6 +1216,9 @@ pub enum MatchValueError {
     /// Hole count must be in `1..=18`.
     #[error("hole count is outside policy")]
     InvalidHole,
+    /// Hole progression must be one of front, back, random, or shuffle.
+    #[error("hole progression is outside policy")]
+    InvalidHoleMode,
     /// Match par must be in `1..=10`.
     #[error("hole par is outside policy")]
     InvalidPar,
@@ -1376,6 +1379,9 @@ impl MatchPlan {
     ) -> Result<Self, MatchValueError> {
         if hole_count == 0 || hole_count > 18 {
             return Err(MatchValueError::InvalidHole);
+        }
+        if hole_mode > 3 {
+            return Err(MatchValueError::InvalidHoleMode);
         }
         if Self::par_in_range(par) {
             Ok(Self {
@@ -4911,6 +4917,10 @@ mod tests {
         assert_eq!(
             MatchPlan::with_holes(course, 19, 0, 4),
             Err(MatchValueError::InvalidHole)
+        );
+        assert_eq!(
+            MatchPlan::with_holes(course, 18, 4, 4),
+            Err(MatchValueError::InvalidHoleMode)
         );
     }
 

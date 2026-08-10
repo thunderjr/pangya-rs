@@ -1063,6 +1063,7 @@ impl PgRepository {
         validate_authority(&row, request.account_id(), request.result_key())?;
         if row.course_id != i64::from(request.config().course_id().get())
             || row.hole != i16::from(request.config().hole_count())
+            || row.hole_mode != i16::from(request.config().hole_mode())
             || row.par != i16::from(request.config().par())
         {
             return Err(MatchRepositoryError::WrongConfig);
@@ -3100,6 +3101,7 @@ fn validate_stroke_commit(
     validate_stroke_aggregate(row, persisted, request.result_key())?;
     if row.course_id != i64::from(request.config().course_id().get())
         || row.hole != i16::from(request.config().hole_count())
+        || row.hole_mode != i16::from(request.config().hole_mode())
         || row.par != i16::from(request.config().par())
     {
         return Err(MatchRepositoryError::WrongConfig);

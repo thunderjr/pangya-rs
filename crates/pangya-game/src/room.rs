@@ -428,6 +428,8 @@ struct RoomState {
     solo: SoloMatchState,
     stroke: StrokeMatchState,
     pending_stroke_persistence: Option<PendingStrokePersistence>,
+    /// Connection currently owning the queued persistence event, if any.
+    stroke_persistence_recipient: Option<PlayerConnectionId>,
     stroke_persistence_event_delivered: bool,
     stroke_persistence_control_delivered: bool,
     deadlines: DeadlineScheduler,
@@ -461,6 +463,7 @@ impl RoomState {
             solo: SoloMatchState::new(),
             stroke: StrokeMatchState::new(),
             pending_stroke_persistence: None,
+            stroke_persistence_recipient: None,
             stroke_persistence_event_delivered: false,
             stroke_persistence_control_delivered: false,
             deadlines: DeadlineScheduler::default(),
@@ -974,6 +977,7 @@ impl RoomState {
         }
         let begin = self.stroke.prepare_start(plan)?;
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         Ok(begin)
@@ -1215,6 +1219,7 @@ impl RoomState {
             .ok_or(StrokeMatchError::InvalidPhase)?;
         let committed = self.stroke.apply_commit(result)?;
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         self.deadlines.clear_stroke();
@@ -1229,6 +1234,7 @@ impl RoomState {
                 PendingStrokePersistence::Abort(abort) => return Some(abort),
                 PendingStrokePersistence::Settlement(_) => {
                     self.pending_stroke_persistence = None;
+                    self.stroke_persistence_recipient = None;
                     self.stroke_persistence_event_delivered = false;
                     self.stroke_persistence_control_delivered = false;
                 }
@@ -1261,6 +1267,7 @@ impl RoomState {
         }
         self.stroke.acknowledge_abort(abort)?;
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         self.broadcast_connections(&roster, RoomEvent::StrokeAborted(abort));
@@ -1323,6 +1330,7 @@ impl RoomState {
                 continue;
             };
             if self.deliver(member, work.event()) {
+                self.stroke_persistence_recipient = Some(member.identity.connection_id);
                 self.stroke_persistence_event_delivered = true;
                 return true;
             }
@@ -1335,6 +1343,7 @@ impl RoomState {
             Some(current) => current == work,
             None => {
                 self.pending_stroke_persistence = Some(work);
+                self.stroke_persistence_recipient = None;
                 self.stroke_persistence_event_delivered = false;
                 self.stroke_persistence_control_delivered = false;
                 true
@@ -1408,6 +1417,7 @@ impl RoomState {
             return;
         }
         self.pending_stroke_persistence = None;
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = false;
         if let Some(abort) = self.stroke.prioritize_abort(reason) {
@@ -1425,6 +1435,7 @@ impl RoomState {
         };
         // Replacement transfers the existing event/control claim to this control caller. Keep the
         // claim marked until durable acknowledgement; concurrent cleanup must never retry it.
+        self.stroke_persistence_recipient = None;
         self.stroke_persistence_event_delivered = false;
         self.stroke_persistence_control_delivered = true;
         Some(abort)
@@ -2545,11 +2556,24 @@ async fn run_room(
                         Err(RoomError::NotMember)
                     } else {
                         let outcome = state.disconnect_outcome(caller, reason);
+                        // If the disconnected connection owned the queued persistence event,
+                        // transfer that exact work to the surviving participant after removal.
+                        // The repository operation remains single-shot; only its coordinator
+                        // changes.
+                        let coordinator_left =
+                            state.stroke_persistence_recipient == Some(caller);
                         let abort = match outcome {
                             RoomCloseOutcome::M5Abort { request, .. } => Some(request),
                             _ => None,
                         };
                         state.remove(caller).map(|snapshot| {
+                            if coordinator_left
+                                && let Some(work) = state.pending_stroke_persistence
+                            {
+                                state.stroke_persistence_recipient = None;
+                                state.stroke_persistence_event_delivered = false;
+                                let _ = state.request_stroke_persistence(work, None);
+                            }
                             let retain_for_persistence = snapshot.is_none()
                                 && state.pending_stroke_persistence.is_some();
                             RoomDisconnect {

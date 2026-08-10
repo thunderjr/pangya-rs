@@ -85,10 +85,11 @@ pub enum RetailHoleProgression {
 /// # Provenance
 ///
 /// The tagged body shapes and valid value sets come from
-/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Types 11 and 12
+/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Types 11 through 13
 /// are additionally documented by `alter-pangya`
 /// `RoomSettingsUpdatePacketHandler.kt`; their bodies are retained as protocol
-/// facts because this server has no repeat-hole mode to apply yet.
+/// facts and explicitly refused by the game service until matching authoritative aggregates
+/// exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetailRoomSettingChange {
     /// Change the room name.
@@ -2772,6 +2773,24 @@ mod tests {
             encode_packet_payload(&RetailRoomInviteInfoResponse { account_id: 42 }, &profile())
                 .expect("legacy response");
         assert_eq!(response.as_slice(), [42, 0, 0, 0]);
+        let notification = encode_packet_payload(
+            &RetailRoomInviteNotification {
+                server_id: 1,
+                channel_id: 2,
+                room_id: 3,
+                inviter_id: 4,
+                inviter_nickname: b"Host".to_vec(),
+                invitee_id: 5,
+            },
+            &profile(),
+        )
+        .expect("target notification");
+        assert_eq!(notification[0..2], [255, 255]);
+        assert_eq!(RetailRoomInviteInfo::OPCODE, 0x0029);
+        assert_eq!(RetailRoomInvite::OPCODE, 0x00ba);
+        assert_eq!(RetailRoomInviteInfoResponse::OPCODE, 0x0130);
+        assert_eq!(RetailRoomInviteResponse::OPCODE, 0x012f);
+        assert_eq!(RetailRoomInviteNotification::OPCODE, 0x0083);
         let response = encode_packet_payload(
             &RetailRoomInviteResponse {
                 server_id: 1,

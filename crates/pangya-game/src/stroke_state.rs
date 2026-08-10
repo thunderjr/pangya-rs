@@ -149,6 +149,8 @@ pub enum StrokeMatchPhase {
     AwaitAction {
         /// Active captured connection.
         active: PlayerConnectionId,
+        /// One-based hole currently in progress.
+        hole: u8,
         /// Global one-based turn number.
         turn: u32,
         /// Active player's required sequence.
@@ -158,6 +160,8 @@ pub enum StrokeMatchPhase {
     AwaitResult {
         /// Active captured connection.
         active: PlayerConnectionId,
+        /// One-based hole currently in progress.
+        hole: u8,
         /// Global one-based turn number.
         turn: u32,
         /// Sequence of the pending action.
@@ -373,11 +377,13 @@ impl StrokeMatchState {
                     }
                     ActivePhase::AwaitAction => StrokeMatchPhase::AwaitAction {
                         active: player.connection_id,
+                        hole: active.current_hole,
                         turn: active.turn,
                         sequence: player.sequence,
                     },
                     ActivePhase::AwaitResult(action) => StrokeMatchPhase::AwaitResult {
                         active: player.connection_id,
+                        hole: active.current_hole,
                         turn: active.turn,
                         sequence: action.sequence(),
                     },
@@ -1268,6 +1274,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 2,
                 sequence: 1,
             }
@@ -1293,6 +1300,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -1363,6 +1371,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[0],
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -1372,6 +1381,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: roster[1],
+                hole: 1,
                 turn: 4,
                 sequence: 2,
             }
@@ -1391,6 +1401,7 @@ mod tests {
             left.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(1),
+                hole: 1,
                 turn: 1,
                 sequence: 1,
             }
@@ -1480,6 +1491,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(2),
+                hole: 1,
                 turn: 2,
                 sequence: 1,
             }
@@ -1506,6 +1518,7 @@ mod tests {
             state.phase(),
             StrokeMatchPhase::AwaitAction {
                 active: connection(2),
+                hole: 1,
                 turn: 3,
                 sequence: 2,
             }
@@ -2030,14 +2043,14 @@ mod tests {
                 prop_assert_eq!(&left, &right);
                 prop_assert_eq!(left.roster(), Some(plan.roster()));
                 match left.phase() {
-                    StrokeMatchPhase::AwaitAction { turn, sequence, active } => {
+                    StrokeMatchPhase::AwaitAction { turn, sequence, active, .. } => {
                         prop_assert!(turn > 0);
                         prop_assert!(sequence > 0);
                         prop_assert!(plan.roster().contains(&active));
                         prop_assert!(left.turn_generation().is_some());
                         prop_assert_eq!(left.game_generation(), Some(1));
                     }
-                    StrokeMatchPhase::AwaitResult { turn, sequence, active } => {
+                    StrokeMatchPhase::AwaitResult { turn, sequence, active, .. } => {
                         prop_assert!(turn > 0);
                         prop_assert!(sequence > 0);
                         prop_assert!(plan.roster().contains(&active));
