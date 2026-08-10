@@ -324,9 +324,11 @@ pub enum RoomOutbound {
     Ordered {
         /// Shared queue sender serialized with ordinary-capacity checks.
         sender: Arc<Mutex<mpsc::Sender<RoomEvent>>>,
-        /// Generation of the terminal frame queued for this session, retained until the socket
-        /// write is acknowledged. This state is shared with the room actor's member clone.
-        terminal_pending_delivery: Arc<AtomicU64>,
+        /// Retained terminal payload for this session. It remains available after the queue marker
+        /// is consumed until the socket write acknowledges the exact generation.
+        terminal_payload: Arc<Mutex<Option<(StrokeMatchResult, u64)>>>,
+        /// Generation of the terminal marker currently in the ordered queue, if any.
+        terminal_queued_generation: Arc<AtomicU64>,
     },
 }
 
@@ -352,7 +354,8 @@ impl RoomOutbound {
         (
             Self::Ordered {
                 sender: Arc::new(Mutex::new(sender)),
-                terminal_pending_delivery: Arc::new(AtomicU64::new(0)),
+                terminal_payload: Arc::new(Mutex::new(None)),
+                terminal_queued_generation: Arc::new(AtomicU64::new(0)),
             },
             receiver,
         )
@@ -369,25 +372,26 @@ impl RoomOutbound {
             },
             Self::Ordered {
                 sender,
-                terminal_pending_delivery,
+                terminal_payload,
+                ..
             } => {
                 let Ok(sender) = sender.lock() else {
                     return OrdinarySendResult::Closed;
                 };
-                // The final queue slot is reserved exclusively for 0x0066 settlement. Holding
-                // this lock while reading the pending flag makes the backpressure decision atomic
-                // with terminal enqueue: an ordinary writer can never cancel a session between a
-                // queued terminal frame and its flag publication.
+                // The final queue slot is reserved exclusively for terminal settlement. Holding
+                // this lock while reading the retained payload makes the backpressure decision
+                // atomic with terminal enqueue.
+                let terminal_pending = terminal_payload
+                    .lock()
+                    .is_ok_and(|payload| payload.is_some());
                 if sender.capacity() <= 1 {
-                    return OrdinarySendResult::Backpressured {
-                        terminal_pending: terminal_pending_delivery.load(Ordering::Acquire) != 0,
-                    };
+                    return OrdinarySendResult::Backpressured { terminal_pending };
                 }
                 match sender.try_send(event) {
                     Ok(()) => OrdinarySendResult::Sent,
-                    Err(mpsc::error::TrySendError::Full(_)) => OrdinarySendResult::Backpressured {
-                        terminal_pending: terminal_pending_delivery.load(Ordering::Acquire) != 0,
-                    },
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        OrdinarySendResult::Backpressured { terminal_pending }
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => OrdinarySendResult::Closed,
                 }
             }
@@ -398,17 +402,15 @@ impl RoomOutbound {
         matches!(self.try_send_ordinary(event), OrdinarySendResult::Sent)
     }
 
-    #[cfg(test)]
     pub(crate) fn terminal_pending_generation(&self) -> Option<u64> {
         match self {
             Self::Legacy(_) => None,
             Self::Ordered {
-                terminal_pending_delivery,
-                ..
-            } => match terminal_pending_delivery.load(Ordering::Acquire) {
-                0 => None,
-                generation => Some(generation),
-            },
+                terminal_payload, ..
+            } => terminal_payload
+                .lock()
+                .ok()
+                .and_then(|payload| payload.map(|(_, generation)| generation)),
         }
     }
 
@@ -421,11 +423,30 @@ impl RoomOutbound {
     /// connection event can therefore never clear a newer pending terminal delivery.
     pub(crate) fn acknowledge_terminal_delivery(&self, generation: u64) {
         if let Self::Ordered {
-            terminal_pending_delivery,
+            terminal_payload,
+            terminal_queued_generation,
             ..
         } = self
         {
-            let _ = terminal_pending_delivery.compare_exchange(
+            let Ok(mut payload) = terminal_payload.lock() else {
+                return;
+            };
+            if payload.is_some_and(|(_, current)| current == generation) {
+                *payload = None;
+                terminal_queued_generation.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// Marks the exact terminal queue marker as consumed by the session writer. The payload stays
+    /// retained until `acknowledge_terminal_delivery` confirms that both socket frames completed.
+    pub(crate) fn begin_terminal_delivery(&self, generation: u64) {
+        if let Self::Ordered {
+            terminal_queued_generation,
+            ..
+        } = self
+        {
+            let _ = terminal_queued_generation.compare_exchange(
                 generation,
                 0,
                 Ordering::AcqRel,
@@ -441,13 +462,42 @@ impl RoomOutbound {
     ) -> bool {
         let event = match self {
             Self::Legacy(_) => RoomEvent::StrokeCommitted(delivery.result),
-            Self::Ordered { .. } => RoomEvent::StrokeCommittedWithGeneration {
-                result: delivery.result,
-                generation: delivery.generation,
-            },
+            Self::Ordered {
+                terminal_payload,
+                terminal_queued_generation,
+                ..
+            } => {
+                let Ok(mut payload) = terminal_payload.lock() else {
+                    return false;
+                };
+                if payload.is_some_and(|(_, current)| current == delivery.generation)
+                    && terminal_queued_generation.load(Ordering::Acquire) == delivery.generation
+                {
+                    return true;
+                }
+                *payload = Some((delivery.result, delivery.generation));
+                terminal_queued_generation.store(delivery.generation, Ordering::Release);
+                drop(payload);
+                RoomEvent::StrokeCommittedWithGeneration {
+                    result: delivery.result,
+                    generation: delivery.generation,
+                }
+            }
         };
         loop {
             if cancellation.is_cancelled() {
+                if let Self::Ordered {
+                    terminal_queued_generation,
+                    ..
+                } = self
+                {
+                    let _ = terminal_queued_generation.compare_exchange(
+                        delivery.generation,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
                 return false;
             }
             let sent = match self {
@@ -458,26 +508,24 @@ impl RoomOutbound {
                 },
                 Self::Ordered {
                     sender,
-                    terminal_pending_delivery,
+                    terminal_payload,
+                    terminal_queued_generation,
                 } => {
                     let Ok(sender) = sender.lock() else {
                         return false;
                     };
-                    // Publish while holding the queue lock. If the queue is full, ordinary
-                    // delivery observes this generation and retains the member instead of
-                    // canceling its session; if enqueue fails, remove the reservation below.
-                    terminal_pending_delivery.store(delivery.generation, Ordering::Release);
                     match sender.try_send(event.clone()) {
                         Ok(()) => return true,
                         Err(mpsc::error::TrySendError::Closed(_))
                         | Err(mpsc::error::TrySendError::Full(_)) => {
-                            let _ = terminal_pending_delivery.compare_exchange(
-                                delivery.generation,
-                                0,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
+                            terminal_queued_generation.store(0, Ordering::Release);
                             if sender.is_closed() {
+                                if let Ok(mut payload) = terminal_payload.lock()
+                                    && payload
+                                        .is_some_and(|(_, current)| current == delivery.generation)
+                                {
+                                    *payload = None;
+                                }
                                 return false;
                             }
                             false
@@ -1506,15 +1554,19 @@ impl RoomState {
         self.stroke_persistence_control_delivered = false;
         self.deadlines.clear_stroke();
         for (index, connection_id) in roster.iter().copied().enumerate() {
-            if delivered[index] {
-                continue;
-            }
             let Some(member_index) = self.member_index(connection_id) else {
                 continue;
             };
             let Some(member) = self.members.get(member_index) else {
                 continue;
             };
+            // `delivered` records that this session was offered the marker, not that the socket
+            // acknowledged the payload. Retry an offered-but-unacknowledged terminal after the
+            // marker has drained; an acknowledged generation has no retained payload and is done.
+            if delivered[index] && member.outbound.terminal_pending_generation() != Some(generation)
+            {
+                continue;
+            }
             let cancellation = member.cancellation.clone();
             let delivery = TerminalDelivery {
                 result: committed,
@@ -3582,6 +3634,24 @@ mod tests {
                 generation: 7
             })
         );
+        // Consuming the ordered marker is not an ACK. A failed socket write leaves the retained
+        // payload eligible for an idempotent retry, while a later socket success clears it.
+        outbound.begin_terminal_delivery(7);
+        assert!(
+            outbound
+                .send_terminal(&CancellationToken::new(), delivery)
+                .await
+        );
+        assert_eq!(
+            events.recv().await,
+            Some(RoomEvent::StrokeCommittedWithGeneration {
+                result,
+                generation: 7
+            })
+        );
+        outbound.begin_terminal_delivery(7);
+        outbound.acknowledge_terminal_delivery(7);
+        assert!(!outbound.terminal_pending_delivery());
     }
 
     fn playing_stroke_room(state: &mut RoomState, plan: &StrokeStartPlan) {

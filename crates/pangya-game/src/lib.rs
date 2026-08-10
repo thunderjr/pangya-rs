@@ -1665,6 +1665,7 @@ where
                         handled = async {
                             match event {
                                 RoomEvent::StrokeCommittedWithGeneration { result, generation } => {
+                                    terminal_outbound.begin_terminal_delivery(generation);
                                     self.handle_terminal_delivery(
                                         &mut framed,
                                         state,
