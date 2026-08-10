@@ -520,6 +520,68 @@ impl crate::EncodePacket for EmptyMessageServerList {
         Ok(())
     }
 }
+/// A MessageService endpoint in LoginService `0x0009` and GameService `0x00fc` lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageServerEntry {
+    /// Display name, at most 39 bytes.
+    pub name: Vec<u8>,
+    /// Protocol server identifier.
+    pub id: u32,
+    /// Maximum simultaneous users.
+    pub max_users: u32,
+    /// Current users.
+    pub num_users: u32,
+    /// IPv4 text, at most 17 bytes.
+    pub ip_address: Vec<u8>,
+    /// TCP endpoint port.
+    pub port: u16,
+    /// Source-observed unknown bytes.
+    pub unknown2: UnknownBytes<2>,
+    /// Region-specific flags.
+    pub flags: UnknownBytes<2>,
+    /// Source-observed unknown bytes.
+    pub unknown3: UnknownBytes<14>,
+    /// Unused message-server character icon.
+    pub char_icon: u16,
+}
+
+/// LoginService opcode `0x0009` MessageService list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageServerList {
+    /// Advertised message endpoints.
+    pub servers: Vec<MessageServerEntry>,
+}
+impl crate::EncodePacket for MessageServerList {
+    const OPCODE: u16 = 9;
+    fn encode(
+        &self,
+        w: &mut crate::PacketWriter,
+        p: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(p)?;
+        if self.servers.len() > 255 {
+            return Err(PacketEncodeError::Limit {
+                field: "message server count",
+                actual: self.servers.len(),
+                maximum: 255,
+            });
+        }
+        w.u8(self.servers.len() as u8);
+        for server in &self.servers {
+            w.fixed_nul(&server.name, 40)?;
+            w.u32_le(server.id);
+            w.u32_le(server.max_users);
+            w.u32_le(server.num_users);
+            w.fixed_nul(&server.ip_address, 18)?;
+            w.u16_le(server.port);
+            w.bytes(&server.unknown2.0);
+            w.bytes(&server.flags.0);
+            w.bytes(&server.unknown3.0);
+            w.u16_le(server.char_icon);
+        }
+        Ok(())
+    }
+}
 /// LoginService opcode `0x0010` login key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoginKey {

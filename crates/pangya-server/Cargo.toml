@@ -16,6 +16,7 @@ pangya-data = { version = "0.1.0", path = "../pangya-data" }
 pangya-domain = { version = "0.1.0", path = "../pangya-domain" }
 pangya-game = { version = "0.1.0", path = "../pangya-game" }
 pangya-login = { version = "0.1.0", path = "../pangya-login" }
+pangya-message = { version = "0.1.0", path = "../pangya-message" }
 pangya-observability = { version = "0.1.0", path = "../pangya-observability" }
 pangya-protocol = { version = "0.1.0", path = "../pangya-protocol" }
 pangya-storage = { version = "0.1.0", path = "../pangya-storage" }

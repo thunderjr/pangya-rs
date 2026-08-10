@@ -13,13 +13,14 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use pangya_domain::{
     AccountId, AccountRepository, AccountStatus, AuthenticationRecord, HandoverRepository,
-    MAX_STARTER_ITEMS, NewAccount, Nickname, NormalizedUsername, RepositoryError,
-    ServiceKind as DomainServiceKind, SetupState, SourceAddressPrefix, StarterGrant, Username,
+    MAX_STARTER_ITEMS, MessageEligibilityRepository, NewAccount, NewMessageEligibility, Nickname,
+    NormalizedUsername, RepositoryError, ServiceKind as DomainServiceKind, SetupState,
+    SourceAddressPrefix, StarterGrant, Username,
 };
 use pangya_protocol::{
-    ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket,
-    EmptyMessageServerList, EncodePacket, ErrorClass, FrameCodec, GameServerEntry, GameServerList,
-    GhostLogin, InboundFrame, LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
+    ChatMacros, CheckNickname, CodecLimits, CompatibilityProfile, DecodePacket, EncodePacket,
+    ErrorClass, FrameCodec, GameServerEntry, GameServerList, GhostLogin, InboundFrame,
+    LOGIN_ERROR_ALREADY_LOGGED_IN, LOGIN_ERROR_DUPLICATE_CONNECTION,
     LOGIN_ERROR_INVALID_CREDENTIALS, LOGIN_ERROR_INVALID_RECONNECT_TOKEN, LoginKey, LoginResult,
     LoginSuccess, NICKNAME_CHECK_IN_USE, NICKNAME_CHECK_SUCCESS, NicknameCheckResult,
     OutboundFrame, PacketEncodeError, PacketReader, ReconnectRequest, SelectCharacter,
@@ -215,6 +216,8 @@ impl LoginObserver for NoopLoginObserver {}
 /// Configured GameService advertisement used only by LoginService.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisedGameServer {
+    /// MessageService endpoint advertised alongside this GameService.
+    pub message_server: Option<pangya_protocol::MessageServerEntry>,
     /// Protocol server identifier.
     pub id: u16,
     /// Fixed-width server display name.
@@ -355,7 +358,7 @@ pub enum LoginRuntimeError {
 /// Generic LoginService composition with no SQLx dependency.
 pub struct LoginService<R>
 where
-    R: AccountRepository + HandoverRepository + 'static,
+    R: AccountRepository + HandoverRepository + MessageEligibilityRepository + 'static,
 {
     repository: Arc<R>,
     credentials: BoundedCredentialExecutor,
@@ -378,13 +381,14 @@ where
 
 struct Admission {
     prefix: SourceAddressPrefix,
+    peer_ip: std::net::IpAddr,
     _global: OwnedSemaphorePermit,
     _source: KeyedCapacityGuard<SourceAddressPrefix>,
 }
 
 impl<R> std::fmt::Debug for LoginService<R>
 where
-    R: AccountRepository + HandoverRepository + 'static,
+    R: AccountRepository + HandoverRepository + MessageEligibilityRepository + 'static,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -397,7 +401,7 @@ where
 
 impl<R> LoginService<R>
 where
-    R: AccountRepository + HandoverRepository + 'static,
+    R: AccountRepository + HandoverRepository + MessageEligibilityRepository + 'static,
 {
     /// Creates a service from validated limits and repository composition.
     ///
@@ -596,6 +600,7 @@ where
             })?;
         Ok(Admission {
             prefix,
+            peer_ip: peer.ip(),
             _global: global,
             _source: source,
         })
@@ -608,6 +613,7 @@ where
         shutdown: CancellationToken,
     ) -> Result<(), LoginRuntimeError> {
         let prefix = admission.prefix.clone();
+        let peer_ip = admission.peer_ip;
         let connection_id = ConnectionId(self.connection_ids.fetch_add(1, Ordering::Relaxed));
         self.observer.accepted(connection_id, &prefix);
         let span = tracing::info_span!(
@@ -640,7 +646,7 @@ where
                 biased;
                 result = timeout(
                     self.config.limits.login_timeout,
-                    self.run_connection(framed, prefix, connection_shutdown, session_control, probes),
+                    self.run_connection(framed, prefix, peer_ip, connection_shutdown, session_control, probes),
                 ) => match result {
                     Ok(result) => result,
                     Err(_) => {
@@ -669,6 +675,7 @@ where
         &self,
         mut framed: Framed<TcpStream, FrameCodec>,
         source: SourceAddressPrefix,
+        peer_ip: std::net::IpAddr,
         shutdown: CancellationToken,
         session_control: SessionControl,
         mut probes: SessionProbeReceiver,
@@ -863,7 +870,13 @@ where
                     _presence = Some(guard);
                     if machine.state() == LoginState::IssueHandover {
                         let token = self
-                            .issue_handover(&mut framed, &mut machine, account.as_ref(), &source)
+                            .issue_handover(
+                                &mut framed,
+                                &mut machine,
+                                account.as_ref(),
+                                &source,
+                                peer_ip,
+                            )
                             .await?;
                         handover_token = Some(token);
                     }
@@ -930,6 +943,12 @@ where
                             needs_character: false,
                         })
                         .map_err(|_| LoginRuntimeError::Protocol)?;
+                    if let Some(record) = account.as_mut() {
+                        record.nickname = Some(
+                            String::from_utf8(packet.nickname.clone())
+                                .map_err(|_| LoginRuntimeError::Protocol)?,
+                        );
+                    }
                     // A successful set is answered with the login result, not another nickname
                     // check response: upstream breaks out of its nickname loop straight into the
                     // common success tail. Answering with `0x000e` leaves a real client sitting on
@@ -948,7 +967,13 @@ where
                     )
                     .await?;
                     let token = self
-                        .issue_handover(&mut framed, &mut machine, account.as_ref(), &source)
+                        .issue_handover(
+                            &mut framed,
+                            &mut machine,
+                            account.as_ref(),
+                            &source,
+                            peer_ip,
+                        )
                         .await?;
                     handover_token = Some(token);
                 }
@@ -1087,7 +1112,13 @@ where
                     )
                     .await?;
                     let token = self
-                        .issue_handover(&mut framed, &mut machine, account.as_ref(), &source)
+                        .issue_handover(
+                            &mut framed,
+                            &mut machine,
+                            account.as_ref(),
+                            &source,
+                            peer_ip,
+                        )
                         .await?;
                     handover_token = Some(token);
                 }
@@ -1252,6 +1283,7 @@ where
             .map_err(|_| LoginRuntimeError::Repository)?;
         Ok(Some(AuthenticationRecord {
             account: aggregate.account,
+            nickname: aggregate.profile.nickname,
             credential_hash: hash,
             setup_state: aggregate.profile.setup_state,
         }))
@@ -1282,6 +1314,7 @@ where
         machine: &mut LoginStateMachine,
         account: Option<&AuthenticationRecord>,
         source: &SourceAddressPrefix,
+        peer_ip: std::net::IpAddr,
     ) -> Result<Zeroizing<Vec<u8>>, LoginRuntimeError> {
         let account = account.ok_or(LoginRuntimeError::Protocol)?;
         let generated = generate_handover(
@@ -1294,6 +1327,23 @@ where
         self.repository_call(self.repository.issue(generated.record))
             .await
             .map_err(|_| LoginRuntimeError::Handover)?;
+        if let Some(nickname) = account.nickname.as_deref() {
+            let now = SystemTime::now();
+            let expires_at = now
+                .checked_add(crate::DEFAULT_HANDOVER_LIFETIME)
+                .ok_or(LoginRuntimeError::Handover)?;
+            self.repository_call(self.repository.issue_message_eligibility(
+                NewMessageEligibility {
+                    account_id: account.account.id,
+                    nickname: nickname.to_owned(),
+                    peer_ip,
+                    issued_at: now,
+                    expires_at,
+                },
+            ))
+            .await
+            .map_err(|_| LoginRuntimeError::Handover)?;
+        }
         machine
             .apply(LoginEvent::HandoverIssued)
             .map_err(|_| LoginRuntimeError::Protocol)?;
@@ -1314,7 +1364,15 @@ where
             .await
             .map_err(|_| LoginRuntimeError::Repository)?;
         self.send(framed, &ChatMacros { values: macros }).await?;
-        self.send(framed, &EmptyMessageServerList).await?;
+        let message_servers = self.config.game_server.message_server.clone().map_or_else(
+            || pangya_protocol::LoginMessageServerList {
+                servers: Vec::new(),
+            },
+            |server| pangya_protocol::LoginMessageServerList {
+                servers: vec![server],
+            },
+        );
+        self.send(framed, &message_servers).await?;
         self.send(framed, &self.server_list()).await?;
         Ok(bearer)
     }

@@ -35,6 +35,7 @@ use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CanonicalTransportSecret, CredentialPolicy,
     LoginRuntimeConfig, LoginRuntimeLimits, LoginService,
 };
+use pangya_message::{MessageService, PostgresStore};
 use pangya_observability::{
     HealthState, LogFormat, M2Metrics, TracingError, install_tracing, serve_admin,
 };
@@ -266,8 +267,9 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
     stroke: Option<configuration::ValidatedStrokeTwo>,
     login_bind: SocketAddr,
     http_bind: SocketAddr,
+    message_bind: SocketAddr,
     game_bind: Option<SocketAddr>,
-) -> Result<(TcpListener, TcpListener, Option<TcpListener>), ServerError> {
+) -> Result<(TcpListener, TcpListener, TcpListener, Option<TcpListener>), ServerError> {
     let recovery = match (solo, stroke) {
         (None, None) => None,
         (Some(solo), None) => Some((solo.commit_timeout, solo.startup_recovery_limit)),
@@ -297,6 +299,9 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
     let http = TcpListener::bind(http_bind)
         .await
         .map_err(|_| ServerError::Bind)?;
+    let message = TcpListener::bind(message_bind)
+        .await
+        .map_err(|_| ServerError::Bind)?;
     let game = match game_bind {
         Some(address) => Some(
             TcpListener::bind(address)
@@ -305,7 +310,7 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
         ),
         None => None,
     };
-    Ok((login, http, game))
+    Ok((login, http, message, game))
 }
 
 /// Resolves the configured course plan a mode will play, preferring an operator-declared par.
@@ -381,6 +386,7 @@ fn compose_game_service<R>(
     repository: Arc<R>,
     catalog: Catalog,
     config: GameRuntimeConfig,
+    message_server: pangya_protocol::MessageServerEntry,
     observer: Arc<dyn GameObserver>,
     shop_overlay: Option<tokio::sync::watch::Receiver<pangya_domain::ShopOverlay>>,
 ) -> Result<Arc<GameService<R>>, ServerError>
@@ -388,6 +394,7 @@ where
     R: HandoverRepository + PlayerRepository + MatchRepository + EconomyRepository + 'static,
 {
     GameService::new(repository, catalog, config, observer)
+        .map(|service| service.with_message_server(message_server))
         .map(|service| match shop_overlay {
             Some(overlay) => service.with_shop_overlay(overlay),
             None => service,
@@ -485,6 +492,18 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 economy,
                 retail_bootstrap: config.retail_bootstrap,
             },
+            pangya_protocol::MessageServerEntry {
+                name: b"PangYa-RS Message".to_vec(),
+                id: u32::from(config.message_id),
+                max_users: config.message_capacity,
+                num_users: 0,
+                ip_address: config.message_advertise.ip().to_string().into_bytes(),
+                port: config.message_advertise.port(),
+                unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                flags: pangya_protocol::UnknownBytes([0; 2]),
+                unknown3: pangya_protocol::UnknownBytes([0; 14]),
+                char_icon: 0,
+            },
             metrics.clone(),
             shop_overlay.as_ref().map(|sender| sender.subscribe()),
         )?),
@@ -495,15 +514,17 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     } else {
         None
     };
-    let (login_listener, http_listener, game_listener) = bind_after_startup_recovery(
-        repository.as_ref(),
-        config.solo_practice,
-        config.stroke_two,
-        config.login_bind,
-        config.http_bind,
-        game_bind,
-    )
-    .await?;
+    let (login_listener, http_listener, message_listener, game_listener) =
+        bind_after_startup_recovery(
+            repository.as_ref(),
+            config.solo_practice,
+            config.stroke_two,
+            config.login_bind,
+            config.http_bind,
+            config.message_bind,
+            game_bind,
+        )
+        .await?;
 
     // Prepared before readiness is claimed and before any client can ask for it. Building the
     // update list checksums the whole client directory, so it runs on a blocking worker rather
@@ -609,6 +630,12 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                 starter: config.starter.clone(),
                 allowed_character_types: config.allowed_character_type_ids.clone(),
                 game_server: AdvertisedGameServer {
+                    message_server: Some(pangya_protocol::MessageServerEntry {
+                        name: b"PangYa-RS Message".to_vec(), id: u32::from(config.message_id), max_users: config.message_capacity,
+                        num_users: 0, ip_address: config.message_advertise.ip().to_string().into_bytes(), port: config.message_advertise.port(),
+                        unknown2: pangya_protocol::UnknownBytes([0; 2]), flags: pangya_protocol::UnknownBytes([0; 2]),
+                        unknown3: pangya_protocol::UnknownBytes([0; 14]), char_icon: 0,
+                    }),
                     id: config.game_id,
                     name: config.game_name.clone(),
                     ipv4: game_ipv4,
@@ -627,6 +654,25 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let login_shutdown = shutdown.child_token();
+    let message = MessageService::with_store(
+        std::sync::Arc::new(PostgresStore::new(pool.clone())),
+        0,
+        CodecLimits {
+            max_client_frame_bytes: config.max_client_frame_bytes,
+            max_server_plaintext_bytes: config.max_plaintext_bytes,
+            max_expansion_ratio: config.max_expansion_ratio,
+        },
+    );
+    let message_shutdown = shutdown.child_token();
+    tasks.spawn(async move {
+        message
+            .serve(message_listener, message_shutdown)
+            .await
+            .map_err(|error| {
+                tracing::error!(service = "message", %error, "listener stopped with an error");
+                ServerError::Runtime
+            })
+    });
     tasks.spawn(async move {
         // The typed listener error is recorded before it collapses into the supervisor's
         // single Runtime outcome. Without this a listener that dies during startup takes the
@@ -1549,6 +1595,18 @@ mod tests {
                     solo_practice: Some(drifted),
                     ..GameRuntimeConfig::default()
                 },
+                pangya_protocol::MessageServerEntry {
+                    name: b"Message".to_vec(),
+                    id: 1,
+                    max_users: 200,
+                    num_users: 0,
+                    ip_address: b"127.0.0.1".to_vec(),
+                    port: 30303,
+                    unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                    flags: pangya_protocol::UnknownBytes([0; 2]),
+                    unknown3: pangya_protocol::UnknownBytes([0; 14]),
+                    char_icon: 0,
+                },
                 Arc::new(M2Metrics::default()),
                 None,
             ),
@@ -1565,10 +1623,18 @@ mod tests {
         let login_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve login");
         let http_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve http");
         let game_reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve game");
+        let message_reservation =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve message");
         let login = login_reservation.local_addr().expect("login address");
         let http = http_reservation.local_addr().expect("http address");
         let game = game_reservation.local_addr().expect("game address");
-        drop((login_reservation, http_reservation, game_reservation));
+        let message = message_reservation.local_addr().expect("message address");
+        drop((
+            login_reservation,
+            http_reservation,
+            game_reservation,
+            message_reservation,
+        ));
 
         let repository = Arc::new(RecoveryGate::new());
         let task_repository = Arc::clone(&repository);
@@ -1597,6 +1663,7 @@ mod tests {
                 }),
                 login,
                 http,
+                message,
                 Some(game),
             )
             .await
@@ -1605,19 +1672,25 @@ mod tests {
             .await
             .expect("recovery started");
         assert_eq!(repository.calls.load(Ordering::Relaxed), 1);
-        for address in [login, http, game] {
+        for address in [login, http, message, game] {
             assert!(TcpStream::connect(address).await.is_err());
         }
 
         repository.release.notify_one();
-        let (login_listener, http_listener, game_listener) = startup
+        let (login_listener, http_listener, message_listener, game_listener) = startup
             .await
             .expect("startup join")
             .expect("startup listeners");
         assert!(TcpStream::connect(login).await.is_ok());
         assert!(TcpStream::connect(http).await.is_ok());
+        assert!(TcpStream::connect(message).await.is_ok());
         assert!(TcpStream::connect(game).await.is_ok());
-        drop((login_listener, http_listener, game_listener));
+        drop((
+            login_listener,
+            http_listener,
+            message_listener,
+            game_listener,
+        ));
     }
 
     #[test]

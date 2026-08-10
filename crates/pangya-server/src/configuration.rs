@@ -68,6 +68,7 @@ struct RawConfig {
     server: ServerSection,
     login: LoginSection,
     game: GameSection,
+    message: MessageSection,
     http: HttpSection,
     client_web: ClientWebSection,
     database: DatabaseSection,
@@ -154,6 +155,12 @@ section_default!(GameSection {
     solo_practice: SoloPracticeSection = SoloPracticeSection::default(),
     stroke_two: StrokeTwoSection = StrokeTwoSection::default(),
     economy: EconomySection = EconomySection::default()
+});
+section_default!(MessageSection {
+    bind: String = "127.0.0.1:30303".to_owned(),
+    advertise: String = "127.0.0.1:30303".to_owned(),
+    id: u16 = 1,
+    capacity: u32 = 200
 });
 section_default!(HttpSection {
     bind: String = "127.0.0.1:8080".to_owned(),
@@ -337,6 +344,14 @@ pub struct AppConfig {
     pub game_name: String,
     /// Game server capacity.
     pub game_capacity: u32,
+    /// MessageService listener.
+    pub message_bind: SocketAddr,
+    /// MessageService endpoint advertised to clients.
+    pub message_advertise: SocketAddr,
+    /// MessageService identifier.
+    pub message_id: u16,
+    /// MessageService capacity.
+    pub message_capacity: u32,
     /// Initial synthetic channel ID.
     pub game_channel_id: u32,
     /// Retail sub-server IDs advertised and accepted for channel transitions.
@@ -653,6 +668,8 @@ fn validate(
         .then(|| socket(&raw.game.bind, "game.bind", &mut issues))
         .flatten();
     let game_advertise = socket(&raw.game.advertise, "game.advertise", &mut issues);
+    let message_bind = socket(&raw.message.bind, "message.bind", &mut issues);
+    let message_advertise = socket(&raw.message.advertise, "message.advertise", &mut issues);
     let http_bind = socket(&raw.http.bind, "http.bind", &mut issues);
     let client_web_bind = raw
         .client_web
@@ -672,6 +689,15 @@ fn validate(
         if address.port() == 0 {
             issue(&mut issues, "game.advertise", "port must be nonzero");
         }
+    }
+    if let Some(address) = message_advertise
+        && (!matches!(address.ip(), IpAddr::V4(_)) || address.port() == 0)
+    {
+        issue(
+            &mut issues,
+            "message.advertise",
+            "must use nonzero IPv4 endpoint",
+        );
     }
     if let Some(address) = login_advertise {
         if !matches!(address.ip(), IpAddr::V4(_)) {
@@ -703,6 +729,7 @@ fn validate(
     for (field, address) in [
         ("login.bind", login_bind),
         ("game.bind", game_bind),
+        ("message.bind", message_bind),
         ("http.bind", http_bind),
         ("client_web.bind", client_web_bind),
     ] {
@@ -710,18 +737,30 @@ fn validate(
             issue(&mut issues, field, "listener port must be nonzero");
         }
     }
-    let binds = [login_bind, game_bind, http_bind, client_web_bind]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let binds = [
+        login_bind,
+        game_bind,
+        message_bind,
+        http_bind,
+        client_web_bind,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     let unique = binds.iter().collect::<HashSet<_>>();
     if unique.len() != binds.len() {
         issue(&mut issues, "binds", "listener binds must be unique");
     }
-    let public_bind_enabled = [login_bind, game_bind, http_bind, client_web_bind]
-        .into_iter()
-        .flatten()
-        .any(|address| !address.ip().is_loopback());
+    let public_bind_enabled = [
+        login_bind,
+        game_bind,
+        message_bind,
+        http_bind,
+        client_web_bind,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|address| !address.ip().is_loopback());
     if public_bind_enabled && !acknowledge_public_bind {
         issue(
             &mut issues,
@@ -1670,6 +1709,10 @@ fn validate(
         game_id: raw.game.id,
         game_name: raw.game.name,
         game_capacity: raw.game.capacity,
+        message_bind: required(message_bind)?,
+        message_advertise: required(message_advertise)?,
+        message_id: raw.message.id,
+        message_capacity: raw.message.capacity,
         game_channel_id: raw.game.channel_id,
         game_channel_ids: raw.game.channels,
         game_max_rooms: raw.game.max_rooms,

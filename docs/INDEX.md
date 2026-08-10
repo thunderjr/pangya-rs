@@ -238,6 +238,7 @@ opcode is handled, client-safely refused, or deliberately ignored with a documen
 | [`protocol/US852_SUBSYSTEM_GAPS.md`](protocol/US852_SUBSYSTEM_GAPS.md) | Every unhandled client opcode by subsystem, the traps, and the ranked order reproduced in §4 above | 2026-08-08 |
 | [`protocol/US852_SOCIAL.md`](protocol/US852_SOCIAL.md) | Issue #12 lobby/social packet layouts, delivery scope, macro persistence, and safe no-reply outcomes | 2026-08-10 |
 | [`protocol/US852_TOURNAMENT_MODE.md`](protocol/US852_TOURNAMENT_MODE.md) | Tournament/Grand Prix mode specification | 2026-08-08 |
+| [`protocol/US852_MESSAGE_SERVICE.md`](protocol/US852_MESSAGE_SERVICE.md) | MessageService namespace, handshake, social state, and advertisements | 2026-08-10 |
 
 **Synthetic — the `0x7f**` families. Placeholders no real client will ever send. Never
 identify these as retail protocol** (ADR-0010 through ADR-0014; removal plan in

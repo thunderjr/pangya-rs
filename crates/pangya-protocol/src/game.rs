@@ -516,6 +516,59 @@ pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
     0x0047, // rank-server address request; rank service is intentionally absent
 ];
 
+/// U.S. 852 GameService request for the MessageService endpoint, client opcode `0x008b`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetailMessageServerListRequest;
+impl DecodePacket for RetailMessageServerListRequest {
+    const OPCODE: u16 = 0x008b;
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        require_end(reader)?;
+        Ok(Self)
+    }
+}
+
+/// U.S. 852 GameService MessageService endpoint response, server opcode `0x00fc`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailMessageServerList {
+    /// Advertised message endpoints.
+    pub servers: Vec<crate::MessageServerEntry>,
+}
+impl EncodePacket for RetailMessageServerList {
+    const OPCODE: u16 = 0x00fc;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        if self.servers.len() > 255 {
+            return Err(PacketEncodeError::Limit {
+                field: "message server count",
+                actual: self.servers.len(),
+                maximum: 255,
+            });
+        }
+        writer.u8(self.servers.len() as u8);
+        for server in &self.servers {
+            writer.fixed_nul(&server.name, 40)?;
+            writer.u32_le(server.id);
+            writer.u32_le(server.max_users);
+            writer.u32_le(server.num_users);
+            writer.fixed_nul(&server.ip_address, 18)?;
+            writer.u16_le(server.port);
+            writer.bytes(&server.unknown2.0);
+            writer.bytes(&server.flags.0);
+            writer.bytes(&server.unknown3.0);
+            writer.u16_le(server.char_icon);
+        }
+        Ok(())
+    }
+}
+
 /// Returns whether `opcode` is a session-level opcode this server accepts without replying.
 #[must_use]
 pub fn is_retail_accepted_session_opcode(opcode: u16) -> bool {

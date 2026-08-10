@@ -85,8 +85,9 @@ use pangya_protocol::{
     RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
-    RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
+    RetailMessageServerList, RetailMessageServerListRequest, RetailMultiplayerJoined,
+    RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered, RetailMyRoomFurniture,
+    RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
     RetailNewSessionKeyRequest, RetailPangBalance, RetailPangRate, RetailPangSpent,
     RetailPlayerData, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailPlayerIdentity,
     RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
@@ -1081,6 +1082,7 @@ where
     /// database. Defaults to empty, which resolves to exactly the catalog's own answers.
     shop_overlay: watch::Receiver<ShopOverlay>,
     config: GameRuntimeConfig,
+    message_server: pangya_protocol::MessageServerEntry,
     observer: Arc<dyn GameObserver>,
     lobby: LobbyHandle,
     captures: CaptureSink,
@@ -1125,6 +1127,15 @@ where
     #[must_use]
     pub fn with_shop_overlay(mut self, overlay: watch::Receiver<ShopOverlay>) -> Self {
         self.shop_overlay = overlay;
+        self
+    }
+    /// Sets the configured MessageService endpoint used by 0x008b responses.
+    #[must_use]
+    pub fn with_message_server(
+        mut self,
+        message_server: pangya_protocol::MessageServerEntry,
+    ) -> Self {
+        self.message_server = message_server;
         self
     }
 
@@ -1378,6 +1389,18 @@ where
             pending_invites: Arc::new(Mutex::new(HashMap::new())),
             captures: CaptureSink::new(limits.unknown_capture_capacity),
             config,
+            message_server: pangya_protocol::MessageServerEntry {
+                name: b"PangYa-RS Message".to_vec(),
+                id: 1,
+                max_users: 200,
+                num_users: 0,
+                ip_address: b"127.0.0.1".to_vec(),
+                port: 30303,
+                unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                flags: pangya_protocol::UnknownBytes([0; 2]),
+                unknown3: pangya_protocol::UnknownBytes([0; 14]),
+                char_icon: 0,
+            },
             observer,
             lobby,
         })
@@ -1935,6 +1958,20 @@ where
                                 let generated = generate_handover(established.account_id, DomainServiceKind::Game, source.clone(), SystemTime::now()).map_err(|_| GameRuntimeError::Authentication)?;
                                 self.repository.issue(generated.record).await.map_err(|_| GameRuntimeError::Authentication)?;
                                 self.send(&mut framed, &RetailNewSessionKey { unknown: UnknownBytes([0; 4]), session_key: generated.token.expose_secret().as_bytes().to_vec().into() }).await?;
+                            } else if frame.opcode == RetailMessageServerListRequest::OPCODE {
+                                if decode_packet_payload::<RetailMessageServerListRequest>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                ).is_err() {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let response = RetailMessageServerList {
+                                    servers: vec![self.message_server.clone()],
+                                };
+                                if let Err(error) = self.send(&mut framed, &response).await {
+                                    break Err(error);
+                                }
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
