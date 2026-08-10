@@ -18,6 +18,7 @@ mod profile;
 mod reader;
 mod registry;
 mod social;
+mod tutorial;
 mod us852_bootstrap;
 mod us852_match;
 mod us852_room;
@@ -116,6 +117,10 @@ pub use social::{
     UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
     UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Whisper,
     WhisperRefusalResponse, WhisperResponse,
+};
+pub use tutorial::{
+    TUTORIAL_MISSION_OPCODE, TUTORIAL_STATUS_OPCODE, TutorialMission, TutorialStatusCompletion,
+    TutorialStatusLogin,
 };
 pub use us852_bootstrap::{
     CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_BLOCK_BYTES, CHARACTER_CARDS,

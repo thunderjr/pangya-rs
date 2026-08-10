@@ -57,7 +57,7 @@ use pangya_domain::{
     RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
     ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
     StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
-    StrokeRosterOrder,
+    StrokeRosterOrder, TutorialKind, tutorial_completion_rewards, tutorial_mission_reward,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -125,7 +125,8 @@ use pangya_protocol::{
     StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion,
     StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase,
     StrokePhaseKind, StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry,
-    StrokeStandings, StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
+    StrokeStandings, StrokeTurnStarted, TutorialMission, TutorialStatusCompletion,
+    TutorialStatusLogin, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
     UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
     UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
     UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
@@ -2255,6 +2256,12 @@ where
                                 // The existing retail practice start also uses 0x000c with the
                                 // reference-defined type-7 four-word body; preserve that full
                                 // lifecycle path rather than stealing its start frame.
+                                // The same numeric 0x000b is also a match-level equipment
+                                // synchronisation packet. Direction is client->server in both
+                                // cases; the authenticated GameService state is the only safe
+                                // discriminator, so leave the InRoom form for match dispatch.
+                                && !(frame.opcode == RETAIL_C2S_EQUIPMENT_LOBBY
+                                    && state == GameState::InRoom)
                                 && !(frame.opcode == RETAIL_C2S_EQUIPMENT_ROOM
                                     && frame.payload.first() == Some(&7)
                                     && frame.payload.len() == 17)
@@ -2554,6 +2561,79 @@ where
                                 // Accepting it explicitly keeps the unknown-opcode policy for
                                 // opcodes that really are unrecognized.
                                 self.observer.unknown(GameUnknownObservation::Ignored);
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == TutorialMission::OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                // `0x00ae` is a GameService client packet. LoginService's
+                                // `0x000b` reconnect packet is never routed here; the state gate
+                                // also prevents a tutorial body from being interpreted in a room.
+                                if state != GameState::InChannel {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let request = decode_packet_payload::<TutorialMission>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                )
+                                .map_err(|_| GameRuntimeError::Protocol)?;
+                                let kind = match request.code {
+                                    0 | 1 => TutorialKind::Rookie,
+                                    256 => TutorialKind::Beginner,
+                                    _ => break Err(GameRuntimeError::Protocol),
+                                };
+                                let Some(mission_reward) = tutorial_mission_reward(kind, request.mission_id) else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                let Some(definition) = self.catalog.item_definition(mission_reward.item_type_id) else {
+                                    break Err(GameRuntimeError::Catalog);
+                                };
+                                if definition.kind != ItemKind::Consumable
+                                    || !matches!(definition.stacking, ItemStacking::Stackable { max_stack } if max_stack >= mission_reward.quantity)
+                                {
+                                    break Err(GameRuntimeError::Catalog);
+                                }
+                                let result = self
+                                    .repository
+                                    .apply_tutorial_mission(established.account_id, kind, request.mission_id)
+                                    .await
+                                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                                // Retry the completion fence even when the mission bit was already
+                                // set. This closes the crash window between the mission transaction
+                                // and its separate exactly-once completion transaction.
+                                let option = match kind {
+                                    TutorialKind::Rookie if result.progress.rookie_complete() => Some(1),
+                                    TutorialKind::Beginner if result.progress.beginner_complete() => Some(2),
+                                    _ => result.completed_option,
+                                };
+                                if let Some(option) = option {
+                                    let rewards = tutorial_completion_rewards(option)
+                                        .ok_or(GameRuntimeError::Catalog)?;
+                                    // A reward is never emitted unless every exact reference ID is
+                                    // present in the active immutable catalog.
+                                    if !self.tutorial_rewards_catalog_valid(option, rewards) {
+                                        break Err(GameRuntimeError::Catalog);
+                                    }
+                                    let _ = self
+                                        .repository
+                                        .claim_tutorial_completion(established.account_id, option, rewards)
+                                        .await
+                                        .map_err(|_| GameRuntimeError::Snapshot)?;
+                                }
+                                let mask = match kind {
+                                    TutorialKind::Rookie => result.progress.rookie,
+                                    TutorialKind::Beginner => result.progress.beginner,
+                                };
+                                self.send(
+                                    &mut framed,
+                                    &TutorialStatusCompletion {
+                                        code: match kind { TutorialKind::Rookie => 0, TutorialKind::Beginner => 1 },
+                                        mission_id: mask,
+                                    },
+                                )
+                                .await?;
                             } else if is_known_economy_opcode(frame.opcode) {
                                 if state != GameState::InChannel {
                                     break Err(GameRuntimeError::Protocol);
@@ -7118,6 +7198,32 @@ where
             })
     }
 
+    fn tutorial_rewards_catalog_valid(
+        &self,
+        option: u8,
+        rewards: [pangya_domain::TutorialReward; 2],
+    ) -> bool {
+        let Some(expected) = tutorial_completion_rewards(option) else {
+            return false;
+        };
+        if rewards != expected {
+            return false;
+        }
+        rewards.iter().enumerate().all(|(index, reward)| {
+            let Some(definition) = self.catalog.item_definition(reward.item_type_id) else {
+                return false;
+            };
+            match (option, index, definition.kind, definition.stacking) {
+                (1, 0, ItemKind::Caddie, ItemStacking::Unique)
+                | (1, 1, ItemKind::ClubSet, ItemStacking::Unique) => reward.quantity == 1,
+                (2, _, ItemKind::Consumable, ItemStacking::Stackable { max_stack }) => {
+                    max_stack >= reward.quantity && max_stack > 0
+                }
+                _ => false,
+            }
+        })
+    }
+
     async fn retail_login_bonus_status(
         &self,
         account_id: AccountId,
@@ -8926,7 +9032,6 @@ where
         for step in 0..=2 {
             self.send(framed, &HandoverControl::Progress(step)).await?;
         }
-
         let character = snapshot
             .characters
             .iter()
@@ -9108,6 +9213,22 @@ where
             framed,
             &RetailPointBalance {
                 points: snapshot.profile.points,
+            },
+        )
+        .await?;
+
+        // Tutorial state follows the complete lobby projection. This preserves the client's
+        // existing loading sequence while matching K4T's post-login TutorialCoreSystem notice.
+        let tutorial = self
+            .repository
+            .load_tutorial_progress(snapshot.account.id)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        self.send(
+            framed,
+            &TutorialStatusLogin {
+                code: 3,
+                mission_id: tutorial.rookie,
             },
         )
         .await
@@ -10794,6 +10915,16 @@ mod tests {
             Arc::new(NoopGameObserver),
         )
         .unwrap_or_else(|_| unreachable!())
+    }
+
+    #[tokio::test]
+    async fn tutorial_completion_requires_exact_catalog_definitions() {
+        let service = test_service(Arc::new(FakeRepository::default()), Duration::from_secs(1));
+        let rewards = tutorial_completion_rewards(1).unwrap_or_else(|| unreachable!());
+        assert!(!service.tutorial_rewards_catalog_valid(1, rewards));
+        let mut altered = rewards;
+        altered[0].quantity = 2;
+        assert!(!service.tutorial_rewards_catalog_valid(1, altered));
     }
 
     #[tokio::test]

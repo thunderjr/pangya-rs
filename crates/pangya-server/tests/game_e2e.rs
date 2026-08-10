@@ -63,7 +63,7 @@ const SECRET: &str = "0123456789abcdef0123456789abcdef";
 /// Generous packet deadline for ordinary E2E assertions. Timeout-path tests use their own short
 /// product deadlines, so a missing expected packet fails deterministically instead of hanging.
 /// Frames the retail bootstrap emits before the client is in the lobby.
-const RETAIL_BOOTSTRAP_FRAMES: usize = 11;
+const RETAIL_BOOTSTRAP_FRAMES: usize = 12;
 
 const E2E_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -6460,7 +6460,8 @@ async fn game_retail_bootstrap_emits_the_reference_derived_sequence(pool: PgPool
     assert_eq!(
         opcodes,
         vec![
-            0x0044, 0x0044, 0x0044, 0x0044, 0x0070, 0x0071, 0x0072, 0x0073, 0x004d, 0x0095, 0x0096
+            0x0044, 0x0044, 0x0044, 0x0044, 0x0070, 0x0071, 0x0072, 0x0073, 0x004d, 0x0095, 0x0096,
+            0x011f
         ]
     );
 
@@ -9367,6 +9368,60 @@ async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgP
     assert!(body.len() > 4);
 
     drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn tutorial_catalog_validation_runs_over_encrypted_game_service(pool: PgPool) {
+    let account = create_account(&pool, "tutoriale2e", 1, 0x1000_0000).await;
+    let service = retail_economy_service(pool.clone(), Arc::new(M2Metrics::default()));
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"tutoriale2e".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let _ = receive_packet(&mut stream, key).await;
+    }
+    send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // Mission 1's exact K4T reward (0x1a00000f) is intentionally absent from the small
+    // synthetic catalog. The encrypted request must be refused before durable mutation.
+    send_packet(&mut stream, key, 3, 0x00ae, &[0, 0, 1, 0, 0, 0]).await;
+    let mut closed = [0_u8; 3];
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut closed))
+        .await
+        .expect("bounded catalog refusal")
+        .expect("read catalog refusal");
+    assert_eq!(read, 0, "catalog refusal must close the encrypted session");
+    let progress_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tutorial_progress WHERE account_id = $1")
+            .bind(account.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("tutorial progress rows");
+    assert_eq!(progress_rows, 0, "catalog validation precedes persistence");
+
     shutdown.cancel();
     assert!(task.await.expect("join").is_ok());
 }

@@ -36,8 +36,9 @@ use pangya_domain::{
     RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
     StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
     StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
-    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
-    synthetic_stroke_reward_v1,
+    StrokeRosterOrder, TutorialKind, TutorialMissionResult, TutorialProgress, TutorialReward,
+    Weather, WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
+    tutorial_mission_reward,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -2631,6 +2632,196 @@ impl PgRepository {
         tx.commit().await.map_err(repository_db_error)
     }
 
+    async fn load_tutorial_progress_inner(
+        &self,
+        account_id: AccountId,
+    ) -> Result<TutorialProgress, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT rookie_mask, beginner_mask FROM tutorial_progress WHERE account_id = $1",
+        )
+        .bind(account_id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(repository_db_error)?;
+        let Some(row) = row else {
+            return Ok(TutorialProgress::default());
+        };
+        Ok(TutorialProgress {
+            rookie: u32::try_from(
+                row.try_get::<i32, _>("rookie_mask")
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            )
+            .map_err(|_| RepositoryError::CorruptData)?,
+            beginner: u32::try_from(
+                row.try_get::<i32, _>("beginner_mask")
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            )
+            .map_err(|_| RepositoryError::CorruptData)?,
+        })
+    }
+
+    async fn apply_tutorial_mission_inner(
+        &self,
+        account_id: AccountId,
+        kind: TutorialKind,
+        mission: u32,
+    ) -> Result<TutorialMissionResult, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(repository_db_error)?;
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id.get())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        sqlx::query("INSERT INTO tutorial_progress (account_id) VALUES ($1) ON CONFLICT (account_id) DO NOTHING")
+            .bind(account_id.get())
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        let row = sqlx::query("SELECT rookie_mask, beginner_mask FROM tutorial_progress WHERE account_id = $1 FOR UPDATE")
+            .bind(account_id.get())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(repository_db_error)?;
+        let before = TutorialProgress {
+            rookie: u32::try_from(
+                row.try_get::<i32, _>("rookie_mask")
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            )
+            .map_err(|_| RepositoryError::CorruptData)?,
+            beginner: u32::try_from(
+                row.try_get::<i32, _>("beginner_mask")
+                    .map_err(|_| RepositoryError::CorruptData)?,
+            )
+            .map_err(|_| RepositoryError::CorruptData)?,
+        };
+        let result = before
+            .apply_result(kind, mission)
+            .ok_or(RepositoryError::CorruptData)?;
+        let reward = tutorial_mission_reward(kind, mission).ok_or(RepositoryError::CorruptData)?;
+        let reward_claim = sqlx::query("INSERT INTO tutorial_mission_rewards (account_id, mission, item_type_id, quantity) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+            .bind(account_id.get())
+            .bind(i32::try_from(mission).map_err(|_| RepositoryError::CorruptData)?)
+            .bind(i64::from(reward.item_type_id.get()))
+            .bind(i32::try_from(reward.quantity).map_err(|_| RepositoryError::CorruptData)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(repository_db_error)?;
+        if reward_claim.rows_affected() == 1 {
+            let starter_key = format!("tutorial.mission.{mission}");
+            sqlx::query(
+                "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) VALUES ($1, $2, $3, $4, 'consumable') ON CONFLICT (account_id, item_type_id) WHERE inventory_class = 'consumable' DO UPDATE SET quantity = inventory_items.quantity + EXCLUDED.quantity, updated_at = now()",
+            )
+            .bind(account_id.get())
+            .bind(i64::from(reward.item_type_id.get()))
+            .bind(starter_key)
+            .bind(i64::from(reward.quantity))
+            .execute(&mut *tx)
+            .await
+            .map_err(repository_db_error)?;
+        }
+        sqlx::query("UPDATE tutorial_progress SET rookie_mask = $2, beginner_mask = $3, updated_at = now() WHERE account_id = $1")
+            .bind(account_id.get())
+            .bind(i32::try_from(result.progress.rookie).map_err(|_| RepositoryError::CorruptData)?)
+            .bind(i32::try_from(result.progress.beginner).map_err(|_| RepositoryError::CorruptData)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        tx.commit().await.map_err(repository_db_error)?;
+        Ok(result)
+    }
+
+    async fn claim_tutorial_completion_inner(
+        &self,
+        account_id: AccountId,
+        option: u8,
+        rewards: [TutorialReward; 2],
+    ) -> Result<bool, RepositoryError> {
+        let Some(expected) = pangya_domain::tutorial_completion_rewards(option) else {
+            return Err(RepositoryError::CorruptData);
+        };
+        if rewards != expected || rewards.iter().any(|reward| reward.quantity == 0) {
+            return Err(RepositoryError::CorruptData);
+        }
+        let mut tx = self.pool.begin().await.map_err(repository_db_error)?;
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id.get())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(repository_db_error)?
+            .ok_or(RepositoryError::NotFound)?;
+        let progress = sqlx::query(
+            "SELECT rookie_mask, beginner_mask FROM tutorial_progress WHERE account_id = $1 FOR UPDATE",
+        )
+        .bind(account_id.get())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        let Some(progress) = progress else {
+            return Err(RepositoryError::CorruptData);
+        };
+        let rookie = u32::try_from(
+            progress
+                .try_get::<i32, _>("rookie_mask")
+                .map_err(|_| RepositoryError::CorruptData)?,
+        )
+        .map_err(|_| RepositoryError::CorruptData)?;
+        let beginner = u32::try_from(
+            progress
+                .try_get::<i32, _>("beginner_mask")
+                .map_err(|_| RepositoryError::CorruptData)?,
+        )
+        .map_err(|_| RepositoryError::CorruptData)?;
+        let complete = match option {
+            1 => rookie == pangya_domain::TUTORIAL_ROOKIE_MASK,
+            2 => beginner == pangya_domain::TUTORIAL_BEGINNER_MASK,
+            _ => false,
+        };
+        if !complete {
+            return Err(RepositoryError::CorruptData);
+        }
+        let already = sqlx::query("SELECT 1 FROM tutorial_reward_claims WHERE account_id = $1 AND completion_option = $2 FOR UPDATE")
+            .bind(account_id.get())
+            .bind(i16::from(option))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(repository_db_error)?
+        .is_some();
+        if already {
+            tx.commit().await.map_err(repository_db_error)?;
+            return Ok(false);
+        }
+        for (index, reward) in rewards.into_iter().enumerate() {
+            let class = if option == 1 {
+                if index == 0 { "caddie" } else { "club_set" }
+            } else {
+                "consumable"
+            };
+            let starter_key = format!("tutorial.{option}.{index}");
+            sqlx::query(
+                "INSERT INTO inventory_items (account_id, item_type_id, starter_key, quantity, inventory_class) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (account_id, item_type_id) WHERE inventory_class = 'consumable' DO UPDATE SET quantity = inventory_items.quantity + EXCLUDED.quantity, updated_at = now()",
+            )
+            .bind(account_id.get())
+            .bind(i64::from(reward.item_type_id.get()))
+            .bind(starter_key)
+            .bind(i64::from(reward.quantity))
+            .bind(class)
+            .execute(&mut *tx)
+            .await
+            .map_err(repository_db_error)?;
+        }
+        sqlx::query(
+            "INSERT INTO tutorial_reward_claims (account_id, completion_option) VALUES ($1, $2)",
+        )
+        .bind(account_id.get())
+        .bind(i16::from(option))
+        .execute(&mut *tx)
+        .await
+        .map_err(repository_db_error)?;
+        tx.commit().await.map_err(repository_db_error)?;
+        Ok(true)
+    }
+
     async fn login_bonus_claimed_inner(
         &self,
         account_id: AccountId,
@@ -2824,6 +3015,31 @@ impl PlayerRepository for PgRepository {
             calendar_day,
             reward,
         )))
+    }
+
+    fn load_tutorial_progress(
+        &self,
+        account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<TutorialProgress, RepositoryError>> {
+        Box::pin(self.observed(self.load_tutorial_progress_inner(account_id)))
+    }
+
+    fn apply_tutorial_mission(
+        &self,
+        account_id: AccountId,
+        kind: TutorialKind,
+        mission: u32,
+    ) -> RepositoryFuture<'_, Result<TutorialMissionResult, RepositoryError>> {
+        Box::pin(self.observed(self.apply_tutorial_mission_inner(account_id, kind, mission)))
+    }
+
+    fn claim_tutorial_completion(
+        &self,
+        account_id: AccountId,
+        option: u8,
+        rewards: [TutorialReward; 2],
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(self.observed(self.claim_tutorial_completion_inner(account_id, option, rewards)))
     }
 
     fn claim_offline_notes(
