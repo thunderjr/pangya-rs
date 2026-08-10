@@ -48,6 +48,7 @@ use pangya_domain::{
     CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, CourseId, EconomyCommit,
     EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
+    LoginBonusReward,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan, MatchRepository, MatchResultKey,
     MatchSeed, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
@@ -82,7 +83,8 @@ use pangya_protocol::{
     RetailGameAuth, RetailHole, RetailHoleProgression, RetailHoleWeather, RetailHoleWind,
     RetailInventoryClass, RetailInventoryItem, RetailLoadProgress, RetailLobbyEquipmentUpdate,
     RetailLockerCombinationAttempt, RetailLockerCombinationResponse, RetailLockerInventoryRequest,
-    RetailLockerInventoryResponse, RetailLoginBonusRequest, RetailLoginBonusStatus,
+    RetailLockerInventoryResponse, RetailLoginBonusClaimResponse, RetailLoginBonusItemGrant,
+    RetailLoginBonusRequest, RetailLoginBonusStatus, RETAIL_LOGIN_BONUS_CLAIM_OPCODE,
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
     RetailMessageServerList, RetailMessageServerListRequest, RetailMultiplayerJoined,
@@ -629,6 +631,36 @@ pub struct EconomyRuntimeConfig {
     pub max_purchase_quantity: u32,
 }
 
+/// Checked daily login bonus configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginBonusRuntimeConfig {
+    /// One catalog-defined reward used for each server day.
+    pub reward: LoginBonusReward,
+    /// Number of calendar days before the display day wraps to one.
+    pub calendar_days: u32,
+}
+
+impl LoginBonusRuntimeConfig {
+    /// Validates the bounded calendar and configured reward quantity.
+    fn validate(self, catalog: &Catalog) -> Result<(), GameRuntimeError> {
+        if self.calendar_days == 0
+            || self.reward.quantity == 0
+            || catalog.find_record(self.reward.definition.type_id).is_none()
+        {
+            return Err(GameRuntimeError::Catalog);
+        }
+        if let ItemStacking::Stackable { max_stack } = self.reward.definition.stacking
+            && self.reward.quantity > max_stack
+        {
+            return Err(GameRuntimeError::Catalog);
+        }
+        if self.reward.definition.kind == ItemKind::Character {
+            return Err(GameRuntimeError::Catalog);
+        }
+        Ok(())
+    }
+}
+
 /// Immutable GameService composition.
 #[derive(Clone, Debug)]
 pub struct GameRuntimeConfig {
@@ -649,6 +681,8 @@ pub struct GameRuntimeConfig {
     pub stroke_two: Option<StrokeRuntimeConfig>,
     /// Optional local-only synthetic economy.
     pub economy: Option<EconomyRuntimeConfig>,
+    /// Optional daily login bonus. The reward is resolved against the immutable catalog at startup.
+    pub login_bonus: Option<LoginBonusRuntimeConfig>,
     /// Emits the reference-derived retail bootstrap instead of the synthetic one.
     ///
     /// Required by a real U.S. client, which never sends or understands the synthetic
@@ -666,6 +700,7 @@ impl Default for GameRuntimeConfig {
             solo_practice: None,
             stroke_two: None,
             economy: None,
+            login_bonus: None,
             retail_bootstrap: false,
         }
     }
@@ -1252,6 +1287,9 @@ where
                     || solo.shot_packets_per_window == 0
                     || solo.shot_packets_per_window > 1_000_000
             })
+            || config.login_bonus.is_some_and(|bonus| {
+                bonus.calendar_days == 0 || bonus.reward.quantity == 0
+            })
             || config.economy.is_some_and(|economy| {
                 economy.command_timeout.is_zero()
                     || economy.command_timeout > limits.shutdown_grace
@@ -1285,6 +1323,11 @@ where
             });
         if invalid {
             return Err(GameRuntimeError::InvalidConfig);
+        }
+        if let Some(login_bonus) = config.login_bonus
+            && login_bonus.validate(&catalog).is_err()
+        {
+            return Err(GameRuntimeError::Catalog);
         }
         if config.economy.is_some()
             && (catalog.shop_offers().is_empty()
@@ -1973,15 +2016,45 @@ where
                                     break Err(error);
                                 }
                             } else if self.config.retail_bootstrap
+                                && frame.opcode == RetailLoginBonusRequest::OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if decode_packet_payload::<RetailLoginBonusRequest>(
+                                    &frame.payload,
+                                    &CompatibilityProfile::US_852,
+                                    ServiceKind::Game,
+                                )
+                                .is_err()
+                                {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                let status = self
+                                    .retail_login_bonus_status(established.account_id)
+                                    .await?;
+                                self.send(&mut framed, &status).await?;
+                            } else if self.config.retail_bootstrap
+                                && frame.opcode == RETAIL_LOGIN_BONUS_CLAIM_OPCODE
+                            {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if !frame.payload.is_empty() {
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                self.retail_login_bonus_claim(
+                                    &mut framed,
+                                    established.account_id,
+                                )
+                                .await?;
+                            } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
                                     RetailLoginBonusRequest::OPCODE
                                         | RetailPlayerHistoryRequest::OPCODE
                                 )
                             {
-                                // A real client sends both of these the moment it finishes entering
-                                // a channel. Leaving them unanswered means the lobby only survives
-                                // under a permissive unknown-opcode policy.
                                 if !frame.payload.is_empty() {
                                     break Err(GameRuntimeError::Protocol);
                                 }
@@ -6715,6 +6788,113 @@ where
         }
     }
 
+    fn retail_server_day() -> i64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX))
+    }
+
+    async fn retail_login_bonus_status(
+        &self,
+        account_id: AccountId,
+    ) -> Result<RetailLoginBonusStatus, GameRuntimeError> {
+        let Some(config) = self.config.login_bonus else {
+            return Ok(RetailLoginBonusStatus::Collected {
+                unknown_a: [0; 4],
+                current_item_id: 0,
+                current_item_quantity: 0,
+                future_item_id: 0,
+                future_item_quantity: 0,
+                future_bonus_day: 0,
+            });
+        };
+        let server_day = Self::retail_server_day();
+        let claimed = self
+            .repository
+            .login_bonus_claimed(account_id, server_day)
+            .await
+            .map_err(|_| GameRuntimeError::Snapshot)?;
+        let day = u32::try_from(server_day.rem_euclid(i64::from(config.calendar_days)))
+            .map_err(|_| GameRuntimeError::Catalog)?
+            .saturating_add(1);
+        let item_id = config.reward.definition.type_id.get();
+        if claimed {
+            Ok(RetailLoginBonusStatus::Collected {
+                unknown_a: [0; 4],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                future_item_id: item_id,
+                future_item_quantity: config.reward.quantity,
+                future_bonus_day: if day == config.calendar_days { 1 } else { day + 1 },
+            })
+        } else {
+            Ok(RetailLoginBonusStatus::Uncollected {
+                unknown_a: [0; 4],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                padding_a: [0; 8],
+                current_bonus_day: day,
+            })
+        }
+    }
+
+    async fn retail_login_bonus_claim(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        account_id: AccountId,
+    ) -> Result<(), GameRuntimeError> {
+        let Some(config) = self.config.login_bonus else {
+            return Err(GameRuntimeError::Protocol);
+        };
+        let server_day = Self::retail_server_day();
+        let calendar_day = u32::try_from(server_day.rem_euclid(i64::from(config.calendar_days)))
+            .map_err(|_| GameRuntimeError::Catalog)?
+            .saturating_add(1);
+        let claim = self
+            .repository
+            .claim_login_bonus(
+                account_id,
+                server_day,
+                calendar_day,
+                config.reward,
+            )
+            .await
+            .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+        let item_id = config.reward.definition.type_id.get();
+        if !claim.already_claimed {
+            let old = claim
+                .quantity_after
+                .checked_sub(config.reward.quantity)
+                .ok_or(GameRuntimeError::Snapshot)?;
+            let unix_time = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| u32::try_from(duration.as_secs()).unwrap_or(u32::MAX));
+            self.send(
+                framed,
+                &RetailLoginBonusItemGrant {
+                    status_date_unix_time: unix_time,
+                    item_id,
+                    inventory_slot: u32::try_from(claim.inventory_item_id.get())
+                        .map_err(|_| GameRuntimeError::Snapshot)?,
+                    quantity_old: old,
+                    quantity_new: claim.quantity_after,
+                },
+            )
+            .await?;
+        }
+        self.send(
+            framed,
+            &RetailLoginBonusClaimResponse {
+                unknown_a: [0; 5],
+                current_item_id: item_id,
+                current_item_quantity: config.reward.quantity,
+                future_item_id: item_id,
+                future_item_quantity: config.reward.quantity,
+                current_bonus_day: calendar_day,
+            },
+        )
+        .await
+    }
     /// Handles one retail lobby/room command.
     ///
     /// Serves the lobby-side services a real client opens from its menu bar: the shop and the

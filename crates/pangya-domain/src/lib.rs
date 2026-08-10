@@ -4168,6 +4168,28 @@ pub struct OfflineNoteCommit {
     pub accepted: bool,
 }
 
+/// Configured one-item login bonus reward and its catalog-resolved inventory semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginBonusReward {
+    /// Catalog definition resolved from the active server catalog.
+    pub definition: ItemDefinition,
+    /// Positive quantity granted on each eligible server day.
+    pub quantity: u32,
+}
+
+/// Durable result of a login-bonus claim attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoginBonusClaim {
+    /// Whether this account had already claimed this server day.
+    pub already_claimed: bool,
+    /// Durable inventory row receiving the reward.
+    pub inventory_item_id: InventoryItemId,
+    /// Quantity after the atomic grant.
+    pub quantity_after: u32,
+    /// Calendar day recorded for the claim.
+    pub calendar_day: u32,
+}
+
 /// Technology-neutral coherent player-bootstrap repository contract.
 /// One bounded recent-player entry shown in the retail lobby.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4206,6 +4228,29 @@ pub trait PlayerRepository: Send + Sync {
         _recent: RecentPlayer,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(std::future::ready(Ok(())))
+    }
+
+    /// Returns whether this account already claimed the configured server day.
+    fn login_bonus_claimed(
+        &self,
+        _account_id: AccountId,
+        _server_day: i64,
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+
+    /// Atomically records one account/day claim and grants its catalog-resolved reward.
+    fn claim_login_bonus(
+        &self,
+        _account_id: AccountId,
+        _server_day: i64,
+        _calendar_day: u32,
+        _reward: LoginBonusReward,
+    ) -> RepositoryFuture<'_, Result<LoginBonusClaim, RepositoryError>> {
+        Box::pin(std::future::ready(Err(RepositoryError::Storage(
+            StorageFault::Other,
+        ))))
+    }
     }
 
     /// Loads bounded visitor-visible My Room state for an account.

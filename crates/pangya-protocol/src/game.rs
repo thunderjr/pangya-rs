@@ -399,6 +399,9 @@ impl EncodePacket for RetailServerTime {
     }
 }
 
+/// U.S. 852 retail login-bonus claim request, client opcode `0x016f`.
+pub const RETAIL_LOGIN_BONUS_CLAIM_OPCODE: u16 = 0x016f;
+
 /// U.S. 852 retail login-bonus status request, client opcode `0x016e`.
 ///
 /// # Provenance
@@ -423,16 +426,78 @@ impl DecodePacket for RetailLoginBonusRequest {
 
 /// U.S. 852 retail login-bonus status response, server opcode `0x0248`.
 ///
-/// This server has no login-bonus schedule, so it answers with the "already collected" form and a
-/// zeroed preview: nothing is offered and nothing is claimable. Reporting the uncollected form
-/// would advertise a reward the client could then try to claim.
-///
 /// # Provenance
 ///
-/// Layout from the vendored PacketDoc `gameservice/server/0248.ksy`. The trailing block is a union
-/// selected by `bonus_collected`; the collected branch is three `u4` preview fields.
+/// Layout from the vendored PacketDoc `gameservice/server/0248.ksy`: four opaque bytes, a
+/// collected flag, current item and quantity, then a flag-selected 12-byte union. The
+/// uncollected branch is eight opaque bytes plus the current calendar day; the collected branch
+/// is the next item, quantity, and calendar day.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetailLoginBonusStatus;
+pub enum RetailLoginBonusStatus {
+    /// The current day's reward is available to claim.
+    Uncollected {
+        /// PacketDoc's unclassified prefix.
+        unknown_a: [u8; 4],
+        /// Current catalog item.
+        current_item_id: u32,
+        /// Current item quantity.
+        current_item_quantity: u32,
+        /// PacketDoc's unclassified current-branch padding.
+        padding_a: [u8; 8],
+        /// One-based calendar day for this reward.
+        current_bonus_day: u32,
+    },
+    /// The current day's reward has been claimed; show the next reward preview.
+    Collected {
+        /// PacketDoc's unclassified prefix.
+        unknown_a: [u8; 4],
+        /// Current catalog item.
+        current_item_id: u32,
+        /// Current item quantity.
+        current_item_quantity: u32,
+        /// Next catalog item.
+        future_item_id: u32,
+        /// Next item quantity.
+        future_item_quantity: u32,
+        /// One-based calendar day for the next reward.
+        future_bonus_day: u32,
+    },
+}
+
+impl DecodePacket for RetailLoginBonusStatus {
+    const OPCODE: u16 = 0x0248;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let unknown_a = reader.array()?;
+        let collected = reader.u8()?;
+        let current_item_id = reader.u32_le()?;
+        let current_item_quantity = reader.u32_le()?;
+        let status = match collected {
+            0 => Self::Uncollected {
+                unknown_a,
+                current_item_id,
+                current_item_quantity,
+                padding_a: reader.array()?,
+                current_bonus_day: reader.u32_le()?,
+            },
+            1 => Self::Collected {
+                unknown_a,
+                current_item_id,
+                current_item_quantity,
+                future_item_id: reader.u32_le()?,
+                future_item_quantity: reader.u32_le()?,
+                future_bonus_day: reader.u32_le()?,
+            },
+            _ => return Err(reader.invalid("login bonus collected flag must be 0 or 1")),
+        };
+        require_end(reader)?;
+        Ok(status)
+    }
+}
 
 impl EncodePacket for RetailLoginBonusStatus {
     const OPCODE: u16 = 0x0248;
@@ -443,13 +508,143 @@ impl EncodePacket for RetailLoginBonusStatus {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
-        writer.bytes(&[0; 4]);
-        writer.u8(0x01);
+        match self {
+            Self::Uncollected {
+                unknown_a,
+                current_item_id,
+                current_item_quantity,
+                padding_a,
+                current_bonus_day,
+            } => {
+                writer.bytes(unknown_a);
+                writer.u8(0);
+                writer.u32_le(*current_item_id);
+                writer.u32_le(*current_item_quantity);
+                writer.bytes(padding_a);
+                writer.u32_le(*current_bonus_day);
+            }
+            Self::Collected {
+                unknown_a,
+                current_item_id,
+                current_item_quantity,
+                future_item_id,
+                future_item_quantity,
+                future_bonus_day,
+            } => {
+                writer.bytes(unknown_a);
+                writer.u8(1);
+                writer.u32_le(*current_item_id);
+                writer.u32_le(*current_item_quantity);
+                writer.u32_le(*future_item_id);
+                writer.u32_le(*future_item_quantity);
+                writer.u32_le(*future_bonus_day);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// U.S. 852 retail login-bonus claim response, server opcode `0x0249`.
+///
+/// # Provenance
+///
+/// Layout from the vendored PacketDoc `gameservice/server/0249.ksy`: five opaque bytes followed
+/// by current and future item/quantity pairs and the current calendar day.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoginBonusClaimResponse {
+    /// PacketDoc's unclassified prefix.
+    pub unknown_a: [u8; 5],
+    /// Claimed catalog item.
+    pub current_item_id: u32,
+    /// Claimed quantity.
+    pub current_item_quantity: u32,
+    /// Next catalog item preview.
+    pub future_item_id: u32,
+    /// Next item quantity preview.
+    pub future_item_quantity: u32,
+    /// One-based calendar day just claimed.
+    pub current_bonus_day: u32,
+}
+
+impl DecodePacket for RetailLoginBonusClaimResponse {
+    const OPCODE: u16 = 0x0249;
+
+    fn decode(
+        reader: &mut PacketReader<'_>,
+        profile: &CompatibilityProfile,
+    ) -> Result<Self, PacketDecodeError> {
+        check_decode_profile(profile, reader)?;
+        let response = Self {
+            unknown_a: reader.array()?,
+            current_item_id: reader.u32_le()?,
+            current_item_quantity: reader.u32_le()?,
+            future_item_id: reader.u32_le()?,
+            future_item_quantity: reader.u32_le()?,
+            current_bonus_day: reader.u32_le()?,
+        };
+        require_end(reader)?;
+        Ok(response)
+    }
+}
+
+impl EncodePacket for RetailLoginBonusClaimResponse {
+    const OPCODE: u16 = 0x0249;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.bytes(&self.unknown_a);
+        writer.u32_le(self.current_item_id);
+        writer.u32_le(self.current_item_quantity);
+        writer.u32_le(self.future_item_id);
+        writer.u32_le(self.future_item_quantity);
+        writer.u32_le(self.current_bonus_day);
+        Ok(())
+    }
+}
+
+/// U.S. 852 item grant status update, server opcode `0x0216`.
+///
+/// # Provenance
+///
+/// This is the PacketDoc `status_change_02_items_achievements_quests` form: one item change
+/// inside the otherwise generic user-status update. The final 25 bytes remain explicitly opaque.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetailLoginBonusItemGrant {
+    /// UTC Unix time truncated to the wire's four-byte field.
+    pub status_date_unix_time: u32,
+    /// Catalog item id.
+    pub item_id: u32,
+    /// Inventory row id used as the status slot.
+    pub inventory_slot: u32,
+    /// Quantity before the grant.
+    pub quantity_old: u32,
+    /// Quantity after the grant.
+    pub quantity_new: u32,
+}
+
+impl EncodePacket for RetailLoginBonusItemGrant {
+    const OPCODE: u16 = 0x0216;
+
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        check_encode_profile(profile)?;
+        writer.u32_le(self.status_date_unix_time);
+        writer.u32_le(1);
+        writer.u8(0x02);
+        writer.u32_le(self.item_id);
+        writer.u32_le(self.inventory_slot);
         writer.u32_le(0);
-        writer.u32_le(0);
-        writer.u32_le(0);
-        writer.u32_le(0);
-        writer.u32_le(0);
+        writer.u32_le(self.quantity_old);
+        writer.u32_le(self.quantity_new);
+        writer.u32_le(self.quantity_new.saturating_sub(self.quantity_old));
+        writer.bytes(&[0; 25]);
         Ok(())
     }
 }
@@ -1031,20 +1226,86 @@ mod tests {
         assert!(us852_game_hello(0x10).is_err());
     }
 
-    /// The client sends the request the moment it enters a channel, so the answer is on the
-    /// critical path to the lobby. `bonus_collected = 1` selects the preview branch, which is
-    /// three `u4`s rather than the uncollected branch's eight padding bytes plus one `u4`.
     #[test]
-    fn retail_login_bonus_status_reports_nothing_claimable() {
+    fn retail_login_bonus_status_preserves_both_reference_union_layouts() {
+        let uncollected = RetailLoginBonusStatus::Uncollected {
+            unknown_a: [1, 2, 3, 4],
+            current_item_id: 0x1122_3344,
+            current_item_quantity: 7,
+            padding_a: [5; 8],
+            current_bonus_day: 9,
+        };
         let mut writer = PacketWriter::new();
-        RetailLoginBonusStatus
+        uncollected
             .encode(&mut writer, &CompatibilityProfile::US_852)
             .expect("encode");
         let bytes = writer.into_inner();
-        assert_eq!(bytes.len(), 4 + 1 + 4 * 5);
-        assert_eq!(&bytes[..4], &[0; 4]);
-        assert_eq!(bytes[4], 0x01, "already collected, so nothing is claimable");
-        assert!(bytes[5..].iter().all(|byte| *byte == 0));
+        assert_eq!(bytes.len(), 25);
+        assert_eq!(bytes[4], 0);
+        let decoded = RetailLoginBonusStatus::decode(
+            &mut PacketReader::new(
+                &bytes,
+                crate::Direction::ServerToClient,
+                crate::ServiceKind::Game,
+                Some(0x0248),
+            ),
+            &CompatibilityProfile::US_852,
+        )
+        .expect("decode");
+        assert_eq!(decoded, uncollected);
+
+        let collected = RetailLoginBonusStatus::Collected {
+            unknown_a: [0; 4],
+            current_item_id: 1,
+            current_item_quantity: 2,
+            future_item_id: 3,
+            future_item_quantity: 4,
+            future_bonus_day: 5,
+        };
+        let mut writer = PacketWriter::new();
+        collected
+            .encode(&mut writer, &CompatibilityProfile::US_852)
+            .expect("encode");
+        let bytes = writer.into_inner();
+        assert_eq!(bytes[4], 1);
+        assert_eq!(RetailLoginBonusStatus::decode(
+            &mut PacketReader::new(
+                &bytes,
+                crate::Direction::ServerToClient,
+                crate::ServiceKind::Game,
+                Some(0x0248),
+            ),
+            &CompatibilityProfile::US_852,
+        )
+        .expect("decode"), collected);
+    }
+
+    #[test]
+    fn retail_login_bonus_claim_response_is_exact_25_byte_layout() {
+        let response = RetailLoginBonusClaimResponse {
+            unknown_a: [9; 5],
+            current_item_id: 1,
+            current_item_quantity: 2,
+            future_item_id: 3,
+            future_item_quantity: 4,
+            current_bonus_day: 5,
+        };
+        let mut writer = PacketWriter::new();
+        response
+            .encode(&mut writer, &CompatibilityProfile::US_852)
+            .expect("encode");
+        let bytes = writer.into_inner();
+        assert_eq!(bytes.len(), 5 + 4 * 5);
+        assert_eq!(RetailLoginBonusClaimResponse::decode(
+            &mut PacketReader::new(
+                &bytes,
+                crate::Direction::ServerToClient,
+                crate::ServiceKind::Game,
+                Some(0x0249),
+            ),
+            &CompatibilityProfile::US_852,
+        )
+        .expect("decode"), response);
     }
 
     /// An empty history is five zeroed slots, not an empty packet: the client reads a fixed

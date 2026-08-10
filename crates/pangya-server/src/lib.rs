@@ -24,11 +24,13 @@ use configuration::{AppConfig, CliOverrides, ConfigLoadError};
 use pangya_data::{Catalog, CatalogKind, CatalogPricing};
 use pangya_domain::{
     AccountId, AccountRepository, AccountRole, AdminRepository, BalanceGrant, CourseId,
-    EconomyRepository, HandoverRepository, ItemTypeId, MatchPlan, MatchRepository, NewAccount,
-    Nickname, PlayerRepository, RepositoryError, StorageObserver, Username,
+    EconomyRepository, HandoverRepository, ItemTypeId, LoginBonusReward, MatchPlan, MatchRepository,
+    NewAccount, Nickname, OneHoleConfig, PlayerRepository, RepositoryError, StorageObserver,
+    Username,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
+    LoginBonusRuntimeConfig,
     LobbyLimits, RoomActorLimits, SoloRuntimeConfig, StrokeRuntimeConfig,
 };
 use pangya_login::{
@@ -479,34 +481,50 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
         None
     };
     let game = match catalog {
-        Some(catalog) => Some(compose_game_service(
-            Arc::clone(&repository),
-            catalog,
-            GameRuntimeConfig {
-                channel_id: config.game_channel_id,
-                advertised_channel_ids: config.game_channel_ids.clone(),
-                unknown_opcode_policy: config.unknown_opcode_policy,
-                limits: game_runtime_limits(&config)?,
-                solo_practice,
-                stroke_two,
-                economy,
-                retail_bootstrap: config.retail_bootstrap,
-            },
-            pangya_protocol::MessageServerEntry {
-                name: b"PangYa-RS Message".to_vec(),
-                id: u32::from(config.message_id),
-                max_users: config.message_capacity,
-                num_users: 0,
-                ip_address: config.message_advertise.ip().to_string().into_bytes(),
-                port: config.message_advertise.port(),
-                unknown2: pangya_protocol::UnknownBytes([0; 2]),
-                flags: pangya_protocol::UnknownBytes([0; 2]),
-                unknown3: pangya_protocol::UnknownBytes([0; 14]),
-                char_icon: 0,
-            },
-            metrics.clone(),
-            shop_overlay.as_ref().map(|sender| sender.subscribe()),
-        )?),
+        Some(catalog) => {
+            let login_bonus = if config.retail_bootstrap {
+                catalog
+                    .shop_offers()
+                    .iter()
+                    .find(|offer| offer.kind == pangya_domain::ItemKind::Consumable)
+                    .copied()
+                    .map(|definition| LoginBonusRuntimeConfig {
+                        reward: LoginBonusReward { definition, quantity: 1 },
+                        calendar_days: 30,
+                    })
+            } else {
+                None
+            };
+            Some(compose_game_service(
+                Arc::clone(&repository),
+                catalog,
+                GameRuntimeConfig {
+                    channel_id: config.game_channel_id,
+                    advertised_channel_ids: config.game_channel_ids.clone(),
+                    unknown_opcode_policy: config.unknown_opcode_policy,
+                    limits: game_runtime_limits(&config)?,
+                    solo_practice,
+                    stroke_two,
+                    economy,
+                    login_bonus,
+                    retail_bootstrap: config.retail_bootstrap,
+                },
+                pangya_protocol::MessageServerEntry {
+                    name: b"PangYa-RS Message".to_vec(),
+                    id: u32::from(config.message_id),
+                    max_users: config.message_capacity,
+                    num_users: 0,
+                    ip_address: config.message_advertise.ip().to_string().into_bytes(),
+                    port: config.message_advertise.port(),
+                    unknown2: pangya_protocol::UnknownBytes([0; 2]),
+                    flags: pangya_protocol::UnknownBytes([0; 2]),
+                    unknown3: pangya_protocol::UnknownBytes([0; 14]),
+                    char_icon: 0,
+                },
+                metrics.clone(),
+                shop_overlay.as_ref().map(|sender| sender.subscribe()),
+            )?)
+        }
         None => None,
     };
     let game_bind = if config.game_enabled {
