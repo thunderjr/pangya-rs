@@ -8514,3 +8514,107 @@ async fn game_issue11_my_room_visit_layout_character_mascot_and_restart(pool: Pg
     shutdown.cancel();
     task.await.expect("restarted service").expect("serve");
 }
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgPool) {
+    let account = create_account(&pool, "Issue23Owner", 1, 0x1000_0000).await;
+    let recent = create_account(&pool, "Issue23Recent", 1, 0x1000_0000).await;
+    sqlx::query(
+        "INSERT INTO retail_recent_players (account_id, recent_account_id, nickname, seen_at) VALUES ($1, $2, $3, now())",
+    )
+    .bind(account.account.id.get())
+    .bind(recent.account.id.get())
+    .bind("RecentPeer")
+    .execute(&pool)
+    .await
+    .expect("recent player fixture");
+
+    let service = Arc::new(
+        GameService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits {
+                    packets_per_window: 200,
+                    ..GameRuntimeLimits::default()
+                },
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("retail service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        account.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut stream, key) = connect_game_retail(address).await;
+    send_typed(
+        &mut stream,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"Issue23Owner".to_vec(),
+            user_id: u32::try_from(account.account.id.get()).expect("user id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    for _ in 0..RETAIL_BOOTSTRAP_FRAMES {
+        let _ = receive_packet(&mut stream, key).await;
+    }
+    send_packet(&mut stream, key, 2, 0x0004, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // Refresh, server time, and channel transition all answer on the encrypted wire.
+    send_packet(&mut stream, key, 3, 0x0043, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x009f);
+    assert_eq!(body.len(), 171);
+    send_packet(&mut stream, key, 4, 0x005c, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!((opcode, body.len()), (0x00ba, 16));
+    send_packet(&mut stream, key, 5, 0x0083, &[1]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x004e);
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x01f6);
+
+    // History is durable and uses the reference's 260-byte fixed-slot response.
+    send_packet(&mut stream, key, 6, 0x009c, &[]).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x010e);
+    assert_eq!(body.len(), 260);
+    assert_eq!(&body[4..14], b"RecentPeer");
+    assert_eq!(
+        u32::from_le_bytes(body[48..52].try_into().expect("recent id")),
+        u32::try_from(recent.account.id.get()).expect("recent id")
+    );
+
+    // Every issue-listed utility request is consumed without an unknown-opcode disconnect.
+    for (salt, opcode) in [0x0047, 0x0088, 0x008b, 0x00a1, 0x00a2, 0x00f4, 0x00fb, 0x00fe] {
+        send_packet(&mut stream, key, salt, opcode, &[]).await;
+    }
+    send_packet(&mut stream, key, 7, 0x005c, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00ba);
+
+    // A destination key is generated only for this configured topology.
+    send_packet(&mut stream, key, 8, 0x0119, &1_u32.to_le_bytes()).await;
+    let (opcode, body) = receive_packet(&mut stream, key).await;
+    assert_eq!(opcode, 0x01d4);
+    assert!(body.len() > 4);
+
+    drop(stream);
+    shutdown.cancel();
+    assert!(task.await.expect("join").is_ok());
+}
