@@ -2,8 +2,10 @@
 
 use pangya_protocol::{
     CompatibilityProfile, EncodePacket, GameChat, GameChatResponse, LoungeAction,
-    LoungeActionResponse, MacroUpdate, TypingIndicator, UserInfoRequest, UserInfoResponse, Whisper,
-    WhisperResponse, decode_packet_payload, encode_packet_payload,
+    LoungeActionResponse, MacroUpdate, TypingIndicator, UserCharacterInfoResponse,
+    UserEquipmentInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserStatisticsInfoResponse, Whisper, WhisperResponse, decode_packet_payload,
+    encode_packet_payload,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
@@ -119,4 +121,57 @@ fn response_opcodes_are_retail() {
     assert_eq!(GameChatResponse::OPCODE, 0x0040);
     assert_eq!(WhisperResponse::OPCODE, 0x0084);
     assert_eq!(LoungeActionResponse::OPCODE, 0x00c4);
+}
+
+#[test]
+fn user_info_fanout_has_reference_widths_and_real_projection_fields() {
+    let name = encode_packet_payload(
+        &UserNameInfoResponse {
+            request_type: 5,
+            user_id: 7,
+            username: b"account".to_vec(),
+            nickname: b"Player".to_vec(),
+        },
+        &PROFILE,
+    )
+    .expect("name");
+    assert_eq!(
+        name.len(),
+        1 + 4 + 2 + 22 + 22 + 21 + 24 + 4 + 12 + 4 + 4 + 2 + 6 + 16 + 128 + 4 + 4
+    );
+    let stats = encode_packet_payload(
+        &UserStatisticsInfoResponse {
+            request_type: 5,
+            user_id: 7,
+            experience: 123,
+            pang: 456,
+        },
+        &PROFILE,
+    )
+    .expect("stats");
+    assert_eq!(
+        stats.len(),
+        1 + 4 + pangya_protocol::PLAYER_STATISTICS_BYTES
+    );
+    let equipment = encode_packet_payload(
+        &UserEquipmentInfoResponse {
+            request_type: 5,
+            user_id: 7,
+            character_uid: 8,
+            comet_iff_id: 9,
+        },
+        &PROFILE,
+    )
+    .expect("equipment");
+    assert_eq!(equipment.len(), 1 + 4 + 29 * 4);
+    let character = encode_packet_payload(
+        &UserCharacterInfoResponse {
+            user_id: 7,
+            character_iff_id: 8,
+            character_uid: 9,
+        },
+        &PROFILE,
+    )
+    .expect("character");
+    assert_eq!(character.len(), 4 + pangya_protocol::CHARACTER_BLOCK_BYTES);
 }
