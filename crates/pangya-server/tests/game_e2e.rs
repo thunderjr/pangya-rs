@@ -7075,16 +7075,23 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
     equipment.extend_from_slice(&[0; 4]);
     equipment.extend_from_slice(&[0; 25 * 4]);
     let mut guild = user_id.to_le_bytes().to_vec();
-    guild.extend_from_slice(&[0; 4]);
-    guild.extend(fixed_nul(&[], 21));
-    guild.extend_from_slice(&[0; 12]);
-    guild.extend_from_slice(&[0; 206]);
-    guild.extend_from_slice(&u32::MAX.to_le_bytes());
-    guild.extend_from_slice(&[0; 22]);
+    guild.extend_from_slice(&[0; 4]); // unknown_a
+    guild.extend(fixed_nul(&[], 21)); // guild_name
+    guild.extend_from_slice(&[0; 12]); // unknown_b, unknown_c, unknown_d
+    guild.extend(fixed_nul(&[], 12)); // guild_emblem_id
+    guild.extend_from_slice(&[0; 206]); // unknown_e
+    guild.extend_from_slice(&u32::MAX.to_le_bytes()); // unknown_f
+    guild.extend_from_slice(&[0; 22]); // unknown_g
     guild.extend_from_slice(&[
         0xc3, 0x41, 0x02, 0xf8, 0x28, 0x3a, 0x02, 0x78, 0x23, 0x09, 0x09, 0x60, 0xf1, 0x01, 0x0b,
         0xd0,
-    ]);
+    ]); // unknown_h
+    assert_eq!(guild.len(), 301, "PacketDoc 0x015d field layout");
+    assert_eq!(&guild[0..4], &user_id.to_le_bytes());
+    assert_eq!(&guild[4..8], &[0; 4]);
+    assert_eq!(&guild[8..29], &[0; 21]);
+    assert_eq!(&guild[29..41], &[0; 12]);
+    assert_eq!(&guild[41..53], &[0; 12]);
     let mut trophies = vec![5];
     trophies.extend_from_slice(&user_id.to_le_bytes());
     trophies.extend_from_slice(&[0; 78]);
@@ -7109,7 +7116,20 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         .concat(),
     ];
     for (index, expected) in expected_packets.into_iter().enumerate() {
-        assert_eq!(fanout[index].1, expected, "golden fanout body {index}");
+        let actual = &fanout[index].1;
+        let first_difference = actual
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected)
+            .or_else(|| {
+                (actual.len() != expected.len()).then_some(actual.len().min(expected.len()))
+            });
+        assert!(
+            first_difference.is_none(),
+            "golden fanout body {index}: first differing offset {first_difference:?}, actual len {}, expected len {}",
+            actual.len(),
+            expected.len(),
+        );
     }
 
     // Malformed payloads are rejected on the encrypted transport; neither client is left with a
