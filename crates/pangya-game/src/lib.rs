@@ -44,19 +44,20 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_data::Catalog;
 use pangya_domain::{
     AbortMatch, AbortMatchOutcome, AbortStrokeMatch, AbortStrokeMatchOutcome, AccountId,
-    BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch, BeginStrokeMatchOutcome,
-    CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem, CourseId, EconomyCommit,
-    EconomyError, EconomyItemSelector, EconomyOperationId, EconomyRepository, EquipmentChange,
-    HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
-    ItemTypeId, LoginBonusReward, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
-    MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan,
-    MatchRepository, MatchResultKey, MatchSeed, MemberCard, MemberSnapshot, Nickname,
-    OfflineNoteClaim, OfflineNoteRequest, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
-    PurchaseRequest, RecentPlayer, RepairItem, RepositoryError, RetailEquipmentChange,
-    RetailEquipmentState, RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings,
-    RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult,
-    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
-    StrokeParticipant, StrokeRosterOrder,
+    AdminItemGrant, BeginSoloMatch, BeginSoloMatchOutcome, BeginStrokeMatch,
+    BeginStrokeMatchOutcome, CatalogFingerprint, CharacterId, ConsumeHandover, ConsumeItem,
+    CourseId, EconomyCommit, EconomyError, EconomyItemSelector, EconomyOperationId,
+    EconomyRepository, EquipmentChange, HandoverRepository, InventoryClass, InventoryItemId,
+    ItemDefinition, ItemDurability, ItemKind, ItemStacking, ItemTypeId, LoginBonusReward,
+    MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
+    MascotMessageUpdate, MatchAbortReason, MatchId, MatchPlan, MatchRepository, MatchResultKey,
+    MatchSeed, MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer, RepairItem,
+    RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId, RoomName,
+    RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
+    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
+    StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -67,10 +68,10 @@ use pangya_protocol::{
     CharacterInfo, CodecLimits, CompatibilityProfile, ConsumeOneRequest, DecodePacket,
     EQUIPPED_ITEM_SLOTS, EconomyCommand, EconomyCommandResult, EconomyItemKind, EconomyOutcome,
     EncodePacket, EquipRequest, EquipmentChanged, EquipmentInfo, FinishHole, FrameCodec,
-    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, GameChat, GameChatResponse, HandoverControl,
-    HandoverReply, HoleResult, IffContainerChunk, IffContainerKind, InventoryBootstrap,
-    InventoryChanged, InventorySegment, Lie, LoadingComplete, LoungeAction, LoungeActionResponse,
-    LoungeEnterRequest, LoungeEnterResponse, MacroUpdate,
+    GAME_INVENTORY_SEGMENT_ITEMS, GameAuth, GameChat, GameChatResponse, GmRequest, GmSubcommand,
+    HandoverControl, HandoverReply, HoleResult, IffContainerChunk, IffContainerKind,
+    InventoryBootstrap, InventoryChanged, InventorySegment, Lie, LoadingComplete, LoungeAction,
+    LoungeActionResponse, LoungeEnterRequest, LoungeEnterResponse, MacroUpdate,
     MatchAbortReason as ProtocolMatchAbortReason, MatchAborted, MatchPhase, MatchStarted,
     MessageServerList, MessageServerListRequest, NoteSend, OutboundFrame, PacketEncodeError,
     PacketWriter, PlayerInfo, PurchaseCommitted, PurchaseRequestPacket,
@@ -805,6 +806,10 @@ struct Admission {
 
 #[derive(Clone, Debug)]
 enum SocialEvent {
+    Notice {
+        nickname: Vec<u8>,
+        message: Vec<u8>,
+    },
     Chat {
         targets: Vec<PlayerConnectionId>,
         nickname: Vec<u8>,
@@ -985,6 +990,10 @@ impl SocialHub {
             })
             .collect()
     }
+    fn notice(&self, nickname: Vec<u8>, message: Vec<u8>) {
+        let _ = self.events.send(SocialEvent::Notice { nickname, message });
+    }
+
     fn chat(&self, id: PlayerConnectionId, nickname: Vec<u8>, message: Vec<u8>) {
         let targets = self.scoped_targets(id);
         let _ = self.events.send(SocialEvent::Chat {
@@ -1960,7 +1969,53 @@ where
                             state = GameState::InChannel;
                         }
                         GameState::InChannel | GameState::InRoom | GameState::InMatchLoading | GameState::InMatch | GameState::InStrokeLoading | GameState::InStrokeMatch => {
-                            if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
+                            if is_gm_opcode(frame.opcode) {
+                                let Some(established) = identity.as_ref() else {
+                                    break Err(GameRuntimeError::Protocol);
+                                };
+                                if let Err(error) = authorize_gm_request(
+                                    established.game_master,
+                                    frame.opcode,
+                                ) {
+                                    tracing::warn!(
+                                        account_id = established.account_id.get(),
+                                        opcode = frame.opcode,
+                                        error = ?error,
+                                        "unauthorized GM request refused"
+                                    );
+                                    break Err(GameRuntimeError::Protocol);
+                                }
+                                match decode_gm_request(frame.opcode, &frame.payload) {
+                                    Ok(GmRequest::Command(command)) => {
+                                        if let Err(error) = self
+                                            .handle_gm_command(
+                                                connection_id,
+                                                room_id,
+                                                command,
+                                            )
+                                            .await
+                                        {
+                                            break Err(error);
+                                        }
+                                    }
+                                    Ok(GmRequest::Notice(message)) => {
+                                        if message.is_empty() {
+                                            break Err(GameRuntimeError::Protocol);
+                                        }
+                                        self.social.notice(
+                                            established.nickname.display().as_bytes().to_vec(),
+                                            message,
+                                        );
+                                    }
+                                    Ok(GmRequest::Identity { .. } | GmRequest::Refused { .. }) => {
+                                        tracing::debug!(opcode = frame.opcode, "GM request refused: unresolved layout");
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(opcode = frame.opcode, error = ?error, "malformed GM request refused");
+                                        break Err(GameRuntimeError::Protocol);
+                                    }
+                                }
+                            } else if matches!(frame.opcode, GameAuth::OPCODE | SelectChannel::OPCODE) {
                                 break Err(GameRuntimeError::Protocol);
                             } else if frame.opcode == RetailClientException::OPCODE {
                                 // This report is fire-and-forget. Decode failures are ignored
@@ -2688,6 +2743,124 @@ where
         }
     }
 
+    async fn handle_gm_command(
+        &self,
+        _connection_id: PlayerConnectionId,
+        room_id: Option<RoomId>,
+        command: GmSubcommand,
+    ) -> Result<(), GameRuntimeError> {
+        match command {
+            GmSubcommand::Kick { oid, .. } | GmSubcommand::Disconnect { oid } => {
+                let target = PlayerConnectionId::new(u64::from(oid))
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                self.lobby
+                    .disconnect(target)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+            }
+            GmSubcommand::Destroy { room } => {
+                let room = RoomId::new(u32::from(room)).map_err(|_| GameRuntimeError::Protocol)?;
+                self.lobby
+                    .destroy_room(room)
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+            }
+            GmSubcommand::Wind { speed, direction } => {
+                let Some(room_id) = room_id else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                self.lobby
+                    .route(
+                        _connection_id,
+                        LobbyRoomCommand::Atmosphere {
+                            weather: None,
+                            wind: Some((speed, direction)),
+                        },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let _ = room_id;
+            }
+            GmSubcommand::Weather { weather } => {
+                let Some(room_id) = room_id else {
+                    return Err(GameRuntimeError::Protocol);
+                };
+                self.lobby
+                    .route(
+                        _connection_id,
+                        LobbyRoomCommand::Atmosphere {
+                            weather: Some(weather),
+                            wind: None,
+                        },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let _ = room_id;
+            }
+            GmSubcommand::GiveItem {
+                oid,
+                item_type_id,
+                quantity,
+            } => {
+                if quantity == 0 || quantity > 20_000 {
+                    return Err(GameRuntimeError::Protocol);
+                }
+                let type_id = ItemTypeId::new(item_type_id);
+                let Some(definition) = self.catalog.item_definition(type_id).copied() else {
+                    tracing::warn!(
+                        item_type_id,
+                        "GM give-item refused: item absent from catalog"
+                    );
+                    return Ok(());
+                };
+                let class = match definition.kind {
+                    ItemKind::ClubSet => InventoryClass::ClubSet,
+                    ItemKind::Ball => InventoryClass::Ball,
+                    ItemKind::Consumable => InventoryClass::Consumable,
+                    ItemKind::CharacterPart => InventoryClass::CharacterPart,
+                    ItemKind::Caddie => InventoryClass::Caddie,
+                    ItemKind::CaddieItem => InventoryClass::CaddieItem,
+                    ItemKind::Mascot => InventoryClass::Mascot,
+                    ItemKind::Card => InventoryClass::Card,
+                    ItemKind::Furniture => InventoryClass::Furniture,
+                    ItemKind::Skin => InventoryClass::Skin,
+                    ItemKind::HairStyle => InventoryClass::HairStyle,
+                    ItemKind::SetItem => InventoryClass::SetItem,
+                    ItemKind::Character => {
+                        tracing::warn!(
+                            item_type_id,
+                            "GM give-item refused: character is not inventory"
+                        );
+                        return Ok(());
+                    }
+                };
+                let target_connection = PlayerConnectionId::new(u64::from(oid))
+                    .map_err(|_| GameRuntimeError::Protocol)?;
+                let target = self
+                    .social
+                    .account_for_connection(target_connection)
+                    .ok_or(GameRuntimeError::Protocol)?;
+                self.repository
+                    .gm_grant_item(AdminItemGrant {
+                        account_id: target,
+                        item_type_id: type_id,
+                        class,
+                        quantity,
+                        durability: match definition.durability {
+                            ItemDurability::Nondurable => None,
+                            ItemDurability::Durable { max, .. } => Some(max),
+                        },
+                    })
+                    .await
+                    .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+            }
+            GmSubcommand::Refused { subcommand } => {
+                tracing::debug!(subcommand, "unresolved GM subcommand refused");
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_economy_command(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -3274,6 +3447,7 @@ where
             RoomIdentity {
                 connection_id,
                 account_id: session.account_id,
+                game_master: loaded.account.game_master,
                 nickname,
                 // Carried from the authenticated snapshot so a room roster can render the
                 // player's character instead of an empty slot. Both halves travel: the client
@@ -4487,6 +4661,10 @@ where
         event: SocialEvent,
     ) -> Result<(), GameRuntimeError> {
         match event {
+            SocialEvent::Notice { nickname, message } => {
+                self.send(framed, &GameChatResponse { nickname, message })
+                    .await?;
+            }
             SocialEvent::Chat {
                 targets,
                 nickname,
@@ -4836,6 +5014,28 @@ where
                     }
                     return Ok(RoomEventEffect::Remain);
                 }
+                RoomEvent::Atmosphere { weather, wind } => {
+                    if let Some(weather) = weather {
+                        let weather = match weather {
+                            0 => RetailWeather::Clear,
+                            1 => RetailWeather::Cloudy,
+                            2 => RetailWeather::Raining,
+                            _ => return Err(GameRuntimeError::Protocol),
+                        };
+                        self.send(framed, &RetailHoleWeather { weather }).await?;
+                    }
+                    if let Some((strength, direction)) = wind {
+                        self.send(
+                            framed,
+                            &RetailHoleWind {
+                                strength: *strength,
+                                direction: u16::from(*direction),
+                            },
+                        )
+                        .await?;
+                    }
+                    return Ok(RoomEventEffect::Remain);
+                }
                 RoomEvent::SoloStarted(plan) => {
                     let begin = plan.begin();
                     // A solo hole has no turn arbitration, so the client's own timers are the
@@ -5135,6 +5335,7 @@ where
                 Ok(RoomEventEffect::Remain)
             }
             RoomEvent::Invite { .. } => Ok(RoomEventEffect::Remain),
+            RoomEvent::Atmosphere { .. } => Ok(RoomEventEffect::Remain),
             RoomEvent::Chat { from, text } => {
                 let room_id = room_id.ok_or(GameRuntimeError::Protocol)?;
                 self.send(
@@ -8920,6 +9121,10 @@ struct UnknownDecision {
     strike_limit: bool,
 }
 
+fn is_gm_opcode(opcode: u16) -> bool {
+    matches!(opcode, 0x003e | 0x0041 | 0x0057 | 0x0060 | 0x0061 | 0x008f)
+}
+
 fn unknown_decision(
     policy: UnknownOpcodePolicy,
     strikes: u32,
@@ -10544,6 +10749,7 @@ mod tests {
         RoomIdentity {
             connection_id: PlayerConnectionId::new(1).unwrap_or_else(|_| unreachable!()),
             account_id: AccountId::new(7).unwrap_or_else(|_| unreachable!()),
+            game_master: false,
             nickname: Nickname::parse("Tester").unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,
@@ -10555,6 +10761,7 @@ mod tests {
         RoomIdentity {
             connection_id: PlayerConnectionId::new(2).unwrap_or_else(|_| unreachable!()),
             account_id: AccountId::new(8).unwrap_or_else(|_| unreachable!()),
+            game_master: false,
             nickname: Nickname::parse("Second").unwrap_or_else(|_| unreachable!()),
             character_id: None,
             character_iff_id: None,

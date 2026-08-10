@@ -18,6 +18,7 @@ pub const GM_DISCONNECT_USER: u16 = 0x0061;
 pub const GM_ENTER_ROOM: u16 = 0x003e;
 
 /// Common GM command sub-command IDs.
+#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GmSubcommand {
     /// Kick a player from their room (`OID`, force byte).
@@ -42,6 +43,7 @@ pub enum GmSubcommand {
 }
 
 /// One accepted or safely refused GM request.
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GmRequest {
     /// Multiplexed command.
@@ -55,6 +57,7 @@ pub enum GmRequest {
 }
 
 /// Parsing/authorization failure. No error contains the request body.
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GmRequestError {
     /// Body is not exactly the established wire shape.
@@ -68,7 +71,6 @@ pub enum GmRequestError {
 /// Unresolved opcodes and subcommands return [`GmRequest::Refused`] and never expose their raw
 /// bytes to callers.  The caller must log and ignore those requests, not route them through a
 /// generic unknown-opcode disconnect path.
-#[must_use]
 pub fn decode_gm_request(opcode: u16, payload: &[u8]) -> Result<GmRequest, GmRequestError> {
     match opcode {
         GM_COMMAND => {
@@ -163,7 +165,6 @@ pub fn decode_gm_request(opcode: u16, payload: &[u8]) -> Result<GmRequest, GmReq
 }
 
 /// Enforce the server-side capability before interpreting any GM request.
-#[must_use]
 pub fn authorize_gm_request(is_game_master: bool, opcode: u16) -> Result<(), GmRequestError> {
     if is_game_master {
         Ok(())

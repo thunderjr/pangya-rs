@@ -531,6 +531,8 @@ pub struct Account {
     pub username_normalized: NormalizedUsername,
     /// Access status.
     pub status: AccountStatus,
+    /// Server-side capability for in-client GM commands.
+    pub game_master: bool,
 }
 
 /// Persisted profile.
@@ -3299,6 +3301,14 @@ pub trait AdminRepository: Send + Sync {
         now: SystemTime,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
 
+    /// Sets the persisted in-client GM capability and audits the mutation.
+    fn set_game_master(
+        &self,
+        account_id: AccountId,
+        enabled: bool,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>>;
+
     /// Appends one admin audit row.
     fn record_admin_audit(
         &self,
@@ -4035,6 +4045,15 @@ pub trait EconomyRepository: Send + Sync {
         &self,
         request: RepairItem,
     ) -> RepositoryFuture<'_, Result<EconomyCommit<RepairItemResult>, EconomyError>>;
+
+    /// Atomically places a catalog-validated GM grant in inventory. Implementations that do not
+    /// expose the operator repository refuse it without mutating state.
+    fn gm_grant_item(
+        &self,
+        _request: AdminItemGrant,
+    ) -> RepositoryFuture<'_, Result<InventoryItem, AdminMutationError>> {
+        Box::pin(std::future::ready(Err(AdminMutationError::NotFound)))
+    }
 }
 
 /// Durable retail equipment selection beyond the minimum character/club/ball aggregate.

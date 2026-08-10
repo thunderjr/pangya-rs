@@ -205,6 +205,27 @@ impl PgRepository {
         Ok(())
     }
 
+    async fn set_game_master_inner(
+        &self,
+        account_id: AccountId,
+        enabled: bool,
+        _now: SystemTime,
+    ) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(repository_db_error)?;
+        let updated = sqlx::query_scalar::<_, i64>(
+            "UPDATE accounts SET game_master = $2, updated_at = now() WHERE id = $1 RETURNING id",
+        )
+        .bind(account_id.get())
+        .bind(enabled)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(repository_db_error)?;
+        if updated.is_none() {
+            return Err(RepositoryError::NotFound);
+        }
+        transaction.commit().await.map_err(repository_db_error)
+    }
+
     async fn record_admin_audit_inner(
         &self,
         event: NewAdminAuditEvent,
@@ -1242,6 +1263,15 @@ impl AdminRepository for PgRepository {
         now: SystemTime,
     ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
         Box::pin(self.observed(self.set_account_role_inner(account_id, role, now)))
+    }
+
+    fn set_game_master(
+        &self,
+        account_id: AccountId,
+        enabled: bool,
+        now: SystemTime,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(self.observed(self.set_game_master_inner(account_id, enabled, now)))
     }
 
     fn record_admin_audit(
