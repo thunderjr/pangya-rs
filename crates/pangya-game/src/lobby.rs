@@ -1891,6 +1891,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_scoped_rooms_are_not_listed_or_joinable_across_channels() {
+        let lobby = spawn_lobby(limits(8));
+        let first = lobby
+            .create_on_channel(
+                RoomName::parse("channel-one").unwrap_or_else(|_| unreachable!()),
+                None,
+                RoomSettings::new(2).unwrap_or_else(|_| unreachable!()),
+                identity(1),
+                1,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("create channel one");
+        assert_eq!(first.channel(), Some(1));
+        assert_eq!(lobby.list_on_channel(1).await.expect("list one").len(), 1);
+        assert!(lobby.list_on_channel(2).await.expect("list two").is_empty());
+        assert_eq!(
+            lobby
+                .join_on_channel(
+                    first.id(),
+                    identity(2),
+                    None,
+                    2,
+                    mpsc::channel(8).0,
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(RoomError::RoomNotFound)
+        );
+        lobby
+            .join_on_channel(
+                first.id(),
+                identity(2),
+                None,
+                1,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("join same channel");
+    }
+
+    #[tokio::test]
     async fn registry_enforces_room_cap_unique_ids_and_one_room_per_connection() {
         let lobby = spawn_lobby(limits(2));
         let first = create(&lobby, 1, 3).await;

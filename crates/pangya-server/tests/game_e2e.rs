@@ -8701,6 +8701,9 @@ async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgP
     // completed authenticated versus E2E, not by a direct table fixture here.
 
     // Every issue-listed utility request is consumed without an unknown-opcode disconnect.
+    // 0x0065 has conflicting reference bodies (item ID versus velocity). Send a bounded inert
+    // exercise over encrypted TCP; the session must remain live without inventing a mutation.
+    send_packet(&mut stream, key, 0x0065, 0x0065, &[0; 4]).await;
     for (salt, opcode) in [
         (0x0047, 0x0047),
         (0x0088, 0x0088),

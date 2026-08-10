@@ -596,6 +596,39 @@ async fn empty_database_runs_embedded_migration(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn upgraded_pre_recent_players_database_keeps_migration_0022_path(pool: PgPool) {
+    // Reproduce a database released immediately before the recent-player migration, then apply
+    // the unchanged 0022 file as the forward upgrade. This deliberately avoids renaming the
+    // already-applied migration, which SQLx checksums and rejects as drift.
+    for migration in MIGRATOR.iter().filter(|migration| migration.version <= 21) {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .expect("previous released migration");
+    }
+    sqlx::raw_sql(include_str!("../migrations/0022_retail_recent_players.sql"))
+        .execute(&pool)
+        .await
+        .expect("0022 forward upgrade");
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'retail_recent_players')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("recent-player catalog query");
+    assert!(table_exists);
+    assert_eq!(
+        MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 22)
+            .map(|migration| migration.description.as_ref()),
+        Some("retail recent players"),
+        "the released migration remains version 0022",
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn m6_forward_migration_preserves_committed_and_incomplete_m5_rows(pool: PgPool) {
     for migration in [
         include_str!("../migrations/0001_m2_account_foundation.sql"),
