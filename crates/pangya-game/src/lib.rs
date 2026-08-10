@@ -3953,7 +3953,7 @@ where
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => {
+            Ok(Err(_)) => {
                 self.observer.stroke_commit(GameCommitObservation::Failed);
                 let abort = AbortStrokeMatch::new(
                     commit.match_id(),
@@ -3968,7 +3968,7 @@ where
                     AbortResolution::Aborted => Err(GameRuntimeError::MatchPersistence),
                 };
             }
-            Err(error) => {
+            Err(_) => {
                 self.observer
                     .stroke_commit(GameCommitObservation::Cancelled);
                 let abort = AbortStrokeMatch::new(
