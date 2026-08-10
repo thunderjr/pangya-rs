@@ -18,8 +18,9 @@ use pangya_domain::{
     StarterCharacter, StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
-    EconomyRuntimeConfig, GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig,
-    StrokeRuntimeConfig, UnknownOpcodePolicy, deterministic_conditions,
+    EconomyRuntimeConfig, GameObserver, GameRuntimeConfig, GameRuntimeLimits, GameService,
+    GameTermination, SoloRuntimeConfig, StrokeRuntimeConfig, UnknownOpcodePolicy,
+    deterministic_conditions,
 };
 use pangya_login::{
     AdvertisedGameServer, BoundedCredentialExecutor, CredentialPolicy, LoginRuntimeConfig,
@@ -71,6 +72,7 @@ struct BlockingStrokeCommitRepository {
     abort_calls: AtomicUsize,
     offline_claim_started: Notify,
     offline_claim_release: Notify,
+    offline_ack_completed: Notify,
     /// When set, economy purchases stall past any sane command deadline.
     stall_economy: bool,
     /// Number of claims to pause so an E2E client can disconnect before the outbound write.
@@ -86,6 +88,7 @@ impl BlockingStrokeCommitRepository {
             abort_calls: AtomicUsize::new(0),
             offline_claim_started: Notify::new(),
             offline_claim_release: Notify::new(),
+            offline_ack_completed: Notify::new(),
             stall_economy: false,
             stall_offline_claims: AtomicUsize::new(0),
         }
@@ -165,7 +168,14 @@ impl pangya_domain::PlayerRepository for BlockingStrokeCommitRepository {
         &self,
         claim: pangya_domain::OfflineNoteClaim,
     ) -> pangya_domain::RepositoryFuture<'_, Result<bool, pangya_domain::RepositoryError>> {
-        pangya_domain::PlayerRepository::ack_offline_note(&self.inner, claim)
+        Box::pin(async move {
+            let acknowledged =
+                pangya_domain::PlayerRepository::ack_offline_note(&self.inner, claim).await?;
+            if acknowledged {
+                self.offline_ack_completed.notify_one();
+            }
+            Ok(acknowledged)
+        })
     }
 
     fn accept_offline_note(
@@ -176,6 +186,17 @@ impl pangya_domain::PlayerRepository for BlockingStrokeCommitRepository {
         Result<pangya_domain::OfflineNoteCommit, pangya_domain::RepositoryError>,
     > {
         pangya_domain::PlayerRepository::accept_offline_note(&self.inner, request)
+    }
+}
+
+#[derive(Default)]
+struct OfflineNoteDeliveryObservation {
+    closed: Notify,
+}
+
+impl GameObserver for OfflineNoteDeliveryObservation {
+    fn closed(&self, _outcome: GameTermination) {
+        self.closed.notify_one();
     }
 }
 
@@ -6662,6 +6683,7 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
     )
     .await
     .expect("queue note");
+    let delivery_observation = Arc::new(OfflineNoteDeliveryObservation::default());
     let service = Arc::new(
         GameService::new(
             Arc::clone(&repository),
@@ -6675,7 +6697,7 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
                 economy: None,
                 retail_bootstrap: true,
             },
-            Arc::new(M2Metrics::default()),
+            delivery_observation.clone(),
         )
         .expect("lease service"),
     );
@@ -6714,12 +6736,17 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
     assert_eq!(leased, (true, true));
     // RST the encrypted peer while claim_offline_notes is paused, then let the server attempt the
     // queued WhisperResponse. The failed write must not turn the lease into a delivered row.
+    // The connection-close observation is the state transition proving the failed write path has
+    // finished. A fixed sleep here races the handler's write and database work under contention.
+    let failed_closed = delivery_observation.closed.notified();
     failed
         .set_linger(Some(Duration::ZERO))
         .expect("reset linger");
     drop(failed);
     repository.offline_claim_release.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, failed_closed)
+        .await
+        .expect("failed delivery connection closed");
     let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
         .fetch_one(&pool)
         .await
@@ -6730,6 +6757,9 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
         .execute(&pool)
         .await
         .expect("expire failed lease");
+    // The packet becoming readable only proves the socket write reached the kernel. Wait for the
+    // repository acknowledgement event before inspecting durable state.
+    let retry_acknowledged = repository.offline_ack_completed.notified();
     let (mut retry, retry_key, _) =
         connect_retail_social_client(&pool, address, recipient.account.id, "LeaseRecipient").await;
     let (opcode, body) = receive_packet(&mut retry, retry_key).await;
@@ -6742,6 +6772,9 @@ async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(po
             105, 108, 117, 114, 101,
         ]
     );
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, retry_acknowledged)
+        .await
+        .expect("retry acknowledgement completed");
     let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
         .fetch_one(&pool)
         .await
