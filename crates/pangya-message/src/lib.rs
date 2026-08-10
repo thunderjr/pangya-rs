@@ -58,8 +58,8 @@ pub const FRIEND_PAGE_SIZE: usize = 30;
 pub const MAX_FRIEND_ROWS: usize = FRIEND_PAGE_SIZE * 10;
 /// Maximum queued messages claimed or presence events emitted in one pass.
 pub const MAX_DELIVERY_BATCH: usize = 30;
-/// Maximum pending/live/in-flight chat rows retained for one recipient in memory.
-pub const MAX_QUEUED_MESSAGES: usize = 1024;
+/// Maximum pending/live/in-flight chat rows retained for one recipient.
+pub const MAX_QUEUED_MESSAGES: usize = 200;
 /// Maximum replay nonces retained by a session.
 pub const MAX_REPLAY_NONCES: usize = 256;
 
@@ -1306,7 +1306,24 @@ impl MessageStore for PostgresStore {
         if body.len() > MAX_TEXT_BYTES {
             return Err(MessageError::Limit);
         }
-        let allowed=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM message_friends a JOIN message_friends b ON b.owner_account_id=$2 AND b.friend_account_id=$1 WHERE a.owner_account_id=$1 AND a.friend_account_id=$2 AND NOT a.blocked AND NOT b.blocked AND NOT a.pending AND NOT b.pending)").bind(Self::id(sender)).bind(Self::id(recipient)).fetch_one(&self.pool).await.map_err(|_| MessageError::Rejected)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        // The count-and-insert must be one serialized transaction per recipient. Without the
+        // advisory lock, concurrent senders can all observe a slot below the cap and overflow it.
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(Self::id(recipient))
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        let allowed = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM message_friends a JOIN message_friends b ON b.owner_account_id=$2 AND b.friend_account_id=$1 WHERE a.owner_account_id=$1 AND a.friend_account_id=$2 AND NOT a.blocked AND NOT b.blocked AND NOT a.pending AND NOT b.pending)")
+            .bind(Self::id(sender))
+            .bind(Self::id(recipient))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
         if !allowed {
             return Err(MessageError::Rejected);
         }
@@ -1315,13 +1332,13 @@ impl MessageStore for PostgresStore {
             .bind(Self::id(recipient))
             .bind(body)
             .bind(i64::try_from(MAX_QUEUED_MESSAGES).map_err(|_| MessageError::Limit)?)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|_| MessageError::Rejected)?;
         if inserted.rows_affected() != 1 {
             return Err(MessageError::Limit);
         }
-        Ok(())
+        tx.commit().await.map_err(|_| MessageError::Rejected)
     }
     async fn queue_guild_message(
         &self,
@@ -2056,6 +2073,12 @@ impl MessageSession {
                 self.user_id = Some(user_id);
                 self.lease = lease;
                 self.nickname = user_nickname;
+                // The normal message-service login establishes the Online projection before the
+                // first Hello. Explicit Status packets still replace this state afterward.
+                self.status = Presence::Online;
+                self.store
+                    .set_online(user_id, self.status, self.channel.clone())
+                    .await?;
                 Ok(vec![ServerPacket::CredentialResponse { user_id }])
             }
             ClientPacket::Hello => {
