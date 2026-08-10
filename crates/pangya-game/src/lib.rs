@@ -5412,6 +5412,10 @@ where
             .load_player_snapshot(identity.account_id)
             .await
             .map_err(|_| GameRuntimeError::Snapshot)?;
+        // A replay returns the durable projection but must not fan out a second room event. The
+        // wire packet has no operation result bit, so suppress announcements when the requested
+        // selection already equals the coherent pre-update projection.
+        let should_announce;
         // Room equipment packets have no application operation id. Derive a stable key from the
         // authenticated account and exact frame so transport retries replay the same economy
         // operation instead of incrementing the equipment version again.
@@ -5420,6 +5424,14 @@ where
         let scope = uuid::Uuid::from_bytes(scope_bytes);
         let announce = match update {
             RetailRoomEquipmentUpdate::Caddie(item_id) => {
+                let current = self
+                    .repository
+                    .load_retail_equipment(identity.account_id)
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+                should_announce = current
+                    .caddie
+                    .is_none_or(|(id, _)| id.get() != i64::from(item_id));
                 let state = self
                     .repository
                     .update_retail_equipment(
@@ -5448,6 +5460,13 @@ where
                 }
             }
             RetailRoomEquipmentUpdate::Ball(ball_type_id) => {
+                let current_ball_type = snapshot
+                    .equipment
+                    .ball_item_id
+                    .and_then(|id| snapshot.inventory.iter().find(|item| item.id == id))
+                    .map(|item| item.item_type_id.get())
+                    .unwrap_or(0);
+                should_announce = current_ball_type != ball_type_id;
                 let ball = snapshot
                     .inventory
                     .iter()
@@ -5508,6 +5527,10 @@ where
                 }
             }
             RetailRoomEquipmentUpdate::ClubSet(club_item_id) => {
+                should_announce = snapshot
+                    .equipment
+                    .club_item_id
+                    .is_none_or(|id| id.get() != i64::from(club_item_id));
                 let club = snapshot
                     .inventory
                     .iter()
@@ -5571,6 +5594,7 @@ where
             RetailRoomEquipmentUpdate::Character(character_uid) => {
                 let character_id = CharacterId::new(i64::from(character_uid))
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
+                should_announce = snapshot.equipment.character_id != character_id;
                 let character = snapshot
                     .characters
                     .iter()
@@ -5638,7 +5662,7 @@ where
                 return Err(GameRuntimeError::Protocol);
             }
         };
-        if state == GameState::InRoom {
+        if state == GameState::InRoom && should_announce {
             let _ = self
                 .lobby
                 .route(
@@ -5930,7 +5954,11 @@ where
                     request.requested,
                     RetailEquipmentRequested::BallAndClub { .. }
                 ) {
-                    valid &= club.is_some();
+                    // Zero clears a slot; a nonzero club row must be an owned catalog club set.
+                    valid &= requested_aux == 0 || club.is_some();
+                }
+                if !valid {
+                    return Err(GameRuntimeError::EconomyPersistence);
                 }
                 let changed = match request.requested {
                     RetailEquipmentRequested::BallAndClub { .. } => {
