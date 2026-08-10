@@ -7800,6 +7800,51 @@ mod tests {
     }
 
     #[test]
+    fn retail_client_exception_is_not_a_silent_session_or_match_allowlist_entry() {
+        assert!(!is_retail_accepted_session_opcode(
+            RetailClientException::OPCODE
+        ));
+        assert!(!is_retail_match_opcode(RetailClientException::OPCODE));
+    }
+
+    #[test]
+    fn retail_client_exception_log_value_is_bounded_and_redacted() {
+        let report = RetailClientException {
+            message: [b"safe", &[b'\n', 0, 0xff][..], &[b'x'; 300][..]].concat(),
+        };
+        let sanitized = report.sanitized();
+        assert_eq!(sanitized.len(), 256);
+        assert_eq!(&sanitized[..7], "safe...");
+        assert!(
+            sanitized
+                .chars()
+                .all(|character| { character == '.' || (' '..='~').contains(&character) })
+        );
+    }
+
+    #[test]
+    fn retail_client_exception_uses_reference_body_and_rejects_truncation() {
+        let valid = [0, 4, 0, b's', b'a', b'f', b'e'];
+        let report = decode_packet_payload::<RetailClientException>(
+            &valid,
+            &CompatibilityProfile::US_852,
+            ServiceKind::Game,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(report.message, b"safe");
+
+        let malformed = [0, 1, 0];
+        assert!(
+            decode_packet_payload::<RetailClientException>(
+                &malformed,
+                &CompatibilityProfile::US_852,
+                ServiceKind::Game,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn unknown_policies_disconnect_ignore_capture_and_bound_strikes() {
         assert!(unknown_decision(UnknownOpcodePolicy::Disconnect, 1, 3).disconnect);
         let ignored = unknown_decision(UnknownOpcodePolicy::Ignore, 1, 2);
