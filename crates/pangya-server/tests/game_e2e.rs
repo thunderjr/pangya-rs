@@ -8101,7 +8101,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         // The reference PlayerData record is fixed-width, and ClubSetInfo is the adjacent
         // inventory/catalog pair. Search only within each fixed record so this remains resilient
         // to opaque fields while still pinning the exact wire values and both player views.
-        let stride = 0x2f95;
+        let stride = 0x2f94;
         let host_entry = 4;
         let peer_entry = host_entry + stride;
         let purchased_club_wire = [
