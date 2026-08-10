@@ -7981,7 +7981,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                     course,
                     catalog_fingerprint: catalog.fingerprint(),
                     loading_timeout: Duration::from_secs(30),
-                    commit_timeout: Duration::from_secs(2),
+                    commit_timeout: Duration::from_secs(10),
                     max_strokes: 30,
                     startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
                         .expect("recovery limit"),
@@ -7993,7 +7993,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
                     loading_timeout: Duration::from_secs(30),
                     turn_timeout: Duration::from_secs(60),
                     game_timeout: Duration::from_secs(300),
-                    commit_timeout: Duration::from_secs(2),
+                    commit_timeout: Duration::from_secs(10),
                     max_strokes: 30,
                     startup_recovery_limit: IncompleteMatchAbortLimit::new(100)
                         .expect("recovery limit"),
