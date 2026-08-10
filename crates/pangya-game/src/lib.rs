@@ -5060,14 +5060,19 @@ where
                 ServiceKind::Game,
             )
             .map_err(|_| GameRuntimeError::Protocol)?;
-            // Results and balances are server-owned. Reply from the authenticated persisted
-            // snapshot rather than accepting client-claimed reward/statistic values.
+            // Results and balances are server-owned. Reload the persisted snapshot rather than
+            // accepting client-claimed reward/statistic values (and include post-match rewards).
+            let snapshot = self
+                .repository
+                .load_player_snapshot(identity.account_id)
+                .await
+                .map_err(|_| GameRuntimeError::Snapshot)?;
             self.send(
                 framed,
                 &RetailPlayerStatisticsReport {
                     statistics: RetailPlayerStatistics {
-                        experience: identity.card.experience,
-                        pang: identity.card.pang,
+                        experience: u32::try_from(snapshot.profile.experience).unwrap_or(u32::MAX),
+                        pang: snapshot.profile.pang,
                         ..RetailPlayerStatistics::default()
                     },
                 },
