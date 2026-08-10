@@ -13,9 +13,9 @@ use pangya_data::Catalog;
 use pangya_domain::{
     AccountAggregate, AccountId, AccountRepository as _, AccountStatus, ChatText, CourseId,
     CredentialHash, HandoverRepository as _, IncompleteMatchAbortLimit, ItemTypeId, MatchSeed,
-    MemberSnapshot, NewAccount, Nickname, PlayerConnectionId, RoomId, RoomName, RoomPassword,
-    RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix, StarterCharacter,
-    StarterGrant, StarterItem, StarterKey, Username, Weather,
+    MemberSnapshot, NewAccount, Nickname, OfflineNoteRequest, PlayerConnectionId, RoomId, RoomName,
+    RoomPassword, RoomSettings, RoomSnapshot, RoomSummary, ServiceKind, SourceAddressPrefix,
+    StarterCharacter, StarterGrant, StarterItem, StarterKey, Username, Weather,
 };
 use pangya_game::{
     EconomyRuntimeConfig, GameRuntimeConfig, GameRuntimeLimits, GameService, SoloRuntimeConfig,
@@ -43,11 +43,8 @@ use pangya_protocol::{
     StrokeCommand, StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandings, StrokeTurnStarted,
-    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
-    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
-    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
-    UserStatisticsInfoResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather, Whisper,
-    WhisperRefusalResponse, WhisperResponse, decode_packet_payload, encode_packet_payload,
+    UserInfoRequest, Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse,
+    decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -72,8 +69,12 @@ struct BlockingStrokeCommitRepository {
     commit_started: Notify,
     commit_calls: AtomicUsize,
     abort_calls: AtomicUsize,
+    offline_claim_started: Notify,
+    offline_claim_release: Notify,
     /// When set, economy purchases stall past any sane command deadline.
     stall_economy: bool,
+    /// Number of claims to pause so an E2E client can disconnect before the outbound write.
+    stall_offline_claims: AtomicUsize,
 }
 
 impl BlockingStrokeCommitRepository {
@@ -83,13 +84,23 @@ impl BlockingStrokeCommitRepository {
             commit_started: Notify::new(),
             commit_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
+            offline_claim_started: Notify::new(),
+            offline_claim_release: Notify::new(),
             stall_economy: false,
+            stall_offline_claims: AtomicUsize::new(0),
         }
     }
 
     fn stalling_economy(pool: PgPool) -> Self {
         Self {
             stall_economy: true,
+            ..Self::new(pool)
+        }
+    }
+
+    fn stalling_offline_claim(pool: PgPool) -> Self {
+        Self {
+            stall_offline_claims: AtomicUsize::new(1),
             ..Self::new(pool)
         }
     }
@@ -123,6 +134,48 @@ impl pangya_domain::PlayerRepository for BlockingStrokeCommitRepository {
         Result<pangya_domain::PlayerSnapshot, pangya_domain::RepositoryError>,
     > {
         pangya_domain::PlayerRepository::load_player_snapshot(&self.inner, account_id)
+    }
+
+    fn claim_offline_notes(
+        &self,
+        recipient_id: AccountId,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<Vec<pangya_domain::OfflineNote>, pangya_domain::RepositoryError>,
+    > {
+        Box::pin(async move {
+            let notes =
+                pangya_domain::PlayerRepository::claim_offline_notes(&self.inner, recipient_id)
+                    .await?;
+            if self
+                .stall_offline_claims
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |claims| {
+                    claims.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.offline_claim_started.notify_one();
+                self.offline_claim_release.notified().await;
+            }
+            Ok(notes)
+        })
+    }
+
+    fn ack_offline_note(
+        &self,
+        claim: pangya_domain::OfflineNoteClaim,
+    ) -> pangya_domain::RepositoryFuture<'_, Result<bool, pangya_domain::RepositoryError>> {
+        pangya_domain::PlayerRepository::ack_offline_note(&self.inner, claim)
+    }
+
+    fn accept_offline_note(
+        &self,
+        request: pangya_domain::OfflineNoteRequest,
+    ) -> pangya_domain::RepositoryFuture<
+        '_,
+        Result<pangya_domain::OfflineNoteCommit, pangya_domain::RepositoryError>,
+    > {
+        pangya_domain::PlayerRepository::accept_offline_note(&self.inner, request)
     }
 }
 
@@ -6586,6 +6639,120 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+#[allow(deprecated)] // SO_LINGER is intentionally used to force the encrypted peer's write failure.
+async fn game_retail_offline_note_encrypted_write_failure_retries_after_lease(pool: PgPool) {
+    let sender = create_account(&pool, "LeaseSender", 1, 0x1000_0000).await;
+    let recipient = create_account(&pool, "LeaseRecipient", 1, 0x1000_0000).await;
+    sqlx::query("UPDATE profiles SET pang = 25 WHERE account_id = $1")
+        .bind(sender.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund sender");
+    let repository = Arc::new(BlockingStrokeCommitRepository::stalling_offline_claim(
+        pool.clone(),
+    ));
+    pangya_domain::PlayerRepository::accept_offline_note(
+        &*repository,
+        OfflineNoteRequest {
+            sender_id: sender.account.id,
+            recipient_id: recipient.account.id,
+            operation_id: [0x35; 32],
+            message: b"retry after socket failure".to_vec(),
+        },
+    )
+    .await
+    .expect("queue note");
+    let service = Arc::new(
+        GameService::new(
+            Arc::clone(&repository),
+            economy_catalog(),
+            GameRuntimeConfig {
+                channel_id: 1,
+                unknown_opcode_policy: UnknownOpcodePolicy::Disconnect,
+                limits: GameRuntimeLimits::default(),
+                solo_practice: None,
+                stroke_two: None,
+                economy: None,
+                retail_bootstrap: true,
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("lease service"),
+    );
+    let (address, shutdown, task) = start_service(service).await;
+    let token = issue_token(
+        &pool,
+        recipient.account.id,
+        SystemTime::now(),
+        ServiceKind::Game,
+    )
+    .await;
+    let (mut failed, key) = connect_game_retail(address).await;
+    let claim_started = repository.offline_claim_started.notified();
+    send_typed(
+        &mut failed,
+        key,
+        1,
+        &pangya_protocol::RetailGameAuth {
+            username: b"LeaseRecipient".to_vec(),
+            user_id: u32::try_from(recipient.account.id.get()).expect("recipient id"),
+            login_key: zeroize::Zeroizing::new(token.into_bytes()),
+            client_version: pangya_protocol::US852_SERVER_VERSION.to_vec(),
+            session_key: zeroize::Zeroizing::new(Vec::new()),
+        },
+    )
+    .await;
+    tokio::time::timeout(E2E_RECEIVE_TIMEOUT, claim_started)
+        .await
+        .expect("offline claim began");
+    let leased: (bool, bool) = sqlx::query_as(
+        "SELECT delivered_at IS NULL, delivery_lease_token IS NOT NULL FROM offline_notes",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("lease state");
+    assert_eq!(leased, (true, true));
+    // RST the encrypted peer while claim_offline_notes is paused, then let the server attempt the
+    // queued WhisperResponse. The failed write must not turn the lease into a delivered row.
+    failed
+        .set_linger(Some(Duration::ZERO))
+        .expect("reset linger");
+    drop(failed);
+    repository.offline_claim_release.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
+        .fetch_one(&pool)
+        .await
+        .expect("failed delivery state");
+    assert!(!delivered, "socket failure acknowledged the note");
+
+    sqlx::query("UPDATE offline_notes SET delivery_lease_until = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .expect("expire failed lease");
+    let (mut retry, retry_key, _) =
+        connect_retail_social_client(&pool, address, recipient.account.id, "LeaseRecipient").await;
+    let (opcode, body) = receive_packet(&mut retry, retry_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        [
+            0, 12, 0, 78, 76, 101, 97, 115, 101, 83, 101, 110, 100, 101, 114, 26, 0, 114, 101, 116,
+            114, 121, 32, 97, 102, 116, 101, 114, 32, 115, 111, 99, 107, 101, 116, 32, 102, 97,
+            105, 108, 117, 114, 101,
+        ]
+    );
+    let delivered: bool = sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM offline_notes")
+        .fetch_one(&pool)
+        .await
+        .expect("retry delivery state");
+    assert!(delivered, "retry was not acknowledged");
+    drop(retry);
+    shutdown.cancel();
+    task.await.expect("lease join").expect("lease serve");
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool: PgPool) {
     let alice = create_account(&pool, "SocialAlice", 1, 0x1000_0000).await;
     let bob = create_account(&pool, "SocialBob", 1, 0x1000_0000).await;
@@ -6828,16 +6995,6 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
             0x0257, 0x0089,
         ]
     );
-    let expected_name = UserNameInfoResponse {
-        request_type: 5,
-        user_id: u32::try_from(bob.account.id.get()).expect("bob id"),
-        username: b"SocialBob".to_vec(),
-        nickname: b"NSocialBob".to_vec(),
-    };
-    assert_eq!(
-        fanout[0].1,
-        wire(&expected_name, &CompatibilityProfile::US_852).expect("name bytes")
-    );
     let user_id = u32::try_from(bob.account.id.get()).expect("bob id");
     let character_uid: i64 =
         sqlx::query_scalar("SELECT character_id FROM equipment_sets WHERE account_id = $1")
@@ -6851,108 +7008,105 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         .fetch_one(&pool)
         .await
         .expect("bob pang");
-    let pang = u64::try_from(pang).expect("bob pang width");
+    let pang = u32::try_from(pang).expect("bob pang width");
+
+    // Independent PacketDoc reference fixtures. Keep these literal builders separate from the
+    // protocol encoders so an encoder regression cannot make this E2E self-validate.
+    fn fixed_nul(value: &[u8], width: usize) -> Vec<u8> {
+        let mut bytes = vec![0; width];
+        bytes[..value.len()].copy_from_slice(value);
+        bytes
+    }
+    fn user_name_fixture(user_id: u32) -> Vec<u8> {
+        let mut bytes = vec![5];
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        bytes.extend_from_slice(&[0xff, 0xff]);
+        bytes.extend(fixed_nul(b"SocialBob", 22));
+        bytes.extend(fixed_nul(b"NSocialBob", 22));
+        bytes.extend(fixed_nul(&[], 21));
+        bytes.extend(fixed_nul(&[], 24));
+        bytes.extend_from_slice(&[0; 4 + 12 + 4 + 4 + 2]);
+        bytes.extend_from_slice(&[0xff; 6]);
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend(fixed_nul(&[], 128));
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+    fn character_fixture(user_id: u32, character_uid: u32) -> Vec<u8> {
+        let mut bytes = user_id.to_le_bytes().to_vec();
+        let mut character = vec![0; pangya_protocol::CHARACTER_BLOCK_BYTES];
+        character[0..4].copy_from_slice(&0x0400_0000_u32.to_le_bytes());
+        character[4..8].copy_from_slice(&character_uid.to_le_bytes());
+        bytes.extend(character);
+        bytes
+    }
+    fn statistics_fixture(user_id: u32, pang: u32) -> Vec<u8> {
+        let mut bytes = vec![5];
+        bytes.extend_from_slice(&user_id.to_le_bytes());
+        let mut body = vec![0; pangya_protocol::PLAYER_STATISTICS_BYTES];
+        body[74..78].copy_from_slice(&0_u32.to_le_bytes());
+        body[79..83].copy_from_slice(&pang.to_le_bytes());
+        body[91..96].fill(0x7f);
+        bytes.extend(body);
+        bytes
+    }
+    fn counted_course_fixture(request_type: u8, user_id: u32) -> Vec<u8> {
+        [
+            vec![request_type],
+            user_id.to_le_bytes().to_vec(),
+            vec![0; 8],
+        ]
+        .concat()
+    }
+    fn short_info_fixture(request_type: u8, user_id: u32, tail: &[u8]) -> Vec<u8> {
+        [
+            vec![request_type],
+            user_id.to_le_bytes().to_vec(),
+            tail.to_vec(),
+        ]
+        .concat()
+    }
+    let mut equipment = vec![5];
+    equipment.extend_from_slice(&user_id.to_le_bytes());
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&character_uid.to_le_bytes());
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&[0; 4]);
+    equipment.extend_from_slice(&[0; 25 * 4]);
+    let mut guild = user_id.to_le_bytes().to_vec();
+    guild.extend_from_slice(&[0; 4]);
+    guild.extend(fixed_nul(&[], 21));
+    guild.extend_from_slice(&[0; 12]);
+    guild.extend_from_slice(&[0; 206]);
+    guild.extend_from_slice(&u32::MAX.to_le_bytes());
+    guild.extend_from_slice(&[0; 22]);
+    guild.extend_from_slice(&[
+        0xc3, 0x41, 0x02, 0xf8, 0x28, 0x3a, 0x02, 0x78, 0x23, 0x09, 0x09, 0x60, 0xf1, 0x01, 0x0b,
+        0xd0,
+    ]);
+    let mut trophies = vec![5];
+    trophies.extend_from_slice(&user_id.to_le_bytes());
+    trophies.extend_from_slice(&[0; 78]);
     let expected_packets = [
-        wire(&expected_name, &CompatibilityProfile::US_852).expect("name bytes"),
-        wire(
-            &UserCharacterInfoResponse {
-                user_id,
-                character_iff_id: 0x0400_0000,
-                character_uid,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("character bytes"),
-        wire(
-            &UserEquipmentInfoResponse {
-                request_type: 5,
-                user_id,
-                character_uid,
-                comet_iff_id: 0,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("equipment bytes"),
-        wire(
-            &UserStatisticsInfoResponse {
-                request_type: 5,
-                user_id,
-                experience: 0,
-                pang,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("statistics bytes"),
-        wire(
-            &UserGuildInfoResponse { user_id },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("guild bytes"),
-        wire(
-            &UserCourseRecordsInfoResponse {
-                request_type: 0x33,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("natural course bytes"),
-        wire(
-            &UserCourseRecordsInfoResponse {
-                request_type: 0x34,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("grand prix course bytes"),
-        wire(
-            &UserRelatedInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("related bytes"),
-        wire(
-            &UserSpecialTrophiesInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("special bytes"),
-        wire(
-            &UserTrophiesInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("trophies bytes"),
-        wire(
-            &UserCourseRecordsInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("season course bytes"),
-        wire(
-            &UserGrandPrixTrophiesInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("grand prix bytes"),
-        wire(
-            &UserInfoResponse {
-                status: 1,
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("acknowledgement bytes"),
+        user_name_fixture(user_id),
+        character_fixture(user_id, character_uid),
+        equipment,
+        statistics_fixture(user_id, pang),
+        guild,
+        counted_course_fixture(0x33, user_id),
+        counted_course_fixture(0x34, user_id),
+        short_info_fixture(5, user_id, &[0, 0]),
+        short_info_fixture(5, user_id, &[0, 0]),
+        trophies,
+        counted_course_fixture(5, user_id),
+        short_info_fixture(5, user_id, &[0, 0]),
+        [
+            1_u32.to_le_bytes().to_vec(),
+            vec![5],
+            user_id.to_le_bytes().to_vec(),
+        ]
+        .concat(),
     ];
     for (index, expected) in expected_packets.into_iter().enumerate() {
         assert_eq!(fanout[index].1, expected, "golden fanout body {index}");

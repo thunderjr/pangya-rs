@@ -841,6 +841,8 @@ async fn offline_note_acceptance_is_atomic_idempotent_and_leased_by_account_id(p
         .await
         .expect("claim once");
     assert!(pending_again.is_empty());
+    // An expired claimant must not be able to acknowledge the replacement lease. The affected
+    // row count is the fence's observable result, and the note remains pending for the new token.
     sqlx::query("UPDATE offline_notes SET delivery_lease_until = now() - interval '1 second'")
         .execute(&pool)
         .await
@@ -851,13 +853,29 @@ async fn offline_note_acceptance_is_atomic_idempotent_and_leased_by_account_id(p
         .expect("claim after disconnect");
     assert_eq!(recovered.len(), 1);
     assert_ne!(recovered[0].lease_token, pending[0].lease_token);
-    repository
-        .ack_offline_note(OfflineNoteClaim {
-            id: recovered[0].id,
-            lease_token: recovered[0].lease_token,
-        })
+    assert!(
+        !repository
+            .ack_offline_note(OfflineNoteClaim {
+                id: recovered[0].id,
+                lease_token: pending[0].lease_token,
+            })
+            .await
+            .expect("stale ack")
+    );
+    let still_pending = repository
+        .claim_offline_notes(recipient.account.id)
         .await
-        .expect("ack pending");
+        .expect("stale ack leaves lease");
+    assert!(still_pending.is_empty(), "replacement lease remains live");
+    assert!(
+        repository
+            .ack_offline_note(OfflineNoteClaim {
+                id: recovered[0].id,
+                lease_token: recovered[0].lease_token,
+            })
+            .await
+            .expect("ack pending")
+    );
     let acknowledged = repository
         .claim_offline_notes(recipient.account.id)
         .await

@@ -4150,12 +4150,13 @@ pub trait PlayerRepository: Send + Sync {
 
     /// Acknowledges one note only after its outbound socket write succeeds.
     ///
-    /// The token fences a delayed acknowledgement from an expired lease and a later claimant.
+    /// Returns whether exactly one pending row carried this lease token. The token fences a
+    /// delayed acknowledgement from an expired lease and a later claimant.
     fn ack_offline_note(
         &self,
         _claim: OfflineNoteClaim,
-    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
-        Box::pin(std::future::ready(Ok(())))
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(false)))
     }
 
     /// Stores an offline note and debits its fixed 10-Pang cost in one transaction.

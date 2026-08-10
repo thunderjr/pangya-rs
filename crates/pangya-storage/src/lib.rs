@@ -519,8 +519,11 @@ impl PgRepository {
         Ok(notes)
     }
 
-    async fn ack_offline_note_inner(&self, claim: OfflineNoteClaim) -> Result<(), RepositoryError> {
-        sqlx::query(
+    async fn ack_offline_note_inner(
+        &self,
+        claim: OfflineNoteClaim,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
             "UPDATE offline_notes SET delivered_at = now(), delivery_lease_until = NULL, \
              delivery_lease_token = NULL WHERE id = $1 AND delivered_at IS NULL \
              AND delivery_lease_token = $2",
@@ -530,7 +533,7 @@ impl PgRepository {
         .execute(&self.pool)
         .await
         .map_err(repository_db_error)?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     async fn accept_offline_note_inner(
@@ -2420,7 +2423,7 @@ impl PlayerRepository for PgRepository {
     fn ack_offline_note(
         &self,
         claim: OfflineNoteClaim,
-    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+    ) -> RepositoryFuture<'_, Result<bool, RepositoryError>> {
         Box::pin(self.observed(self.ack_offline_note_inner(claim)))
     }
 
