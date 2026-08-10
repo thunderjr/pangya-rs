@@ -11,7 +11,9 @@ use tokio::{
 };
 use tokio_util::{codec::Framed, sync::CancellationToken};
 
-use crate::{ClientPacket, MemoryStore, MessageSession, MessageStore, ServerPacket};
+use crate::{
+    ClientPacket, MemoryStore, MessageSession, MessageStore, ServerPacket, SessionRegistry,
+};
 
 /// Bounded MessageService listener composition.
 #[derive(Clone)]
@@ -19,6 +21,7 @@ pub struct MessageService {
     store: std::sync::Arc<dyn MessageStore>,
     key: u8,
     limits: pangya_protocol::CodecLimits,
+    registry: std::sync::Arc<SessionRegistry>,
 }
 impl MessageService {
     /// Creates a listener around shared social state.
@@ -28,6 +31,7 @@ impl MessageService {
             store: std::sync::Arc::new(store),
             key,
             limits,
+            registry: std::sync::Arc::new(SessionRegistry::default()),
         }
     }
     /// Composes a listener from durable storage.
@@ -37,7 +41,12 @@ impl MessageService {
         key: u8,
         limits: pangya_protocol::CodecLimits,
     ) -> Self {
-        Self { store, key, limits }
+        Self {
+            store,
+            key,
+            limits,
+            registry: std::sync::Arc::new(SessionRegistry::default()),
+        }
     }
     /// Runs until cancellation. Each accepted connection gets a fresh authenticated session.
     pub async fn serve(
@@ -50,10 +59,10 @@ impl MessageService {
                 biased;
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.map_err(|_| MessageRuntimeError::Accept)?;
+                    let (stream, peer) = accepted.map_err(|_| MessageRuntimeError::Accept)?;
                     let service = self.clone();
                     let token = shutdown.child_token();
-                    tokio::spawn(async move { let _ = service.connection(stream, token).await; });
+                    tokio::spawn(async move { let _ = service.connection(stream, peer.ip(), token).await; });
                 }
             }
         }
@@ -61,6 +70,7 @@ impl MessageService {
     async fn connection(
         &self,
         mut stream: TcpStream,
+        peer_ip: std::net::IpAddr,
         shutdown: CancellationToken,
     ) -> Result<(), MessageRuntimeError> {
         // A zero constructor key requests the same per-connection random 4-bit key used by
@@ -79,7 +89,9 @@ impl MessageService {
             stream,
             FrameCodec::new(key, ServiceKind::Message, self.limits),
         );
-        let mut session = MessageSession::with_store(self.store.clone());
+        let mut session = MessageSession::with_store(self.store.clone())
+            .with_registry(self.registry.clone())
+            .with_peer_ip(peer_ip);
         let mut ticker = interval(Duration::from_millis(50));
         ticker.tick().await; // interval's immediate tick is not a useful poll
         let mut response_salt = 0;
@@ -89,8 +101,17 @@ impl MessageService {
                 () = shutdown.cancelled() => { let _ = session.disconnect().await; return Ok(()); },
                 _ = ticker.tick() => {
                     if session.is_authenticated() {
-                        let responses = session.poll().await.map_err(|_| MessageRuntimeError::Rejected)?;
-                        Self::send_responses(&mut framed, responses, response_salt).await?;
+                        let responses = match session.poll().await {
+                            Ok(responses) => responses,
+                            Err(_) => {
+                                let _ = session.disconnect().await;
+                                return Err(MessageRuntimeError::Rejected);
+                            }
+                        };
+                        if let Err(error) = Self::send_responses(&mut framed, responses, response_salt).await {
+                            let _ = session.disconnect().await;
+                            return Err(error);
+                        }
                     }
                 }
                 next = framed.next() => {
@@ -98,15 +119,45 @@ impl MessageService {
                         let _ = session.disconnect().await;
                         return Ok(());
                     };
-                    let frame = frame.map_err(|_| MessageRuntimeError::Protocol)?;
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            let _ = session.disconnect().await;
+                            return Err(MessageRuntimeError::Protocol);
+                        }
+                    };
                     response_salt = frame.metadata.salt;
                     let nonce = (u64::from(frame.opcode) << 8) | u64::from(frame.metadata.salt);
-                    session.admit_nonce(nonce).map_err(|_| MessageRuntimeError::Rejected)?;
-                    let packet = ClientPacket::decode(frame.opcode, &frame.payload).map_err(|_| MessageRuntimeError::Protocol)?;
+                    if session.admit_nonce(nonce).is_err() {
+                        let _ = session.disconnect().await;
+                        return Err(MessageRuntimeError::Rejected);
+                    }
+                    let packet = match ClientPacket::decode(frame.opcode, &frame.payload) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            let _ = session.disconnect().await;
+                            return Err(MessageRuntimeError::Protocol);
+                        }
+                    };
                     let goodbye = matches!(&packet, ClientPacket::Goodbye);
-                    let mut responses = session.handle(packet).await.map_err(|_| MessageRuntimeError::Rejected)?;
-                    responses.extend(session.poll().await.map_err(|_| MessageRuntimeError::Rejected)?);
-                    Self::send_responses(&mut framed, responses, response_salt).await?;
+                    let mut responses = match session.handle(packet).await {
+                        Ok(responses) => responses,
+                        Err(_) => {
+                            let _ = session.disconnect().await;
+                            return Err(MessageRuntimeError::Rejected);
+                        }
+                    };
+                    match session.poll().await {
+                        Ok(polled) => responses.extend(polled),
+                        Err(_) => {
+                            let _ = session.disconnect().await;
+                            return Err(MessageRuntimeError::Rejected);
+                        }
+                    }
+                    if let Err(error) = Self::send_responses(&mut framed, responses, response_salt).await {
+                        let _ = session.disconnect().await;
+                        return Err(error);
+                    }
                     if goodbye {
                         let _ = session.disconnect().await;
                         return Ok(());

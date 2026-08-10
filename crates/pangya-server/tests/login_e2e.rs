@@ -422,6 +422,16 @@ async fn local_login_server_selection_and_single_use_handover_are_real_db_proven
     })
     .await
     .expect("completed connection metric");
+    let eligibility = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM message_login_eligibility e JOIN accounts a ON a.id=e.account_id WHERE a.username_normalized='synthetic_one' AND e.nickname='Synthetic-Nick' AND e.peer_ip='127.0.0.1'::inet AND e.expires_at > now()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("message eligibility");
+    assert_eq!(
+        eligibility, 1,
+        "successful LoginService auth issues MessageService eligibility"
+    );
 
     let parsed = parse_handover(token).expect("parse token");
     let consumed = repository

@@ -8,6 +8,8 @@
 use sqlx::{PgPool, Row};
 use std::{
     collections::{HashMap, VecDeque},
+    net::IpAddr,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -397,29 +399,46 @@ pub enum ServerPacket {
         status: u32,
         entry: FriendEntry,
     },
+    /// Reference-described 0x0115 status packet. Its eleven-byte, one-byte, and 64-byte
+    /// regions are intentionally opaque: PacketDoc does not assign them presence semantics.
     Presence {
         user_id: u32,
-        status: Presence,
-        channel: ChannelInfo,
+        unknown_f: [u8; 11],
+        server_id: u32,
+        unknown_g: u8,
+        unknown_h: Vec<u8>,
     },
+    /// SuperSS 0x010b delete-friend result.
+    DeleteResult {
+        status: u32,
+        user_id: u32,
+    },
+    /// SuperSS 0x010c block-friend result.
+    BlockResult {
+        status: u32,
+        user_id: u32,
+    },
+    /// SuperSS 0x010d unblock-friend result.
+    UnblockResult {
+        status: u32,
+        user_id: u32,
+    },
+    /// Reference-described 0x010f logout notification.
     Logout {
         user_id: u32,
     },
+    /// SuperSS 0x0119 alias result.
+    AliasResult {
+        status: u32,
+        user_id: u32,
+        alias: Vec<u8>,
+    },
+    /// Reference-described 0x0113 friend/guild chat delivery.
     Chat {
         user_id: u32,
         nickname: Vec<u8>,
         message: Vec<u8>,
         guild: bool,
-    },
-    Mutation {
-        subtype: u16,
-        status: u32,
-        user_id: u32,
-        text: Vec<u8>,
-    },
-    GuildNotice {
-        subtype: u16,
-        user_id: u32,
     },
 }
 impl ServerPacket {
@@ -461,24 +480,46 @@ impl ServerPacket {
             }
             Self::Presence {
                 user_id,
-                status,
-                channel,
+                unknown_f,
+                server_id,
+                unknown_g,
+                unknown_h,
             } => {
                 o.extend(0x115_u16.to_le_bytes());
                 o.extend(user_id.to_le_bytes());
-                // PacketDoc 0x0115 is user_id + unknown[11] + server_id +
-                // unknown:u8 + sub-server-name[64]. Keep the status in the
-                // first opaque byte for our own projection; all remaining
-                // bytes retain the reference layout.
-                o.push(*status as u8);
-                o.extend([0; 10]);
-                o.extend(channel.server_id.to_le_bytes());
-                o.push(channel.channel_id as u8);
-                fixed(&mut o, &channel.channel_name, 64);
+                o.extend(unknown_f);
+                o.extend(server_id.to_le_bytes());
+                o.push(*unknown_g);
+                fixed(&mut o, unknown_h, 64);
+            }
+            Self::DeleteResult { status, user_id } => {
+                o.extend(0x10b_u16.to_le_bytes());
+                o.extend(status.to_le_bytes());
+                o.extend(user_id.to_le_bytes());
+            }
+            Self::BlockResult { status, user_id } => {
+                o.extend(0x10c_u16.to_le_bytes());
+                o.extend(status.to_le_bytes());
+                o.extend(user_id.to_le_bytes());
+            }
+            Self::UnblockResult { status, user_id } => {
+                o.extend(0x10d_u16.to_le_bytes());
+                o.extend(status.to_le_bytes());
+                o.extend(user_id.to_le_bytes());
             }
             Self::Logout { user_id } => {
                 o.extend(0x10f_u16.to_le_bytes());
                 o.extend(user_id.to_le_bytes());
+            }
+            Self::AliasResult {
+                status,
+                user_id,
+                alias,
+            } => {
+                o.extend(0x119_u16.to_le_bytes());
+                o.extend(status.to_le_bytes());
+                o.extend(user_id.to_le_bytes());
+                string(&mut o, alias, 10)?;
             }
             Self::Chat {
                 user_id,
@@ -491,23 +532,6 @@ impl ServerPacket {
                 string(&mut o, nickname, MAX_NICKNAME_BYTES)?;
                 string(&mut o, message, MAX_TEXT_BYTES)?;
                 o.push(u8::from(*guild));
-            }
-            Self::Mutation {
-                subtype,
-                status,
-                user_id,
-                text,
-            } => {
-                o.extend(subtype.to_le_bytes());
-                o.extend(status.to_le_bytes());
-                o.extend(user_id.to_le_bytes());
-                if !text.is_empty() {
-                    string(&mut o, text, MAX_TEXT_BYTES)?;
-                }
-            }
-            Self::GuildNotice { subtype, user_id } => {
-                o.extend(subtype.to_le_bytes());
-                o.extend(user_id.to_le_bytes());
             }
         }
         Ok(o)
@@ -548,26 +572,37 @@ impl ServerPacket {
                 let entry = FriendEntry::decode(&mut r)?;
                 Self::FriendRequest { status, entry }
             }
-            0x115 => {
-                let user_id = r.u32()?;
-                let status = Presence::try_from(r.u8()?)?;
-                r.take(10)?;
-                let server_id = r.u32()?;
-                let channel_id = r.u8()? as i8;
-                let channel_name = r.fixed(64)?;
-                Self::Presence {
-                    user_id,
-                    status,
-                    channel: ChannelInfo {
-                        room_number: -1,
-                        room_type: -1,
-                        server_id,
-                        channel_id,
-                        channel_name,
-                    },
-                }
-            }
+            0x115 => Self::Presence {
+                user_id: r.u32()?,
+                unknown_f: r.array()?,
+                server_id: r.u32()?,
+                unknown_g: r.u8()?,
+                unknown_h: r.fixed(64)?,
+            },
+            0x10b => Self::DeleteResult {
+                status: r.u32()?,
+                user_id: r.u32()?,
+            },
+            0x10c => Self::BlockResult {
+                status: r.u32()?,
+                user_id: r.u32()?,
+            },
+            0x10d => Self::UnblockResult {
+                status: r.u32()?,
+                user_id: r.u32()?,
+            },
             0x10f => Self::Logout { user_id: r.u32()? },
+            0x113 => Self::Chat {
+                user_id: r.u32()?,
+                nickname: r.string(MAX_NICKNAME_BYTES)?,
+                message: r.string(MAX_TEXT_BYTES)?,
+                guild: r.u8()? != 0,
+            },
+            0x119 => Self::AliasResult {
+                status: r.u32()?,
+                user_id: r.u32()?,
+                alias: r.string(10)?,
+            },
             0x117 => {
                 let status = r.u32()?;
                 let nickname = r.string(MAX_NICKNAME_BYTES)?;
@@ -607,14 +642,14 @@ pub enum MessageError {
     Truncated,
     #[error("message packet has trailing bytes")]
     Trailing,
+    #[error("invalid client status {0}")]
+    InvalidPresence(u8),
     #[error("message packet exceeds a bounded field")]
     Limit,
     #[error("unknown MessageService opcode {0:#x}")]
     UnknownOpcode(u16),
     #[error("unknown MessageService subtype {0:#x}")]
     UnknownSubtype(u16),
-    #[error("invalid presence status {0}")]
-    InvalidPresence(u8),
     #[error("session is not authenticated")]
     Unauthorized,
     #[error("social operation rejected")]
@@ -623,13 +658,25 @@ pub enum MessageError {
 impl TryFrom<u8> for Presence {
     type Error = MessageError;
     fn try_from(v: u8) -> Result<Self, Self::Error> {
+        // PacketDoc 0x001d establishes only playing, idle, and online client declarations.
+        match v {
+            0 => Ok(Self::Playing),
+            1 => Ok(Self::Idle),
+            4 => Ok(Self::Online),
+            x => Err(MessageError::InvalidPresence(x)),
+        }
+    }
+}
+
+impl Presence {
+    fn from_stored(v: i16) -> Result<Self, MessageError> {
         match v {
             0 => Ok(Self::Playing),
             1 => Ok(Self::Idle),
             3 => Ok(Self::Busy),
             4 => Ok(Self::Online),
             5 => Ok(Self::Offline),
-            x => Err(MessageError::InvalidPresence(x)),
+            _ => Err(MessageError::Rejected),
         }
     }
 }
@@ -706,6 +753,27 @@ fn fixed(out: &mut Vec<u8>, value: &[u8], width: usize) {
     out.resize(out.len() + width - n, 0);
 }
 
+/// Builds the only reference-established status notification (0x0115). PacketDoc marks all
+/// fields other than the user and server IDs opaque; never place our local presence enum into
+/// those bytes.
+fn status_packet(user_id: u32, status: Presence, channel: &ChannelInfo) -> ServerPacket {
+    let mut unknown_f = [0; 11];
+    // SuperSS writes state:u32, result:u8, room.number:i16, room.type:i32 before the
+    // separately named server/channel/name fields. Preserve that established byte order while
+    // keeping the packet decoder's opaque representation.
+    unknown_f[..4].copy_from_slice(&(status as u32).to_le_bytes());
+    unknown_f[4] = 1;
+    unknown_f[5..7].copy_from_slice(&channel.room_number.to_le_bytes());
+    unknown_f[7..11].copy_from_slice(&channel.room_type.to_le_bytes());
+    ServerPacket::Presence {
+        user_id,
+        unknown_f,
+        server_id: channel.server_id,
+        unknown_g: channel.channel_id as u8,
+        unknown_h: channel.channel_name.clone(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct User {
     pub id: u32,
@@ -733,7 +801,12 @@ struct StoreData {
 }
 #[async_trait::async_trait]
 pub trait MessageStore: Send + Sync {
-    async fn authenticate(&self, user_id: u32, nickname: &[u8]) -> Result<bool, MessageError>;
+    async fn authenticate(
+        &self,
+        user_id: u32,
+        nickname: &[u8],
+        peer_ip: IpAddr,
+    ) -> Result<bool, MessageError>;
     async fn friends(&self, id: u32) -> Result<Vec<FriendEntry>, MessageError>;
     async fn lookup(&self, nickname: &[u8]) -> Result<Option<u32>, MessageError>;
     async fn add_friend(&self, a: u32, b: u32) -> Result<(), MessageError>;
@@ -766,7 +839,12 @@ pub trait MessageStore: Send + Sync {
 
 #[async_trait::async_trait]
 impl MessageStore for MemoryStore {
-    async fn authenticate(&self, user_id: u32, nickname: &[u8]) -> Result<bool, MessageError> {
+    async fn authenticate(
+        &self,
+        user_id: u32,
+        nickname: &[u8],
+        _peer_ip: IpAddr,
+    ) -> Result<bool, MessageError> {
         Ok(self
             .0
             .lock()
@@ -872,20 +950,49 @@ impl PostgresStore {
         i64::from(id)
     }
     fn presence(value: i16) -> Result<Presence, MessageError> {
-        Presence::try_from(value as u8)
+        Presence::from_stored(value)
     }
 }
 #[async_trait::async_trait]
 impl MessageStore for PostgresStore {
-    async fn authenticate(&self, user_id: u32, nickname: &[u8]) -> Result<bool, MessageError> {
-        let row = sqlx::query("SELECT nickname_display FROM profiles WHERE account_id = $1")
-            .bind(Self::id(user_id))
-            .fetch_optional(&self.pool)
+    async fn authenticate(
+        &self,
+        user_id: u32,
+        nickname: &[u8],
+        peer_ip: IpAddr,
+    ) -> Result<bool, MessageError> {
+        let nickname = String::from_utf8(nickname.to_vec()).map_err(|_| MessageError::Rejected)?;
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        Ok(row
-            .and_then(|r| r.try_get::<String, _>("nickname_display").ok())
-            .is_some_and(|v| v.as_bytes() == nickname))
+        let row = sqlx::query("SELECT e.expires_at, a.status FROM message_login_eligibility e JOIN accounts a ON a.id = e.account_id JOIN profiles p ON p.account_id = e.account_id AND p.nickname_display = e.nickname WHERE e.account_id = $1 AND e.nickname = $2 AND e.peer_ip = $3::inet FOR UPDATE")
+            .bind(Self::id(user_id))
+            .bind(&nickname)
+            .bind(peer_ip.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| MessageError::Rejected)?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let expires_at: chrono::DateTime<chrono::Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| MessageError::Rejected)?;
+        let status: String = row.try_get("status").map_err(|_| MessageError::Rejected)?;
+        if status != "active" || chrono::Utc::now() >= expires_at {
+            sqlx::query("DELETE FROM message_login_eligibility WHERE account_id = $1 AND nickname = $2 AND peer_ip = $3::inet")
+                .bind(Self::id(user_id)).bind(&nickname).bind(peer_ip.to_string())
+                .execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+            tx.commit().await.map_err(|_| MessageError::Rejected)?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM message_login_eligibility WHERE account_id = $1 AND nickname = $2 AND peer_ip = $3::inet")
+            .bind(Self::id(user_id)).bind(&nickname).bind(peer_ip.to_string())
+            .execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
+        tx.commit().await.map_err(|_| MessageError::Rejected)?;
+        Ok(true)
     }
     async fn friends(&self, id: u32) -> Result<Vec<FriendEntry>, MessageError> {
         let rows = sqlx::query("SELECT f.friend_account_id, f.alias, f.blocked, p.nickname_display, pr.status, pr.room_number, pr.room_type, pr.server_id, pr.channel_id, pr.channel_name FROM message_friends f JOIN profiles p ON p.account_id=f.friend_account_id LEFT JOIN message_presence pr ON pr.account_id=f.friend_account_id WHERE f.owner_account_id=$1 ORDER BY f.friend_account_id")
@@ -1077,6 +1184,40 @@ impl MessageStore for PostgresStore {
         // query against an absent column. Guild packets remain a safe no-op until its durable
         // schema is introduced.
         Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct SessionRegistry {
+    active: Mutex<HashMap<u32, u64>>,
+    next: AtomicU64,
+}
+impl SessionRegistry {
+    fn claim(&self, user_id: u32) -> Result<u64, MessageError> {
+        let mut active = self.active.lock().map_err(|_| MessageError::Rejected)?;
+        let lease = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // Replacement is intentional: the old connection becomes fenced immediately and its
+        // next packet/poll is rejected, allowing the runtime to disconnect it without a race.
+        active.insert(user_id, lease);
+        Ok(lease)
+    }
+    fn is_current(&self, user_id: u32, lease: u64) -> Result<bool, MessageError> {
+        Ok(self
+            .active
+            .lock()
+            .map_err(|_| MessageError::Rejected)?
+            .get(&user_id)
+            .copied()
+            == Some(lease))
+    }
+    fn release(&self, user_id: u32, lease: u64) -> Result<bool, MessageError> {
+        let mut active = self.active.lock().map_err(|_| MessageError::Rejected)?;
+        if active.get(&user_id).copied() == Some(lease) {
+            active.remove(&user_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -1322,25 +1463,29 @@ pub struct MessageSession {
     store: Arc<dyn MessageStore>,
     user_id: Option<u32>,
     nickname: Vec<u8>,
+    peer_ip: IpAddr,
     status: Presence,
     channel: ChannelInfo,
     rate: RateLimiter,
     replay: ReplayGuard,
+    registry: Option<Arc<SessionRegistry>>,
+    lease: Option<u64>,
 }
 impl MessageSession {
     /// Drains presence and live-chat notifications generated for this session.
     pub async fn poll(&self) -> Result<Vec<ServerPacket>, MessageError> {
         let id = self.user_id.ok_or(MessageError::Unauthorized)?;
+        if let (Some(registry), Some(lease)) = (&self.registry, self.lease)
+            && !registry.is_current(id, lease)?
+        {
+            return Err(MessageError::Rejected);
+        }
         let mut responses = self
             .store
             .take_presence_events(id)
             .await?
             .into_iter()
-            .map(|(user_id, status, channel)| ServerPacket::Presence {
-                user_id,
-                status,
-                channel,
-            })
+            .map(|(user_id, status, channel)| status_packet(user_id, status, &channel))
             .collect::<Vec<_>>();
         responses.extend(
             self.store
@@ -1371,15 +1516,33 @@ impl MessageSession {
             store,
             user_id: None,
             nickname: Vec::new(),
+            peer_ip: "127.0.0.1".parse().expect("literal peer"),
             status: Presence::Offline,
             channel: ChannelInfo::offline(),
             rate: RateLimiter::new(60),
             replay: ReplayGuard::new(256),
+            registry: None,
+            lease: None,
         }
+    }
+    pub(crate) fn with_registry(mut self, registry: Arc<SessionRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+    pub(crate) fn with_peer_ip(mut self, peer_ip: IpAddr) -> Self {
+        self.peer_ip = peer_ip;
+        self
     }
     pub async fn disconnect(&mut self) -> Result<(), MessageError> {
         if let Some(id) = self.user_id.take() {
-            self.store.set_offline(id).await?;
+            let owns_generation = match (&self.registry, self.lease) {
+                (Some(registry), Some(lease)) => registry.release(id, lease)?,
+                _ => true,
+            };
+            if owns_generation {
+                self.store.set_offline(id).await?;
+            }
+            self.lease = None;
         }
         Ok(())
     }
@@ -1393,30 +1556,45 @@ impl MessageSession {
         &mut self,
         packet: ClientPacket,
     ) -> Result<Vec<ServerPacket>, MessageError> {
+        if let (Some(id), Some(registry), Some(lease)) = (self.user_id, &self.registry, self.lease)
+            && !registry.is_current(id, lease)?
+        {
+            return Err(MessageError::Rejected);
+        }
         if !self.rate.admit() {
             return Err(MessageError::Rejected);
         };
+        // Every operation other than the credential declaration is bound to the authenticated
+        // account. In particular, lookup is not a public nickname oracle.
+        if self.user_id.is_none() && !matches!(packet, ClientPacket::CredentialDeclaration { .. }) {
+            return Err(MessageError::Unauthorized);
+        }
         match packet {
             ClientPacket::CredentialDeclaration {
                 user_id,
                 user_nickname,
             } => {
                 if self.user_id.is_some()
-                    || !self.store.authenticate(user_id, &user_nickname).await?
+                    || !self
+                        .store
+                        .authenticate(user_id, &user_nickname, self.peer_ip)
+                        .await?
                 {
                     return Err(MessageError::Rejected);
                 }
+                let lease = self
+                    .registry
+                    .as_ref()
+                    .map(|registry| registry.claim(user_id))
+                    .transpose()?;
                 self.user_id = Some(user_id);
+                self.lease = lease;
                 self.nickname = user_nickname;
                 Ok(vec![ServerPacket::CredentialResponse { user_id }])
             }
             ClientPacket::Hello => {
                 let id = self.user_id.ok_or(MessageError::Unauthorized)?;
-                let mut out = vec![ServerPacket::Presence {
-                    user_id: id,
-                    status: self.status,
-                    channel: self.channel.clone(),
-                }];
+                let mut out = vec![status_packet(id, self.status, &self.channel)];
                 out.push(ServerPacket::FriendList {
                     page: Page {
                         number: 1,
@@ -1440,6 +1618,7 @@ impl MessageSession {
                 Ok(Vec::new())
             }
             ClientPacket::Lookup { nickname } => {
+                self.user_id.ok_or(MessageError::Unauthorized)?;
                 let found = self.store.lookup(&nickname).await?;
                 Ok(vec![ServerPacket::LookupResponse {
                     status: u32::from(found.is_none()),
@@ -1472,32 +1651,17 @@ impl MessageSession {
             ClientPacket::BlockFriend { user_id } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
                 self.store.block_friend(me, user_id).await?;
-                Ok(vec![ServerPacket::Mutation {
-                    subtype: 0x10c,
-                    status: 0,
-                    user_id,
-                    text: Vec::new(),
-                }])
+                Ok(vec![ServerPacket::BlockResult { status: 0, user_id }])
             }
             ClientPacket::UnblockFriend { user_id } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
                 self.store.unblock_friend(me, user_id).await?;
-                Ok(vec![ServerPacket::Mutation {
-                    subtype: 0x10d,
-                    status: 0,
-                    user_id,
-                    text: Vec::new(),
-                }])
+                Ok(vec![ServerPacket::UnblockResult { status: 0, user_id }])
             }
             ClientPacket::DeleteFriend { user_id, .. } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
                 self.store.delete_friend(me, user_id).await?;
-                Ok(vec![ServerPacket::Mutation {
-                    subtype: 0x10b,
-                    status: 0,
-                    user_id,
-                    text: Vec::new(),
-                }])
+                Ok(vec![ServerPacket::DeleteResult { status: 0, user_id }])
             }
             ClientPacket::Status { status } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
@@ -1509,18 +1673,14 @@ impl MessageSession {
                         .set_online(me, status, self.channel.clone())
                         .await?;
                 }
-                let mut responses = vec![ServerPacket::Presence {
-                    user_id: me,
-                    status,
-                    channel: self.channel.clone(),
-                }];
-                responses.extend(self.store.take_presence_events(me).await?.into_iter().map(
-                    |(user_id, status, channel)| ServerPacket::Presence {
-                        user_id,
-                        status,
-                        channel,
-                    },
-                ));
+                let mut responses = vec![status_packet(me, status, &self.channel)];
+                responses.extend(
+                    self.store
+                        .take_presence_events(me)
+                        .await?
+                        .into_iter()
+                        .map(|(user_id, status, channel)| status_packet(user_id, status, &channel)),
+                );
                 Ok(responses)
             }
             ClientPacket::Server {
@@ -1557,14 +1717,11 @@ impl MessageSession {
             ClientPacket::Alias { user_id, alias } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;
                 self.store.set_alias(me, user_id, alias.clone()).await?;
-                {
-                    Ok(vec![ServerPacket::Mutation {
-                        subtype: 0x119,
-                        status: 0,
-                        user_id,
-                        text: alias,
-                    }])
-                }
+                Ok(vec![ServerPacket::AliasResult {
+                    status: 0,
+                    user_id,
+                    alias,
+                }])
             }
             ClientPacket::GuildChat { message } => {
                 let me = self.user_id.ok_or(MessageError::Unauthorized)?;

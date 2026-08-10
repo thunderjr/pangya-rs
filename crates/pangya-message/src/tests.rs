@@ -21,8 +21,8 @@ fn packetdoc_handshake_uses_message_namespace_and_exact_pstrings() {
 
 #[test]
 fn packetdoc_literal_status_sub_layouts_match_reference() {
-    // 0x0115 is uid + unknown[11] + server:u32 + unknown:u8 + name[64].
-    let mut fixture = vec![0x15, 0x01, 7, 0, 0, 0, 4];
+    // PacketDoc 0x0115 is uid + unknown[11] + server:u32 + unknown:u8 + unknown[64].
+    let mut fixture = vec![0x15, 0x01, 7, 0, 0, 0, 0x7f];
     fixture.extend([0; 10]);
     fixture.extend(9_u32.to_le_bytes());
     fixture.push(0xff);
@@ -31,14 +31,10 @@ fn packetdoc_literal_status_sub_layouts_match_reference() {
         ServerPacket::decode(0x30, &fixture),
         Ok(ServerPacket::Presence {
             user_id: 7,
-            status: Presence::Online,
-            channel: ChannelInfo {
-                room_number: -1,
-                room_type: -1,
-                server_id: 9,
-                channel_id: -1,
-                channel_name: vec![],
-            },
+            unknown_f: [0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            server_id: 9,
+            unknown_g: 0xff,
+            unknown_h: vec![],
         })
     );
 
@@ -114,6 +110,89 @@ fn packetdoc_status_friend_entry_round_trips_without_single_hole_assumptions() {
             if page == Page { number: 1, total: 1, current: 1 }
                 && entries.len() == 1 && entries[0].user_id == 7
     ));
+}
+
+#[tokio::test]
+async fn duplicate_message_sessions_fence_and_disconnect_old_generation() {
+    let store = MemoryStore::default();
+    store.register_user(User {
+        id: 1,
+        nickname: b"Alice".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    let registry = Arc::new(SessionRegistry::default());
+    let mut first = MessageSession::new(store.clone()).with_registry(registry.clone());
+    first
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("first auth");
+    let mut replacement = MessageSession::new(store).with_registry(registry);
+    replacement
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("replacement auth");
+    assert_eq!(first.poll().await, Err(MessageError::Rejected));
+    first.disconnect().await.expect("old disconnect");
+    replacement
+        .disconnect()
+        .await
+        .expect("replacement disconnect");
+}
+
+#[tokio::test]
+async fn lookup_and_actions_require_authenticated_account() {
+    let store = MemoryStore::default();
+    store.register_user(User {
+        id: 1,
+        nickname: b"Alice".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    let mut session = MessageSession::new(store);
+    assert_eq!(
+        session
+            .handle(ClientPacket::Lookup {
+                nickname: b"Alice".to_vec(),
+            })
+            .await,
+        Err(MessageError::Unauthorized)
+    );
+    assert_eq!(
+        session
+            .handle(ClientPacket::BlockFriend { user_id: 1 })
+            .await,
+        Err(MessageError::Unauthorized)
+    );
+}
+
+#[test]
+fn reference_chat_reply_round_trips_without_invented_subtype() {
+    let packet = ServerPacket::Chat {
+        user_id: 7,
+        nickname: b"Alice".to_vec(),
+        message: b"hello".to_vec(),
+        guild: false,
+    };
+    let payload = packet.encode_payload().expect("encode");
+    assert_eq!(
+        ServerPacket::decode(
+            0x30,
+            &[
+                0x13, 0x01, 7, 0, 0, 0, 5, 0, b'A', b'l', b'i', b'c', b'e', 5, 0, b'h', b'e', b'l',
+                b'l', b'o', 0,
+            ]
+        )
+        .expect("decode"),
+        packet
+    );
+    assert_eq!(payload[0..2], [0x13, 0x01]);
 }
 
 #[test]

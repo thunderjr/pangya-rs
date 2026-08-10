@@ -555,6 +555,8 @@ pub struct Profile {
 pub struct AuthenticationRecord {
     /// Account identity.
     pub account: Account,
+    /// Stored profile nickname, when setup has selected one.
+    pub nickname: Option<String>,
     /// Stored PHC credential.
     pub credential_hash: CredentialHash,
     /// Current setup state.
@@ -4288,6 +4290,30 @@ pub trait PlayerRepository: Send + Sync {
     ) -> RepositoryFuture<'_, Result<OfflineNoteCommit, RepositoryError>> {
         Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
+}
+
+/// Short-lived server-side LoginService → MessageService eligibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewMessageEligibility {
+    /// Authenticated account.
+    pub account_id: AccountId,
+    /// Exact profile nickname sent on MessageService 0x0012.
+    pub nickname: String,
+    /// Exact peer address observed by LoginService.
+    pub peer_ip: std::net::IpAddr,
+    /// Creation time supplied by the application clock.
+    pub issued_at: SystemTime,
+    /// Strict expiry time.
+    pub expires_at: SystemTime,
+}
+
+/// Repository contract for one-time LoginService → MessageService eligibility.
+pub trait MessageEligibilityRepository: Send + Sync {
+    /// Stores/replaces the bounded eligibility after verifying the account is active.
+    fn issue_message_eligibility(
+        &self,
+        eligibility: NewMessageEligibility,
+    ) -> RepositoryFuture<'_, Result<(), HandoverError>>;
 }
 
 /// Technology-neutral single-use handover repository contract.

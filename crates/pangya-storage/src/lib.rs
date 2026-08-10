@@ -27,16 +27,16 @@ use pangya_domain::{
     ItemStacking, ItemTypeId, MAX_PLAYER_CHARACTERS, MAX_PLAYER_INVENTORY, MAX_RECENT_PLAYERS,
     MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository,
-    MatchRepositoryError, MatchResultKey, MyRoomFurniture, MyRoomProjection, NewAccount,
-    NewHandover, Nickname, NoopStorageObserver, NormalizedNickname, NormalizedUsername,
-    OfflineNote, OfflineNoteClaim, OfflineNoteCommit, OfflineNoteRequest, PlayerRepository,
-    PlayerSnapshot, Profile, PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem,
-    RepairItemResult, RepositoryError, RepositoryFuture, RetailEquipmentChange,
-    RetailEquipmentState, ServerBalances, ServiceKind, SetupState, SoloMatchResult, StarterGrant,
-    StarterKey, StorageFault, StorageFaulted, StorageObserver, StrokeCompletion, StrokeCount,
-    StrokeMatchResult, StrokePlace, StrokePlayerCommit, StrokePlayerResult, StrokeReward,
-    StrokeRosterOrder, Weather, WindConditions, synthetic_solo_reward_v1,
-    synthetic_stroke_reward_v1,
+    MatchRepositoryError, MatchResultKey, MessageEligibilityRepository, MyRoomFurniture,
+    MyRoomProjection, NewAccount, NewHandover, NewMessageEligibility, Nickname,
+    NoopStorageObserver, NormalizedNickname, NormalizedUsername, OfflineNote, OfflineNoteClaim,
+    OfflineNoteCommit, OfflineNoteRequest, PlayerRepository, PlayerSnapshot, Profile,
+    PurchaseRequest, PurchaseResult, RecentPlayer, RepairItem, RepairItemResult, RepositoryError,
+    RepositoryFuture, RetailEquipmentChange, RetailEquipmentState, ServerBalances, ServiceKind,
+    SetupState, SoloMatchResult, StarterGrant, StarterKey, StorageFault, StorageFaulted,
+    StorageObserver, StrokeCompletion, StrokeCount, StrokeMatchResult, StrokePlace,
+    StrokePlayerCommit, StrokePlayerResult, StrokeReward, StrokeRosterOrder, Weather,
+    WindConditions, synthetic_solo_reward_v1, synthetic_stroke_reward_v1,
 };
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
@@ -309,16 +309,15 @@ impl PgRepository {
         &self,
         username: &NormalizedUsername,
     ) -> Result<Option<AuthenticationRecord>, RepositoryError> {
-        let row = sqlx::query_as!(
-            AuthenticationRow,
+        let row = sqlx::query_as::<_, AuthenticationRow>(
             "SELECT a.id, a.username_display, a.username_normalized, a.status, \
-                    c.password_hash, p.setup_state \
+                    c.password_hash, p.setup_state, p.nickname_display \
              FROM accounts a \
              JOIN credentials c ON c.account_id = a.id \
              JOIN profiles p ON p.account_id = a.id \
              WHERE a.username_normalized = $1",
-            username.as_str()
         )
+        .bind(username.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(repository_db_error)?;
@@ -765,6 +764,47 @@ impl PgRepository {
         }
         transaction.commit().await.map_err(repository_db_error)?;
         Ok(())
+    }
+
+    async fn issue_message_eligibility_inner(
+        &self,
+        eligibility: NewMessageEligibility,
+    ) -> Result<(), HandoverError> {
+        if eligibility.nickname.is_empty()
+            || eligibility.nickname.len() > 22
+            || eligibility.expires_at <= eligibility.issued_at
+        {
+            return Err(HandoverError::Invalid);
+        }
+        let mut transaction = self.pool.begin().await.map_err(handover_db_error)?;
+        let status = sqlx::query_scalar!(
+            "SELECT status FROM accounts WHERE id = $1 FOR UPDATE",
+            eligibility.account_id.get()
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?
+        .ok_or(HandoverError::Invalid)?;
+        if parse_account_status(&status)
+            .map_err(|_| HandoverError::Storage(StorageFault::Decode))?
+            != AccountStatus::Active
+        {
+            return Err(HandoverError::AccountInactive);
+        }
+        sqlx::query(
+            "INSERT INTO message_login_eligibility (account_id, nickname, peer_ip, issued_at, expires_at) \
+             VALUES ($1, $2, $3::inet, $4, $5) \
+             ON CONFLICT (account_id, nickname, peer_ip) DO UPDATE SET issued_at = EXCLUDED.issued_at, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(eligibility.account_id.get())
+        .bind(eligibility.nickname)
+        .bind(eligibility.peer_ip.to_string())
+        .bind(system_time(eligibility.issued_at))
+        .bind(system_time(eligibility.expires_at))
+        .execute(&mut *transaction)
+        .await
+        .map_err(handover_db_error)?;
+        transaction.commit().await.map_err(handover_db_error)
     }
 
     async fn issue_handover_inner(&self, handover: NewHandover) -> Result<(), HandoverError> {
@@ -2660,6 +2700,15 @@ impl PlayerRepository for PgRepository {
     }
 }
 
+impl MessageEligibilityRepository for PgRepository {
+    fn issue_message_eligibility(
+        &self,
+        eligibility: NewMessageEligibility,
+    ) -> RepositoryFuture<'_, Result<(), HandoverError>> {
+        Box::pin(self.observed(self.issue_message_eligibility_inner(eligibility)))
+    }
+}
+
 impl HandoverRepository for PgRepository {
     fn issue(&self, handover: NewHandover) -> RepositoryFuture<'_, Result<(), HandoverError>> {
         Box::pin(self.observed(self.issue_handover_inner(handover)))
@@ -2746,6 +2795,7 @@ struct AuthenticationRow {
     status: String,
     password_hash: String,
     setup_state: String,
+    nickname_display: Option<String>,
 }
 
 impl AuthenticationRow {
@@ -2758,6 +2808,7 @@ impl AuthenticationRow {
                     .map_err(|_| RepositoryError::CorruptData)?,
                 status: parse_account_status(&self.status)?,
             },
+            nickname: self.nickname_display,
             credential_hash: CredentialHash::new(self.password_hash),
             setup_state: parse_setup_state(&self.setup_state)?,
         })
