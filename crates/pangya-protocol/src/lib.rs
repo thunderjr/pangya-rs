@@ -98,8 +98,11 @@ pub use registry::{PacketRegistry, RegistryKey, RegistryLookup};
 pub use social::{
     GameChat, GameChatResponse, LoungeAction, LoungeActionResponse, LoungeEnterRequest,
     LoungeEnterResponse, MacroUpdate, TypingIndicator, TypingIndicatorResponse,
-    UserCharacterInfoResponse, UserEquipmentInfoResponse, UserInfoRequest, UserInfoResponse,
-    UserNameInfoResponse, UserStatisticsInfoResponse, Whisper, WhisperResponse,
+    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
+    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
+    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
+    UserStatisticsInfoResponse, UserTrophiesInfoResponse, Whisper, WhisperRefusalResponse,
+    WhisperResponse,
 };
 pub use us852_bootstrap::{
     CHANNEL_NAME_BYTES, CHARACTER_AUX_PARTS, CHARACTER_BLOCK_BYTES, CHARACTER_CARDS,

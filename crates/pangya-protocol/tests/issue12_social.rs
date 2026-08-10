@@ -3,9 +3,11 @@
 use pangya_protocol::{
     CompatibilityProfile, EncodePacket, GameChat, GameChatResponse, LoungeAction,
     LoungeActionResponse, MacroUpdate, TypingIndicator, UserCharacterInfoResponse,
-    UserEquipmentInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
-    UserStatisticsInfoResponse, Whisper, WhisperResponse, decode_packet_payload,
-    encode_packet_payload,
+    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
+    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
+    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
+    UserTrophiesInfoResponse, Whisper, WhisperRefusalResponse, WhisperResponse,
+    decode_packet_payload, encode_packet_payload,
 };
 
 const PROFILE: CompatibilityProfile = CompatibilityProfile::US_852;
@@ -113,6 +115,109 @@ fn macros_are_nine_fixed_64_byte_slots_and_user_info_is_typed() {
             .expect("info response encoding")
             .as_slice(),
         [1, 0, 0, 0, 5, 77, 0, 0, 0]
+    );
+    let zero_type = UserInfoResponse {
+        request_type: 0,
+        ..response
+    };
+    assert_eq!(
+        encode_packet_payload(&zero_type, &PROFILE)
+            .expect("zero request type")
+            .as_slice(),
+        [1, 0, 0, 0, 0, 77, 0, 0, 0]
+    );
+}
+
+#[test]
+fn whisper_refusal_statuses_are_encoded_without_transport_failure() {
+    for status in [4, 5] {
+        let packet = WhisperRefusalResponse {
+            status,
+            nickname: b"target".to_vec(),
+        };
+        let encoded = encode_packet_payload(&packet, &PROFILE).expect("refusal encoding");
+        assert_eq!(encoded[0], status);
+        assert_eq!(WhisperRefusalResponse::OPCODE, 0x0040);
+    }
+    assert!(
+        encode_packet_payload(
+            &WhisperResponse {
+                status: 2,
+                nickname: Vec::new(),
+                message: Vec::new(),
+            },
+            &PROFILE,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn all_user_info_fanout_packets_have_reference_bodies() {
+    let course = UserCourseRecordsInfoResponse {
+        request_type: 0x33,
+        user_id: 7,
+    };
+    assert_eq!(
+        encode_packet_payload(&course, &PROFILE)
+            .expect("course")
+            .len(),
+        13
+    );
+    assert_eq!(UserGuildInfoResponse::OPCODE, 0x015d);
+    assert_eq!(
+        encode_packet_payload(&UserGuildInfoResponse { user_id: 7 }, &PROFILE)
+            .expect("guild")
+            .len(),
+        301
+    );
+    assert_eq!(
+        encode_packet_payload(
+            &UserRelatedInfoResponse {
+                request_type: 5,
+                user_id: 7
+            },
+            &PROFILE
+        )
+        .expect("related")
+        .len(),
+        7
+    );
+    assert_eq!(
+        encode_packet_payload(
+            &UserSpecialTrophiesInfoResponse {
+                request_type: 5,
+                user_id: 7
+            },
+            &PROFILE
+        )
+        .expect("special trophies")
+        .len(),
+        7
+    );
+    assert_eq!(
+        encode_packet_payload(
+            &UserTrophiesInfoResponse {
+                request_type: 5,
+                user_id: 7
+            },
+            &PROFILE
+        )
+        .expect("trophies")
+        .len(),
+        1 + 4 + 13 * 6
+    );
+    assert_eq!(
+        encode_packet_payload(
+            &UserGrandPrixTrophiesInfoResponse {
+                request_type: 5,
+                user_id: 7
+            },
+            &PROFILE
+        )
+        .expect("gp trophies")
+        .len(),
+        7
     );
 }
 

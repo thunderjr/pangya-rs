@@ -159,7 +159,10 @@ impl EncodePacket for WhisperResponse {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         profile_encode(profile)?;
-        if self.status > 1 {
+        // 0/1 are delivery/result statuses; 4 (blocked) and 5 (offline) are
+        // documented refusal statuses and are still valid response packets. The
+        // retail client stays in the lobby after either response.
+        if !matches!(self.status, 0 | 1 | 4 | 5) {
             return Err(PacketEncodeError::Invalid {
                 field: "whisper status",
             });
@@ -169,6 +172,33 @@ impl EncodePacket for WhisperResponse {
         write_string(writer, &self.message, MAX_TEXT, "message")
     }
 }
+/// Retail whisper refusal response, server opcode `0x0040`.
+///
+/// SuperSS emits refusal statuses 4 (target blocks whispers) and 5 (target is offline) on the
+/// message-data opcode with only the target pstring; successful delivery uses `0x0084`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhisperRefusalResponse {
+    pub status: u8,
+    pub nickname: Vec<u8>,
+}
+impl EncodePacket for WhisperRefusalResponse {
+    const OPCODE: u16 = 0x0040;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.status, 4 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "whisper refusal status",
+            });
+        }
+        writer.u8(self.status);
+        write_string(writer, &self.nickname, MAX_NAME, "nickname")
+    }
+}
+
 /// Retail typing indicator, client opcode `0x0018`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TypingIndicator {
@@ -466,7 +496,7 @@ impl EncodePacket for UserNameInfoResponse {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         profile_encode(profile)?;
-        if self.request_type != 5 {
+        if !matches!(self.request_type, 0 | 5) {
             return Err(PacketEncodeError::Invalid {
                 field: "user info request type",
             });
@@ -507,7 +537,7 @@ impl EncodePacket for UserStatisticsInfoResponse {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         profile_encode(profile)?;
-        if self.request_type != 5 {
+        if !matches!(self.request_type, 0 | 5) {
             return Err(PacketEncodeError::Invalid {
                 field: "user info request type",
             });
@@ -539,7 +569,7 @@ impl EncodePacket for UserEquipmentInfoResponse {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         profile_encode(profile)?;
-        if self.request_type != 5 {
+        if !matches!(self.request_type, 0 | 5) {
             return Err(PacketEncodeError::Invalid {
                 field: "user info request type",
             });
@@ -585,6 +615,172 @@ impl EncodePacket for UserCharacterInfoResponse {
         Ok(())
     }
 }
+/// Retail user guild fan-out response, server opcode `0x015D`.
+///
+/// PacketDoc defines this response without a request-type byte. Its fixed guild body is emitted
+/// with the documented neutral values (including the observed `-1` field and fixed 16-byte tail).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserGuildInfoResponse {
+    pub user_id: u32,
+}
+impl EncodePacket for UserGuildInfoResponse {
+    const OPCODE: u16 = 0x015d;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        writer.u32_le(self.user_id);
+        writer.u32_le(0);
+        writer.fixed_nul(&[], 21)?;
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.u32_le(0);
+        writer.fixed_nul(&[], 12)?;
+        writer.bytes(&[0; 206]);
+        writer.u32_le(u32::MAX);
+        writer.bytes(&[0; 22]);
+        writer.bytes(&[
+            0xc3, 0x41, 0x02, 0xf8, 0x28, 0x3a, 0x02, 0x78, 0x23, 0x09, 0x09, 0x60, 0xf1, 0x01,
+            0x0b, 0xd0,
+        ]);
+        Ok(())
+    }
+}
+
+/// Retail course-record fan-out response, server opcode `0x015C`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserCourseRecordsInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserCourseRecordsInfoResponse {
+    const OPCODE: u16 = 0x015c;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5 | 0x0a | 0x0b | 0x33 | 0x34) {
+            return Err(PacketEncodeError::Invalid {
+                field: "course record request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        // PacketDoc's two counted arrays are empty until durable course records are modelled.
+        writer.u32_le(0);
+        writer.u32_le(0);
+        Ok(())
+    }
+}
+
+/// Retail user-related response, server opcode `0x015B`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserRelatedInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserRelatedInfoResponse {
+    const OPCODE: u16 = 0x015b;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        writer.u16_le(0);
+        Ok(())
+    }
+}
+
+/// Retail special-trophy response, server opcode `0x015A`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserSpecialTrophiesInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserSpecialTrophiesInfoResponse {
+    const OPCODE: u16 = 0x015a;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        writer.u16_le(0);
+        Ok(())
+    }
+}
+
+/// Retail standard-trophy response, server opcode `0x0159`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserTrophiesInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserTrophiesInfoResponse {
+    const OPCODE: u16 = 0x0159;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        writer.bytes(&[0; 13 * 6]);
+        Ok(())
+    }
+}
+
+/// Retail Grand Prix trophy response, server opcode `0x0257`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserGrandPrixTrophiesInfoResponse {
+    pub request_type: u8,
+    pub user_id: u32,
+}
+impl EncodePacket for UserGrandPrixTrophiesInfoResponse {
+    const OPCODE: u16 = 0x0257;
+    fn encode(
+        &self,
+        writer: &mut PacketWriter,
+        profile: &CompatibilityProfile,
+    ) -> Result<(), PacketEncodeError> {
+        profile_encode(profile)?;
+        if !matches!(self.request_type, 0 | 5) {
+            return Err(PacketEncodeError::Invalid {
+                field: "user info request type",
+            });
+        }
+        writer.u8(self.request_type);
+        writer.u32_le(self.user_id);
+        writer.u16_le(0);
+        Ok(())
+    }
+}
+
 /// Retail user information acknowledgement, server opcode `0x0089`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserInfoResponse {
