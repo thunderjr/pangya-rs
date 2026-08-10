@@ -9,6 +9,14 @@ advertise = "127.0.0.1:10103"
 client_profile = "us_852"
 auto_create_accounts = false
 
+[message]
+# The listener and advertised endpoint are independent so containers can bind wildcard while
+# clients receive a routable address.
+bind = "127.0.0.1:30303"
+advertise = "127.0.0.1:30303"
+id = 1
+capacity = 200
+
 [game]
 # False preserves the M2-only process. Enabling requires the [data] gates below.
 enabled = false

@@ -20,7 +20,73 @@ fn packetdoc_handshake_uses_message_namespace_and_exact_pstrings() {
 }
 
 #[test]
-#[allow(clippy::redundant_clone)]
+fn packetdoc_literal_status_sub_layouts_match_reference() {
+    // 0x0115 is uid + unknown[11] + server:u32 + unknown:u8 + name[64].
+    let mut fixture = vec![0x15, 0x01, 7, 0, 0, 0, 4];
+    fixture.extend([0; 10]);
+    fixture.extend(9_u32.to_le_bytes());
+    fixture.push(0xff);
+    fixture.extend([0; 64]);
+    assert_eq!(
+        ServerPacket::decode(0x30, &fixture),
+        Ok(ServerPacket::Presence {
+            user_id: 7,
+            status: Presence::Online,
+            channel: ChannelInfo {
+                room_number: -1,
+                room_type: -1,
+                server_id: 9,
+                channel_id: -1,
+                channel_name: vec![],
+            },
+        })
+    );
+
+    let mut lookup = vec![0x17, 0x01, 0, 0, 0, 0, 3, 0, b'B', b'o', b'b'];
+    lookup.extend(9_u32.to_le_bytes());
+    assert_eq!(
+        ServerPacket::decode(0x30, &lookup),
+        Ok(ServerPacket::LookupResponse {
+            status: 0,
+            nickname: b"Bob".to_vec(),
+            user_id: Some(9),
+        })
+    );
+}
+
+#[test]
+fn packetdoc_friend_request_sub_layout_has_one_result_word() {
+    let mut fixture = vec![0x04, 0x01, 0, 0, 0, 0];
+    fixture.extend(b"Bob\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0".iter());
+    fixture.extend(b"Friend\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0".iter());
+    fixture.extend(7_u32.to_le_bytes());
+    fixture.extend([0; 99 + 2 + 1 + 2]);
+    assert_eq!(fixture.len(), 2 + 4 + FriendEntry::WIRE_LEN);
+    let packet = ServerPacket::decode(0x30, &fixture).expect("literal 0x104");
+    assert!(matches!(
+        packet,
+        ServerPacket::FriendRequest {
+            status: 0,
+            entry: FriendEntry {
+                user_id: 7,
+                state: Presence::Offline,
+                ..
+            }
+        }
+    ));
+}
+
+#[test]
+fn packetdoc_literal_friend_list_header_and_entry_are_bounded() {
+    let mut fixture = vec![0x02, 0x01, 0, 1, 0, 1, 0, 0, 0];
+    fixture.extend([0x42; FriendEntry::WIRE_LEN]);
+    let packet = ServerPacket::decode(0x30, &fixture).expect("literal 0x102");
+    assert!(
+        matches!(packet, ServerPacket::FriendList { entries, .. } if entries[0].user_id == 0x42424242)
+    );
+}
+
+#[test]
 fn packetdoc_status_friend_entry_round_trips_without_single_hole_assumptions() {
     let entry = FriendEntry {
         nickname: b"Bob".to_vec(),
@@ -37,11 +103,17 @@ fn packetdoc_status_friend_entry_round_trips_without_single_hole_assumptions() {
             total: 1,
             current: 1,
         },
-        entries: vec![entry.clone()],
+        entries: vec![entry],
     };
-    let decoded =
-        ServerPacket::decode(0x30, &packet.encode_payload().expect("encode")).expect("decode");
-    assert_eq!(decoded, packet);
+    let encoded = packet.encode_payload().expect("encode");
+    assert_eq!(encoded.len(), 2 + 1 + 2 + 4 + FriendEntry::WIRE_LEN);
+    let decoded = ServerPacket::decode(0x30, &encoded).expect("decode");
+    assert!(matches!(
+        decoded,
+        ServerPacket::FriendList { page, entries }
+            if page == Page { number: 1, total: 1, current: 1 }
+                && entries.len() == 1 && entries[0].user_id == 7
+    ));
 }
 
 #[test]

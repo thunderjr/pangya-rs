@@ -17,10 +17,10 @@ CREATE TABLE message_offline_messages (
     id BIGSERIAL PRIMARY KEY,
     sender_account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     recipient_account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    body TEXT NOT NULL,
+    body BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at TIMESTAMPTZ,
-    CHECK (char_length(body) <= 512)
+    CHECK (octet_length(body) <= 512)
 );
 CREATE INDEX message_offline_pending_idx
     ON message_offline_messages(recipient_account_id, id)
