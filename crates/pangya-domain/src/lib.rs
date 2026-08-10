@@ -4055,6 +4055,37 @@ pub struct RetailEquipmentState {
     pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
 }
 
+/// One atomically accepted offline note.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineNoteRequest {
+    /// Authenticated sender account.
+    pub sender_id: AccountId,
+    /// Recipient account from the wire's user id.
+    pub recipient_id: AccountId,
+    /// Stable digest of the exact authenticated request payload.
+    pub operation_id: [u8; 32],
+    /// Bounded note text.
+    pub message: Vec<u8>,
+}
+
+/// One note removed from the pending offline bridge for delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineNote {
+    /// Sender's display nickname.
+    pub sender_nickname: Vec<u8>,
+    /// Note text.
+    pub message: Vec<u8>,
+}
+
+/// Durable result of an offline-note submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineNoteCommit {
+    /// Sender's balance after the operation.
+    pub pang: u64,
+    /// Whether this request inserted a new note rather than replaying one.
+    pub accepted: bool,
+}
+
 /// Technology-neutral coherent player-bootstrap repository contract.
 pub trait PlayerRepository: Send + Sync {
     /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
@@ -4094,14 +4125,22 @@ pub trait PlayerRepository: Send + Sync {
         Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
 
-    /// Debits the fixed 10-Pang cost of a retail offline note atomically.
-    ///
-    /// The default refuses, so a repository without a durable balance mutation cannot claim that
-    /// a note succeeded.
-    fn spend_note_pang(
+    /// Takes pending notes for delivery after a recipient authenticates.
+    fn take_offline_notes(
         &self,
-        _account_id: AccountId,
-    ) -> RepositoryFuture<'_, Result<u64, RepositoryError>> {
+        _recipient_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<Vec<OfflineNote>, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+
+    /// Stores an offline note and debits its fixed 10-Pang cost in one transaction.
+    ///
+    /// Implementations must resolve the recipient by account id (not presence), insert or replay
+    /// the operation idempotently, and never debit a rejected or failed insert.
+    fn accept_offline_note(
+        &self,
+        _request: OfflineNoteRequest,
+    ) -> RepositoryFuture<'_, Result<OfflineNoteCommit, RepositoryError>> {
         Box::pin(std::future::ready(Err(RepositoryError::NotFound)))
     }
 }

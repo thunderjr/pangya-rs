@@ -277,7 +277,6 @@ pub const RETAIL_ACCEPTED_SESSION_OPCODES: &[u16] = &[
     0x0033, // client-side exception report
     0x0038, // nickname change (safe refusal until economy is wired)
     0x003a, // report player chat (safe refusal)
-    0x003c, // note/offline-message bridge (safe refusal)
     0x004f, // chat block state
     0x0054, // team chat
     0x0055, // whisper accept state (decoded by GameService)

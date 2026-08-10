@@ -16,11 +16,11 @@ use pangya_domain::{
     ItemCompatibility, ItemDefinition, ItemDurability, ItemKind, ItemSale, ItemStacking,
     ItemTypeId, MAX_STARTER_ITEMS, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame,
     MarkStrokeInGameOutcome, MatchAbortReason, MatchId, MatchRepository, MatchRepositoryError,
-    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OneHoleConfig,
-    PlayerRepository, PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange,
-    ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant, StarterItem, StarterKey,
-    StorageFault, StorageObserver, StrokeCompletion, StrokeCount, StrokePlace, StrokePlayerCommit,
-    StrokeRosterOrder, Username, Weather, WindConditions,
+    MatchResultKey, MatchSeed, NewAccount, Nickname, NormalizedUsername, OfflineNoteRequest,
+    OneHoleConfig, PlayerRepository, PurchaseRequest, RepairItem, RepositoryError,
+    RetailEquipmentChange, ServiceKind, SourceAddressPrefix, StarterCharacter, StarterGrant,
+    StarterItem, StarterKey, StorageFault, StorageObserver, StrokeCompletion, StrokeCount,
+    StrokePlace, StrokePlayerCommit, StrokeRosterOrder, Username, Weather, WindConditions,
 };
 use pangya_login::{generate_handover, parse_handover};
 use pangya_storage::{MIGRATOR, PgRepository, migrate};
@@ -790,6 +790,83 @@ async fn operator_success_audit_failure_rolls_back_whole_aggregate(pool: PgPool)
         .await
         .expect("audit count");
     assert_eq!(audits, 0);
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
+async fn offline_note_acceptance_is_atomic_idempotent_and_delivered_by_account_id(pool: PgPool) {
+    let repository = PgRepository::new(pool.clone());
+    let sender = repository
+        .create_account(account("NoteSender", Some("SenderNick")))
+        .await
+        .expect("sender");
+    let recipient = repository
+        .create_account(account("NoteRecipient", Some("RecipientNick")))
+        .await
+        .expect("recipient");
+    sqlx::query("UPDATE profiles SET pang = 25 WHERE account_id = $1")
+        .bind(sender.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund sender");
+    let request = OfflineNoteRequest {
+        sender_id: sender.account.id,
+        recipient_id: recipient.account.id,
+        operation_id: [7; 32],
+        message: b"offline fixture".to_vec(),
+    };
+    let first = repository
+        .accept_offline_note(request.clone())
+        .await
+        .expect("accept");
+    assert_eq!(first.pang, 15);
+    assert!(first.accepted);
+    let replay = repository
+        .accept_offline_note(request)
+        .await
+        .expect("replay");
+    assert_eq!(replay.pang, 15);
+    assert!(!replay.accepted);
+    let pending = repository
+        .take_offline_notes(recipient.account.id)
+        .await
+        .expect("take pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].sender_nickname, b"SenderNick");
+    assert_eq!(pending[0].message, b"offline fixture");
+    let pending_again = repository
+        .take_offline_notes(recipient.account.id)
+        .await
+        .expect("take once");
+    assert!(pending_again.is_empty());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_notes")
+        .fetch_one(&pool)
+        .await
+        .expect("note count");
+    assert_eq!(count, 1);
+    sqlx::query("UPDATE profiles SET pang = 5 WHERE account_id = $1")
+        .bind(sender.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("empty sender");
+    assert_eq!(
+        repository
+            .accept_offline_note(OfflineNoteRequest {
+                sender_id: sender.account.id,
+                recipient_id: recipient.account.id,
+                operation_id: [8; 32],
+                message: b"must not charge".to_vec(),
+            })
+            .await,
+        Err(RepositoryError::BalanceInsufficient)
+    );
+    let (pang, rows): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT pang FROM profiles WHERE account_id = $1), count(*) FROM offline_notes",
+    )
+    .bind(sender.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("unchanged failed note");
+    assert_eq!((pang, rows), (5, 1));
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

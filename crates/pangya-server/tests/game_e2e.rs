@@ -30,24 +30,24 @@ use pangya_protocol::{
     BalanceUpdate, CompatibilityProfile, ConsumeOneRequest, DecodePacket, EconomyCommand,
     EconomyCommandResult, EconomyOutcome, EncodePacket, EquipRequest, EquipmentChanged, FinishHole,
     GameChat, GameChatResponse, HoleResult, InventoryChanged, Lie, LoadingComplete, LoungeAction,
-    LoungeActionResponse, LoungeEnterRequest, LoungeEnterResponse, MatchAbortReason, MatchAborted,
-    MatchPhase, MatchStarted, PacketWriter, PurchaseCommitted, PurchaseRequestPacket,
-    RepairCommitted, RepairRequest, RetailEquipment, RetailEquipmentAnnounce, RoomChatEvent,
-    RoomChatRequest, RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest,
-    RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse,
-    RoomMembershipEvent, RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest,
-    RoomStateRequest, RoomStateResponse, ServiceKind as ProtocolServiceKind, ShopPage,
-    ShopPageRequest, ShotAction, ShotActionRelay, ShotResult, ShotResultRelay, SoloCommand,
-    SoloCommandOutcome, SoloCommandResult, SoloPhase, StartSolo, StartStrokeTwo, StrokeAbortReason,
-    StrokeActionRelay, StrokeBalanceUpdate, StrokeCommand, StrokeCommandOutcome,
-    StrokeCommandResult, StrokeCompletion, StrokeGiveUp, StrokeLoadingComplete, StrokeMatchAborted,
-    StrokeMatchStarted, StrokePhase, StrokePhaseKind, StrokeResultRelay, StrokeShotAction,
-    StrokeShotResult, StrokeStandings, StrokeTurnStarted, UserCharacterInfoResponse,
-    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
-    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
-    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
-    UserTrophiesInfoResponse, Weather as ProtocolWeather, Whisper, WhisperRefusalResponse,
-    WhisperResponse, decode_packet_payload, encode_packet_payload,
+    LoungeActionResponse, LoungeEnterRequest, LoungeEnterResponse, MacroUpdate, MatchAbortReason,
+    MatchAborted, MatchPhase, MatchStarted, NoteSend, PacketWriter, PurchaseCommitted,
+    PurchaseRequestPacket, RepairCommitted, RepairRequest, RetailEquipment,
+    RetailEquipmentAnnounce, RetailPangBalance, RoomChatEvent, RoomChatRequest, RoomCommand,
+    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRequest,
+    RoomKickRequest, RoomLeaveRequest, RoomListRequest, RoomListResponse, RoomMembershipEvent,
+    RoomMembershipKind, RoomReadyRequest, RoomSettingsRequest, RoomStateRequest, RoomStateResponse,
+    ServiceKind as ProtocolServiceKind, ShopPage, ShopPageRequest, ShotAction, ShotActionRelay,
+    ShotResult, ShotResultRelay, SoloCommand, SoloCommandOutcome, SoloCommandResult, SoloPhase,
+    StartSolo, StartStrokeTwo, StrokeAbortReason, StrokeActionRelay, StrokeBalanceUpdate,
+    StrokeCommand, StrokeCommandOutcome, StrokeCommandResult, StrokeCompletion, StrokeGiveUp,
+    StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
+    StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandings, StrokeTurnStarted,
+    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
+    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
+    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
+    UserStatisticsInfoResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather, Whisper,
+    WhisperRefusalResponse, WhisperResponse, decode_packet_payload, encode_packet_payload,
 };
 use pangya_storage::{MIGRATOR, PgRepository};
 use sqlx::PgPool;
@@ -6589,6 +6589,18 @@ async fn game_retail_room_equipment_changes_are_exactly_broadcast_and_replayed(p
 async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool: PgPool) {
     let alice = create_account(&pool, "SocialAlice", 1, 0x1000_0000).await;
     let bob = create_account(&pool, "SocialBob", 1, 0x1000_0000).await;
+    let offline = create_account(&pool, "SocialOffline", 1, 0x1000_0000).await;
+    // Give this fixture a real LoginService credential; GameService still authenticates by
+    // handover below, while the restarted login instance proves the persisted macro path.
+    let policy = CredentialPolicy::new().expect("macro credential policy");
+    let secret = pangya_login::CanonicalTransportSecret::parse(SECRET).expect("macro secret");
+    let hash = policy.hash(&secret).expect("macro hash");
+    sqlx::query("UPDATE credentials SET password_hash = $2 WHERE account_id = $1")
+        .bind(alice.account.id.get())
+        .bind(hash.expose_phc())
+        .execute(&pool)
+        .await
+        .expect("macro credential");
     let service = Arc::new(
         GameService::new(
             Arc::new(PgRepository::new(pool.clone())),
@@ -6615,6 +6627,59 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         connect_retail_social_client(&pool, address, alice.account.id, "SocialAlice").await;
     let (mut second, second_key, second_connection) =
         connect_retail_social_client(&pool, address, bob.account.id, "SocialBob").await;
+    sqlx::query("UPDATE profiles SET pang = 100 WHERE account_id = $1")
+        .bind(alice.account.id.get())
+        .execute(&pool)
+        .await
+        .expect("fund note sender");
+
+    // A note resolves by durable user id, not by live presence. It is charged and acknowledged
+    // only after the offline bridge accepts the row.
+    let offline_id = u32::try_from(offline.account.id.get()).expect("offline id");
+    send_typed(
+        &mut first,
+        first_key,
+        5,
+        &NoteSend {
+            subtype: 0x0111,
+            user_id: offline_id,
+            message: b"queued while away".to_vec(),
+            unknown: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        receive_packet(&mut first, first_key).await.0,
+        RetailPangBalance::OPCODE
+    );
+    let stored: (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT message, (SELECT pang FROM profiles WHERE account_id = $1) \
+         FROM offline_notes WHERE sender_account_id = $2 AND recipient_account_id = $3",
+    )
+    .bind(alice.account.id.get())
+    .bind(alice.account.id.get())
+    .bind(offline.account.id.get())
+    .fetch_one(&pool)
+    .await
+    .expect("offline note persisted");
+    assert_eq!(stored.0, b"queued while away");
+    assert_eq!(stored.1, 90);
+    let (mut offline_stream, offline_key, _) =
+        connect_retail_social_client(&pool, address, offline.account.id, "SocialOffline").await;
+    let (opcode, body) = receive_packet(&mut offline_stream, offline_key).await;
+    assert_eq!(opcode, WhisperResponse::OPCODE);
+    assert_eq!(
+        body,
+        wire(
+            &WhisperResponse {
+                status: 0,
+                nickname: b"NSocialAlice".to_vec(),
+                message: b"queued while away".to_vec(),
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("offline delivery")
+    );
 
     // Both sockets are independently encrypted, and lobby chat is broadcast to every member.
     let chat = GameChat::new(b"NSocialAlice".to_vec(), b"hello lobby".to_vec());
@@ -6742,6 +6807,18 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         .expect("offline refusal")
     );
 
+    // Save a literal fixture through 0x0069 before the malformed-packet closure below. The
+    // restarted LoginService assertion builds its expected 576-byte body independently.
+    let macro_values: [Vec<u8>; 9] =
+        std::array::from_fn(|index| format!("literal-macro-{index}").into_bytes());
+    send_typed(
+        &mut first,
+        first_key,
+        12,
+        &MacroUpdate::new(macro_values.clone()),
+    )
+    .await;
+
     // User-info is a golden 13-packet sequence. Every wire body is canonicalized against its
     // independently typed PacketDoc contract, so this pins order and exact bytes, not only IDs.
     send_typed(
@@ -6761,7 +6838,7 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
     assert_eq!(
         fanout.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>(),
         vec![
-            0x0157, 0x015e, 0x0156, 0x0158, 0x015d, 0x015c, 0x015c, 0x015c, 0x015b, 0x015a, 0x0159,
+            0x0157, 0x015e, 0x0156, 0x0158, 0x015d, 0x015c, 0x015c, 0x015b, 0x015a, 0x0159, 0x015c,
             0x0257, 0x0089,
         ]
     );
@@ -6842,14 +6919,6 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
         )
         .expect("grand prix course bytes"),
         wire(
-            &UserCourseRecordsInfoResponse {
-                request_type: 5,
-                user_id,
-            },
-            &CompatibilityProfile::US_852,
-        )
-        .expect("season course bytes"),
-        wire(
             &UserRelatedInfoResponse {
                 request_type: 5,
                 user_id,
@@ -6873,6 +6942,14 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
             &CompatibilityProfile::US_852,
         )
         .expect("trophies bytes"),
+        wire(
+            &UserCourseRecordsInfoResponse {
+                request_type: 5,
+                user_id,
+            },
+            &CompatibilityProfile::US_852,
+        )
+        .expect("season course bytes"),
         wire(
             &UserGrandPrixTrophiesInfoResponse {
                 request_type: 5,
@@ -6917,9 +6994,80 @@ async fn game_retail_social_is_encrypted_multiclient_and_exactly_fanned_out(pool
     .await;
     assert_closed(&mut pre_auth).await;
 
+    let persisted_macros: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT chat_macros FROM profiles WHERE account_id = $1")
+            .bind(alice.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("macro row");
+    assert_eq!(persisted_macros, macro_values, "macro save before restart");
+    drop(offline_stream);
     drop(second);
     shutdown.cancel();
     assert!(task.await.expect("social join").is_ok());
+
+    let login_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("macro login bind");
+    let login_address = login_listener.local_addr().expect("macro login address");
+    let login = Arc::new(
+        LoginService::new(
+            Arc::new(PgRepository::new(pool.clone())),
+            BoundedCredentialExecutor::new(
+                Arc::new(policy),
+                2,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("macro executor"),
+            LoginRuntimeConfig {
+                auto_create_accounts: false,
+                starter: starter(1, 0x1000_0000),
+                allowed_character_types: vec![0x0400_0000],
+                game_server: AdvertisedGameServer {
+                    id: 1,
+                    name: "Macro Fixture".to_owned(),
+                    ipv4: "127.0.0.1".to_owned(),
+                    port: 1,
+                    capacity: 1,
+                },
+                limits: LoginRuntimeLimits::default(),
+            },
+            Arc::new(M2Metrics::default()),
+        )
+        .expect("macro login service"),
+    );
+    let login_shutdown = CancellationToken::new();
+    let login_child = login_shutdown.clone();
+    let login_task = tokio::spawn(async move { login.serve(login_listener, login_child).await });
+    let (mut login_stream, login_key) = connect_login(login_address).await;
+    send_packet(
+        &mut login_stream,
+        login_key,
+        20,
+        1,
+        &login_payload("SocialAlice"),
+    )
+    .await;
+    let mut macro_body = None;
+    for expected_opcode in [1, 0x10, 6, 9, 2] {
+        let (opcode, body) = receive_packet(&mut login_stream, login_key).await;
+        assert_eq!(opcode, expected_opcode);
+        if opcode == 6 {
+            macro_body = Some(body);
+        }
+    }
+    let mut expected_macro_body = Vec::with_capacity(9 * 64);
+    for value in &macro_values {
+        expected_macro_body.extend_from_slice(value);
+        expected_macro_body.resize(expected_macro_body.len() + 64 - value.len(), 0);
+    }
+    assert_eq!(
+        macro_body.expect("login macro response"),
+        expected_macro_body
+    );
+    login_shutdown.cancel();
+    assert!(login_task.await.expect("macro login join").is_ok());
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]

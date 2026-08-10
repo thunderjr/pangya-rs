@@ -48,12 +48,12 @@ use pangya_domain::{
     HandoverRepository, InventoryItemId, ItemDefinition, ItemDurability, ItemKind, ItemStacking,
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed, MemberCard,
-    MemberSnapshot, Nickname, OneHoleConfig, PlayerConnectionId, PlayerRepository, PlayerSnapshot,
-    PurchaseRequest, RepairItem, RepositoryError, RetailEquipmentChange, RoomError, RoomId,
-    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
-    ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
-    StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
-    StrokeRosterOrder,
+    MemberSnapshot, Nickname, OfflineNoteRequest, OneHoleConfig, PlayerConnectionId,
+    PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem, RepositoryError,
+    RetailEquipmentChange, RoomError, RoomId, RoomName, RoomPassword, RoomProfile, RoomSettings,
+    RoomSnapshot, RoomSummary, ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult,
+    SourceAddressPrefix, StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult,
+    StrokeParticipant, StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
@@ -727,6 +727,11 @@ enum SocialEvent {
         nickname: Vec<u8>,
         message: Vec<u8>,
     },
+    OfflineNote {
+        target: PlayerConnectionId,
+        nickname: Vec<u8>,
+        message: Vec<u8>,
+    },
     Whisper {
         target: PlayerConnectionId,
         status: u8,
@@ -825,6 +830,13 @@ impl SocialHub {
             .keys()
             .any(|member| u32::try_from(member.get()).ok() == Some(id))
     }
+    fn account_for_connection(&self, id: PlayerConnectionId) -> Option<AccountId> {
+        self.members
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|member| member.account_id)
+    }
     fn contains_account(&self, id: u32) -> bool {
         let Ok(members) = self.members.lock() else {
             return false;
@@ -833,12 +845,26 @@ impl SocialHub {
             .values()
             .any(|member| u32::try_from(member.account_id.get()).ok() == Some(id))
     }
-    fn account_for_connection(&self, id: PlayerConnectionId) -> Option<AccountId> {
-        self.members
-            .lock()
-            .ok()?
-            .get(&id)
-            .map(|member| member.account_id)
+    fn deliver_offline_note(
+        &self,
+        recipient: AccountId,
+        sender_nickname: Vec<u8>,
+        message: Vec<u8>,
+    ) {
+        let Ok(members) = self.members.lock() else {
+            return;
+        };
+        let Some(target) = members
+            .iter()
+            .find(|(_, member)| member.account_id == recipient)
+        else {
+            return;
+        };
+        let _ = self.events.send(SocialEvent::OfflineNote {
+            target: *target.0,
+            nickname: sender_nickname,
+            message,
+        });
     }
     fn update_card(&self, id: PlayerConnectionId, card: MemberCard) {
         if let Ok(mut members) = self.members.lock()
@@ -1613,6 +1639,21 @@ where
                                         established.nickname.display().as_bytes().to_vec(),
                                         established.card.clone(),
                                     );
+                                    // Claim pending durable notes only after authentication. The
+                                    // repository marks each row delivered in the same bridge
+                                    // transaction, so reconnecting cannot lose the offline queue.
+                                    let pending = self
+                                        .repository
+                                        .take_offline_notes(established.account_id)
+                                        .await
+                                        .map_err(|_| GameRuntimeError::Snapshot)?;
+                                    for note in pending {
+                                        let _ = self.social.events.send(SocialEvent::OfflineNote {
+                                            target: connection_id,
+                                            nickname: note.sender_nickname,
+                                            message: note.message,
+                                        });
+                                    }
                                     presence = Some(guard);
                                     identity = Some(established);
                                     state = GameState::AwaitChannel;
@@ -1834,29 +1875,52 @@ where
                                 self.send(&mut framed, &UserStatusResponse).await?;
                             } else if self.config.retail_bootstrap && frame.opcode == <NoteSend as DecodePacket>::OPCODE {
                                 let request = decode_packet_payload::<NoteSend>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
-                                if request.subtype != 0x0111 || !self.social.contains_account(request.user_id) {
+                                if request.subtype != 0x0111 {
                                     break Err(GameRuntimeError::Protocol);
                                 }
                                 let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
                                 if !chats.admit_count(self.config.limits.chat_messages_per_window) { break Err(GameRuntimeError::Limited); }
+                                let recipient_id = AccountId::new(i64::from(request.user_id)).map_err(|_| GameRuntimeError::Protocol)?;
                                 let digest: [u8; 32] = Sha256::digest(&frame.payload).into();
-                                if !social_replays.is_replay(frame.metadata.salt, &digest) {
-                                    let _ = social_replays.sequence(frame.metadata.salt, digest);
-                                    match self.repository.spend_note_pang(established.account_id).await {
-                                        Ok(pang) => {
-                                            self.refresh_social_projection(connection_id, established.account_id).await?;
-                                            self.send(&mut framed, &RetailPangBalance { pang }).await?
-                                        }
-                                        Err(_) => {
-                                            let (pang, _) = self.retail_balances(established.account_id).await?;
-                                            self.send(&mut framed, &RetailPangBalance { pang }).await?;
-                                        }
-                                    }
-                                } else {
+                                if social_replays.is_replay(frame.metadata.salt, &digest) {
                                     // A transport retry must still receive the money update, but
                                     // must never debit the account a second time.
                                     let (pang, _) = self.retail_balances(established.account_id).await?;
                                     self.send(&mut framed, &RetailPangBalance { pang }).await?;
+                                    continue;
+                                }
+                                match self.repository.accept_offline_note(OfflineNoteRequest {
+                                    sender_id: established.account_id,
+                                    recipient_id,
+                                    operation_id: digest,
+                                    message: request.message.clone(),
+                                }).await {
+                                    Ok(commit) => {
+                                        let _ = social_replays.sequence(frame.metadata.salt, digest);
+                                        if self.social.contains_account(request.user_id) {
+                                            for note in self
+                                                .repository
+                                                .take_offline_notes(recipient_id)
+                                                .await
+                                                .map_err(|_| GameRuntimeError::Snapshot)?
+                                            {
+                                                self.social.deliver_offline_note(
+                                                    recipient_id,
+                                                    note.sender_nickname,
+                                                    note.message,
+                                                );
+                                            }
+                                        }
+                                        self.refresh_social_projection(connection_id, established.account_id).await?;
+                                        self.send(&mut framed, &RetailPangBalance { pang: commit.pang }).await?;
+                                    }
+                                    Err(RepositoryError::BalanceInsufficient | RepositoryError::NotFound | RepositoryError::AccountInactive) => {
+                                        // Rejection is side-effect free. Keep the transport usable
+                                        // and report the unchanged authoritative balance.
+                                        let (pang, _) = self.retail_balances(established.account_id).await?;
+                                        self.send(&mut framed, &RetailPangBalance { pang }).await?;
+                                    }
+                                    Err(_) => break Err(GameRuntimeError::Snapshot),
                                 }
                             } else if self.config.retail_bootstrap && frame.opcode == <MessageServerListRequest as DecodePacket>::OPCODE {
                                 if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
@@ -3956,6 +4020,21 @@ where
                 self.send(framed, &GameChatResponse { nickname, message })
                     .await?;
             }
+            SocialEvent::OfflineNote {
+                target,
+                nickname,
+                message,
+            } if target == connection_id => {
+                self.send(
+                    framed,
+                    &WhisperResponse {
+                        status: 0,
+                        nickname,
+                        message,
+                    },
+                )
+                .await?;
+            }
             SocialEvent::Whisper {
                 target,
                 status,
@@ -4051,7 +4130,7 @@ where
                         .await?;
                     let natural_type = if request_type == 5 { 0x33 } else { 0x0a };
                     let grand_prix_type = if request_type == 5 { 0x34 } else { 0x0b };
-                    for record_type in [natural_type, grand_prix_type, request_type] {
+                    for record_type in [natural_type, grand_prix_type] {
                         self.send(
                             framed,
                             &UserCourseRecordsInfoResponse {
@@ -4080,6 +4159,14 @@ where
                     self.send(
                         framed,
                         &UserTrophiesInfoResponse {
+                            request_type,
+                            user_id,
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        framed,
+                        &UserCourseRecordsInfoResponse {
                             request_type,
                             user_id,
                         },
