@@ -192,8 +192,8 @@ where
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RegistryError {
     /// The key is already present (duplicate authenticated LoginService session).
-    #[error("duplicate active login")]
-    Duplicate,
+    #[error("duplicate active login (lease {0})")]
+    Duplicate(u64),
     /// The bounded registry is full or unavailable.
     #[error("active registry is full")]
     Capacity,
@@ -227,8 +227,8 @@ where
     /// Returns a duplicate or capacity failure without exposing the key.
     pub fn acquire(&self, key: K) -> Result<RegistryGuard<K>, RegistryError> {
         let mut entries = self.entries.lock().map_err(|_| RegistryError::Capacity)?;
-        if entries.contains_key(&key) {
-            return Err(RegistryError::Duplicate);
+        if let Some(&lease) = entries.get(&key) {
+            return Err(RegistryError::Duplicate(lease));
         }
         if entries.len() >= self.capacity {
             return Err(RegistryError::Capacity);
@@ -247,14 +247,19 @@ where
         })
     }
 
-    /// Invalidates one active registration. A stale guard cannot remove a later lease for the same
-    /// key, which makes ghost recovery safe when the old connection eventually unwinds.
+    /// Invalidates one active registration only when it still owns `lease`.
+    ///
+    /// The generation comparison prevents a delayed ghost request from removing a replacement
+    /// session that acquired the same account after the original connection ended.
     #[must_use]
-    pub fn invalidate(&self, key: &K) -> bool {
+    pub fn invalidate(&self, key: &K, lease: u64) -> bool {
         self.entries
             .lock()
             .ok()
-            .and_then(|mut entries| entries.remove(key))
+            .and_then(|mut entries| {
+                (entries.get(key).copied() == Some(lease)).then(|| entries.remove(key))
+            })
+            .flatten()
             .is_some()
     }
 
@@ -270,6 +275,17 @@ where
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl<K> RegistryGuard<K>
+where
+    K: Eq + Hash,
+{
+    /// Returns the generation held by this lease.
+    #[must_use]
+    pub const fn lease(&self) -> u64 {
+        self.lease
     }
 }
 
@@ -339,7 +355,10 @@ mod tests {
     fn guard_cleans_up_duplicate_registry() {
         let registry = CapacityRegistry::new(1);
         let guard = registry.acquire(7).expect("first");
-        assert!(matches!(registry.acquire(7), Err(RegistryError::Duplicate)));
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Duplicate(_))
+        ));
         drop(guard);
         assert!(registry.acquire(7).is_ok());
     }
@@ -348,10 +367,15 @@ mod tests {
     fn invalidation_does_not_let_stale_guard_remove_new_lease() {
         let registry = CapacityRegistry::new(1);
         let stale = registry.acquire(7).expect("stale lease");
-        assert!(registry.invalidate(&7));
+        let stale_lease = stale.lease();
+        assert!(registry.invalidate(&7, stale_lease));
         let current = registry.acquire(7).expect("replacement lease");
+        assert!(!registry.invalidate(&7, stale_lease));
         drop(stale);
-        assert!(matches!(registry.acquire(7), Err(RegistryError::Duplicate)));
+        assert!(matches!(
+            registry.acquire(7),
+            Err(RegistryError::Duplicate(_))
+        ));
         drop(current);
         assert!(registry.acquire(7).is_ok());
     }

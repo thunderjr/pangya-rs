@@ -892,11 +892,11 @@ async fn nickname_unavailable_and_duplicate_retries_are_bounded(pool: PgPool) {
     .await;
     assert_eq!(receive_packet(&mut alternating, alternating_key).await.0, 1);
     for (salt, nickname, expected) in [
-        (6, b"TakenNick".as_slice(), 1_u32),
+        (6, b"TakenNick".as_slice(), 2_u32),
         (7, b"FreshOne".as_slice(), 0_u32),
-        (8, b"TakenNick".as_slice(), 1_u32),
+        (8, b"TakenNick".as_slice(), 2_u32),
         (9, b"FreshTwo".as_slice(), 0_u32),
-        (10, b"TakenNick".as_slice(), 1_u32),
+        (10, b"TakenNick".as_slice(), 2_u32),
     ] {
         send_packet(
             &mut alternating,

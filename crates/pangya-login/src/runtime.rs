@@ -670,7 +670,7 @@ where
         // A duplicate login is held in this connection until the client explicitly requests ghost
         // recovery. The account ID is authenticated before it is stored; the 0x0004 packet itself
         // has no identity fields and can never ghost an arbitrary account.
-        let mut pending_ghost: Option<AccountId> = None;
+        let mut pending_ghost: Option<(AccountId, u64)> = None;
 
         loop {
             match machine.state() {
@@ -771,7 +771,7 @@ where
                     };
                     let guard = match self.active_accounts.acquire(authenticated.account.id) {
                         Ok(guard) => guard,
-                        Err(RegistryError::Duplicate) => {
+                        Err(RegistryError::Duplicate(lease)) => {
                             self.observer.login("duplicate");
                             // PacketDoc distinguishes a stale-session refusal (which arms 0x0004)
                             // from a live duplicate connection. LoginService cannot observe a
@@ -783,7 +783,7 @@ where
                                 &LoginResult::Error(LOGIN_ERROR_ALREADY_LOGGED_IN),
                             )
                             .await?;
-                            pending_ghost = Some(authenticated.account.id);
+                            pending_ghost = Some((authenticated.account.id, lease));
                             machine
                                 .apply(LoginEvent::AuthenticationRejected)
                                 .map_err(|_| LoginRuntimeError::Protocol)?;
@@ -900,7 +900,7 @@ where
                         .await?;
                         return Ok(ConnectionTermination::Rejected);
                     }
-                    let Some(account_id) = pending_ghost.take() else {
+                    let Some((account_id, lease)) = pending_ghost.take() else {
                         self.send(
                             &mut framed,
                             &LoginResult::Error(LOGIN_ERROR_INVALID_CREDENTIALS),
@@ -908,7 +908,7 @@ where
                         .await?;
                         return Ok(ConnectionTermination::Rejected);
                     };
-                    if !self.active_accounts.invalidate(&account_id) {
+                    if !self.active_accounts.invalidate(&account_id, lease) {
                         self.send(
                             &mut framed,
                             &LoginResult::Error(LOGIN_ERROR_DUPLICATE_CONNECTION),
