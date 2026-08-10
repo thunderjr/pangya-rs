@@ -8428,9 +8428,16 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         );
         assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
     }
+    // Keep every frame each client consumes from its own final-hole submission onward. The
+    // terminal room event can arrive in either this first post-guest read or a later read while
+    // the coordinator commits; asserting one contiguous post-guest window loses that history.
+    let mut host_final_history = host_waiting.clone();
+    let mut visitor_final_history = visitor_waiting.clone();
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
     let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
+    host_final_history.extend(first_next.clone());
     let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
+    visitor_final_history.extend(second_next.clone());
     assert_retail_hole_intro_order(&first_next, "hole 2 host");
     assert_retail_hole_intro_order(&second_next, "hole 2 visitor");
     assert!(
@@ -8520,24 +8527,31 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         send_packet(&mut visitor, visitor_key, hole_salt, 0x0031, &[]).await;
         salt = hole_salt;
     }
-    for (stream, key, who) in [
-        (&mut host, host_key, "host"),
-        (&mut visitor, visitor_key, "visitor"),
+    for (stream, key, who, history) in [
+        (&mut host, host_key, "host", &mut host_final_history),
+        (
+            &mut visitor,
+            visitor_key,
+            "visitor",
+            &mut visitor_final_history,
+        ),
     ] {
-        let frames = drain_available(stream, key, Duration::from_millis(2000)).await;
+        history.extend(drain_frames(stream, key, Duration::from_millis(2000)).await);
+        let terminal_pairs = history
+            .windows(2)
+            .filter(|pair| pair[0].0 == 0x0065 && pair[1].0 == 0x0066)
+            .count();
         assert_eq!(
-            frames.iter().filter(|opcode| **opcode == 0x0065).count(),
-            1,
-            "{who} receives exactly one final hole finish: {frames:04x?}"
+            terminal_pairs, 1,
+            "{who} receives exactly one terminal 0065/0066 pair across final-hole history: {history:04x?}"
         );
         assert_eq!(
-            frames.iter().filter(|opcode| **opcode == 0x0066).count(),
+            history
+                .iter()
+                .filter(|(opcode, _)| *opcode == 0x0066)
+                .count(),
             1,
-            "{who} receives exactly one final standings frame: {frames:04x?}"
-        );
-        assert!(
-            frames.windows(2).any(|pair| pair == [0x0065, 0x0066]),
-            "{who} receives the retained terminal pair in wire order: {frames:04x?}"
+            "{who} receives exactly one final standings frame: {history:04x?}"
         );
     }
 
