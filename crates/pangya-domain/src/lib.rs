@@ -4132,12 +4132,44 @@ pub struct OfflineNoteCommit {
 }
 
 /// Technology-neutral coherent player-bootstrap repository contract.
+/// One bounded recent-player entry shown in the retail lobby.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentPlayer {
+    /// Account id of the encountered player.
+    pub account_id: AccountId,
+    /// Display nickname at encounter time.
+    pub nickname: String,
+    /// Encounter timestamp.
+    pub seen_at: SystemTime,
+}
+
+/// Maximum persisted recent-player entries per account.
+pub const MAX_RECENT_PLAYERS: usize = 20;
+
+/// Durable player projections and bounded social history.
 pub trait PlayerRepository: Send + Sync {
     /// Loads one coherent active/complete player bootstrap snapshot by authenticated account ID.
     fn load_player_snapshot(
         &self,
         account_id: AccountId,
     ) -> RepositoryFuture<'_, Result<PlayerSnapshot, RepositoryError>>;
+
+    /// Loads the bounded, newest-first retail recent-player history.
+    fn load_recent_players(
+        &self,
+        _account_id: AccountId,
+    ) -> RepositoryFuture<'_, Result<Vec<RecentPlayer>, RepositoryError>> {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+
+    /// Records one encounter, retaining at most [`MAX_RECENT_PLAYERS`] newest distinct accounts.
+    fn record_recent_player(
+        &self,
+        _account_id: AccountId,
+        _recent: RecentPlayer,
+    ) -> RepositoryFuture<'_, Result<(), RepositoryError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
 
     /// Loads bounded visitor-visible My Room state for an account.
     fn load_my_room(

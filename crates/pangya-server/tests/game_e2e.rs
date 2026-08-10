@@ -8528,6 +8528,23 @@ async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgP
     .execute(&pool)
     .await
     .expect("recent player fixture");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM retail_recent_players WHERE account_id = $1",
+        )
+        .bind(account.account.id.get())
+        .fetch_one(&pool)
+        .await
+        .expect("recent player count"),
+        1,
+    );
+    let persisted = PgRepository::new(pool.clone())
+        .load_recent_players(account.account.id)
+        .await
+        .expect("load recent players");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].nickname, "RecentPeer");
+    assert!(recent.account.id.get() <= i64::from(u32::MAX));
 
     let service = Arc::new(
         GameService::new(
@@ -8602,9 +8619,21 @@ async fn game_issue23_topology_utility_opcodes_work_over_encrypted_tcp(pool: PgP
     );
 
     // Every issue-listed utility request is consumed without an unknown-opcode disconnect.
-    for (salt, opcode) in [0x0047, 0x0088, 0x008b, 0x00a1, 0x00a2, 0x00f4, 0x00fb, 0x00fe] {
+    for (salt, opcode) in [
+        (0x0047, 0x0047),
+        (0x0088, 0x0088),
+        (0x00a1, 0x00a1),
+        (0x00a2, 0x00a2),
+        (0x00f4, 0x00f4),
+        (0x00fb, 0x00fb),
+        (0x00fe, 0x00fe),
+    ] {
         send_packet(&mut stream, key, salt, opcode, &[]).await;
     }
+    // The message-server request is handled, not inert: this deployment truthfully answers with
+    // the zero-count `0x00fc` list.
+    send_packet(&mut stream, key, 6, 0x008b, &[]).await;
+    assert_eq!(receive_packet(&mut stream, key).await.0, 0x00fc);
     send_packet(&mut stream, key, 7, 0x005c, &[]).await;
     assert_eq!(receive_packet(&mut stream, key).await.0, 0x00ba);
 

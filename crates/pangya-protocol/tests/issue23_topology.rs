@@ -74,8 +74,7 @@ fn server_list_response_is_the_009f_layout() {
 #[test]
 fn every_issue23_session_opcode_is_explicitly_accepted() {
     for opcode in [
-        0x0043, 0x0047, 0x005c, 0x0065, 0x0083, 0x0088, 0x008b, 0x009c, 0x00a1, 0x00a2,
-        0x00f4, 0x00fb, 0x00fe, 0x0119,
+        0x0047, 0x0065, 0x0088, 0x008b, 0x00a1, 0x00a2, 0x00f4, 0x00fb, 0x00fe,
     ] {
         assert!(
             is_retail_accepted_session_opcode(opcode),
@@ -98,7 +97,11 @@ fn recent_player_slots_follow_reference_field_order() {
         &PROFILE,
     )
     .expect("history");
-    assert_eq!(&payload[0..4], &[0xdd, 0xcc, 0xbb, 0xaa], "unknown field comes first");
+    assert_eq!(
+        &payload[0..4],
+        &[0xdd, 0xcc, 0xbb, 0xaa],
+        "unknown field comes first"
+    );
     assert_eq!(&payload[4..8], b"Nick");
     assert_eq!(&payload[26..30], b"User");
     assert_eq!(&payload[48..52], &[0x44, 0x33, 0x22, 0x11]);

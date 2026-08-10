@@ -38,6 +38,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use chrono::{Datelike as _, Timelike as _};
 use futures_util::{SinkExt as _, StreamExt as _};
 use pangya_data::Catalog;
 use pangya_domain::{
@@ -49,16 +50,16 @@ use pangya_domain::{
     ItemTypeId, MarkSoloInGame, MarkSoloInGameOutcome, MarkStrokeInGame, MarkStrokeInGameOutcome,
     MascotMessageUpdate, MatchAbortReason, MatchId, MatchRepository, MatchResultKey, MatchSeed,
     MemberCard, MemberSnapshot, Nickname, OfflineNoteClaim, OfflineNoteRequest, OneHoleConfig,
-    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RepairItem,
-    RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId, RoomName,
-    RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
+    PlayerConnectionId, PlayerRepository, PlayerSnapshot, PurchaseRequest, RecentPlayer,
+    RepairItem, RepositoryError, RetailEquipmentChange, RetailEquipmentState, RoomError, RoomId,
+    RoomName, RoomPassword, RoomProfile, RoomSettings, RoomSnapshot, RoomSummary,
     ServiceKind as DomainServiceKind, ShopOverlay, SoloMatchResult, SourceAddressPrefix,
     StrokeCompletion as DomainStrokeCompletion, StrokeMatchResult, StrokeParticipant,
     StrokeRosterOrder,
 };
 use pangya_login::{
     CapacityRegistry, FixedWindowLimiter, KeyedCapacityGuard, KeyedCapacityRegistry, RateDecision,
-    RegistryError, RegistryGuard, parse_handover,
+    RegistryError, RegistryGuard, generate_handover, parse_handover,
 };
 use pangya_protocol::{
     BalanceUpdate, CHARACTER_PARTS, CHARACTER_STATS, ChannelJoined, CharacterBootstrap,
@@ -84,16 +85,19 @@ use pangya_protocol::{
     RetailMascotMessageResult, RetailMascotMessageUpdate, RetailMascotSeed, RetailMatchFinish,
     RetailMatchInfo, RetailMatchOpen, RetailMatchOpenAck, RetailMatchPlayer, RetailMatchStart,
     RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
-    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailPangBalance,
-    RetailPangRate, RetailPangSpent, RetailPlayerData, RetailPlayerHistory,
-    RetailPlayerHistoryRequest, RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole,
-    RetailPlayerStatistics, RetailPlayerStatisticsReport, RetailPointBalance,
-    RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem,
-    RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable, RetailRoom, RetailRoomCensus,
-    RetailRoomCreate, RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
+    RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
+    RetailNewSessionKeyRequest, RetailPangBalance, RetailPangRate, RetailPangSpent,
+    RetailPlayerData, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailPlayerIdentity,
+    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
+    RetailPointBalance, RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart,
+    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable,
+    RetailRecentPlayerSlot, RetailRoom, RetailRoomCensus, RetailRoomCreate,
+    RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
     RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailShopJoin, RetailShopJoined,
-    RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTurnEnd, RetailTurnStart,
+    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailServerEntry, RetailServerList,
+    RetailServerListRequest, RetailServerTime, RetailServerTimeRequest, RetailShopJoin,
+    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
+    RetailSubServerConnect, RetailSubServerEntry, RetailTurnEnd, RetailTurnStart,
     RetailUccUploadKeyRefusal, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
     RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
     RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
@@ -113,14 +117,15 @@ use pangya_protocol::{
     StrokeCommandResult, StrokeCompletion as ProtocolStrokeCompletion, StrokeGiveUp,
     StrokeLoadingComplete, StrokeMatchAborted, StrokeMatchStarted, StrokePhase, StrokePhaseKind,
     StrokeResultRelay, StrokeShotAction, StrokeShotResult, StrokeStandingEntry, StrokeStandings,
-    StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UserCharacterInfoResponse,
-    UserCourseRecordsInfoResponse, UserEquipmentInfoResponse, UserGrandPrixTrophiesInfoResponse,
-    UserGuildInfoResponse, UserInfoRequest, UserInfoResponse, UserNameInfoResponse,
-    UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse, UserStatisticsInfoResponse,
-    UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse, Weather as ProtocolWeather,
-    Whisper, WhisperRefusalResponse, WhisperResponse, Wind, decode_packet_payload,
-    encode_packet_payload, is_retail_accepted_match_opcode, is_retail_accepted_session_opcode,
-    is_retail_explicit_social_refusal, packed_system_time, synthetic_game_hello, us852_game_hello,
+    StrokeTurnStarted, TypingIndicator, TypingIndicatorResponse, UnknownBytes,
+    UserCharacterInfoResponse, UserCourseRecordsInfoResponse, UserEquipmentInfoResponse,
+    UserGrandPrixTrophiesInfoResponse, UserGuildInfoResponse, UserInfoRequest, UserInfoResponse,
+    UserNameInfoResponse, UserRelatedInfoResponse, UserSpecialTrophiesInfoResponse,
+    UserStatisticsInfoResponse, UserStatusRequest, UserStatusResponse, UserTrophiesInfoResponse,
+    Weather as ProtocolWeather, Whisper, WhisperRefusalResponse, WhisperResponse, Wind,
+    decode_packet_payload, encode_packet_payload, is_retail_accepted_match_opcode,
+    is_retail_accepted_session_opcode, is_retail_explicit_social_refusal, packed_system_time,
+    synthetic_game_hello, us852_game_hello,
 };
 use rand::{RngCore as _, rngs::OsRng};
 use sha2::{Digest as _, Sha256};
@@ -1734,6 +1739,48 @@ where
                                 // after the bounded frame has been consumed: a client diagnostic
                                 // must never turn into a second disconnect or stall the session.
                                 observe_retail_client_exception(&frame.payload);
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailServerListRequest::OPCODE {
+                                if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
+                                let server = RetailServerEntry {
+                                    name: b"PangYa-RS".to_vec(), id: self.config.channel_id,
+                                    user_max: 200, user_count: 0, ip: Vec::new(), port: 0,
+                                    unknown_c: UnknownBytes([0; 2]), flags: UnknownBytes([0; 2]),
+                                    unknown_d: UnknownBytes([0; 14]), icon: 1,
+                                };
+                                let channel = RetailSubServerEntry {
+                                    name: b"Channel 1".to_vec(), unknown_a: UnknownBytes([0; 47]),
+                                    id: u8::try_from(self.config.channel_id).map_err(|_| GameRuntimeError::Protocol)?,
+                                    unknown_b: UnknownBytes([0; 8]),
+                                };
+                                self.send(&mut framed, &RetailServerList { servers: vec![server], sub_servers: vec![channel] }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailServerTimeRequest::OPCODE {
+                                if !frame.payload.is_empty() { break Err(GameRuntimeError::Protocol); }
+                                let now = chrono::Local::now();
+                                self.send(&mut framed, &RetailServerTime {
+                                    year: u16::try_from(now.year()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    month: u16::try_from(now.month()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    weekday: u16::try_from(now.weekday().num_days_from_sunday()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    day: u16::try_from(now.day()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    hour: u16::try_from(now.hour()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    minute: u16::try_from(now.minute()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    second: u16::try_from(now.second()).map_err(|_| GameRuntimeError::Protocol)?,
+                                    millisecond: u16::try_from(now.nanosecond() / 1_000_000).map_err(|_| GameRuntimeError::Protocol)?,
+                                }).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailSubServerConnect::OPCODE {
+                                let request = decode_packet_payload::<RetailSubServerConnect>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                if u32::from(request.sub_server_id) != self.config.channel_id { break Err(GameRuntimeError::Protocol); }
+                                self.send(&mut framed, &RetailChannelJoined).await?;
+                                self.send(&mut framed, &RetailChannelJoinNotice).await?;
+                            } else if self.config.retail_bootstrap && frame.opcode == RetailNewSessionKeyRequest::OPCODE {
+                                let request = decode_packet_payload::<RetailNewSessionKeyRequest>(&frame.payload, &CompatibilityProfile::US_852, ServiceKind::Game).map_err(|_| GameRuntimeError::Protocol)?;
+                                let Some(established) = identity.as_ref() else { break Err(GameRuntimeError::Protocol); };
+                                // A destination that is not this configured service is refused;
+                                // issuing a key for an unknown topology would create an unusable
+                                // bearer and, worse, widen the handover trust boundary.
+                                if request.server_id != self.config.channel_id { continue; }
+                                let generated = generate_handover(established.account_id, DomainServiceKind::Game, source.clone(), SystemTime::now()).map_err(|_| GameRuntimeError::Authentication)?;
+                                self.repository.issue(generated.record).await.map_err(|_| GameRuntimeError::Authentication)?;
+                                self.send(&mut framed, &RetailNewSessionKey { unknown: UnknownBytes([0; 4]), session_key: generated.token.expose_secret().as_bytes().to_vec().into() }).await?;
                             } else if self.config.retail_bootstrap
                                 && matches!(
                                     frame.opcode,
@@ -1754,7 +1801,14 @@ where
                                         if frame.opcode == RetailLoginBonusRequest::OPCODE {
                                             self.send(&mut framed, &RetailLoginBonusStatus).await
                                         } else {
-                                            self.send(&mut framed, &RetailPlayerHistory).await
+                                            let Some(established) = identity.as_ref() else { return Err(GameRuntimeError::Protocol); };
+                                            let recent = self.repository.load_recent_players(established.account_id).await.map_err(|_| GameRuntimeError::Snapshot)?;
+                                            let entries = recent.into_iter().take(pangya_domain::MAX_RECENT_PLAYERS).filter_map(|player: RecentPlayer| {
+                                                let account_id = u32::try_from(player.account_id.get()).ok()?;
+                                                let nickname = player.nickname.as_bytes().get(..player.nickname.len().min(21))?.to_vec();
+                                                Some(RetailRecentPlayerSlot { account_id, secondary_name: nickname.clone(), nickname, unknown: 0 })
+                                            }).collect::<Vec<_>>();
+                                            self.send(&mut framed, &RetailPlayerHistoryEntries { entries }).await
                                         }
                                     } => sent,
                                 };
@@ -5062,6 +5116,33 @@ where
     ///
     /// Every figure here is the committed server-side result. A forfeit has no golf score, so
     /// its line reports zero rather than inventing one.
+    /// Records only players who entered the same authoritative match roster. Lobby presence is
+    /// not match history: a user merely seeing another account online must not populate 0x010e.
+    async fn record_retail_match_history(
+        &self,
+        members: &[MemberSnapshot],
+    ) -> Result<(), GameRuntimeError> {
+        for owner in members {
+            for recent in members {
+                if owner.account_id() == recent.account_id() {
+                    continue;
+                }
+                self.repository
+                    .record_recent_player(
+                        owner.account_id(),
+                        RecentPlayer {
+                            account_id: recent.account_id(),
+                            nickname: recent.nickname().to_owned(),
+                            seen_at: SystemTime::now(),
+                        },
+                    )
+                    .await
+                    .map_err(|_| GameRuntimeError::Snapshot)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn send_retail_stroke_committed(
         &self,
         framed: &mut Framed<TcpStream, FrameCodec>,
@@ -5764,6 +5845,7 @@ where
                 ) {
                     return Ok(Some(GameState::InRoom));
                 }
+                self.record_retail_match_history(snapshot.members()).await?;
                 self.begin_retail_stroke_match(
                     &snapshot,
                     room_id,
