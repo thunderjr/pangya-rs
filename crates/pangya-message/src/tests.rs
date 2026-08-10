@@ -226,15 +226,104 @@ async fn authenticated_hello_publishes_online_and_explicit_status_still_changes_
         })
         .await
         .expect("explicit status");
+    assert!(
+        responses.is_empty(),
+        "0x001d broadcasts 0x0115; it does not reply to sender"
+    );
+    assert_eq!(store.friends(2)[0].state, Presence::Idle);
+}
+
+#[tokio::test]
+async fn status_broadcasts_0115_only_to_confirmed_friends() {
+    let store = MemoryStore::default();
+    for (id, nickname) in [
+        (1, b"Alice".to_vec()),
+        (2, b"Bob".to_vec()),
+        (3, b"Carol".to_vec()),
+    ] {
+        store.register_user(User {
+            id,
+            nickname,
+            guild_id: None,
+            guild_name: vec![],
+        });
+    }
+    store.add_friend(1, 2).expect("friend request");
+    store.confirm_friend(2, 1).expect("friend confirmation");
+    store.add_friend(1, 3).expect("pending friend request");
+
+    let mut alice = MessageSession::new(store.clone());
+    alice
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+    // Discard the login transition so the declaration under test is unambiguous.
+    assert!(
+        store
+            .take_presence_events(2)
+            .iter()
+            .any(|(id, _, _)| *id == 1)
+    );
+
+    let responses = alice
+        .handle(ClientPacket::Status {
+            status: Presence::Idle,
+        })
+        .await
+        .expect("status declaration");
+    assert!(
+        responses.is_empty(),
+        "the sender receives no self 0x0115 reply"
+    );
+    assert!(
+        store
+            .take_presence_events(2)
+            .iter()
+            .any(|(id, status, _)| *id == 1 && *status == Presence::Idle),
+        "confirmed friends receive the status broadcast"
+    );
+    assert!(
+        store.take_presence_events(3).is_empty(),
+        "pending friends do not receive status broadcasts"
+    );
+}
+
+#[tokio::test]
+async fn server_declaration_returns_self_status_update_not_friend_pages() {
+    let store = social_store_for_tests();
+    let mut session = MessageSession::new(store);
+    session
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+
+    let responses = session
+        .handle(ClientPacket::Server {
+            unknown_a: [0; 2],
+            unknown_b: [0; 4],
+            server_id: 9,
+            channel_id: 3,
+            channel_name: b"Lobby".to_vec(),
+        })
+        .await
+        .expect("server declaration");
     assert!(matches!(
-        responses.first(),
-        Some(ServerPacket::Presence {
+        responses.as_slice(),
+        [ServerPacket::Presence {
             user_id: 1,
             unknown_f,
-            ..
-        }) if u32::from_le_bytes(unknown_f[..4].try_into().expect("state")) == Presence::Idle as u32
+            server_id: 9,
+            unknown_g: 3,
+            unknown_h,
+        }] if u32::from_le_bytes(unknown_f[..4].try_into().expect("state")) == Presence::Online as u32
+            && unknown_h == b"Lobby"
     ));
-    assert_eq!(store.friends(2)[0].state, Presence::Idle);
 }
 
 #[tokio::test]
