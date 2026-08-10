@@ -585,8 +585,8 @@ pub enum RetailEquipmentRequested {
     CutIn {
         /// Owned character id.
         character_id: u32,
-        /// Cut-in body words.
-        values: [u32; 4],
+        /// PacketDoc-defined opaque bytes.
+        data: [u8; 16],
     },
 }
 
@@ -775,14 +775,8 @@ impl DecodePacket for RetailEquipmentUpdate {
             RetailEquipmentSlot::Mascot => RetailEquipmentRequested::Mascot(reader.u32_le()?),
             RetailEquipmentSlot::CutIn => {
                 let character_id = reader.u32_le()?;
-                let mut values = [0_u32; 4];
-                for value in &mut values {
-                    *value = reader.u32_le()?;
-                }
-                RetailEquipmentRequested::CutIn {
-                    character_id,
-                    values,
-                }
+                let data = reader.array::<16>()?;
+                RetailEquipmentRequested::CutIn { character_id, data }
             }
         };
         Ok(Self { slot, requested })
@@ -797,6 +791,11 @@ impl DecodePacket for RetailEquipmentUpdate {
 /// per-slot bodies), ISC licensed, including the status value it sends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailEquipmentUpdated {
+    /// Validation/ownership failure; status 1 retains the old durable projection.
+    Rejected {
+        /// Slot whose prior projection remains active.
+        slot: RetailEquipmentSlot,
+    },
     /// Full equipped-character body returned for subtype zero.
     CharacterFull(RetailCharacter),
     /// The caddie in use; zero when none is.
@@ -835,7 +834,7 @@ pub enum RetailEquipmentUpdated {
     CutIn {
         /// Character roster slot.
         character_id: u32,
-        /// Preserved response bytes.
+        /// Opaque subtype-9 bytes. PacketDoc does not establish skin semantics for these bytes.
         data: [u8; 16],
     },
 }
@@ -848,6 +847,7 @@ impl RetailEquipmentUpdated {
     #[must_use]
     pub const fn slot(&self) -> RetailEquipmentSlot {
         match self {
+            Self::Rejected { slot } => *slot,
             Self::CharacterFull(_) => RetailEquipmentSlot::CharacterParts,
             Self::Caddie { .. } => RetailEquipmentSlot::Caddie,
             Self::Consumables { .. } => RetailEquipmentSlot::Consumables,
@@ -869,9 +869,15 @@ impl EncodePacket for RetailEquipmentUpdated {
         profile: &CompatibilityProfile,
     ) -> Result<(), PacketEncodeError> {
         check_encode_profile(profile)?;
-        writer.u8(Self::STATUS_APPLIED);
+        writer.u8(if matches!(self, Self::Rejected { .. }) {
+            1
+        } else {
+            Self::STATUS_APPLIED
+        });
         writer.u8(self.slot().tag());
         match self {
+            Self::Rejected { .. } => {}
+
             Self::CharacterFull(character) => character.encode_body(writer),
             Self::Caddie { caddie_id } => writer.u32_le(*caddie_id),
             Self::Consumables { item_type_ids } => {
@@ -1850,7 +1856,7 @@ mod tests {
             cut_in.requested,
             RetailEquipmentRequested::CutIn {
                 character_id: 42,
-                values: [100, 200, 300, 400],
+                data: [100, 0, 0, 0, 200, 0, 0, 0, 44, 1, 0, 0, 144, 1, 0, 0,],
             }
         );
     }

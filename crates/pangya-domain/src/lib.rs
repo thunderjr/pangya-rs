@@ -3977,12 +3977,12 @@ pub enum RetailEquipmentChange {
     Decoration([u32; 6]),
     /// Replace the equipped mascot, or clear it with zero.
     Mascot(u32),
-    /// Replace the four-word cut-in projection for an owned character.
+    /// Replace the opaque subtype-9 cut-in bytes for an owned character.
     CutIn {
         /// Character roster/inventory id.
         character_id: CharacterId,
-        /// Cut-in catalog ids (zero means empty).
-        values: [u32; 4],
+        /// PacketDoc-defined opaque bytes; their meaning is intentionally not inferred.
+        data: [u8; 16],
     },
     /// Replace all 24 worn character parts for an owned character.
     CharacterParts {
@@ -3992,6 +3992,8 @@ pub enum RetailEquipmentChange {
         type_ids: [u32; 24],
         /// Owned inventory row ids, zero means empty.
         inventory_ids: [u32; 24],
+        /// Hair colour stored on the character row.
+        hair_color: u8,
     },
 }
 
@@ -4006,8 +4008,12 @@ pub struct RetailEquipmentState {
     pub decoration: [u32; 6],
     /// Mascot inventory row and catalog id.
     pub mascot: Option<(InventoryItemId, u32)>,
-    /// Cut-in character and four catalog ids.
-    pub cut_in: Option<(CharacterId, [u32; 4])>,
+    /// Cut-in character and PacketDoc-defined opaque bytes.
+    pub cut_in: Option<(CharacterId, [u8; 16])>,
+    /// Hair colour persisted with character-part changes.
+    pub character_hair_color: u8,
+    /// Inventory slots and catalog ids for the six proven decoration fields.
+    pub decoration_slots: [u32; 6],
     /// Worn character part catalog ids and owned row ids.
     pub character_parts: Option<(CharacterId, [u32; 24], [u32; 24])>,
 }

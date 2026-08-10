@@ -28,7 +28,6 @@ pub const EQUIPPED_ITEM_SLOTS: usize = 10;
 /// four equipped ids and the ten item slots. Getting this width wrong moved every block after
 /// it sixteen bytes early, which left the client reading a player's character block from the
 /// middle of itself and building no model for them.
-const EQUIPMENT_TRAILING_SLOTS: usize = 15;
 /// Maximum channels the retail server channel list may advertise.
 pub const MAX_SERVER_CHANNELS: usize = 255;
 /// Fixed byte width of a retail channel name.
@@ -234,6 +233,12 @@ pub struct RetailEquipment {
     pub comet_iff_id: u32,
     /// Equipped consumable catalog ids.
     pub item_iff_ids: [u32; EQUIPPED_ITEM_SLOTS],
+    /// Proven inventory slots for portrait decoration and cut-in fields.
+    pub decoration_slots: [u32; 6],
+    /// Proven catalog ids for portrait decoration and cut-in fields.
+    pub decoration_iff_ids: [u32; 6],
+    /// Opaque furniture fields retained as zero because no durable projection exists.
+    pub furniture_ids: [u32; 2],
 }
 
 impl RetailEquipment {
@@ -245,10 +250,15 @@ impl RetailEquipment {
         for id in self.item_iff_ids {
             writer.u32_le(id);
         }
-        // Background, frame, sticker, slot, unknown, title, and the four skin variants
-        // plus one further unknown. All are cosmetic and unset by this server.
-        for _ in 0..EQUIPMENT_TRAILING_SLOTS {
-            writer.u32_le(0);
+        for id in self.decoration_slots {
+            writer.u32_le(id);
+        }
+        for id in self.decoration_iff_ids {
+            writer.u32_le(id);
+        }
+        writer.u32_le(0); // PacketDoc unknown_user_equipment_data_b
+        for id in self.furniture_ids {
+            writer.u32_le(id);
         }
     }
 }
@@ -546,15 +556,15 @@ mod tests {
             club_set_uid: 3,
             comet_iff_id: 0x1400_0000,
             item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+            decoration_slots: [0; 6],
+            decoration_iff_ids: [0; 6],
+            furniture_ids: [0; 2],
         };
         let payload = encode_packet_payload(&equipment, &profile()).expect("encode");
         // Four ids, ten item slots, fifteen cosmetic slots, all u32: 116 bytes, the width of
         // the reference `UserEquip`. Every block after this one in a player record is placed
         // by it, so the total is worth pinning.
-        assert_eq!(
-            payload.len(),
-            (4 + EQUIPPED_ITEM_SLOTS + EQUIPMENT_TRAILING_SLOTS) * 4
-        );
+        assert_eq!(payload.len(), (4 + EQUIPPED_ITEM_SLOTS + 15) * 4);
         assert_eq!(payload.len(), 116);
         assert_eq!(&payload[12..16], &0x1400_0000_u32.to_le_bytes());
     }
@@ -643,6 +653,9 @@ mod tests {
                 club_set_uid: 2,
                 comet_iff_id: 0x1400_0000,
                 item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+                decoration_slots: [0; 6],
+                decoration_iff_ids: [0; 6],
+                furniture_ids: [0; 2],
             },
             character: RetailCharacter {
                 iff_id: 0x0400_0000,

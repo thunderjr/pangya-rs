@@ -1614,15 +1614,25 @@ impl PgRepository {
         &self,
         account_id: AccountId,
     ) -> Result<RetailEquipmentState, RepositoryError> {
-        let rows = sqlx::query!(
-            "SELECT slot_family, slot_index, inventory_item_id, item_type_id, character_id \
+        let rows = sqlx::query_as::<_, RetailEquipmentSlotRow>(
+            "SELECT slot_family, slot_index, inventory_item_id, item_type_id, character_id, cut_in_opaque \
              FROM player_equipment_slots WHERE account_id = $1 ORDER BY slot_family, slot_index",
-            account_id.get()
         )
+        .bind(account_id.get())
         .fetch_all(&self.pool)
         .await
         .map_err(repository_db_error)?;
         let mut state = RetailEquipmentState::default();
+        state.character_hair_color = sqlx::query_scalar::<_, i16>(
+            "SELECT c.hair_color FROM characters c JOIN profiles p ON p.selected_character_id = c.id WHERE c.account_id = $1",
+        )
+        .bind(account_id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(repository_db_error)?
+        .map(|value| u8::try_from(value).map_err(|_| RepositoryError::CorruptData))
+        .transpose()?
+        .unwrap_or(0);
         let part_rows = sqlx::query!(
             "SELECT s.character_id, s.slot_index, s.item_type_id, s.inventory_item_id \
              FROM character_part_slots s JOIN profiles p ON p.selected_character_id = s.character_id \
@@ -1670,7 +1680,10 @@ impl PgRepository {
                     state.consumables[index] = item_type
                 }
                 "decoration" if index < state.decoration.len() => {
-                    state.decoration[index] = item_type
+                    state.decoration[index] = item_type;
+                    state.decoration_slots[index] =
+                        u32::try_from(row.inventory_item_id.unwrap_or(0))
+                            .map_err(|_| RepositoryError::CorruptData)?;
                 }
                 "mascot" => {
                     if index != 0 || state.mascot.is_some() {
@@ -1682,17 +1695,16 @@ impl PgRepository {
                         item_type,
                     ));
                 }
-                "cut_in" if index < 4 => {
+                "cut_in" if index == 0 => {
                     let character_id = row.character_id.ok_or(RepositoryError::CorruptData)?;
                     let character_id =
                         CharacterId::new(character_id).map_err(|_| RepositoryError::CorruptData)?;
-                    if state.cut_in.is_some_and(|(id, _)| id != character_id) {
-                        return Err(RepositoryError::CorruptData);
-                    }
-                    let mut values = state.cut_in.map(|(_, values)| values).unwrap_or([0; 4]);
-                    values[index] = item_type;
-                    state.cut_in = Some((character_id, values));
+                    let bytes = row.cut_in_opaque.ok_or(RepositoryError::CorruptData)?;
+                    let data: [u8; 16] =
+                        bytes.try_into().map_err(|_| RepositoryError::CorruptData)?;
+                    state.cut_in = Some((character_id, data));
                 }
+                "cut_in" => return Err(RepositoryError::CorruptData),
                 _ => return Err(RepositoryError::CorruptData),
             }
         }
@@ -1794,30 +1806,21 @@ impl PgRepository {
                     }
                 }
             }
-            RetailEquipmentChange::CutIn {
-                character_id,
-                values,
-            } => {
+            RetailEquipmentChange::CutIn { character_id, data } => {
                 ensure_owned_character(&mut transaction, account_id, character_id).await?;
-                let mut owned_values = Vec::with_capacity(values.len());
-                for value in values {
-                    owned_values.push(
-                        owned_by_type_any(&mut transaction, account_id, value, &["skin"]).await?,
-                    );
-                }
                 sqlx::query!("DELETE FROM player_equipment_slots WHERE account_id = $1 AND slot_family = 'cut_in'", account_id.get())
                     .execute(&mut *transaction).await.map_err(repository_db_error)?;
-                for (index, value) in owned_values.into_iter().enumerate() {
-                    if let Some((id, item_type_id)) = value {
-                        sqlx::query!("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id, character_id) VALUES ($1, 'cut_in', $2, $3, $4, $5)", account_id.get(), i16::try_from(index).map_err(|_| RepositoryError::CorruptData)?, id, item_type_id, character_id.get())
-                            .execute(&mut *transaction).await.map_err(repository_db_error)?;
-                    }
-                }
+                sqlx::query("INSERT INTO player_equipment_slots (account_id, slot_family, slot_index, inventory_item_id, item_type_id, character_id, cut_in_opaque) VALUES ($1, 'cut_in', 0, NULL, 0, $2, $3)")
+                    .bind(account_id.get())
+                    .bind(character_id.get())
+                    .bind(data.as_slice())
+                    .execute(&mut *transaction).await.map_err(repository_db_error)?;
             }
             RetailEquipmentChange::CharacterParts {
                 character_id,
                 type_ids,
                 inventory_ids,
+                hair_color,
             } => {
                 ensure_owned_character(&mut transaction, account_id, character_id).await?;
                 for (type_id, inventory_id) in type_ids.into_iter().zip(inventory_ids) {
@@ -1838,6 +1841,15 @@ impl PgRepository {
                         }
                     }
                 }
+                sqlx::query(
+                    "UPDATE characters SET hair_color = $1 WHERE account_id = $2 AND id = $3",
+                )
+                .bind(i16::from(hair_color))
+                .bind(account_id.get())
+                .bind(character_id.get())
+                .execute(&mut *transaction)
+                .await
+                .map_err(repository_db_error)?;
                 sqlx::query!(
                     "DELETE FROM character_part_slots WHERE account_id = $1 AND character_id = $2",
                     account_id.get(),
@@ -2044,6 +2056,16 @@ struct AccountRow {
     username_display: String,
     username_normalized: String,
     status: String,
+}
+
+#[derive(FromRow)]
+struct RetailEquipmentSlotRow {
+    slot_family: String,
+    slot_index: i16,
+    inventory_item_id: Option<i64>,
+    item_type_id: i64,
+    character_id: Option<i64>,
+    cut_in_opaque: Option<Vec<u8>>,
 }
 
 #[derive(FromRow)]

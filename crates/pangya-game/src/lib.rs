@@ -1487,6 +1487,21 @@ where
                                         established.card = card;
                                     }
                                     Ok(None) => {}
+                                    Err(GameRuntimeError::EconomyPersistence) => {
+                                        if let Some(slot) = frame
+                                            .payload
+                                            .first()
+                                            .and_then(|tag| RetailEquipmentSlot::from_tag(*tag))
+                                        {
+                                            self.send(
+                                                &mut framed,
+                                                &RetailEquipmentUpdated::Rejected { slot },
+                                            )
+                                            .await?;
+                                        } else {
+                                            break Err(GameRuntimeError::Protocol);
+                                        }
+                                    }
                                     Err(error) => break Err(error),
                                 }
                             } else if self.config.retail_bootstrap
@@ -5404,7 +5419,12 @@ where
             .load_player_snapshot(identity.account_id)
             .await
             .map_err(|_| GameRuntimeError::Snapshot)?;
-        let scope = uuid::Uuid::new_v4();
+        // Room equipment packets have no application operation id. Derive a stable key from the
+        // authenticated account and exact frame so transport retries replay the same economy
+        // operation instead of incrementing the equipment version again.
+        let mut scope_bytes = [0_u8; 16];
+        scope_bytes.copy_from_slice(&Sha256::digest(payload)[..16]);
+        let scope = uuid::Uuid::from_bytes(scope_bytes);
         let announce = match update {
             RetailRoomEquipmentUpdate::Caddie(item_id) => {
                 let state = self
@@ -5680,6 +5700,7 @@ where
                             character_id,
                             type_ids: parts.part_type_ids,
                             inventory_ids: parts.part_uids,
+                            hair_color: parts.hair_color,
                         },
                     )
                     .await
@@ -5771,10 +5792,7 @@ where
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
                 Some(RetailEquipmentUpdated::Mascot { data: [0; 62] })
             }
-            RetailEquipmentRequested::CutIn {
-                character_id,
-                values,
-            } => {
+            RetailEquipmentRequested::CutIn { character_id, data } => {
                 let snapshot = self
                     .repository
                     .load_player_snapshot(account_id)
@@ -5794,16 +5812,13 @@ where
                     .update_retail_equipment(
                         account_id,
                         snapshot.equipment.version,
-                        RetailEquipmentChange::CutIn {
-                            character_id,
-                            values,
-                        },
+                        RetailEquipmentChange::CutIn { character_id, data },
                     )
                     .await
                     .map_err(|_| GameRuntimeError::EconomyPersistence)?;
                 Some(RetailEquipmentUpdated::CutIn {
                     character_id: u32::try_from(character_id.get()).unwrap_or(0),
-                    data: [0; 16],
+                    data,
                 })
             }
             _ => None,
@@ -6533,6 +6548,9 @@ where
                 })
                 .unwrap_or(0),
             item_iff_ids: retail_state.consumables,
+            decoration_slots: retail_state.decoration_slots,
+            decoration_iff_ids: retail_state.decoration,
+            furniture_ids: [0; 2],
         };
         let reply = HandoverReply {
             server_name: b"pangya-rs".to_vec(),
@@ -6562,7 +6580,7 @@ where
                 character: RetailCharacter {
                     iff_id: character.item_type_id.get(),
                     uid: narrow(character.id.get())?,
-                    hair_color: 0,
+                    hair_color: u32::from(retail_state.character_hair_color),
                     part_iff_ids: retail_state
                         .character_parts
                         .filter(|(id, _, _)| *id == character.id)
@@ -7190,6 +7208,9 @@ fn retail_match_player(slot: usize, member: &MemberSnapshot) -> RetailMatchPlaye
                 club_set_uid: card.club_set_uid,
                 comet_iff_id: card.comet_iff_id,
                 item_iff_ids: [0; EQUIPPED_ITEM_SLOTS],
+                decoration_slots: [0; 6],
+                decoration_iff_ids: [0; 6],
+                furniture_ids: [0; 2],
             },
             character: RetailCharacter {
                 iff_id: card.character_iff_id,

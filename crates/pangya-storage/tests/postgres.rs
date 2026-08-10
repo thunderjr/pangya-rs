@@ -240,12 +240,12 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
             u32::try_from(version).expect("version"),
             RetailEquipmentChange::CutIn {
                 character_id: aggregate.equipment.character_id,
-                values: [skin_type, 0, 0, 0],
+                data: [7; 16],
             },
         )
         .await
         .expect("cut-in");
-    assert_eq!(state.cut_in.map(|(_, values)| values[0]), Some(skin_type));
+    assert_eq!(state.cut_in.map(|(_, data)| data), Some([7; 16]));
     let version = version + 1;
     let mut part_types = [0_u32; 24];
     let mut part_ids = [0_u32; 24];
@@ -259,6 +259,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
                 character_id: aggregate.equipment.character_id,
                 type_ids: part_types,
                 inventory_ids: part_ids,
+                hair_color: 0,
             },
         )
         .await
@@ -292,7 +293,7 @@ async fn retail_equipment_update_is_owned_and_transactional(pool: PgPool) {
                 u32::try_from(version).expect("version"),
                 RetailEquipmentChange::CutIn {
                     character_id: missing_character,
-                    values: [0; 4],
+                    data: [0; 16],
                 },
             )
             .await
