@@ -45,6 +45,104 @@ async fn encrypted_connect(address: std::net::SocketAddr) -> TcpStream {
 }
 
 #[sqlx::test(migrator = "MIGRATOR")]
+async fn postgres_expired_presence_emits_and_deletes_one_offline_transition(pool: PgPool) {
+    for (id, username, nickname) in [
+        (1_i64, "alice", "Alice"),
+        (2, "bob", "Bob"),
+        (3, "cara", "Cara"),
+    ] {
+        sqlx::query(
+            "INSERT INTO accounts(id, username_normalized, username_display) VALUES($1,$2,$2)",
+        )
+        .bind(id)
+        .bind(username)
+        .execute(&pool)
+        .await
+        .expect("account");
+        sqlx::query("INSERT INTO profiles(account_id,nickname_display,nickname_normalized,setup_state) VALUES($1,$2,lower($2),'complete')")
+            .bind(id)
+            .bind(nickname)
+            .execute(&pool)
+            .await
+            .expect("profile");
+    }
+    let store = PostgresStore::new(pool.clone());
+    store.add_friend(1, 2).await.expect("friend request");
+    store
+        .confirm_friend(2, 1)
+        .await
+        .expect("friend confirmation");
+    store.add_friend(2, 3).await.expect("second friend request");
+    store
+        .confirm_friend(3, 2)
+        .await
+        .expect("second friend confirmation");
+    store
+        .set_online(2, Presence::Online, ChannelInfo::offline())
+        .await
+        .expect("online");
+    sqlx::query(
+        "UPDATE message_presence SET expires_at=now()-interval '1 second' WHERE account_id=2",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire presence");
+
+    let first = store
+        .take_presence_events(1)
+        .await
+        .expect("first presence poll");
+    assert_eq!(
+        first,
+        vec![(2, Presence::Offline, ChannelInfo::offline())],
+        "expiry emits exactly one offline transition"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM message_presence_events WHERE recipient_account_id=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("event deletion count"),
+        0,
+        "delivered transition is deleted"
+    );
+
+    assert!(
+        store
+            .take_presence_events(1)
+            .await
+            .expect("second presence poll")
+            .is_empty(),
+        "the same expired projection is not reinserted on a later poll"
+    );
+    assert_eq!(
+        store
+            .take_presence_events(3)
+            .await
+            .expect("second recipient presence poll"),
+        vec![(2, Presence::Offline, ChannelInfo::offline())],
+        "expiry fans out to every confirmed friend"
+    );
+    assert!(
+        store
+            .take_presence_events(3)
+            .await
+            .expect("second recipient repeat poll")
+            .is_empty(),
+        "each recipient deletes its transition exactly once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM message_presence WHERE account_id=2",)
+            .fetch_one(&pool)
+            .await
+            .expect("expired projection count"),
+        0,
+        "the expired projection is removed after transition materialization"
+    );
+}
+
+#[sqlx::test(migrator = "MIGRATOR")]
 async fn postgres_social_state_survives_store_restart_and_claims_once(pool: PgPool) {
     for (id, username, nickname) in [(1_i64, "alice", "Alice"), (2, "bob", "Bob")] {
         sqlx::query(

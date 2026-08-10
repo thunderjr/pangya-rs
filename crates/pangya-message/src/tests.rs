@@ -183,6 +183,47 @@ fn superss_confirm_result_fixture_is_status_and_user_id() {
 }
 
 #[tokio::test]
+async fn hello_with_no_friends_emits_empty_friend_list_page() {
+    let store = MemoryStore::default();
+    store.register_user(User {
+        id: 1,
+        nickname: b"Alice".to_vec(),
+        guild_id: None,
+        guild_name: vec![],
+    });
+    let mut session = MessageSession::new(store);
+    session
+        .handle(ClientPacket::CredentialDeclaration {
+            user_id: 1,
+            user_nickname: b"Alice".to_vec(),
+        })
+        .await
+        .expect("auth");
+
+    let responses = session.handle(ClientPacket::Hello).await.expect("hello");
+    assert_eq!(responses.len(), 2, "Hello returns status plus 0x0102 page");
+    assert!(matches!(
+        responses[0],
+        ServerPacket::Presence { user_id: 1, .. }
+    ));
+    assert!(matches!(
+        responses[1],
+        ServerPacket::FriendList {
+            page: Page {
+                number: 1,
+                total: 0,
+                current: 0,
+            },
+            ref entries,
+        } if entries.is_empty()
+    ));
+    assert_eq!(
+        responses[1].encode_payload().expect("empty 0x0102"),
+        [0x02, 0x01, 1, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[tokio::test]
 async fn confirm_requires_pending_incoming_request() {
     let store = MemoryStore::default();
     store.register_user(User {

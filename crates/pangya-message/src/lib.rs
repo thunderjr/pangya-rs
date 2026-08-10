@@ -1268,8 +1268,11 @@ impl MessageStore for PostgresStore {
             .begin()
             .await
             .map_err(|_| MessageError::Rejected)?;
-        sqlx::query("INSERT INTO message_presence_events(recipient_account_id,sender_account_id,sender_generation,status,room_number,room_type,server_id,channel_id,channel_name) SELECT $1,p.account_id,p.generation,5,-1,-1,-1,-1,''::bytea FROM message_presence p JOIN message_friends f ON f.owner_account_id=$1 AND f.friend_account_id=p.account_id AND f.pending=false AND NOT f.blocked WHERE p.expires_at <= now() AND NOT EXISTS (SELECT 1 FROM message_presence_events old WHERE old.recipient_account_id=$1 AND old.sender_account_id=p.account_id AND old.sender_generation=p.generation AND old.status=5) ORDER BY p.account_id LIMIT $2")
-            .bind(Self::id(id)).bind(i64::try_from(MAX_DELIVERY_BATCH).map_err(|_| MessageError::Limit)?)
+        // Atomically consume each expired projection before fanout. The CTE makes concurrent
+        // polls observe one transition: the first poll removes the source and queues all
+        // recipients, while later polls only drain the already-queued rows instead of reinserting
+        // the same transition forever.
+        sqlx::query("WITH expired AS (DELETE FROM message_presence WHERE expires_at <= now() RETURNING account_id,generation) INSERT INTO message_presence_events(recipient_account_id,sender_account_id,sender_generation,status,room_number,room_type,server_id,channel_id,channel_name) SELECT f.owner_account_id,expired.account_id,expired.generation,5,-1,-1,-1,-1,''::bytea FROM expired JOIN message_friends f ON f.friend_account_id=expired.account_id AND f.pending=false AND NOT f.blocked")
             .execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
         sqlx::query("DELETE FROM message_presence_events e WHERE e.recipient_account_id=$1 AND ((e.status <> 5 AND NOT EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.generation=e.sender_generation AND p.expires_at > now())) OR (e.status=5 AND EXISTS (SELECT 1 FROM message_presence p WHERE p.account_id=e.sender_account_id AND p.generation <> e.sender_generation)))")
             .bind(Self::id(id)).execute(&mut *tx).await.map_err(|_| MessageError::Rejected)?;
@@ -1940,6 +1943,16 @@ impl MessageSession {
     async fn friend_pages(&self, id: u32) -> Result<Vec<ServerPacket>, MessageError> {
         let entries = self.store.friends(id).await?;
         let total = u16::try_from(entries.len()).map_err(|_| MessageError::Limit)?;
+        if entries.is_empty() {
+            return Ok(vec![ServerPacket::FriendList {
+                page: Page {
+                    number: 1,
+                    total: 0,
+                    current: 0,
+                },
+                entries: Vec::new(),
+            }]);
+        }
         Ok(entries
             .chunks(FRIEND_PAGE_SIZE)
             .enumerate()
