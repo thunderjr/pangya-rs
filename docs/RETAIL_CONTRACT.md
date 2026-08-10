@@ -268,9 +268,10 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x00f5` | `RetailMultiplayerJoined` | `us852_room.rs:841` | `lib.rs:5113` | empty body; `ServerMultiplayerJoined`, PacketDoc `00f5.ksy` |
 | `0x00f6` | `RetailMultiplayerLeft` | `us852_room.rs:862` | `lib.rs:5120` | empty body |
 | `0x0047` | `RetailRoomList` | `us852_room.rs:883` | `lib.rs:5105`, `:5297` | 210-byte room records |
-| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:1110` | `lib.rs:5211`, `:5279`, and every room snapshot while in the room | 341-byte player records. **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent. A snapshot re-sends the whole roster rather than a delta |
-| `0x0049` | `RetailRoomJoinResult` | `us852_room.rs:926` | `lib.rs:5163`, `:5206`, `:5259` | success writes a `u16` status then the room record; rejection writes one byte. The widths genuinely differ |
-| `0x004c` | `RetailRoomLeave` | `us852_room.rs:967` | `lib.rs:5241` | `0xffff` means the lobby; also sent to a kicked member |
+| `0x0048` | `RetailRoomCensus::List` | `us852_room.rs:2115` | `lib.rs:4520`, `:7908`, and every room snapshot while in the room | 854-byte player records (341-byte identity plus 513-byte character block). **Only the `List` form is emitted**; `Add`/`Remove`/`Update` are modelled but never sent. A snapshot re-sends the whole roster rather than a delta |
+| `0x0049` | `RetailRoomJoinResult` | `us852_room.rs:914` | `lib.rs:6720`, `:6950` | success writes a `u16` status then the room record; rejection writes one byte. The widths genuinely differ |
+| `0x004c` | `RetailRoomLeave` | `us852_room.rs:1008` | `lib.rs:6830` | `0xffff` means the lobby; also sent to a kicked member |
+| `0x0086` | `RetailRoomInformationResponse` | `us852_room.rs:2110` | `lib.rs:6934`, `:6960` | PacketDoc exact 18-byte user records: connection id, rank, five opaque bytes, title badge, four opaque bytes; do not reuse the 341-byte census identity |
 | `0x007d` | `RetailTeamChangeAnnounce` | `us852_room.rs:385` | room event fanout | one announce plus one census per team mutation |
 | `0x0083` | `RetailRoomInviteNotification` | `us852_room.rs:466` | room event fanout | invitee notification; do not reuse request opcode `0x00ba` |
 | `0x012f` / `0x0130` | `RetailRoomInviteResponse` / `RetailRoomInviteInfoResponse` | `us852_room.rs:429` / `:408` | `lib.rs` invite handlers | `0x00ba` / `0x0029` request pairing respectively |
@@ -283,9 +284,9 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 | `0x00cc` | `RetailTurnEnd` | `us852_match.rs:234` | `lib.rs:3532`, `:4465` | |
 | `0x0055` | `RetailShotCommitRelay` | `us852_match.rs:285` | `lib.rs:3565` | the client's own shot payload, relayed unchanged |
 | `0x0064` | `RetailShotSync` | `us852_match.rs:316` | `lib.rs:3573` | `ServerRoomShotSync`, `game/room/room.go` `handleRoomGameShotSync` |
-| `0x0065` | `RetailFinishHole` | `us852_match.rs:419` | `lib.rs:4015`, `:4499` | empty body |
+| `0x0065` | `RetailFinishHole` | `us852_match.rs:846` | `lib.rs:4608`, `:5440` | empty body; nonterminal holes reply to the caller, while the terminal room event sends exactly one to every captured player |
 | `0x0090` | `RetailFirstShotReady` | `game.rs` | `handle_retail_stroke_command` | empty body; `ServerPlayerFirstShotReady`. Its arrival is the whole message |
-| `0x0066` | `RetailMatchFinish` | `us852_match.rs:386` | `lib.rs:4016` | the durable server-side settlement, never anything the client claimed. `ServerRoomFinishGame` |
+| `0x0066` | `RetailMatchFinish` | `us852_match.rs:802` | `lib.rs:4612` | the durable server-side settlement, never anything the client claimed. Every captured player receives one terminal `0x0065` immediately before this frame. `ServerRoomFinishGame` |
 
 ### 2.6 Retail types defined but not routed
 
@@ -293,7 +294,7 @@ one would hide a gap instead of surfacing it. This allowlist is what makes the s
 |---|---|---|
 | `RetailAimRotate` (`0x0056`) | `us852_match.rs:258` | aim rotation is never relayed; no handler decodes `0x0013` |
 | `RetailRoomCensus::Add` / `Remove` / `Update` | `us852_room.rs:1110` | lobby broadcasts are dropped in retail mode (`lib.rs:3425`), so a room does not update live |
-| `RetailRoomSettingChange::Artifact` | `us852_room.rs:118` | applied to the authoritative room profile and emitted in room-list records; reward calculation remains server-owned (`pangbox/server` `ArtifactID`) |
+| `RetailRoomSettingChange::Artifact` | `us852_room.rs:118` | parsed but refused without mutating the room: PacketDoc carries the id, while the checked references provide no authoritative gameplay/reward effect |
 | `HandoverRejection` (all eight codes) | `us852_bootstrap.rs:36` | a failed handover closes the connection instead of naming a client-visible reason |
 | `RetailRoomType::Chat` / `Tournament` / `Battle` | `us852_room.rs:41` | decoded from the create request, then discarded; every room runs the versus lifecycle |
 | `RetailRoomSettingChange::RepeatHole` / `FixedRepeatHole` | `us852_room.rs:112-117` | decoded for compatibility but deterministically refused without a disconnect; the checked references define no semantics for types 11/12, so the room remains unchanged |

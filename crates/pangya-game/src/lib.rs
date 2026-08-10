@@ -17,7 +17,7 @@ pub use lobby::{
 };
 pub use match_state::{
     LOADING_TIMEOUT_HARD_CAP, MAX_SOLO_STROKES, RelayDisposition, SoloMatchError, SoloMatchPhase,
-    SoloMatchState, SoloStartPlan, deterministic_conditions,
+    SoloMatchState, SoloStartPlan, deterministic_conditions, deterministic_conditions_for_gameplay,
 };
 pub use room::{
     MAX_RETAIL_RELAY_BYTES, RetailMatchRelay, RoomActorLimits, RoomDisconnect, RoomEvent,
@@ -87,19 +87,23 @@ use pangya_protocol::{
     RetailMultiplayerJoined, RetailMultiplayerLeft, RetailMyRoomEnter, RetailMyRoomEntered,
     RetailMyRoomFurniture, RetailMyRoomInventoryRequest, RetailMyRoomLayout, RetailNewSessionKey,
     RetailNewSessionKeyRequest, RetailPangBalance, RetailPangRate, RetailPangSpent,
-    RetailPlayerData, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest, RetailPlayerIdentity,
-    RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics, RetailPlayerStatisticsReport,
-    RetailPointBalance, RetailPracticeShotSync, RetailPracticeShotSyncRequest, RetailPracticeStart,
-    RetailPurchaseItem, RetailPurchaseRequest, RetailPurchaseResponse, RetailRateTable,
-    RetailRecentPlayerSlot, RetailRoom, RetailRoomCensus, RetailRoomCreate,
-    RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket, RetailRoomJoin,
-    RetailRoomJoinResult, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomState,
-    RetailRoomStatus, RetailRoomType, RetailSelectChannel, RetailServerEntry, RetailServerList,
+    RetailPlayerData, RetailPlayerHistory, RetailPlayerHistoryEntries, RetailPlayerHistoryRequest,
+    RetailPlayerIdentity, RetailPlayerInfo, RetailPlayerStartHole, RetailPlayerStatistics,
+    RetailPlayerStatisticsReport, RetailPointBalance, RetailPracticeShotSync,
+    RetailPracticeShotSyncRequest, RetailPracticeStart, RetailPurchaseItem, RetailPurchaseRequest,
+    RetailPurchaseResponse, RetailRateTable, RetailRecentPlayerSlot, RetailRoom, RetailRoomCensus,
+    RetailRoomCreate, RetailRoomEquipmentUpdate, RetailRoomEquipmentUpdatePacket,
+    RetailRoomInformationRequest, RetailRoomInformationResponse, RetailRoomInformationUser,
+    RetailRoomInvite, RetailRoomInviteInfo, RetailRoomInviteInfoResponse,
+    RetailRoomInviteNotification, RetailRoomInviteResponse, RetailRoomJoin, RetailRoomJoinResult,
+    RetailRoomKick, RetailRoomLeave, RetailRoomList, RetailRoomPlayer, RetailRoomResync,
+    RetailRoomSettingChange, RetailRoomSettingsUpdate, RetailRoomState, RetailRoomStatus,
+    RetailRoomType, RetailSelectChannel, RetailServerEntry, RetailServerList,
     RetailServerListRequest, RetailServerTime, RetailServerTimeRequest, RetailShopJoin,
-    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding,
-    RetailSubServerConnect, RetailSubServerEntry, RetailTurnEnd, RetailTurnStart,
-    RetailUccUploadKeyRefusal, RetailWeather, RoomChatEvent, RoomChatRequest, RoomCommand,
-    RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
+    RetailShopJoined, RetailShotCommitRelay, RetailShotSync, RetailStanding, RetailTeamChange,
+    RetailTeamChangeAnnounce, RetailSubServerConnect, RetailSubServerEntry, RetailTurnEnd,
+    RetailTurnStart, RetailUccUploadKeyRefusal, RetailWeather, RoomChatEvent, RoomChatRequest,
+    RoomCommand, RoomCommandResult, RoomCommandResultResponse, RoomCreateRequest, RoomJoinRejection,
     RoomJoinRequest, RoomKickRequest, RoomLeaveRequest, RoomListKind, RoomListRequest,
     RoomListResponse, RoomMembershipEvent, RoomMembershipKind, RoomPlayerFlags, RoomReadyRequest,
     RoomSettingsRequest, RoomStateRequest, RoomStateResponse, SYNTHETIC_M4_C2S_CHAT,
@@ -727,6 +731,8 @@ struct RetailHoleAtmosphere {
 struct ConnectionStrokeContext {
     match_id: MatchId,
     roster: [PlayerConnectionId; 2],
+    seed: pangya_domain::MatchSeed,
+    natural_wind: bool,
     /// One-based hole whose opening frame was last emitted.
     hole: u8,
     /// The participant this connection was last told owns the turn, so a handover can name
@@ -1284,12 +1290,18 @@ where
             // catalog does not: its Course table is a presentation row with no par field, so
             // par is operator-declared and there is nothing here to compare it against.
             let catalog_course = catalog
-                .declared_course_plan(course.course_id(), course.par())
+                .declared_course_plan(
+                    course.course_id(),
+                    course.hole_count(),
+                    course.hole_mode(),
+                    course.par(),
+                )
                 .map_err(|_| GameRuntimeError::Catalog)?;
             if catalog_course != course || catalog.fingerprint() != fingerprint {
                 return Err(GameRuntimeError::Catalog);
             }
-            if let Ok(derived) = catalog.course_plan(course.course_id())
+            if let Ok(derived) =
+                catalog.course_plan(course.course_id(), course.hole_count(), course.hole_mode())
                 && derived != course
             {
                 return Err(GameRuntimeError::Catalog);
@@ -4565,7 +4577,8 @@ where
                                 hole_count: begin.config().hole_count(),
                                 hole_mode: begin.config().hole_mode(),
                                 weather: begin.weather(),
-                                wind: begin.wind(),
+                                seed: begin.seed(),
+                                natural_wind: self.retail_natural_wind(connection_id).await,
                                 shot_timer: RETAIL_SOLO_SHOT_TIMER,
                                 game_timer: RETAIL_SOLO_GAME_TIMER,
                             },
@@ -4648,7 +4661,8 @@ where
                                 hole_count: begin.config().hole_count(),
                                 hole_mode: begin.config().hole_mode(),
                                 weather: begin.weather(),
-                                wind: begin.wind(),
+                                seed: begin.seed(),
+                                natural_wind: self.retail_natural_wind(connection_id).await,
                                 shot_timer: plan.turn_timeout(),
                                 game_timer: plan.game_timeout(),
                             },
@@ -4658,6 +4672,8 @@ where
                     match_context.stroke = Some(ConnectionStrokeContext {
                         match_id: begin.match_id(),
                         roster: *plan.roster(),
+                        seed: begin.seed(),
+                        natural_wind: self.retail_natural_wind(connection_id).await,
                         hole: 1,
                         active: None,
                     });
@@ -4676,6 +4692,22 @@ where
                     // Keep this check before the active-player comparison so every subsequent
                     // hole receives the required 0x0053 and never an early 0x0063.
                     if context.active.is_some() && hole != context.hole {
+                        let (weather, wind) = deterministic_conditions_for_gameplay(
+                            context.seed,
+                            context.natural_wind,
+                            hole,
+                        )
+                        .map_err(|_| GameRuntimeError::InvalidConfig)?;
+                        let weather = match weather {
+                            pangya_domain::Weather::Clear => RetailWeather::Clear,
+                            pangya_domain::Weather::Cloudy => RetailWeather::Cloudy,
+                            pangya_domain::Weather::Rain => RetailWeather::Raining,
+                        };
+                        self.send_retail_hole_atmosphere(
+                            framed,
+                            RetailHoleAtmosphere { weather, wind },
+                        )
+                        .await?;
                         self.send(
                             framed,
                             &RetailPlayerStartHole {
@@ -5007,6 +5039,8 @@ where
                 match_context.stroke = Some(ConnectionStrokeContext {
                     match_id: begin.match_id(),
                     roster,
+                    seed: begin.seed(),
+                    natural_wind: false,
                     hole: 1,
                     active: None,
                 });
@@ -5201,7 +5235,7 @@ where
         // preserving the client-selected course ID rather than silently reverting the course.
         let par = self
             .catalog
-            .course_plan(course_id)
+            .course_plan(course_id, profile.hole_count, profile.hole_progression)
             .map(|declared| declared.par())
             .or_else(|_| {
                 self.config
@@ -5217,6 +5251,18 @@ where
             .map_err(|_| GameRuntimeError::InvalidConfig)?;
         MatchPlan::with_holes(course_id, profile.hole_count, profile.hole_progression, par)
             .map_err(|_| GameRuntimeError::InvalidConfig)
+    }
+
+    /// Reads the room's natural-wind switch for gameplay generation.
+    async fn retail_natural_wind(&self, connection_id: PlayerConnectionId) -> bool {
+        match self
+            .lobby
+            .route(connection_id, LobbyRoomCommand::GetState)
+            .await
+        {
+            Ok(LobbyRouteResult::Snapshot(snapshot)) => snapshot.summary().profile().natural_wind,
+            _ => false,
+        }
     }
 
     /// Builds a deterministic full-course hole order for the retail card.
@@ -5275,9 +5321,9 @@ where
     /// Sends the frames a retail client needs before it will load a hole.
     ///
     /// The framing pair and the pang rate come first, then the roster carrying every player
-    /// whole, because the client builds each of them from it; the plan follows and is one
-    /// hole, because that is what this server settles. The client reads the whole plan up
-    /// front, so an incomplete one strands it, and the mascot seed closes the sequence.
+    /// whole, because the client builds each of them from it; the plan follows with the room's
+    /// complete card shape. The client reads the whole plan up front, so an incomplete card
+    /// strands it, and the mascot seed closes the sequence.
     ///
     /// Weather and wind are deliberately not here. They are returned for the caller to hold
     /// until every player has reported its hole loaded — no reference server sends either
@@ -5294,10 +5340,13 @@ where
             hole_count,
             hole_mode,
             weather,
-            wind,
+            seed,
+            natural_wind,
             shot_timer,
             game_timer,
         } = hole;
+        let (_, wind) = deterministic_conditions_for_gameplay(seed, natural_wind, 1)
+            .map_err(|_| GameRuntimeError::InvalidConfig)?;
         let millis = |duration: Duration| {
             u32::try_from(duration.as_millis()).map_err(|_| GameRuntimeError::InvalidConfig)
         };
@@ -5491,11 +5540,10 @@ where
             })
             .to_vec();
         standings.sort_by_key(|standing| standing.place);
-        // The caller's accepted 0x0031 already received its 0x0065 in the command path when
-        // this was a nonterminal hole. On the terminal hole the room event is the single source
-        // of the finish frame for both roster members, including a member that has not sent its
-        // own duplicate 0x0031 yet. Never emit a second 0x0065 here: the retail client treats the
-        // duplicate as a second card completion and may leave the results screen twice.
+        // A terminal room event is delivered once to each captured roster member, including the
+        // last finisher's opponent. Emit the terminal hole marker here (rather than in the command
+        // path) so every player gets exactly one `0x0065`, then one authoritative `0x0066`.
+        self.send(framed, &RetailFinishHole).await?;
         self.send(framed, &RetailMatchFinish { standings }).await
     }
 
@@ -7867,11 +7915,13 @@ where
                         RetailRoomSettingChange::NaturalWind(enabled) => {
                             profile_update.natural_wind = enabled
                         }
-                        RetailRoomSettingChange::Artifact(artifact_id) => {
-                            // PacketDoc/pangbox carry this catalog id in the room record. The
-                            // reward aggregate does not yet consume it, so retain and advertise
-                            // the selected id while leaving reward calculation server-owned.
-                            profile_update.artifact_id = artifact_id;
+                        RetailRoomSettingChange::Artifact(_artifact_id) => {
+                            // PacketDoc carries the catalog id, but the checked gameplay
+                            // references provide no authoritative effect or reward semantics.
+                            // Refuse it without mutating the room rather than advertising a
+                            // cosmetic setting the match would silently discard.
+                            self.observer.unknown(GameUnknownObservation::Ignored);
+                            return Ok(state);
                         }
                         RetailRoomSettingChange::RepeatHole(_)
                         | RetailRoomSettingChange::FixedRepeatHole(_) => {
@@ -7979,8 +8029,7 @@ where
                 let players = snapshot
                     .members()
                     .iter()
-                    .enumerate()
-                    .map(|(slot, member)| retail_room_player(slot, member))
+                    .map(retail_room_information_user)
                     .collect();
                 self.send(framed, &RetailRoomInformationResponse { players })
                     .await?;
@@ -8004,8 +8053,7 @@ where
                 let players = snapshot
                     .members()
                     .iter()
-                    .enumerate()
-                    .map(|(slot, member)| retail_room_player(slot, member))
+                    .map(retail_room_information_user)
                     .collect();
                 self.send(framed, &RetailRoomInformationResponse { players })
                     .await?;
@@ -8798,7 +8846,8 @@ struct RetailHoleIntro {
     hole_count: u8,
     hole_mode: u8,
     weather: pangya_domain::Weather,
-    wind: pangya_domain::WindConditions,
+    seed: pangya_domain::MatchSeed,
+    natural_wind: bool,
     shot_timer: Duration,
     game_timer: Duration,
 }
@@ -8948,6 +8997,14 @@ fn retail_match_player(slot: usize, member: &MemberSnapshot) -> RetailMatchPlaye
 ///
 /// `slot` is one-based: `pangbox/packetdoc` (`gameservice/server/0048.ksy`, `room_user_slot`)
 /// documents it as "from 1 to the user_max", and the client numbers the seats it draws from it.
+fn retail_room_information_user(member: &MemberSnapshot) -> RetailRoomInformationUser {
+    RetailRoomInformationUser::new(
+        u32::try_from(member.connection_id().get()).unwrap_or(0),
+        1,
+        0,
+    )
+}
+
 fn retail_room_player(slot: usize, member: &MemberSnapshot) -> RetailRoomPlayer {
     RetailRoomPlayer {
         connection_id: u32::try_from(member.connection_id().get()).unwrap_or(0),
@@ -9947,7 +10004,11 @@ mod tests {
     fn solo_config(catalog: &Catalog, commit_timeout: Duration) -> SoloRuntimeConfig {
         SoloRuntimeConfig {
             course: catalog
-                .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+                .course_plan(
+                    pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()),
+                    1,
+                    0,
+                )
                 .unwrap_or_else(|_| unreachable!()),
             catalog_fingerprint: catalog.fingerprint(),
             loading_timeout: Duration::from_secs(5),
@@ -10001,7 +10062,11 @@ mod tests {
     fn stroke_config(catalog: &Catalog, commit_timeout: Duration) -> StrokeRuntimeConfig {
         StrokeRuntimeConfig {
             course: catalog
-                .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+                .course_plan(
+                    pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()),
+                    1,
+                    0,
+                )
                 .unwrap_or_else(|_| unreachable!()),
             catalog_fingerprint: catalog.fingerprint(),
             loading_timeout: Duration::from_secs(5),
@@ -11735,8 +11800,10 @@ mod tests {
     #[test]
     fn stroke_runtime_rejects_invalid_course_before_listener_binding() {
         let catalog = test_catalog();
-        let invalid_course = MatchPlan::new(
+        let invalid_course = MatchPlan::with_holes(
             pangya_domain::CourseId::new(99).unwrap_or_else(|_| unreachable!()),
+            1,
+            0,
             3,
         )
         .unwrap_or_else(|_| unreachable!());
@@ -11771,7 +11838,11 @@ mod tests {
     async fn solo_runtime_cross_checks_catalog_and_persists_cleanup_abort_once() {
         let catalog = test_catalog();
         let course = catalog
-            .course_plan(pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()))
+            .course_plan(
+                pangya_domain::CourseId::new(7).unwrap_or_else(|_| unreachable!()),
+                1,
+                0,
+            )
             .unwrap_or_else(|_| unreachable!());
         let solo = SoloRuntimeConfig {
             course,

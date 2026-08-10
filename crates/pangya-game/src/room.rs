@@ -3032,7 +3032,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(101)),
                 MatchResultKey::new(Uuid::from_u128(102)),
                 account_id,
-                MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -3070,7 +3070,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(204)),
                 ),
             ],
-            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

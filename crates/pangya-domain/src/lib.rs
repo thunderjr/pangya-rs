@@ -1363,13 +1363,6 @@ impl MatchPlan {
         par >= Self::MIN_PAR && par <= Self::MAX_PAR
     }
 
-    /// Validates a plan with the legacy default of one hole.
-    ///
-    /// New room-driven callers should use [`Self::with_holes`].
-    pub const fn new(course_id: CourseId, par: u8) -> Result<Self, MatchValueError> {
-        Self::with_holes(course_id, 1, 0, par)
-    }
-
     /// Validates a room-driven plan with an explicit hole count and progression mode.
     pub const fn with_holes(
         course_id: CourseId,
@@ -1413,7 +1406,7 @@ impl MatchPlan {
         self.hole_mode
     }
 
-    /// Configured first-hole ordinal for legacy consumers.
+    /// Configured first-hole ordinal for consumers that address the current card entry.
     #[must_use]
     pub const fn hole(self) -> u8 {
         1
@@ -2774,7 +2767,7 @@ pub enum MatchRepositoryError {
     /// The requested lifecycle API does not match the persisted match mode/formula.
     #[error("match mode does not match the requested lifecycle API")]
     WrongMode,
-    /// Course or one-hole configuration does not match.
+    /// Course, hole-count, progression, or par configuration does not match.
     #[error("match configuration does not match")]
     WrongConfig,
     /// The match was aborted and cannot commit.
@@ -4966,7 +4959,8 @@ mod tests {
             MatchId::new(Uuid::nil()),
             MatchResultKey::new(Uuid::nil()),
             AccountId::new(1).expect("account"),
-            MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+            MatchPlan::with_holes(CourseId::new(7).expect("course"), 1, 0, 3)
+                .expect("configuration"),
             CatalogFingerprint::new([0; 32]),
             seed,
             Weather::Clear,
@@ -5034,7 +5028,7 @@ mod tests {
     #[test]
     fn synthetic_match_values_and_rewards_are_checked() {
         let course = CourseId::new(7).expect("course");
-        let config = MatchPlan::new(course, 3).expect("configuration");
+        let config = MatchPlan::with_holes(course, 1, 0, 3).expect("configuration");
         assert_eq!(config.hole(), 1);
         assert_eq!(
             synthetic_solo_reward_v1(config, StrokeCount::new(2).expect("strokes")),
@@ -5045,7 +5039,10 @@ mod tests {
             Ok(SoloReward::from_persisted(2, 10, 5))
         );
         assert_eq!(CourseId::new(0), Err(MatchValueError::InvalidCourse));
-        assert_eq!(MatchPlan::new(course, 0), Err(MatchValueError::InvalidPar));
+        assert_eq!(
+            MatchPlan::with_holes(course, 1, 0, 0),
+            Err(MatchValueError::InvalidPar)
+        );
         assert_eq!(StrokeCount::new(0), Err(MatchValueError::InvalidStrokes));
         assert_eq!(
             WindConditions::new(151, 0),
@@ -5087,7 +5084,8 @@ mod tests {
             StrokeRosterOrder::Second,
             MatchResultKey::new(Uuid::from_u128(3)),
         );
-        let config = MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration");
+        let config = MatchPlan::with_holes(CourseId::new(7).expect("course"), 1, 0, 3)
+            .expect("configuration");
         assert!(
             BeginStrokeMatch::new(
                 MatchId::new(Uuid::from_u128(4)),
@@ -5146,7 +5144,8 @@ mod tests {
                 MatchResultKey::new(Uuid::from_u128(12)),
             ),
         ];
-        let config = MatchPlan::new(CourseId::new(7).expect("course"), 4).expect("configuration");
+        let config = MatchPlan::with_holes(CourseId::new(7).expect("course"), 1, 0, 4)
+            .expect("configuration");
         let commit = |left: (StrokePlace, StrokeCompletion),
                       right: (StrokePlace, StrokeCompletion)| {
             let strokes = |completion| {

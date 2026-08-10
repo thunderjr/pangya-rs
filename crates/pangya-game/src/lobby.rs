@@ -1986,7 +1986,7 @@ mod tests {
                 MatchId::new(Uuid::from_u128(201)),
                 MatchResultKey::new(Uuid::from_u128(202)),
                 account_id,
-                MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+                MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                     .unwrap_or_else(|_| unreachable!()),
                 CatalogFingerprint::new([3; 32]),
                 seed,
@@ -2017,7 +2017,7 @@ mod tests {
                     MatchResultKey::new(Uuid::from_u128(304)),
                 ),
             ],
-            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

@@ -1560,7 +1560,7 @@ fn solo_begin(account_id: pangya_domain::AccountId) -> BeginSoloMatch {
         MatchId::new(Uuid::new_v4()),
         MatchResultKey::new(Uuid::new_v4()),
         account_id,
-        MatchPlan::new(CourseId::new(7).expect("course"), 3).expect("configuration"),
+        MatchPlan::with_holes(CourseId::new(7).expect("course"), 1, 0, 3).expect("configuration"),
         CatalogFingerprint::new([0x42; 32]),
         MatchSeed::new([0x24; 32]),
         Weather::Clear,
@@ -1615,7 +1615,7 @@ fn stroke_begin(first: AccountId, second: AccountId) -> BeginStrokeMatch {
     stroke_begin_with_config(
         first,
         second,
-        MatchPlan::new(CourseId::new(17).expect("course"), 3).expect("configuration"),
+        MatchPlan::with_holes(CourseId::new(17).expect("course"), 1, 0, 3).expect("configuration"),
     )
 }
 
@@ -2085,7 +2085,7 @@ async fn solo_match_rejects_begin_drift_and_wrong_authority_or_config(pool: PgPo
         begin.match_id(),
         begin.result_key(),
         begin.account_id(),
-        MatchPlan::new(CourseId::new(8).expect("course"), 3).expect("config"),
+        MatchPlan::with_holes(CourseId::new(8).expect("course"), 1, 0, 3).expect("config"),
         StrokeCount::new(3).expect("strokes"),
     );
     assert_eq!(
@@ -3327,7 +3327,7 @@ async fn stroke_course_records_keep_deterministic_best_and_count_only_holed(pool
         let begin = stroke_begin_with_config(
             first.account.id,
             second.account.id,
-            MatchPlan::new(course, par).expect("configuration"),
+            MatchPlan::with_holes(course, 1, 0, par).expect("configuration"),
         );
         repository.begin_stroke(begin.clone()).await.expect("begin");
         repository

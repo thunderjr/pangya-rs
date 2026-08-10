@@ -283,7 +283,9 @@ Same provenance and caveat. Implemented in `pangya-protocol::us852_match`.
 | `0x0065` | Hole finished | empty |
 | `0x0090` | Finish-preview acknowledgement | empty |
 
-One hole record is `u32` random id, `u8` pin, `u8` course, `u8` number.
+Each hole record is `u32` random id, `u8` pin, `u8` course, `u8` number. The room-driven
+retail plan carries the selected 3/6/9/18-hole count and progression; the synthetic M5/M6
+one-hole flows are separate compatibility modes.
 
 Four details that are easy to get wrong and were pinned by tests:
 
@@ -298,7 +300,8 @@ Four details that are easy to get wrong and were pinned by tests:
   `Acrisio-Filho/SuperSS-Dev` `versus_base.cpp` `checkAllLoadHole`, and
   `hsreina/pangya-server` `Game.pas` `HandlePlayerLoadOk`.
 - A wind strength of `0` is never sent; upstream picks `1..8`, so a still hole is reported
-  as the weakest breeze.
+  as the weakest breeze. With the room's natural-wind option enabled, the server derives a
+  deterministic per-hole strength in that same range while retaining the seed-derived bearing.
 - Shots are relayed, not recomputed. The client owns trajectory; the server owns turn
   order, scoring, and persistence. The relay body is deliberately opaque.
 

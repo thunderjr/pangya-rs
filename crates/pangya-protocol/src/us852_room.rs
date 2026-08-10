@@ -2244,11 +2244,52 @@ impl RetailRoomPlayer {
     }
 }
 
+/// One user entry in the room-information response, server opcode `0x0086`.
+///
+/// This is deliberately not [`RetailRoomPlayer`]. PacketDoc `gameservice/server/0086.ksy`
+/// defines a compact 18-byte user record; the 341-byte identity record belongs only to the
+/// room census (`0x0048`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetailRoomInformationUser {
+    /// Per-connection identifier.
+    pub connection_id: u32,
+    /// User rank byte.
+    pub rank: u8,
+    /// Reference-defined opaque bytes.
+    pub unknown_a: [u8; 5],
+    /// Custom title badge catalog id.
+    pub title_badge: u32,
+    /// Reference-defined opaque bytes.
+    pub unknown_c: [u8; 4],
+}
+
+impl RetailRoomInformationUser {
+    /// Builds the reference-compatible compact record with zero opaque fields.
+    #[must_use]
+    pub const fn new(connection_id: u32, rank: u8, title_badge: u32) -> Self {
+        Self {
+            connection_id,
+            rank,
+            unknown_a: [0; 5],
+            title_badge,
+            unknown_c: [0; 4],
+        }
+    }
+
+    fn encode_body(&self, writer: &mut PacketWriter) {
+        writer.u32_le(self.connection_id);
+        writer.u8(self.rank);
+        writer.bytes(&self.unknown_a);
+        writer.u32_le(self.title_badge);
+        writer.bytes(&self.unknown_c);
+    }
+}
+
 /// Room information response, server opcode `0x0086`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetailRoomInformationResponse {
-    /// Public member records for the requested room.
-    pub players: Vec<RetailRoomPlayer>,
+    /// Compact public user records for the requested room.
+    pub players: Vec<RetailRoomInformationUser>,
 }
 
 impl EncodePacket for RetailRoomInformationResponse {
@@ -2268,7 +2309,7 @@ impl EncodePacket for RetailRoomInformationResponse {
         writer.u32_le(count);
         writer.bytes(&[0; 12]);
         for player in &self.players {
-            player.encode_identity(writer)?;
+            player.encode_body(writer);
         }
         Ok(())
     }
@@ -2728,6 +2769,23 @@ mod tests {
             decode_packet_payload::<RetailRoomSettingsUpdate>(&wind, &profile(), ServiceKind::Game)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn room_information_uses_packetdoc_18_byte_user_records() {
+        let payload = encode_packet_payload(
+            &RetailRoomInformationResponse {
+                players: vec![RetailRoomInformationUser::new(0x1122_3344, 7, 0x5566_7788)],
+            },
+            &profile(),
+        )
+        .expect("room information");
+        assert_eq!(payload.len(), 16 + 18);
+        assert_eq!(&payload[..4], &1_u32.to_le_bytes());
+        assert_eq!(&payload[4..16], &[0; 12]);
+        assert_eq!(&payload[16..20], &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(payload[20], 7);
+        assert_eq!(&payload[26..30], &0x5566_7788_u32.to_le_bytes());
     }
 
     #[test]

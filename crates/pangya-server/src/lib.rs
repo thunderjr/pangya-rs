@@ -308,7 +308,9 @@ async fn bind_after_startup_recovery<R: MatchRepository>(
     Ok((login, http, game))
 }
 
-/// Resolves the one-hole course a mode will play, preferring an operator-declared par.
+/// Resolves the configured course plan a mode will play, preferring an operator-declared par.
+/// Synthetic mode shape is explicit in the returned plan rather than supplied by a legacy
+/// one-hole constructor.
 ///
 /// A declared par wins over a catalog-derived one so that an operator can always override a
 /// generated catalog's value; a catalog with no par of its own then requires the declaration.
@@ -319,9 +321,9 @@ fn resolve_course_plan(
 ) -> Result<MatchPlan, ServerError> {
     match declared_par {
         Some(par) => catalog
-            .declared_course_plan(course_id, par)
+            .declared_course_plan(course_id, 1, 0, par)
             .map_err(|_| ServerError::Data),
-        None => catalog.course_plan(course_id).map_err(|error| {
+        None => catalog.course_plan(course_id, 1, 0).map_err(|error| {
             // Distinguish "this catalog has no par to give" from "this course is not in the
             // catalog", because only the first one is fixed by editing configuration.
             if catalog.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {

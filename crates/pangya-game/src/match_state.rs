@@ -33,14 +33,36 @@ pub const MAX_SOLO_STROKES: u8 = 30;
 pub fn deterministic_conditions(
     seed: MatchSeed,
 ) -> Result<(Weather, WindConditions), SoloMatchError> {
+    deterministic_conditions_for_gameplay(seed, false, 1)
+}
+
+/// Derives the wind sent for a retail hole.
+///
+/// PacketDoc/pangbox establish the room's natural-wind flag and the retail capture contract
+/// reports wind strength in `1..=8`; the gameplay references describe natural wind as changing
+/// power while keeping the bearing. Keep the persisted base bearing and derive only the strength
+/// when the room enables the option. The hole ordinal makes the result stable across retries.
+pub fn deterministic_conditions_for_gameplay(
+    seed: MatchSeed,
+    natural_wind: bool,
+    hole: u8,
+) -> Result<(Weather, WindConditions), SoloMatchError> {
     let mut rng = ChaCha12Rng::from_seed(*seed.as_bytes());
     let weather = match rng.next_u32() % 3 {
         0 => Weather::Clear,
         1 => Weather::Cloudy,
         _ => Weather::Rain,
     };
-    let speed_tenths = (rng.next_u32() % 151) as u16;
+    let mut speed_tenths = (rng.next_u32() % 151) as u16;
     let angle_degrees = (rng.next_u32() % 360) as u16;
+    if natural_wind {
+        // Reference gameplay reports natural wind as a power change, not a bearing change.
+        // Consume a hole-specific value so each card entry is deterministic and distinct.
+        for _ in 1..hole {
+            let _ = rng.next_u32();
+        }
+        speed_tenths = (((rng.next_u32() % 8) + 1) * 10) as u16;
+    }
     // Both modulo ranges are subsets of the current domain constructor bounds. Propagate an
     // explicit invariant failure rather than silently substituting different persisted input if
     // those bounds ever change.
@@ -610,6 +632,16 @@ mod tests {
     use pangya_domain::{
         CatalogFingerprint, CourseId, MatchPlan, MatchResultKey, ServerBalances, SoloReward,
     };
+
+    #[test]
+    fn natural_wind_changes_power_but_keeps_reference_bearing() {
+        let seed = MatchSeed::new([7; 32]);
+        let (_, fixed) = deterministic_conditions_for_gameplay(seed, false, 1).expect("fixed");
+        let (_, natural) = deterministic_conditions_for_gameplay(seed, true, 1).expect("natural");
+        assert_ne!(natural.speed_tenths(), fixed.speed_tenths());
+        assert_eq!(natural.angle_degrees(), fixed.angle_degrees());
+        assert!((10..=80).contains(&natural.speed_tenths()));
+    }
     use pangya_protocol::Lie;
     use uuid::Uuid;
 
@@ -626,7 +658,7 @@ mod tests {
             MatchId::new(Uuid::from_u128(1)),
             MatchResultKey::new(Uuid::from_u128(2)),
             account(),
-            MatchPlan::new(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 4)
+            MatchPlan::with_holes(CourseId::new(1).unwrap_or_else(|_| unreachable!()), 1, 0, 4)
                 .unwrap_or_else(|_| unreachable!()),
             CatalogFingerprint::new([3; 32]),
             seed,

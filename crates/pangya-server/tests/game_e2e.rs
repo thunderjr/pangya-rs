@@ -598,7 +598,7 @@ fn solo_service(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .course_plan(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -654,7 +654,7 @@ fn stroke_service_with_deadlines(
 ) -> Arc<GameService<PgRepository>> {
     let catalog = m5_catalog();
     let course = catalog
-        .course_plan(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     Arc::new(
         GameService::new(
@@ -4476,7 +4476,7 @@ async fn game_m6_shutdown_replacement_retains_the_only_cleanup_claim(pool: PgPoo
     let repository = Arc::new(BlockingStrokeCommitRepository::new(pool.clone()));
     let catalog = m5_catalog();
     let course = catalog
-        .course_plan(CourseId::new(1).expect("course ID"))
+        .course_plan(CourseId::new(1).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let service = Arc::new(
         GameService::new(
@@ -7709,7 +7709,7 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
 async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .course_plan(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let account = create_account(&pool, "RetailGolfer", 1, 0x1000_0000).await;
     let service = Arc::new(
@@ -7969,7 +7969,7 @@ async fn game_retail_match_plays_and_settles_one_hole(pool: PgPool) {
 async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     let catalog = economy_catalog();
     let course = catalog
-        .course_plan(CourseId::new(7).expect("course ID"))
+        .course_plan(CourseId::new(7).expect("course ID"), 1, 0)
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
@@ -8178,7 +8178,16 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
     // The room describes itself the way its creator asked for, not as a default versus room.
     // A client told its own room is something else renders the wrong header and gates Start on
     // the wrong rules — a practice room of one reported as versus never starts at all.
-    send_packet(&mut host, host_key, 3, 0x000a, &[0xff, 0xff, 0]).await;
+    // Exercise a non-empty encrypted PacketDoc 000A edit: natural wind is persisted in the
+    // room profile and reflected by the authoritative 004A response.
+    send_packet(
+        &mut host,
+        host_key,
+        3,
+        0x000a,
+        &[0xff, 0xff, 1, 14, 1, 0, 0, 0],
+    )
+    .await;
     let described = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
     let status = described
         .iter()
@@ -8187,6 +8196,7 @@ async fn game_retail_two_players_play_and_settle_one_versus_hole(pool: PgPool) {
         .unwrap_or_default();
     assert_eq!(status.get(2).copied(), Some(0), "the mode it was made with");
     assert_eq!(status.get(4).copied(), Some(18), "eighteen holes");
+    assert_eq!(status.get(6).copied(), Some(1), "natural wind is enabled");
     assert_eq!(
         status.get(10).copied(),
         Some(2),

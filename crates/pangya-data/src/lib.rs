@@ -121,7 +121,7 @@ pub enum CatalogKind {
     Consumable,
     /// Character-compatible part records (required by v2).
     CharacterPart,
-    /// Optional locally generated one-hole course records.
+    /// Optional locally generated course records with local par metadata.
     Course,
     // ── families added when the shop was widened past the original six ──
     //
@@ -192,7 +192,7 @@ pub struct CatalogRecord {
 }
 
 impl CatalogRecord {
-    /// Returns the explicit local one-hole par only for a generated Course record.
+    /// Returns the explicit local par only for a generated Course record.
     #[must_use]
     pub const fn local_course_par(&self) -> Option<u8> {
         self.local_course_par
@@ -497,22 +497,28 @@ impl Catalog {
         self.0.records.get(&kind)?.get(&type_id.get())
     }
 
-    /// Returns a checked local one-hole configuration from the optional Course family.
+    /// Returns a checked course configuration from the optional Course family.
     ///
     /// Only the generated schemas carry a par byte. A real client catalog has none, so this
     /// rejects it rather than inventing one; use [`Self::declared_course_plan`] there.
     ///
     /// # Errors
     /// Rejects a missing course, a zero/out-of-range course ID, or invalid generated par.
-    pub fn course_plan(&self, course_id: CourseId) -> Result<MatchPlan, CatalogError> {
+    pub fn course_plan(
+        &self,
+        course_id: CourseId,
+        hole_count: u8,
+        hole_mode: u8,
+    ) -> Result<MatchPlan, CatalogError> {
         let record = self
             .record(CatalogKind::Course, ItemTypeId::new(course_id.get()))
             .ok_or(CatalogError::Binding)?;
         let par = record.local_course_par().ok_or(CatalogError::Structure)?;
-        MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)
+        MatchPlan::with_holes(course_id, hole_count, hole_mode, par)
+            .map_err(|_| CatalogError::Structure)
     }
 
-    /// Returns a checked one-hole configuration whose par the operator declared.
+    /// Returns a checked course configuration whose par the operator declared.
     ///
     /// The real U.S. client's `Course.iff` record is a presentation row: identifier, display
     /// and Korean names, map directory, short name, a length-prefixed property XML filename,
@@ -527,12 +533,15 @@ impl Catalog {
     pub fn declared_course_plan(
         &self,
         course_id: CourseId,
+        hole_count: u8,
+        hole_mode: u8,
         par: u8,
     ) -> Result<MatchPlan, CatalogError> {
         if !self.contains(CatalogKind::Course, ItemTypeId::new(course_id.get())) {
             return Err(CatalogError::Binding);
         }
-        MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)
+        MatchPlan::with_holes(course_id, hole_count, hole_mode, par)
+            .map_err(|_| CatalogError::Structure)
     }
 
     /// Cross-checks configured starter IDs against the minimum catalog.
@@ -688,7 +697,7 @@ pub fn parse_iff_bytes(
         let (local_course_par, opaque) = if entry.kind == CatalogKind::Course {
             let course_id = CourseId::new(type_id).map_err(|_| CatalogError::Structure)?;
             let par = *record.get(4).ok_or(CatalogError::Structure)?;
-            MatchPlan::new(course_id, par).map_err(|_| CatalogError::Structure)?;
+            MatchPlan::with_holes(course_id, 1, 0, par).map_err(|_| CatalogError::Structure)?;
             (Some(par), &record[5..])
         } else {
             (None, &record[4..])
