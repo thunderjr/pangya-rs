@@ -295,6 +295,7 @@ pub fn reconstruct(
     if final_iff != rebuilt_iff {
         return Err(PatchError::DigestMismatch);
     }
+    Iff::parse(&final_iff)?.validate_all(&final_iff)?;
     Ok(result)
 }
 
@@ -639,6 +640,10 @@ impl Iff {
             .find(|&i| le32(&input[i..i + 4]).ok() == Some(ZIP_END))
             .ok_or(PatchError::BadZip)?;
         let end = get(input, end_at, 22)?;
+        let comment_len = le16(&end[20..22])? as usize;
+        if end_at.checked_add(22 + comment_len) != Some(input.len()) {
+            return Err(PatchError::BadZip);
+        }
         let disk = le16(&end[4..6])?;
         let cd_disk = le16(&end[6..8])?;
         let count = le16(&end[8..10])?;
@@ -742,6 +747,12 @@ impl Iff {
             end_raw: input[end_at..].to_vec(),
             count,
         })
+    }
+    fn validate_all(&self, input: &[u8]) -> Result<(), PatchError> {
+        for entry in &self.entries {
+            entry.data(input)?;
+        }
+        Ok(())
     }
     fn end(&self, offset: u32, length: u32) -> Result<Vec<u8>, PatchError> {
         let mut e = self.end_raw.clone();
