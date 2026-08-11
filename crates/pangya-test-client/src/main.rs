@@ -132,6 +132,9 @@ struct Args {
     /// Strokes to play before holing out.
     #[arg(long, default_value_t = 2)]
     strokes: u8,
+    /// Holes for a hosted room (1, 3, 6, 9, or 18).
+    #[arg(long, default_value_t = 1, value_parser = parse_holes)]
+    holes: u8,
 }
 
 #[tokio::main]
@@ -152,12 +155,30 @@ async fn main() -> Result<(), ClientError> {
             session.join_room(room).await?;
             session.ready().await?;
         }
-        None if args.host => session.host_room(&args.room_name).await?,
+        None if args.host => session.host_room(&args.room_name, args.holes).await?,
         None => return Err(ClientError::NoSeat),
     }
     session.play_hole(args.strokes).await?;
     tracing::info!("the hole settled; this seat is done");
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn holes_accept_retail_room_lengths_only() {
+    for value in ["1", "3", "6", "9", "18"] {
+        assert!(parse_holes(value).is_ok());
+    }
+    for value in ["0", "2", "19", "abc"] {
+        assert!(parse_holes(value).is_err());
+    }
+}
+
+fn parse_holes(value: &str) -> Result<u8, String> {
+    match value.parse() {
+        Ok(holes @ (1 | 3 | 6 | 9 | 18)) => Ok(holes),
+        _ => Err("holes must be one of: 1, 3, 6, 9, 18".to_owned()),
+    }
 }
 
 /// Whether a census lists exactly two players and every one of them but the master is ready.
@@ -268,17 +289,16 @@ impl Session {
 
     /// Opens a two-player versus room, waits for the other seat, and starts the match.
     ///
-    /// One hole and a capacity of two, because that is what this server settles and the smallest
-    /// a real client's Make Room dialog offers. Pressing Start is also what says the master is
+    /// Requested holes and a capacity of two. Pressing Start is also what says the master is
     /// ready — a real client's button reads Start for the master and Ready for everyone else.
-    async fn host_room(&mut self, name: &str) -> Result<(), ClientError> {
+    async fn host_room(&mut self, name: &str, holes: u8) -> Result<(), ClientError> {
         let mut writer = PacketWriter::default();
         writer.u8(0); // room kind: versus
         writer.u32_le(30_000); // shot timer
         writer.u32_le(600_000); // game timer
         writer.u8(2); // capacity
         writer.u8(0); // hole progression
-        writer.u8(1); // holes
+        writer.u8(holes); // holes
         writer.u8(0); // course
         writer.bytes(&[0; 5]);
         writer

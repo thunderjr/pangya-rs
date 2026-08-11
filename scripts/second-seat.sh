@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/second-seat.sh --username rsp5 --room 3          # join the room a real client made
-#   scripts/second-seat.sh --username rsp5 --host            # host, and print the room number
+#   scripts/second-seat.sh --username rsp5 --host --holes 3  # host a 3-hole room
 #
 # DATABASE_URL must be set. Point the script at a non-default config with PANGYA_CONFIG, and at
 # a non-default GameService with PANGYA_GAME (default 127.0.0.1:20201). RUST_LOG=debug prints
@@ -24,6 +24,7 @@ username=""
 room=""
 host=0
 strokes=2
+holes=1
 
 usage() {
     sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --room) room="${2:?--room needs a value}"; shift 2 ;;
         --host) host=1; shift ;;
         --strokes) strokes="${2:?--strokes needs a value}"; shift 2 ;;
+        --holes) holes="${2:?--holes needs a value}"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -86,7 +88,7 @@ fi
 
 client_args=(--game "$game" --account-id "$account_id" --username "$username" --strokes "$strokes")
 if [[ "$host" == 1 ]]; then
-    client_args+=(--host)
+    client_args+=(--host --holes "$holes")
 else
     client_args+=(--room "$room")
 fi
