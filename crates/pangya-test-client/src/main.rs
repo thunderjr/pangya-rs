@@ -255,29 +255,38 @@ fn turn_announcements_are_exact_four_byte_connection_ids() {
 
 #[cfg(test)]
 #[test]
-fn shot_packets_have_documented_retail_shapes_and_offsets() {
-    let shot = normal_shot_commit();
-    assert_eq!(shot.len(), 79, "u16 subtype plus 77-byte common body");
-    assert_eq!(&shot[0..2], &0_u16.to_le_bytes());
-    assert_eq!(&shot[2..6], &300.0_f32.to_le_bytes());
-    assert_eq!(&shot[6..10], &140.0_f32.to_le_bytes());
-    assert_eq!(&shot[10..14], &0.0_f32.to_le_bytes());
-    assert_eq!(&shot[14..18], &0.0_f32.to_le_bytes());
-    assert_eq!(&shot[42..46], &0.0_f32.to_le_bytes());
-    assert_eq!(&shot[50..54], &140.0_f32.to_le_bytes());
-    assert_eq!(&shot[54..58], &0_u32.to_le_bytes());
-    assert!(shot[18..34].iter().all(|byte| *byte == 0));
-    assert!(shot[58..71].iter().all(|byte| *byte == 0));
+fn shot_packets_replay_the_checked_us851_normal_swing_shape() {
+    // Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/
+    // server.jsonl`, 2026-08-11T12:11:41Z: accepted C2S `0x0012` (64 bytes), followed by
+    // `0x001b` (54 bytes) and `0x001c` (`01 00`). The server echoed `0x0055`/`0x0064` and
+    // continued normal processing. The payload below is deliberately byte-for-byte replayed;
+    // PacketDoc `gameservice/client/0012.ksy:21-29` confirms its leading normal-shot subtype.
+    assert_eq!(
+        normal_shot_commit(),
+        [
+            0x00, 0x00, 0x00, 0x00, 0xce, 0x43, 0x00, 0x00, 0x49, 0x43, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00, 0xc0,
+            0x5a, 0x25, 0xbe, 0x4c, 0x74, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x43, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x48, 0xb9, 0x41,
+        ]
+    );
 
     let sync = shot_sync(0x7856_3412);
-    assert_eq!(sync.len(), 38);
-    assert_eq!(&sync[0..4], &0x7856_3412_u32.to_le_bytes());
-    assert_eq!(&sync[4..8], &1.0_f32.to_le_bytes());
-    assert_eq!(&sync[8..12], &0.0_f32.to_le_bytes());
-    assert_eq!(&sync[12..16], &1.0_f32.to_le_bytes());
-    assert_eq!(sync[16], 2);
-    assert!(sync[17..].iter().all(|byte| *byte == 0));
-    assert_eq!(SHOT_END_BODY, [0, 0], "PacketDoc 001c no-collectables body");
+    assert_eq!(sync.len(), 54);
+    // `oid` is the first `u32` of SuperSS-Dev `TYPE/game_type.hpp:222-350`; it names the
+    // current second-seat socket, so it is the one required substitution. No checked evidence
+    // supports changing the captured position or any other client-owned bytes.
+    assert_eq!(
+        sync,
+        [
+            0x12, 0x34, 0x56, 0x78, 0xae, 0x47, 0xc0, 0xc3, 0x8a, 0x98, 0x0c, 0x43, 0xa4, 0xb0,
+            0x64, 0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
+    assert_eq!(SHOT_END_BODY, [1, 0], "checked 001c barrier has no entries");
 }
 
 #[cfg(test)]
@@ -563,51 +572,48 @@ impl HoleScript {
     }
 }
 
-/// Builds the normal 79-byte `0x0012` packet: subtype plus PacketDoc's 77-byte common body
-/// (`opensource-references/pangbox--packetdoc/.../gameservice/client/0012.ksy:21-64`).
-fn normal_shot_commit() -> Vec<u8> {
-    let mut body = Vec::with_capacity(79);
-    body.extend_from_slice(&0_u16.to_le_bytes()); // normal subtype
-    // Neutral curve, spin, and aim are finite. Club zero is documented as the ordinary 1 wood
-    // in PacketDoc `gameservice/client/0016.ksy`.
-    for value in [300.0_f32, 140.0, 0.0, 0.0] {
-        body.extend_from_slice(&value.to_le_bytes());
-    }
-    body.extend_from_slice(&[0; 16]); // documented opaque `unknown_dc`
-    body.extend_from_slice(&0.0_f32.to_le_bytes()); // documented opaque `unknown_fb`
-    body.extend_from_slice(&[0; 4]); // documented opaque `unknown_dd`
-    body.extend_from_slice(&0.0_f32.to_le_bytes()); // neutral shot angle
-    body.extend_from_slice(&[0; 4]); // documented opaque `unknown_de`
-    body.extend_from_slice(&140.0_f32.to_le_bytes()); // pangya bar
-    body.extend_from_slice(&0_u32.to_le_bytes()); // club_1_wood
-    body.extend_from_slice(&[0; 13]); // documented opaque `unknown_df`
-    body.extend_from_slice(&0_i32.to_le_bytes()); // documented opaque `unknown_sa`
-    body.extend_from_slice(&0.0_f32.to_le_bytes()); // documented opaque `unknown_fa`
-    debug_assert_eq!(body.len(), 79);
+/// Builds the accepted 64-byte normal `0x0012` capture from the real U.S. 851 client.
+///
+/// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
+/// at `2026-08-11T12:11:41Z` is the only checked source for this revision-specific body.
+/// PacketDoc `gameservice/client/0012.ksy:21-29` independently identifies the leading `u16` as
+/// the normal-shot subtype. Its fields do not contain a connection identity, so every byte is
+/// retained rather than inventing a second-seat substitution.
+const fn normal_shot_commit() -> [u8; 64] {
+    [
+        0x00, 0x00, 0x00, 0x00, 0xce, 0x43, 0x00, 0x00, 0x49, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00, 0xc0, 0x5a, 0x25,
+        0xbe, 0x4c, 0x74, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x48, 0xb9, 0x41,
+    ]
+}
+
+/// Builds the 54-byte C2S `0x001b` body accepted in that same real U.S. 851 swing.
+///
+/// SuperSS-Dev `TYPE/game_type.hpp:222-350` identifies the first four bytes as the player's
+/// `oid`; substitute this socket's connection ID so the echoed `0x0064` is attributable to the
+/// second seat. The checked capture supplies no evidence that its position or other opaque,
+/// client-owned fields must vary, so they remain an exact deterministic replay.
+fn shot_sync(connection_id: u32) -> [u8; 54] {
+    let mut body = [
+        0x0f, 0x00, 0x00, 0x00, 0xae, 0x47, 0xc0, 0xc3, 0x8a, 0x98, 0x0c, 0x43, 0xa4, 0xb0, 0x64,
+        0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    body[..4].copy_from_slice(&connection_id.to_le_bytes());
     body
 }
 
-/// Builds the packed 38-byte `ShotSyncData` supplied as C2S `0x001b`
-/// (`us852_match.rs:609-621`; `SuperSS-Dev TYPE/game_type.hpp:222-350`).
-fn shot_sync(connection_id: u32) -> [u8; 38] {
-    let mut body = [0_u8; 38];
-    body[0..4].copy_from_slice(&connection_id.to_le_bytes());
-    body[4..8].copy_from_slice(&1.0_f32.to_le_bytes()); // x
-    body[8..12].copy_from_slice(&0.0_f32.to_le_bytes()); // y
-    body[12..16].copy_from_slice(&1.0_f32.to_le_bytes()); // z
-    body[16] = 2; // ShotSyncData::PLAYABLE_AREA
-    // The remaining bunker, reward, state-bitfield, duration, and penalty counters default to
-    // their documented bounded zero values.
-    body
-}
+/// The checked `0x001c` barrier has `unknown_a = 1` and `entry_count = 0`.
+/// PacketDoc `gameservice/client/001c.ksy:35-45` confirms the latter means no collectable entries.
+const SHOT_END_BODY: [u8; 2] = [1, 0];
 
-/// `0x001c` with no collectables, exactly `unknown_a = 0, entry_count = 0`.
-const SHOT_END_BODY: [u8; 2] = [0, 0];
-
-/// Tests whether an echoed S2C `0x0064` has the exact packed sync shape for this connection.
+/// Tests whether an echoed S2C `0x0064` has the exact checked sync shape for this connection.
 fn is_own_shot_sync(body: &[u8], connection_id: u32) -> bool {
     let expected = connection_id.to_le_bytes();
-    body.len() == 38 && body.get(..4) == Some(expected.as_slice())
+    body.len() == 54 && body.get(..4) == Some(expected.as_slice())
 }
 
 /// Builds PacketDoc's packed, cumulative 239-byte `user_course_result_data` for C2S `0x0031`
