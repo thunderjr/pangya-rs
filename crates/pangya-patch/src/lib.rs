@@ -218,6 +218,9 @@ pub fn produce_release(
         return Err(PatchError::Manifest);
     }
     members.sort_by(|left, right| left.name.cmp(&right.name));
+    // Preserve the base ZIP layout; authored output may have been repacked independently.
+    let deterministic_iff = rebuild_iff(&base_iff, &members, &payloads)?;
+    let deterministic_pak = base_pak.replace_basic("data/pangya_gb.iff", &deterministic_iff)?;
     let manifest = ReleaseManifest {
         schema_version: 1,
         tool_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -228,13 +231,16 @@ pub fn produce_release(
         current_iff_sha256: hash(&base_iff),
         current_iff_size: base_iff.len() as u64,
         members,
-        result_iff_sha256: hash(&result_iff),
-        result_iff_size: result_iff.len() as u64,
-        result_pak: metadata(result),
+        result_iff_sha256: hash(&deterministic_iff),
+        result_iff_size: deterministic_iff.len() as u64,
+        // The source result supplies intended IFF members; final archive provenance is always
+        // the deterministic base-preserving replacement, never unrelated authored PAK layout.
+        result_pak: metadata(&deterministic_pak),
     };
     // Publishing only changed IFF members is sound only when this library can reproduce the
-    // complete operator result; unrelated PAK changes must be rejected before signing.
-    if reconstruct(base, key, &manifest, &payloads)? != result {
+    // complete base-preserving archive before signing.
+    let rebuilt = reconstruct(base, key, &manifest, &payloads)?;
+    if metadata(&rebuilt) != manifest.result_pak {
         return Err(PatchError::DigestMismatch);
     }
     let signature = signer
@@ -556,15 +562,15 @@ fn decompress(input: &[u8], kind: u8, expected: usize) -> Result<Vec<u8>, PatchE
             }
             let offset = (value & 0x0fff) as usize;
             let size = (value >> 12) as usize + 2;
-            if offset.checked_add(size).ok_or(PatchError::BadLz)? > out.len()
-                || out.len().checked_add(size).ok_or(PatchError::TooLarge)? > MAX_OUTPUT
-                || out.len().checked_add(size).ok_or(PatchError::TooLarge)? > expected
-            {
+            // Reference decompressor appends zero bytes before copying (decompress.go:54-59).
+            // Its source may overlap that appended range, so only the offset must be in old output.
+            let old_len = out.len();
+            let total = old_len.checked_add(size).ok_or(PatchError::TooLarge)?;
+            if offset > old_len || total > MAX_OUTPUT || total > expected {
                 return Err(PatchError::BadLz);
             }
-            let start = out.len() - offset - size;
-            let copy = out[start..start + size].to_vec();
-            out.extend_from_slice(&copy);
+            out.resize(total, 0);
+            out.copy_within(old_len - offset..total - offset, old_len);
         }
         seq >>= 1;
         bits -= 1;
@@ -1009,10 +1015,19 @@ fn xtea_decrypt(key: [u32; 4], b: &mut [u8; 8]) {
 mod tests {
     use super::*;
     #[test]
+    fn lz_overlap_uses_reference_zero_append_semantics() {
+        // pangbox--pangfiles/pak/decompress.go:54-59 appends zeros before overlap copy.
+        assert_eq!(
+            decompress(&[0x08, b'a', b'b', b'c', 1, 0], LZ, 5).expect("lz"),
+            b"abcc\0"
+        );
+    }
+
+    #[test]
     fn lz_rejects_a_backreference_before_output() {
         // Retail token layout: /Users/thunderjr/projects/pangya-rs/opensource-references/pangbox--pangfiles/pak/decompress.go:48-63
         assert!(matches!(
-            decompress(&[1, 0, 0], LZ, 2),
+            decompress(&[1, 1, 0], LZ, 2),
             Err(PatchError::BadLz)
         ));
     }
