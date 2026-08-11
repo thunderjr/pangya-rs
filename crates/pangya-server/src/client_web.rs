@@ -115,6 +115,7 @@ struct Prepared {
 }
 
 struct IncrementalRelease {
+    metadata: ReleaseManifest,
     manifest: Vec<u8>,
     signature: Vec<u8>,
     payloads: HashMap<String, Vec<u8>>,
@@ -222,7 +223,7 @@ fn load_incremental(
     }
     let mut payloads = HashMap::new();
     let mut total = 0_u64;
-    for member in parsed.members {
+    for member in parsed.members.clone() {
         if member.new_length > MAX_INCREMENTAL_MEMBER_BYTES {
             return Err(ClientWebError::IncrementalRelease);
         }
@@ -240,6 +241,7 @@ fn load_incremental(
         payloads.insert(member.name, bytes);
     }
     Ok(Some(IncrementalRelease {
+        metadata: parsed,
         manifest,
         signature,
         payloads,
@@ -275,14 +277,39 @@ impl ClientWebState {
         let client_directory =
             Dir::open_ambient_dir(&settings.client_directory, ambient_authority())
                 .map_err(|_| ClientWebError::ClientDirectory)?;
-        let update_list = build_from_directory(
+        let incremental = load_incremental(settings.incremental_release.as_deref())?;
+        let mut update_list = build_from_directory(
             &client_directory,
             settings.entries,
             &settings.patch_version,
             settings.patch_number,
         )?;
+        if let Some(release) = &incremental {
+            let target = &release.metadata.target_pak;
+            let entry = update_list
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name.eq_ignore_ascii_case(target))
+                .ok_or(ClientWebError::IncrementalRelease)?;
+            if entry.size != release.metadata.base_pak.size
+                || entry.checksum != release.metadata.base_pak.pangya_crc
+                || entry.sha256 != release.metadata.base_pak.sha256
+            {
+                return Err(ClientWebError::IncrementalRelease);
+            }
+            entry.size = release.metadata.result_pak.size;
+            entry.checksum = release.metadata.result_pak.pangya_crc;
+            entry.sha256 = release.metadata.result_pak.sha256.clone();
+        }
         let mut patch_files = HashMap::with_capacity(update_list.entries.len());
         for entry in &update_list.entries {
+            if incremental.as_ref().is_some_and(|release| {
+                entry
+                    .name
+                    .eq_ignore_ascii_case(&release.metadata.target_pak)
+            }) {
+                continue;
+            }
             let file = client_directory
                 .open(&entry.name)
                 .map_err(|_| ClientWebError::ClientDirectory)?;
@@ -314,6 +341,11 @@ impl ClientWebState {
             .collect();
         let stat_snapshot = launcher_paks
             .iter()
+            .filter(|pak| {
+                !incremental.as_ref().is_some_and(|release| {
+                    pak.name.eq_ignore_ascii_case(&release.metadata.target_pak)
+                })
+            })
             .map(|pak| {
                 let observed = client_directory.metadata(&pak.name).ok().map(|meta| {
                     (
@@ -364,8 +396,6 @@ impl ClientWebState {
             // downloads nothing.
             None => (Theme::default().to_xml()?, None),
         };
-
-        let incremental = load_incremental(settings.incremental_release.as_deref())?;
 
         let translation = match &settings.translation_catalog {
             Some(path) => {
@@ -734,6 +764,14 @@ mod router_tests {
             theme_document: String::new(),
             theme_directory: None,
             incremental: Some(IncrementalRelease {
+                metadata: serde_json::from_slice(
+                    &manifest
+                        .iter()
+                        .copied()
+                        .filter(|byte| *byte != b'\\')
+                        .collect::<Vec<_>>(),
+                )
+                .expect("metadata"),
                 manifest: manifest.clone(),
                 signature: vec![7; 64],
                 payloads: HashMap::from([("one.iff".into(), b"changed".to_vec())]),
