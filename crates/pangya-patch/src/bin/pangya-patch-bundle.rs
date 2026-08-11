@@ -30,9 +30,11 @@ struct Args {
 fn main() -> Result<(), String> {
     let args = Args::parse();
     // Deliberately environment-only: a signing seed in argv leaks through process listings.
-    let seed_text = std::env::var("PANGYA_PATCH_SIGNING_SEED")
-        .map_err(|_| "PANGYA_PATCH_SIGNING_SEED is required".to_owned())?;
-    let seed = decode_seed(&seed_text)?;
+    let seed_text = zeroize::Zeroizing::new(
+        std::env::var("PANGYA_PATCH_SIGNING_SEED")
+            .map_err(|_| "PANGYA_PATCH_SIGNING_SEED is required".to_owned())?,
+    );
+    let seed = zeroize::Zeroizing::new(decode_seed(&seed_text)?);
     if args.output.exists()
         && std::fs::read_dir(&args.output)
             .map_err(|e| e.to_string())?
@@ -80,8 +82,18 @@ fn write_release(
 }
 
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("invalid output name")?,
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| e.to_string())?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| e.to_string())?;
