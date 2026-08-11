@@ -42,10 +42,13 @@ const ROOM_WAIT: Duration = Duration::from_secs(600);
 /// Real-client flight time before the post-shot end barrier.
 ///
 /// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
-/// records accepted C2S `0x001b` at `2026-08-11T12:11:41.567841Z` and C2S `0x001c` at
-/// `2026-08-11T12:11:47.206591Z`: 5.638750 seconds. The bounded 5.6-second delay deliberately
-/// rounds down to retain a close deterministic approximation without inventing precision.
-const RETAIL_SHOT_FLIGHT: Duration = Duration::from_millis(5_600);
+/// first recorded accepted C2S `0x001b` at `2026-08-11T12:11:41.567841Z` and C2S `0x001c` at
+/// `2026-08-11T12:11:47.206591Z` (5.638750 seconds). The newer Windows trace
+/// `/private/tmp/issue45-server-89400e1.log` shows the real host receive the mirrored shot at
+/// `2026-08-11T13:44:54.198` and finish `0x001c` at `13:44:59.916851Z` (5.718851 seconds),
+/// after the former 5.6-second headless barrier at `13:44:59.801013Z`. The bounded six-second
+/// delay is the smallest round duration above the latest observed real-client flight.
+const RETAIL_SHOT_FLIGHT: Duration = Duration::from_secs(6);
 /// Grace period after the end barrier before an optional hole-finish announcement.
 ///
 /// Production log `/private/tmp/issue45-server-4f64913-restart.log` records the headless seat's
@@ -192,7 +195,8 @@ async fn main() -> Result<(), ClientError> {
 #[cfg(test)]
 #[test]
 fn checked_transport_pacing_is_bounded() {
-    assert_eq!(RETAIL_SHOT_FLIGHT, Duration::from_millis(5_600));
+    assert_eq!(RETAIL_SHOT_FLIGHT, Duration::from_secs(6));
+    assert!(RETAIL_SHOT_FLIGHT >= Duration::from_micros(5_718_851));
     assert_eq!(RETAIL_HOLE_FINISH_GRACE, Duration::from_millis(500));
     assert!(RETAIL_HOLE_FINISH_GRACE >= Duration::from_micros(112_275));
     assert!(RETAIL_SHOT_FLIGHT < FRAME_TIMEOUT);
