@@ -214,7 +214,7 @@ pub fn produce_release(
         }
     }
     // An add/remove is not a member replacement and would make preservation ambiguous.
-    if !before_names.is_empty() || members.is_empty() {
+    if !before_names.is_empty() {
         return Err(PatchError::Manifest);
     }
     members.sort_by(|left, right| left.name.cmp(&right.name));
@@ -780,11 +780,7 @@ impl ZipEntry {
 }
 
 fn validate_manifest(m: &ReleaseManifest) -> Result<(), PatchError> {
-    if m.schema_version != 1
-        || m.tool_version.is_empty()
-        || !safe_pak(&m.target_pak)
-        || m.members.is_empty()
-    {
+    if m.schema_version != 1 || m.tool_version.is_empty() || !safe_pak(&m.target_pak) {
         return Err(PatchError::Manifest);
     }
     let mut seen = HashSet::new();
@@ -1049,6 +1045,26 @@ mod tests {
                 result
             );
         }
+    }
+
+    #[test]
+    fn synthetic_noop_release_is_deterministic_and_byte_stable() {
+        let iff = stored_zip(&[("one.iff", b"same"), ("keep.iff", b"keep")]);
+        let base = basic_pak(&iff);
+        let signer = SigningKey::from_bytes(&[9u8; 32]);
+        let first =
+            produce_release(&base, &base, [0; 4], 7, "test".into(), &signer).expect("first");
+        let second =
+            produce_release(&base, &base, [0; 4], 7, "test".into(), &signer).expect("second");
+        assert!(first.0.members.is_empty());
+        assert_eq!(
+            first.0.canonical_json().expect("canonical"),
+            second.0.canonical_json().expect("canonical")
+        );
+        assert_eq!(
+            reconstruct(&base, [0; 4], &first.0, &first.2).expect("noop"),
+            base
+        );
     }
 
     #[test]
