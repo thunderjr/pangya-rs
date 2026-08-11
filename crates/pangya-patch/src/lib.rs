@@ -316,6 +316,9 @@ struct Pak {
 
 impl Pak {
     fn parse(bytes: &[u8], key: [u32; 4]) -> Result<Self, PatchError> {
+        if bytes.len() > MAX_OUTPUT {
+            return Err(PatchError::TooLarge);
+        }
         if bytes.len() < TRAILER {
             return Err(PatchError::Truncated);
         }
@@ -332,6 +335,7 @@ impl Pak {
         let mut entries = Vec::with_capacity(count);
         let mut names = HashSet::with_capacity(count);
         let mut ranges = Vec::with_capacity(count);
+        let mut total_real = 0usize;
         for _ in 0..count {
             let raw = get(bytes, at, ENTRY)?.to_vec();
             at += ENTRY;
@@ -413,6 +417,12 @@ impl Pak {
             if payload_type == BASIC && packed != real {
                 return Err(PatchError::Truncated);
             }
+            if payload_type != DIRECTORY {
+                total_real = total_real
+                    .checked_add(real)
+                    .filter(|size| *size <= MAX_OUTPUT)
+                    .ok_or(PatchError::TooLarge)?;
+            }
             entries.push(entry);
         }
         if at != bytes.len() - TRAILER {
@@ -463,6 +473,14 @@ impl Pak {
             let changing = e.path.eq_ignore_ascii_case(name);
             found |= changing;
             let packed = if changing { replacement } else { &e.packed };
+            if data
+                .len()
+                .checked_add(packed.len())
+                .filter(|size| *size <= MAX_OUTPUT)
+                .is_none()
+            {
+                return Err(PatchError::TooLarge);
+            }
             data.extend_from_slice(packed);
             records.push((e, offset, packed.len() as u32, changing));
         }

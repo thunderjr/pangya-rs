@@ -44,6 +44,8 @@ pub const MAX_TRANSLATION_BYTES: u64 = 4 * 1024 * 1024;
 /// Incremental payloads are changed IFF tables, not archives; cap both one member and release.
 const MAX_INCREMENTAL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INCREMENTAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_INCREMENTAL_MANIFEST_BYTES: u64 = 1024 * 1024;
+const INCREMENTAL_SIGNATURE_BYTES: u64 = 64;
 
 /// Validated client web-service policy.
 #[derive(Clone, Debug)]
@@ -186,8 +188,15 @@ fn load_incremental(
     let Some(path) = path else {
         return Ok(None);
     };
-    let manifest = std::fs::read(path.join("release-manifest.json"))
-        .map_err(|_| ClientWebError::IncrementalRelease)?;
+    let manifest_path = path.join("release-manifest.json");
+    if std::fs::metadata(&manifest_path)
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        .len()
+        > MAX_INCREMENTAL_MANIFEST_BYTES
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let manifest = std::fs::read(&manifest_path).map_err(|_| ClientWebError::IncrementalRelease)?;
     let parsed: ReleaseManifest =
         serde_json::from_slice(&manifest).map_err(|_| ClientWebError::IncrementalRelease)?;
     // Re-serialize through the canonical validator before serving anything.
@@ -198,9 +207,17 @@ fn load_incremental(
     {
         return Err(ClientWebError::IncrementalRelease);
     }
-    let signature = std::fs::read(path.join("release-manifest.json.sig"))
-        .map_err(|_| ClientWebError::IncrementalRelease)?;
-    if signature.len() != 64 {
+    let signature_path = path.join("release-manifest.json.sig");
+    if std::fs::metadata(&signature_path)
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        .len()
+        != INCREMENTAL_SIGNATURE_BYTES
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let signature =
+        std::fs::read(signature_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+    if signature.len() != INCREMENTAL_SIGNATURE_BYTES as usize {
         return Err(ClientWebError::IncrementalRelease);
     }
     let mut payloads = HashMap::new();
