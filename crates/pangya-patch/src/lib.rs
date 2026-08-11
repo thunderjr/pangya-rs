@@ -171,6 +171,9 @@ pub fn verify_bundle(
 /// Reconstructs a target PAK after all signature/base/current checks have completed.
 /// The changed member is emitted as a basic PAK record; every unrelated packed record remains
 /// byte-for-byte unchanged. The final metadata is verified independently before returning.
+/// Produced release metadata, signature, and raw changed-member payloads.
+pub type ProducedRelease = (ReleaseManifest, Vec<u8>, BTreeMap<String, Vec<u8>>);
+
 /// Produces a release from two operator-owned PAKs. Only differing IFF member bytes are
 /// returned in `payloads`; neither input PAK is written to the release directory.
 pub fn produce_release(
@@ -180,7 +183,7 @@ pub fn produce_release(
     release_id: u64,
     key_id: String,
     signer: &SigningKey,
-) -> Result<(ReleaseManifest, Vec<u8>, BTreeMap<String, Vec<u8>>), PatchError> {
+) -> Result<ProducedRelease, PatchError> {
     let base_pak = Pak::parse(base, key)?;
     let result_pak = Pak::parse(result, key)?;
     let base_iff = base_pak.read("data/pangya_gb.iff")?;
@@ -631,7 +634,7 @@ impl Iff {
             let method = le16(&raw[10..12])?;
             if flags & (1 | 8) != 0
                 || !matches!(method, 0 | 8)
-                || raw[34..46].iter().any(|byte| *byte == 0xff)
+                || raw[34..46].contains(&0xff)
                 || le32(&raw[20..24])? == u32::MAX
                 || le32(&raw[24..28])? == u32::MAX
             {
