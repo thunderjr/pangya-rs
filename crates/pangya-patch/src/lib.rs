@@ -794,7 +794,12 @@ impl ZipEntry {
 }
 
 fn validate_manifest(m: &ReleaseManifest) -> Result<(), PatchError> {
-    if m.schema_version != 1 || m.tool_version.is_empty() || !safe_pak(&m.target_pak) {
+    if m.schema_version != 1
+        || m.release_id == 0
+        || !portable_token(&m.key_id)
+        || !portable_token(&m.tool_version)
+        || !safe_pak(&m.target_pak)
+    {
         return Err(PatchError::Manifest);
     }
     let mut seen = HashSet::new();
@@ -819,6 +824,12 @@ fn validate_manifest(m: &ReleaseManifest) -> Result<(), PatchError> {
         }
     }
     Ok(())
+}
+fn portable_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 fn safe_name(s: &str) -> bool {
     !s.is_empty()
