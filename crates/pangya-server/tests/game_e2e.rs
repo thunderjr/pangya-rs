@@ -8741,6 +8741,18 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
             salt = salt.wrapping_add(1);
             send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
             salt = salt.wrapping_add(1);
+            // Replaying 0012 after the early 0031 is an actor-level duplicate, not a new
+            // accepted action: it cannot replace the retained finish or relay a second 0055.
+            let mut duplicate_shot = vec![0, 0];
+            duplicate_shot.extend_from_slice(&[0xab; 62]);
+            send_packet(&mut host, host_key, salt, 0x0012, &duplicate_shot).await;
+            assert!(
+                !drain_available(&mut visitor, visitor_key, Duration::from_millis(400))
+                    .await
+                    .contains(&0x0055),
+                "duplicate 0012 is not relayed as a new accepted action"
+            );
+            salt = salt.wrapping_add(1);
         }
         {
             let (from, from_key) = if host_shoots {

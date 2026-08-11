@@ -800,6 +800,17 @@ struct RetailStrokeSequence {
     early_hole_finish: bool,
 }
 
+/// Whether the stroke actor admitted a client `0x0012` as this connection's next action.
+///
+/// A duplicate is a successful idempotence response, not a new action: it must leave any
+/// earlier pending `0x0031` claim intact until the original action's result arrives.
+fn retail_action_is_accepted(routed: &Result<LobbyStrokeRouteResult, StrokeMatchError>) -> bool {
+    matches!(
+        routed,
+        Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Accepted))
+    )
+}
+
 impl RetailStrokeSequence {
     fn accepted_action(&mut self) {
         self.awaiting_result = true;
@@ -6932,7 +6943,8 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_COMMIT) => {
                 if !self.admit_retail_stroke_shot(shots) {
-                    retail_sequence.clear();
+                    // A rate-limited/rejected replay must not erase the original accepted
+                    // action's pending early-hole-finish claim.
                     return Ok(Some(state));
                 }
                 // The payload is the client's own shot. It is relayed unchanged and counted as
@@ -6940,24 +6952,21 @@ where
                 let sequence = strokes.saturating_add(1);
                 let action = StrokeShotAction::new(sequence, 0, 1.0, 0.0, 0.0, 0.0)
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                if self
+                let routed = self
                     .lobby
                     .route_stroke(
                         identity.connection_id,
                         LobbyStrokeCommand::ShotAction(action),
                     )
-                    .await
-                    .is_err()
-                {
-                    retail_sequence.clear();
-                    return Ok(Some(state));
+                    .await;
+                if retail_action_is_accepted(&routed) {
+                    retail_sequence.accepted_action();
+                    self.relay_retail_match_frame(
+                        identity.connection_id,
+                        RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
+                    )
+                    .await;
                 }
-                retail_sequence.accepted_action();
-                self.relay_retail_match_frame(
-                    identity.connection_id,
-                    RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
-                )
-                .await;
                 Ok(Some(state))
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_SYNC) => {
@@ -10425,6 +10434,30 @@ mod tests {
         assert!(
             !sequence.accepted_result(),
             "a replayed result cannot complete the remembered claim twice"
+        );
+    }
+
+    #[test]
+    fn retail_stroke_sequence_duplicate_or_foreign_action_preserves_pending_early_finish() {
+        let accepted = Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Accepted));
+        let duplicate = Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Duplicate));
+        let foreign = Err(StrokeMatchError::InvalidTurn);
+        assert!(retail_action_is_accepted(&accepted));
+        assert!(!retail_action_is_accepted(&duplicate));
+        assert!(!retail_action_is_accepted(&foreign));
+
+        let mut sequence = RetailStrokeSequence::default();
+        sequence.accepted_action();
+        assert!(sequence.remember_early_hole_finish());
+        if retail_action_is_accepted(&duplicate) {
+            sequence.accepted_action();
+        }
+        if retail_action_is_accepted(&foreign) {
+            sequence.accepted_action();
+        }
+        assert!(
+            sequence.accepted_result(),
+            "duplicate/foreign 0012 cannot clear or replace the original early 0031"
         );
     }
 
