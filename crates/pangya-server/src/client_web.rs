@@ -41,6 +41,9 @@ pub const MAX_THEME_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum bytes read for the translation catalog.
 pub const MAX_TRANSLATION_BYTES: u64 = 4 * 1024 * 1024;
+/// Incremental payloads are changed IFF tables, not archives; cap both one member and release.
+const MAX_INCREMENTAL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INCREMENTAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Validated client web-service policy.
 #[derive(Clone, Debug)]
@@ -201,12 +204,22 @@ fn load_incremental(
         return Err(ClientWebError::IncrementalRelease);
     }
     let mut payloads = HashMap::new();
+    let mut total = 0_u64;
     for member in parsed.members {
-        let bytes = std::fs::read(path.join("payload").join(&member.name))
-            .map_err(|_| ClientWebError::IncrementalRelease)?;
-        if bytes.len() as u64 != member.new_length {
+        if member.new_length > MAX_INCREMENTAL_MEMBER_BYTES {
             return Err(ClientWebError::IncrementalRelease);
         }
+        total = total
+            .checked_add(member.new_length)
+            .filter(|n| *n <= MAX_INCREMENTAL_TOTAL_BYTES)
+            .ok_or(ClientWebError::IncrementalRelease)?;
+        let payload_path = path.join("payload").join(&member.name);
+        let metadata =
+            std::fs::metadata(&payload_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+        if !metadata.is_file() || metadata.len() != member.new_length {
+            return Err(ClientWebError::IncrementalRelease);
+        }
+        let bytes = std::fs::read(payload_path).map_err(|_| ClientWebError::IncrementalRelease)?;
         payloads.insert(member.name, bytes);
     }
     Ok(Some(IncrementalRelease {

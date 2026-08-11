@@ -282,6 +282,7 @@ pub fn reconstruct(
     }
     // Independent parse/re-read catches writer bugs, not merely matching a writer-side buffer.
     let check = Pak::parse(&result, key)?;
+    check.validate_all()?;
     let final_iff = check.read("data/pangya_gb.iff")?;
     if final_iff != rebuilt_iff {
         return Err(PatchError::DigestMismatch);
@@ -429,6 +430,14 @@ impl Pak {
             return Err(PatchError::DigestMismatch);
         }
         Ok(output)
+    }
+    fn validate_all(&self) -> Result<(), PatchError> {
+        for entry in &self.entries {
+            if entry.typ & TYPE_MASK != DIRECTORY {
+                self.read(&entry.path)?;
+            }
+        }
+        Ok(())
     }
     fn replace_basic(&self, name: &str, replacement: &[u8]) -> Result<Vec<u8>, PatchError> {
         if replacement.len() > MAX_OUTPUT {
@@ -648,9 +657,10 @@ impl Iff {
             let method = le16(&raw[10..12])?;
             if flags & (1 | 8) != 0
                 || !matches!(method, 0 | 8)
-                || raw[34..46].contains(&0xff)
+                || le16(&raw[34..36])? != 0
                 || le32(&raw[20..24])? == u32::MAX
                 || le32(&raw[24..28])? == u32::MAX
+                || le32(&raw[42..46])? == u32::MAX
             {
                 return Err(PatchError::UnsafeZip);
             }
