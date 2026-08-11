@@ -1125,6 +1125,17 @@ mod tests {
     }
 
     #[test]
+    fn noop_release_rejects_mutated_signed_result_metadata() {
+        let iff = stored_zip(&[("one.iff", b"same")]);
+        let base = basic_pak(&iff);
+        let signer = SigningKey::from_bytes(&[8u8; 32]);
+        let (mut manifest, _, payloads) =
+            produce_release(&base, &base, [0; 4], 8, "test".into(), &signer).expect("release");
+        manifest.result_pak.sha256 = "0".repeat(64);
+        assert!(reconstruct(&base, [0; 4], &manifest, &payloads).is_err());
+    }
+
+    #[test]
     fn synthetic_noop_release_is_deterministic_and_byte_stable() {
         let iff = stored_zip(&[("one.iff", b"same"), ("keep.iff", b"keep")]);
         let base = basic_pak(&iff);
