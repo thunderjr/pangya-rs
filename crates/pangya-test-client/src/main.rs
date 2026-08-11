@@ -360,6 +360,12 @@ fn pending_shot_requires_exact_own_sync_before_resync_and_hole_finish() {
     assert!(script.pending_shot);
     let own_sync = shot_sync(7);
     assert!(is_own_shot_sync(&own_sync, 7));
+    let mut changed_tail = own_sync;
+    changed_tail[53] ^= 1;
+    assert!(
+        !is_own_shot_sync(&changed_tail, 7),
+        "a local OID alone must not advance the post-shot barrier"
+    );
     assert!(!is_own_shot_sync(&[0; 37], 7));
     assert!(!is_own_shot_sync(&[8; 38], 7));
     assert!(
@@ -612,8 +618,7 @@ const SHOT_END_BODY: [u8; 2] = [1, 0];
 
 /// Tests whether an echoed S2C `0x0064` has the exact checked sync shape for this connection.
 fn is_own_shot_sync(body: &[u8], connection_id: u32) -> bool {
-    let expected = connection_id.to_le_bytes();
-    body.len() == 54 && body.get(..4) == Some(expected.as_slice())
+    body == shot_sync(connection_id)
 }
 
 /// Builds PacketDoc's packed, cumulative 239-byte `user_course_result_data` for C2S `0x0031`
