@@ -44,8 +44,16 @@ const ROOM_WAIT: Duration = Duration::from_secs(600);
 /// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
 /// records accepted C2S `0x001b` at `2026-08-11T12:11:41.567841Z` and C2S `0x001c` at
 /// `2026-08-11T12:11:47.206591Z`: 5.638750 seconds. The bounded 5.6-second delay deliberately
-/// rounds down to avoid inventing precision while allowing the observed shot flight to complete.
+/// rounds down to retain a close deterministic approximation without inventing precision.
 const RETAIL_SHOT_FLIGHT: Duration = Duration::from_millis(5_600);
+/// Grace period after the end barrier before an optional hole-finish announcement.
+///
+/// Production log `/private/tmp/issue45-server-4f64913-restart.log` records the headless seat's
+/// C2S `0x001c`/`0x0031` at `2026-08-11T13:14:19.676`, an immediate S2C `0x0063` at
+/// `2026-08-11T13:14:19.676497`, and the real host's mirrored C2S `0x001c` at
+/// `2026-08-11T13:14:19.788706`, 112.275ms after that premature ordering boundary. The bounded
+/// 500ms grace exceeds that observation without claiming it is production-game timing.
+const RETAIL_HOLE_FINISH_GRACE: Duration = Duration::from_millis(500);
 
 /// Retail client opcodes this instrument sends.
 mod client_opcode {
@@ -183,9 +191,12 @@ async fn main() -> Result<(), ClientError> {
 
 #[cfg(test)]
 #[test]
-fn checked_shot_flight_pacing_is_bounded() {
+fn checked_transport_pacing_is_bounded() {
     assert_eq!(RETAIL_SHOT_FLIGHT, Duration::from_millis(5_600));
+    assert_eq!(RETAIL_HOLE_FINISH_GRACE, Duration::from_millis(500));
+    assert!(RETAIL_HOLE_FINISH_GRACE >= Duration::from_micros(112_275));
     assert!(RETAIL_SHOT_FLIGHT < FRAME_TIMEOUT);
+    assert!(RETAIL_HOLE_FINISH_GRACE < FRAME_TIMEOUT);
 }
 
 #[cfg(test)]
@@ -881,7 +892,10 @@ impl Session {
                     tokio::time::sleep(RETAIL_SHOT_FLIGHT).await;
                     self.send(client_opcode::SHOT_END, &SHOT_END_BODY).await?
                 }
+                // `on_shot_sync` emits `ShotEnd` before optional `HoleFinish`; delay only at
+                // transport level so the pure state tests retain that exact command ordering.
                 ScriptWrite::HoleFinish => {
+                    tokio::time::sleep(RETAIL_HOLE_FINISH_GRACE).await;
                     self.send(client_opcode::HOLE_FINISH, &script.hole_result())
                         .await?;
                     tracing::info!(played = script.played, "holed out");
