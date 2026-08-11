@@ -803,11 +803,18 @@ mod router_tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            incremental_payload(State(state), Path("projectg851gb.pak".into()))
+            incremental_payload(State(state.clone()), Path("projectg851gb.pak".into()))
                 .await
                 .status(),
             StatusCode::NOT_FOUND,
             "final PAK is never a v2 payload"
+        );
+        assert_eq!(
+            patch_file(State(state), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "detached target is not served by v1"
         );
     }
 
