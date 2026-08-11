@@ -749,6 +749,64 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn prepare_detaches_only_signed_result_target_and_preserves_legacy() {
+        let root = std::env::temp_dir().join(format!("pangya-detached-{}", std::process::id()));
+        let release = root.join("release");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&release).expect("release");
+        std::fs::write(root.join("projectg851gb.pak"), b"physical-base").expect("pak");
+        let settings = ClientWebSettings {
+            advertise: "127.0.0.1:1".parse().expect("address"),
+            region: UpdateListRegion::Us,
+            client_directory: root.clone(),
+            entries: EntrySelection::PakSeriesOnly,
+            patch_version: "test".into(),
+            patch_number: 851,
+            translation_catalog: None,
+            theme_directory: None,
+            incremental_release: None,
+        };
+        let legacy = ClientWebState::prepare(&settings).expect("legacy");
+        let base = legacy
+            .0
+            .launcher_paks
+            .iter()
+            .find(|pak| pak.name == "projectg851gb.pak")
+            .expect("base")
+            .clone();
+        assert!(legacy.0.patch_files.contains_key("projectg851gb.pak"));
+        let value = serde_json::json!({"schema_version":1,"tool_version":"test","release_id":1,"key_id":"test","target_pak":"projectg851gb.pak","base_pak":{"size":base.size,"pangya_crc":base.pangya_crc,"sha256":base.sha256},"current_iff_sha256":"0000000000000000000000000000000000000000000000000000000000000000","current_iff_size":0,"members":[],"result_iff_sha256":"0000000000000000000000000000000000000000000000000000000000000000","result_iff_size":0,"result_pak":{"size":2,"pangya_crc":7,"sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}});
+        let manifest: ReleaseManifest = serde_json::from_value(value).expect("manifest");
+        std::fs::write(
+            release.join("release-manifest.json"),
+            manifest.canonical_json().expect("canonical"),
+        )
+        .expect("manifest file");
+        std::fs::write(release.join("release-manifest.json.sig"), [0u8; 64]).expect("signature");
+        let mut detached_settings = settings.clone();
+        detached_settings.incremental_release = Some(release);
+        let detached = ClientWebState::prepare(&detached_settings).expect("detached");
+        let target = detached
+            .0
+            .launcher_paks
+            .iter()
+            .find(|pak| pak.name == "projectg851gb.pak")
+            .expect("target");
+        assert_eq!(
+            (target.size, target.pangya_crc, &target.sha256),
+            (2, 7, &"f".repeat(64))
+        );
+        assert!(!detached.0.patch_files.contains_key("projectg851gb.pak"));
+        assert_eq!(
+            patch_file(State(detached), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn incremental_routes_serve_only_declared_metadata_and_payloads() {
         let manifest = br#"{\"schema_version\":1,\"tool_version\":\"test\",\"release_id\":1,\"key_id\":\"test\",\"target_pak\":\"projectg851gb.pak\",\"base_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"current_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"current_iff_size\":1,\"members\":[],\"result_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"result_iff_size\":1,\"result_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}"#.to_vec();
         let state = ClientWebState(Arc::new(Prepared {
