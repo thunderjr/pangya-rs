@@ -252,10 +252,6 @@ pub fn reconstruct(
     payloads: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>, PatchError> {
     validate_manifest(manifest)?;
-    // A signed no-op must not rewrite table/path metadata at all.
-    if manifest.members.is_empty() {
-        return Ok(base.to_vec());
-    }
     if base.len() as u64 != manifest.base_pak.size
         || hash(base) != manifest.base_pak.sha256
         || pangya_crc(base) != manifest.base_pak.pangya_crc
@@ -266,6 +262,18 @@ pub fn reconstruct(
     let iff = pak.read("data/pangya_gb.iff")?;
     if iff.len() as u64 != manifest.current_iff_size || hash(&iff) != manifest.current_iff_sha256 {
         return Err(PatchError::DigestMismatch);
+    }
+    // A signed no-op must still attest both the current IFF and byte-identical result PAK.
+    if manifest.members.is_empty() {
+        if base.len() as u64 != manifest.result_pak.size
+            || hash(base) != manifest.result_pak.sha256
+            || pangya_crc(base) != manifest.result_pak.pangya_crc
+            || iff.len() as u64 != manifest.result_iff_size
+            || hash(&iff) != manifest.result_iff_sha256
+        {
+            return Err(PatchError::DigestMismatch);
+        }
+        return Ok(base.to_vec());
     }
     let rebuilt_iff = rebuild_iff(&iff, &manifest.members, payloads)?;
     if rebuilt_iff.len() as u64 != manifest.result_iff_size
