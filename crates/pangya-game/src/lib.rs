@@ -785,6 +785,49 @@ struct RetailHoleAtmosphere {
     wind: pangya_domain::WindConditions,
 }
 
+/// Connection-local order state for a retail stroke's opaque wire phases.
+///
+/// PacketDoc models `0x0012` as the committed shot (`gameservice/client/0012.ksy:21-64`),
+/// describes `0x001c` after the undocumented `0x001b` sync
+/// (`gameservice/client/001c.ksy:10-40`), and documents `0x0031` as the cumulative hole
+/// statistics submission (`gameservice/client/0031.ksy:10-27`). A real U.S. 851 trace at
+/// `/private/tmp/issue45-server-4f64913-restart.log` reverses the latter two barriers: accepted
+/// `0x0012` at `2026-08-11T13:23:49.906575`, `0x001b` at `13:23:50.206577`, `0x0031` at
+/// `13:23:54.356862`, then `0x001c` at `13:23:59.328564`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetailStrokeSequence {
+    awaiting_result: bool,
+    early_hole_finish: bool,
+}
+
+impl RetailStrokeSequence {
+    fn accepted_action(&mut self) {
+        self.awaiting_result = true;
+        self.early_hole_finish = false;
+    }
+
+    fn remember_early_hole_finish(&mut self) -> bool {
+        if !self.awaiting_result {
+            return false;
+        }
+        self.early_hole_finish = true;
+        true
+    }
+
+    fn accepted_result(&mut self) -> bool {
+        if !self.awaiting_result {
+            self.clear();
+            return false;
+        }
+        self.awaiting_result = false;
+        std::mem::take(&mut self.early_hole_finish)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConnectionStrokeContext {
     match_id: MatchId,
@@ -1810,6 +1853,7 @@ where
         let mut social_replays = RetailWireReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
+        let mut retail_stroke_sequence = RetailStrokeSequence::default();
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             RoomOutbound::ordered(self.config.limits.outbound_room_event_capacity);
@@ -1906,18 +1950,32 @@ where
                     match handled {
                         Ok(RoomEventEffect::Remain) => {}
                         Ok(RoomEventEffect::EnterChannel) => {
+                            retail_stroke_sequence.clear();
                             state = GameState::InChannel;
                             room_id = None;
                             self.social.set_room(connection_id, None);
                         }
                         Ok(RoomEventEffect::EnterRoom) => {
+                            retail_stroke_sequence.clear();
                             state = GameState::InRoom;
                             match_context = ConnectionMatchContext::default();
                         }
-                        Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
-                        Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
-                        Ok(RoomEventEffect::EnterStrokeLoading) => state = GameState::InStrokeLoading,
-                        Ok(RoomEventEffect::EnterStrokeMatch) => state = GameState::InStrokeMatch,
+                        Ok(RoomEventEffect::EnterLoading) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InMatchLoading;
+                        }
+                        Ok(RoomEventEffect::EnterMatch) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InMatch;
+                        }
+                        Ok(RoomEventEffect::EnterStrokeLoading) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InStrokeLoading;
+                        }
+                        Ok(RoomEventEffect::EnterStrokeMatch) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InStrokeMatch;
+                        }
                         Err(error) => break Err(error),
                     }
                 }
@@ -2647,6 +2705,7 @@ where
                                         idle_deadline,
                                         &mut shots,
                                         &mut retail_strokes,
+                                        &mut retail_stroke_sequence,
                                         &mut match_context,
                                         frame.opcode,
                                         &frame.payload,
@@ -6465,6 +6524,7 @@ where
         idle_deadline: Instant,
         shots: &mut LocalRateWindow,
         strokes: &mut u32,
+        retail_sequence: &mut RetailStrokeSequence,
         match_context: &mut ConnectionMatchContext,
         opcode: u16,
         payload: &[u8],
@@ -6479,6 +6539,7 @@ where
                 idle_deadline,
                 shots,
                 strokes,
+                retail_sequence,
                 opcode,
                 payload,
             )
@@ -6757,6 +6818,7 @@ where
         idle_deadline: Instant,
         shots: &mut LocalRateWindow,
         strokes: &mut u32,
+        retail_sequence: &mut RetailStrokeSequence,
         opcode: u16,
         payload: &[u8],
     ) -> Result<Option<GameState>, GameRuntimeError> {
@@ -6870,6 +6932,7 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_COMMIT) => {
                 if !self.admit_retail_stroke_shot(shots) {
+                    retail_sequence.clear();
                     return Ok(Some(state));
                 }
                 // The payload is the client's own shot. It is relayed unchanged and counted as
@@ -6886,8 +6949,10 @@ where
                     .await
                     .is_err()
                 {
+                    retail_sequence.clear();
                     return Ok(Some(state));
                 }
+                retail_sequence.accepted_action();
                 self.relay_retail_match_frame(
                     identity.connection_id,
                     RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
@@ -6908,6 +6973,7 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_END) => {
                 if !self.admit_retail_stroke_shot(shots) {
+                    retail_sequence.clear();
                     return Ok(Some(state));
                 }
                 // Both clients send this barrier after a shot; only the participant who owns
@@ -6927,42 +6993,66 @@ where
                 {
                     *strokes = sequence;
                     self.observer.stroke_shot(GameShotObservation::Accepted);
+                    if retail_sequence.accepted_result() {
+                        self.complete_retail_stroke_hole(framed, identity.connection_id, strokes)
+                            .await?;
+                    }
+                } else {
+                    // A declined/duplicate result cannot complete an earlier client claim.
+                    retail_sequence.clear();
                 }
                 Ok(Some(state))
             }
             (GameState::InStrokeMatch, RETAIL_C2S_HOLE_FINISH) => {
-                // The holing shot was already counted through the ordinary action/result pair,
-                // so this completes the caller's hole without charging another stroke. The
-                // finish frame precedes the next 0x0053/turn sequence for a multi-hole card.
-                let routed = self
-                    .lobby
-                    .route_stroke(identity.connection_id, LobbyStrokeCommand::HoleOut)
-                    .await;
-                match routed {
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Waiting)) => {
-                        // Each connection's counter mirrors that participant's per-hole sequence;
-                        // finishing this participant's hole resets it even while another
-                        // participant may still be finishing the current card entry.
-                        *strokes = 0;
-                        self.send(framed, &RetailFinishHole).await?;
-                    }
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Settlement(_))) => {
-                        // The terminal room event sends one 0x0065 and one 0x0066 to every
-                        // captured roster member. Sending 0x0065 here as well duplicates the
-                        // final completion for whichever participant triggered settlement.
-                        *strokes = 0;
-                    }
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Duplicate))
-                    | Err(_) => {
-                        // Replayed 0x0031 is idempotent and has no wire reply. A transport race
-                        // after settlement is handled by the retained terminal room event.
-                    }
-                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                // U.S. 851 may send its cumulative `0x0031` during ball flight, before the
+                // ordinary `0x001c` result barrier. Retain one claim locally until that already
+                // accepted action is actually committed; replayed early claims remain one bit.
+                if retail_sequence.remember_early_hole_finish() {
+                    return Ok(Some(state));
                 }
+                self.complete_retail_stroke_hole(framed, identity.connection_id, strokes)
+                    .await?;
                 Ok(Some(state))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Completes a hole after its ordinary accepted result, regardless of which side of that
+    /// result barrier carried the opaque retail `0x0031` body.
+    async fn complete_retail_stroke_hole(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        connection_id: PlayerConnectionId,
+        strokes: &mut u32,
+    ) -> Result<(), GameRuntimeError> {
+        // The holing shot was already counted through the ordinary action/result pair, so this
+        // completes the caller's hole without charging another stroke. The finish frame precedes
+        // the next 0x0053/turn sequence for a multi-hole card.
+        let routed = self
+            .lobby
+            .route_stroke(connection_id, LobbyStrokeCommand::HoleOut)
+            .await;
+        match routed {
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Waiting)) => {
+                // Each connection's counter mirrors that participant's per-hole sequence;
+                // finishing this participant resets it while another may still finish this card
+                // entry.
+                *strokes = 0;
+                self.send(framed, &RetailFinishHole).await?;
+            }
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Settlement(_))) => {
+                // The terminal room event sends one 0x0065 and one 0x0066 to every captured
+                // roster member. Sending 0x0065 here would duplicate the final completion.
+                *strokes = 0;
+            }
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Duplicate)) | Err(_) => {
+                // Replayed `0x0031` is idempotent and has no wire reply. A transport race after
+                // settlement is handled by the retained terminal room event.
+            }
+            Ok(_) => return Err(GameRuntimeError::Protocol),
+        }
+        Ok(())
     }
 
     /// Applies the shared shot rate window, reporting a refusal the same way the solo path does.
@@ -10317,6 +10407,39 @@ mod tests {
             ServiceKind::Game,
         )
         .expect("documented retail room-create layout")
+    }
+
+    #[test]
+    fn retail_stroke_sequence_defers_one_early_hole_finish_until_accepted_result() {
+        let mut sequence = RetailStrokeSequence::default();
+        assert!(!sequence.remember_early_hole_finish());
+
+        sequence.accepted_action();
+        assert!(sequence.remember_early_hole_finish());
+        assert!(
+            sequence.remember_early_hole_finish(),
+            "a duplicate early 0031 remains one pending claim"
+        );
+        assert!(sequence.accepted_result());
+        assert_eq!(sequence, RetailStrokeSequence::default());
+        assert!(
+            !sequence.accepted_result(),
+            "a replayed result cannot complete the remembered claim twice"
+        );
+    }
+
+    #[test]
+    fn retail_stroke_sequence_leaves_post_result_hole_finish_for_normal_routing() {
+        let mut sequence = RetailStrokeSequence::default();
+        sequence.accepted_action();
+        assert!(
+            !sequence.accepted_result(),
+            "without early 0031, the normal post-result 0031 still routes HoleOut"
+        );
+        assert_eq!(sequence, RetailStrokeSequence::default());
+        sequence.accepted_action();
+        sequence.clear();
+        assert_eq!(sequence, RetailStrokeSequence::default());
     }
 
     #[test]

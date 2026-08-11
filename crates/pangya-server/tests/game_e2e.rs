@@ -8730,6 +8730,18 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
             );
         }
         salt = salt.wrapping_add(1);
+        if host_shoots {
+            // Real U.S. 851 sends its opaque sync and cumulative hole statistics before the
+            // end-shot barrier: `/private/tmp/issue45-server-4f64913-restart.log`,
+            // 2026-08-11T13:23:49.906575 (0012), 13:23:50.206577 (001b),
+            // 13:23:54.356862 (0031), then 13:23:59.328564 (001c). PacketDoc identifies
+            // 0012/001c/0031 in their respective gameservice client schemas; 001c documents
+            // 001b as its preceding undocumented sync.
+            send_packet(&mut host, host_key, salt, 0x001b, &[0; 54]).await;
+            salt = salt.wrapping_add(1);
+            send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
+            salt = salt.wrapping_add(1);
+        }
         {
             let (from, from_key) = if host_shoots {
                 (&mut host, host_key)
@@ -8740,8 +8752,8 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
             send_packet(from, from_key, salt, 0x001c, &[]).await;
             let handover = drain_available(from, from_key, Duration::from_millis(900)).await;
             assert!(
-                handover.contains(&0x00cc) && handover.contains(&0x0063),
-                "the turn ends and the next one starts: {handover:04x?}"
+                handover.contains(&0x0063),
+                "the accepted result advances to the next turn: {handover:04x?}"
             );
         }
         {
@@ -8790,25 +8802,15 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         seen.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>()
     );
 
-    // Both hole out. The second completion advances the card and emits a fresh 0x0053;
-    // only hole 18 settles the two-player match.
+    // The host's early 0031 was committed immediately after its accepted 001c above. Its
+    // replay remains idempotent, while the visitor's ordinary post-result 0031 advances hole 2.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
-    // Drain the first finisher's valid current-hole handover from both sockets before asking the
-    // second player to finish; otherwise it remains queued ahead of hole 2's introduction.
-    let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
-    let visitor_waiting =
-        drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
-    for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
-        assert_eq!(
-            frames
-                .iter()
-                .filter(|(opcode, _)| *opcode == 0x0063)
-                .count(),
-            1,
-            "{who} receives one current-hole handover: {frames:04x?}"
-        );
-        assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
-    }
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(400))
+            .await
+            .is_empty(),
+        "replayed early 0031 has no second completion"
+    );
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
     let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
     let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
