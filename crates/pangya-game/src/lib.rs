@@ -7034,12 +7034,13 @@ where
             wind,
         )
         .map_err(|_| GameRuntimeError::InvalidConfig)?;
-        // The room profile is authoritative for both the advertised and enforced deadlines.
-        // Process-wide values remain the loading fallback and stroke-count safety cap; using
-        // those turn/game defaults here made a 0x000a timer edit cosmetic.
+        // The live room timer is authoritative. Versus and chat carry a whole-game timer on
+        // the wire, but PacketDoc identifies it as unused; use the checked stroke configuration
+        // for that actor deadline instead of turning the retained zero wire value into an invalid
+        // duration. Room announcements continue to use the untouched profile value.
         let profile = snapshot.summary().profile();
         let shot_timeout = Duration::from_millis(u64::from(profile.shot_timer_ms));
-        let game_timeout = Duration::from_millis(u64::from(profile.game_timer_ms));
+        let game_timeout = retail_stroke_game_timeout(profile, stroke.game_timeout);
         let plan = StrokeStartPlan::new(
             begin,
             [first.connection_id(), second.connection_id()],
@@ -8621,8 +8622,11 @@ where
                 }
                 if !matches!(profile_update.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(profile_update.course)
-                    || profile_update.shot_timer_ms == 0
-                    || profile_update.game_timer_ms == 0
+                    || !retail_room_has_valid_timers(
+                        profile_update.mode,
+                        profile_update.shot_timer_ms,
+                        profile_update.game_timer_ms,
+                    )
                 {
                     return Err(GameRuntimeError::Protocol);
                 }
@@ -9946,17 +9950,34 @@ fn is_retail_course_value(course: u8) -> bool {
 /// timer. Both wire fields remain bounded when present; retaining the former requirement for
 /// unknown room types avoids assigning semantics that the profile does not define.
 fn retail_room_create_has_valid_timers(request: &RetailRoomCreate) -> bool {
+    retail_room_has_valid_timers(
+        request.room_type,
+        request.shot_timer_ms,
+        request.game_timer_ms,
+    )
+}
+
+fn retail_room_has_valid_timers(room_type: u8, shot_timer_ms: u32, game_timer_ms: u32) -> bool {
     const MAX_RETAIL_ROOM_TIMER_MS: u32 = 3_600_000;
     let timer_is_bounded = |timer_ms: u32| timer_ms <= MAX_RETAIL_ROOM_TIMER_MS;
-    if !timer_is_bounded(request.shot_timer_ms) || !timer_is_bounded(request.game_timer_ms) {
+    if !timer_is_bounded(shot_timer_ms) || !timer_is_bounded(game_timer_ms) {
         return false;
     }
-    match RetailRoomType::from_wire(request.room_type) {
-        Some(RetailRoomType::Versus | RetailRoomType::Chat) => request.shot_timer_ms != 0,
+    match RetailRoomType::from_wire(room_type) {
+        Some(RetailRoomType::Versus | RetailRoomType::Chat) => shot_timer_ms != 0,
         Some(RetailRoomType::Tournament | RetailRoomType::Battle | RetailRoomType::Practice) => {
-            request.game_timer_ms != 0
+            game_timer_ms != 0
         }
-        None => request.shot_timer_ms != 0 && request.game_timer_ms != 0,
+        None => shot_timer_ms != 0 && game_timer_ms != 0,
+    }
+}
+
+/// Selects the actor's whole-game deadline without changing the room's announced wire profile.
+fn retail_stroke_game_timeout(profile: RoomProfile, configured_game_timeout: Duration) -> Duration {
+    match RetailRoomType::from_wire(profile.mode) {
+        Some(RetailRoomType::Versus | RetailRoomType::Chat) => configured_game_timeout,
+        Some(RetailRoomType::Tournament | RetailRoomType::Battle | RetailRoomType::Practice)
+        | None => Duration::from_millis(u64::from(profile.game_timer_ms)),
     }
 }
 
@@ -10318,6 +10339,52 @@ mod tests {
 
         let missing_game_timer = decoded_retail_room_create(RetailRoomType::Tournament, 120_000, 0);
         assert!(!retail_room_create_has_valid_timers(&missing_game_timer));
+    }
+
+    #[tokio::test]
+    async fn retail_stroke_plan_uses_configured_game_timeout_for_versus_zero_wire_timer() {
+        let profile = RoomProfile {
+            mode: RetailRoomType::Versus as u8,
+            course: 1,
+            hole_count: 3,
+            shot_timer_ms: 120_000,
+            game_timer_ms: 0,
+            ..RoomProfile::default()
+        };
+        assert!(retail_room_has_valid_timers(
+            profile.mode,
+            profile.shot_timer_ms,
+            profile.game_timer_ms,
+        ));
+        let service =
+            test_stroke_service(Arc::new(FakeRepository::default()), Duration::from_secs(1));
+        let stroke = service.config.stroke_two.unwrap_or_else(|| unreachable!());
+        let base = test_stroke_plan(&service, 1);
+        let game_timeout = retail_stroke_game_timeout(profile, stroke.game_timeout);
+        let plan = StrokeStartPlan::new(
+            base.begin().clone(),
+            *base.roster(),
+            base.loading_timeout(),
+            Duration::from_millis(u64::from(profile.shot_timer_ms)),
+            game_timeout,
+            base.max_strokes(),
+        )
+        .expect("real three-hole versus profile prepares with configured game fallback");
+
+        assert_eq!(profile.game_timer_ms, 0, "retained room-announcement value");
+        assert_eq!(plan.turn_timeout(), Duration::from_secs(120));
+        assert_eq!(plan.game_timeout(), stroke.game_timeout);
+
+        let tournament = RoomProfile {
+            mode: RetailRoomType::Tournament as u8,
+            game_timer_ms: 900_000,
+            ..profile
+        };
+        assert_eq!(
+            retail_stroke_game_timeout(tournament, stroke.game_timeout),
+            Duration::from_secs(900),
+            "Tournament retains its live whole-game timer"
+        );
     }
 
     #[test]
