@@ -689,6 +689,61 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn incremental_routes_serve_only_declared_metadata_and_payloads() {
+        let manifest = br#"{\"schema_version\":1,\"tool_version\":\"test\",\"release_id\":1,\"key_id\":\"test\",\"target_pak\":\"projectg851gb.pak\",\"base_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"current_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"current_iff_size\":1,\"members\":[],\"result_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"result_iff_size\":1,\"result_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}"#.to_vec();
+        let state = ClientWebState(Arc::new(Prepared {
+            launcher_paks: Vec::new(),
+            stat_snapshot: Vec::new(),
+            patch_version: "test".into(),
+            patch_number: 851,
+            client_directory_path: std::path::PathBuf::new(),
+            update_list: Vec::new(),
+            patch_files: HashMap::new(),
+            translation: String::new(),
+            extra_contents: String::new(),
+            theme_document: String::new(),
+            theme_directory: None,
+            incremental: Some(IncrementalRelease {
+                manifest: manifest.clone(),
+                signature: vec![7; 64],
+                payloads: HashMap::from([("one.iff".into(), b"changed".to_vec())]),
+            }),
+        }));
+        assert_eq!(
+            incremental_manifest(State(state.clone())).await.status(),
+            StatusCode::OK
+        );
+        let signature = incremental_signature(State(state.clone())).await;
+        assert_eq!(signature.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(signature.into_body(), 128)
+                .await
+                .expect("body")
+                .len(),
+            64
+        );
+        assert_eq!(
+            incremental_payload(State(state.clone()), Path("one.iff".into()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            incremental_payload(State(state.clone()), Path("../projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            incremental_payload(State(state), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "final PAK is never a v2 payload"
+        );
+    }
+
+    #[tokio::test]
     async fn patch_payload_is_streamed_only_for_an_allowlisted_packed_name() {
         let root = std::env::temp_dir().join(format!("pangya-patch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).expect("temp directory");
