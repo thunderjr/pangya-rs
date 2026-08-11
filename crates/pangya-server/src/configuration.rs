@@ -197,7 +197,9 @@ section_default!(ClientWebSection {
     theme_directory: Option<PathBuf> = None,
     // shop-sync-report.json from scripts/sync-client-shop.sh. When set, startup refuses if the
     // served client archive and the loaded catalog did not come from one authoring run.
-    publish_report: Option<PathBuf> = None
+    publish_report: Option<PathBuf> = None,
+    // Directory made by pangya-patch-bundle: metadata/signature/changed IFF members only.
+    incremental_release: Option<PathBuf> = None
 });
 section_default!(DatabaseSection {
     url_env: String = "DATABASE_URL".to_owned(),
@@ -496,6 +498,8 @@ pub struct ValidatedClientWeb {
     pub theme_directory: Option<PathBuf>,
     /// Optional authoring report cross-checked against the served archive and loaded catalog.
     pub publish_report: Option<PathBuf>,
+    /// Optional signed changed-member release directory. It never contains a final PAK.
+    pub incremental_release: Option<PathBuf>,
 }
 
 /// Validated operator admin API policy.
@@ -1941,6 +1945,7 @@ fn validated_client_web(
         translation_catalog: raw.translation_catalog.clone(),
         theme_directory: raw.theme_directory.clone(),
         publish_report: raw.publish_report.clone(),
+        incremental_release: raw.incremental_release.clone(),
     })
 }
 

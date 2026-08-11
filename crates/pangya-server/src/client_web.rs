@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use pangya_patch::ReleaseManifest;
 use pangya_updater::{
     EntrySelection, Theme, UpdateListRegion, build_from_directory, encode_translation_catalog,
     extra_contents_xml,
@@ -60,6 +61,8 @@ pub struct ClientWebSettings {
     pub translation_catalog: Option<std::path::PathBuf>,
     /// Optional directory holding the theme images.
     pub theme_directory: Option<std::path::PathBuf>,
+    /// Directory produced by pangya-patch-bundle; only metadata/signature/member payloads.
+    pub incremental_release: Option<std::path::PathBuf>,
 }
 
 /// Failures while preparing the client web content.
@@ -80,6 +83,9 @@ pub enum ClientWebError {
     /// The translation catalog could not be read.
     #[error("the configured translation catalog could not be read")]
     TranslationCatalog,
+    /// Incremental release directory is malformed or contains unavailable payloads.
+    #[error("the configured incremental release could not be read")]
+    IncrementalRelease,
 }
 
 /// Everything the routes serve, prepared once.
@@ -100,6 +106,13 @@ struct Prepared {
     extra_contents: String,
     theme_document: String,
     theme_directory: Option<Dir>,
+    incremental: Option<IncrementalRelease>,
+}
+
+struct IncrementalRelease {
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
+    payloads: HashMap<String, Vec<u8>>,
 }
 
 /// One archive as the launcher sees it.
@@ -164,6 +177,45 @@ fn read_bounded(directory: &Dir, name: &str, limit: u64) -> Option<Vec<u8>> {
 /// lobby wallpapers, and `background_*`/`loading_background` loading wallpapers. Deriving the
 /// theme from the directory rather than a config list means an operator points at the folder the
 /// client already has and gets the same content the retail theme document named.
+fn load_incremental(
+    path: Option<&std::path::Path>,
+) -> Result<Option<IncrementalRelease>, ClientWebError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let manifest = std::fs::read(path.join("release-manifest.json"))
+        .map_err(|_| ClientWebError::IncrementalRelease)?;
+    let parsed: ReleaseManifest =
+        serde_json::from_slice(&manifest).map_err(|_| ClientWebError::IncrementalRelease)?;
+    // Re-serialize through the canonical validator before serving anything.
+    if parsed
+        .canonical_json()
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        != manifest
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let signature = std::fs::read(path.join("release-manifest.json.sig"))
+        .map_err(|_| ClientWebError::IncrementalRelease)?;
+    if signature.len() != 64 {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let mut payloads = HashMap::new();
+    for member in parsed.members {
+        let bytes = std::fs::read(path.join("payload").join(&member.name))
+            .map_err(|_| ClientWebError::IncrementalRelease)?;
+        if bytes.len() as u64 != member.new_length {
+            return Err(ClientWebError::IncrementalRelease);
+        }
+        payloads.insert(member.name, bytes);
+    }
+    Ok(Some(IncrementalRelease {
+        manifest,
+        signature,
+        payloads,
+    }))
+}
+
 fn classify_theme(names: &[String]) -> Theme {
     let mut theme = Theme::default();
     for name in names {
@@ -283,6 +335,8 @@ impl ClientWebState {
             None => (Theme::default().to_xml()?, None),
         };
 
+        let incremental = load_incremental(settings.incremental_release.as_deref())?;
+
         let translation = match &settings.translation_catalog {
             Some(path) => {
                 let parent = path
@@ -317,6 +371,7 @@ impl ClientWebState {
             extra_contents,
             theme_document,
             theme_directory,
+            incremental,
         })))
     }
 
@@ -341,7 +396,16 @@ pub fn client_web_router(state: ClientWebState) -> Router {
     // asks for. Nothing retail requests this; it exists for the launcher.
     let mut router = Router::new()
         .route("/Translation/Read.aspx", get(translation))
-        .route("/launcher/v1/manifest", get(launcher_manifest));
+        .route("/launcher/v1/manifest", get(launcher_manifest))
+        .route(
+            "/launcher/v2/release-manifest.json",
+            get(incremental_manifest),
+        )
+        .route(
+            "/launcher/v2/release-manifest.json.sig",
+            get(incremental_signature),
+        )
+        .route("/launcher/v2/payload/{name}", get(incremental_payload));
     for prefix in PREFIXES {
         router = router
             .route(&format!("{prefix}/updatelist"), get(updatelist))
@@ -404,6 +468,51 @@ async fn launcher_manifest(State(state): State<ClientWebState>) -> Response {
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+async fn incremental_manifest(State(state): State<ClientWebState>) -> Response {
+    state.0.incremental.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |release| {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                release.manifest.clone(),
+            )
+                .into_response()
+        },
+    )
+}
+async fn incremental_signature(State(state): State<ClientWebState>) -> Response {
+    state.0.incremental.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |release| {
+            (
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                release.signature.clone(),
+            )
+                .into_response()
+        },
+    )
+}
+async fn incremental_payload(
+    State(state): State<ClientWebState>,
+    Path(name): Path<String>,
+) -> Response {
+    state
+        .0
+        .incremental
+        .as_ref()
+        .and_then(|release| release.payloads.get(&name))
+        .map_or_else(
+            || StatusCode::NOT_FOUND.into_response(),
+            |payload| {
+                (
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    payload.clone(),
+                )
+                    .into_response()
+            },
+        )
 }
 
 async fn client_web_not_found(uri: Uri) -> StatusCode {

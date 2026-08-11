@@ -13,10 +13,11 @@
 //! The XTEA round function is derived from
 //! `/Users/thunderjr/projects/pangya-rs/opensource-references/pangbox--pangfiles/crypto/pyxtea/xtea.go:20-46`.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read as _;
 
 const TRAILER: usize = 9;
 const ENTRY: usize = 14;
@@ -170,6 +171,72 @@ pub fn verify_bundle(
 /// Reconstructs a target PAK after all signature/base/current checks have completed.
 /// The changed member is emitted as a basic PAK record; every unrelated packed record remains
 /// byte-for-byte unchanged. The final metadata is verified independently before returning.
+/// Produces a release from two operator-owned PAKs. Only differing IFF member bytes are
+/// returned in `payloads`; neither input PAK is written to the release directory.
+pub fn produce_release(
+    base: &[u8],
+    result: &[u8],
+    key: [u32; 4],
+    release_id: u64,
+    key_id: String,
+    signer: &SigningKey,
+) -> Result<(ReleaseManifest, Vec<u8>, BTreeMap<String, Vec<u8>>), PatchError> {
+    let base_pak = Pak::parse(base, key)?;
+    let result_pak = Pak::parse(result, key)?;
+    let base_iff = base_pak.read("data/pangya_gb.iff")?;
+    let result_iff = result_pak.read("data/pangya_gb.iff")?;
+    let before = Iff::parse(&base_iff)?;
+    let after = Iff::parse(&result_iff)?;
+    let mut before_names = BTreeMap::new();
+    for entry in &before.entries {
+        before_names.insert(entry.name.clone(), entry);
+    }
+    let mut members = Vec::new();
+    let mut payloads = BTreeMap::new();
+    for entry in &after.entries {
+        let old = before_names
+            .remove(&entry.name)
+            .ok_or(PatchError::DigestMismatch)?;
+        let old_bytes = old.data(&base_iff)?;
+        let new_bytes = entry.data(&result_iff)?;
+        if old_bytes != new_bytes {
+            members.push(MemberChange {
+                name: entry.name.clone(),
+                old_sha256: hash(&old_bytes),
+                old_length: old_bytes.len() as u64,
+                new_sha256: hash(&new_bytes),
+                new_length: new_bytes.len() as u64,
+            });
+            payloads.insert(entry.name.clone(), new_bytes.to_vec());
+        }
+    }
+    // An add/remove is not a member replacement and would make preservation ambiguous.
+    if !before_names.is_empty() || members.is_empty() {
+        return Err(PatchError::Manifest);
+    }
+    members.sort_by(|left, right| left.name.cmp(&right.name));
+    let manifest = ReleaseManifest {
+        schema_version: 1,
+        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+        release_id,
+        key_id,
+        target_pak: "projectg851gb.pak".to_owned(),
+        base_pak: metadata(base),
+        current_iff_sha256: hash(&base_iff),
+        current_iff_size: base_iff.len() as u64,
+        members,
+        result_iff_sha256: hash(&result_iff),
+        result_iff_size: result_iff.len() as u64,
+        result_pak: metadata(result),
+    };
+    let signature = signer
+        .sign(&manifest.signing_message()?)
+        .to_bytes()
+        .to_vec();
+    Ok((manifest, signature, payloads))
+}
+
+/// Reconstructs a target PAK after all signature/base/current checks have completed.
 pub fn reconstruct(
     base: &[u8],
     key: [u32; 4],
@@ -215,6 +282,8 @@ struct PakEntry {
     path: String,
     typ: u8,
     raw_path: Vec<u8>,
+    /// On-disk path-length field; XTEA path padding is not part of this value.
+    path_length: u8,
     packed: Vec<u8>,
     real: u32,
 }
@@ -313,8 +382,9 @@ impl Pak {
             };
             let entry = PakEntry {
                 path,
-                typ: if meta == 0 { typ | XOR } else { typ },
+                typ,
                 raw_path,
+                path_length: decoded[0],
                 packed: packed_data,
                 real: real as u32,
             };
@@ -336,15 +406,17 @@ impl Pak {
             .find(|e| e.path.eq_ignore_ascii_case(name))
             .ok_or(PatchError::UnsafePath)?;
         let kind = e.typ & TYPE_MASK;
-        if kind == BASIC {
-            return Ok(e.packed.clone());
+        let output = if kind == BASIC {
+            e.packed.clone()
+        } else if kind == DIRECTORY {
+            Vec::new()
+        } else {
+            decompress(&e.packed, kind, e.real as usize)?
+        };
+        if output.len() != e.real as usize {
+            return Err(PatchError::DigestMismatch);
         }
-        if kind == DIRECTORY {
-            return Ok(Vec::new());
-        }
-        // real size lives in metadata but only compressed output is capped by LZ logic. Derive
-        // it while parsing wire metadata is intentionally avoided; LZ must terminate exactly.
-        decompress(&e.packed, kind)
+        Ok(output)
     }
     fn replace_basic(&self, name: &str, replacement: &[u8]) -> Result<Vec<u8>, PatchError> {
         if replacement.len() > MAX_OUTPUT {
@@ -370,7 +442,7 @@ impl Pak {
             let typ = if changing { meta | BASIC } else { e.typ };
             let real = if changing { size } else { e.real };
             let stored_real = if meta == XOR { real ^ 0x71 } else { real };
-            let mut header = vec![e.raw_path.len() as u8, typ];
+            let mut header = vec![e.path_length, typ];
             header.extend_from_slice(&offset.to_le_bytes());
             header.extend_from_slice(&size.to_le_bytes());
             header.extend_from_slice(&stored_real.to_le_bytes());
@@ -396,7 +468,7 @@ impl Pak {
     }
 }
 
-fn decompress(input: &[u8], kind: u8) -> Result<Vec<u8>, PatchError> {
+fn decompress(input: &[u8], kind: u8, expected: usize) -> Result<Vec<u8>, PatchError> {
     if !matches!(kind, LZ | LZ2) {
         return Err(PatchError::UnsupportedPak);
     }
@@ -416,6 +488,9 @@ fn decompress(input: &[u8], kind: u8) -> Result<Vec<u8>, PatchError> {
         if seq & 1 == 0 {
             out.push(*input.get(at).ok_or(PatchError::Truncated)?);
             at += 1;
+            if out.len() > expected {
+                return Err(PatchError::TooLarge);
+            }
         } else {
             let b = get(input, at, 2)?;
             at += 2;
@@ -427,6 +502,7 @@ fn decompress(input: &[u8], kind: u8) -> Result<Vec<u8>, PatchError> {
             let size = (value >> 12) as usize + 2;
             if offset.checked_add(size).ok_or(PatchError::BadLz)? > out.len()
                 || out.len().checked_add(size).ok_or(PatchError::TooLarge)? > MAX_OUTPUT
+                || out.len().checked_add(size).ok_or(PatchError::TooLarge)? > expected
             {
                 return Err(PatchError::BadLz);
             }
@@ -436,6 +512,9 @@ fn decompress(input: &[u8], kind: u8) -> Result<Vec<u8>, PatchError> {
         }
         seq >>= 1;
         bits -= 1;
+    }
+    if out.len() != expected {
+        return Err(PatchError::DigestMismatch);
     }
     Ok(out)
 }
@@ -468,7 +547,7 @@ fn rebuild_iff(
         let offset = u32::try_from(out.len()).map_err(|_| PatchError::TooLarge)?;
         if let Some(c) = change {
             let old = e.data(input)?;
-            if old.len() as u64 != c.old_length || hash(old) != c.old_sha256 {
+            if old.len() as u64 != c.old_length || hash(&old) != c.old_sha256 {
                 return Err(PatchError::DigestMismatch);
             }
             let payload = payloads.get(&c.name).ok_or(PatchError::DigestMismatch)?;
@@ -509,6 +588,8 @@ struct ZipEntry {
     local: usize,
     central_raw: Vec<u8>,
     local_head: Vec<u8>,
+    /// Original local name and extra fields; central fields are not interchangeable.
+    local_name_extra: Vec<u8>,
     data_start: usize,
     data_len: usize,
     local_end: usize,
@@ -548,7 +629,12 @@ impl Iff {
             at += raw.len();
             let flags = le16(&raw[8..10])?;
             let method = le16(&raw[10..12])?;
-            if flags & 1 != 0 || method > 8 {
+            if flags & (1 | 8) != 0
+                || !matches!(method, 0 | 8)
+                || raw[34..46].iter().any(|byte| *byte == 0xff)
+                || le32(&raw[20..24])? == u32::MAX
+                || le32(&raw[24..28])? == u32::MAX
+            {
                 return Err(PatchError::UnsafeZip);
             }
             let name = std::str::from_utf8(&raw[46..46 + nl])
@@ -564,6 +650,16 @@ impl Iff {
             }
             let lnl = le16(&lh[26..28])? as usize;
             let lxl = le16(&lh[28..30])? as usize;
+            let local_name_extra = get(input, local + 30, lnl + lxl)?.to_vec();
+            if le16(&lh[6..8])? != flags
+                || le16(&lh[8..10])? != method
+                || local_name_extra[..lnl] != raw[46..46 + nl]
+                || le32(&lh[14..18])? != le32(&raw[16..20])?
+                || le32(&lh[18..22])? != le32(&raw[20..24])?
+                || le32(&lh[22..26])? != le32(&raw[24..28])?
+            {
+                return Err(PatchError::BadZip);
+            }
             let data_start = local
                 .checked_add(30 + lnl + lxl)
                 .ok_or(PatchError::BadZip)?;
@@ -576,6 +672,7 @@ impl Iff {
                 local,
                 central_raw: raw,
                 local_head: lh,
+                local_name_extra,
                 data_start,
                 data_len,
                 local_end: 0,
@@ -622,11 +719,24 @@ impl ZipEntry {
     fn raw_local<'a>(&self, input: &'a [u8]) -> Result<&'a [u8], PatchError> {
         get(input, self.local, self.local_end - self.local)
     }
-    fn data<'a>(&self, input: &'a [u8]) -> Result<&'a [u8], PatchError> {
-        if self.method != 0 {
-            return Err(PatchError::UnsafeZip);
+    fn data(&self, input: &[u8]) -> Result<Vec<u8>, PatchError> {
+        let wire = get(input, self.data_start, self.data_len)?;
+        let expected = le32(&self.central_raw[24..28])? as usize;
+        let out = if self.method == 0 {
+            wire.to_vec()
+        } else {
+            let decoder = flate2::read::DeflateDecoder::new(wire);
+            let mut out = Vec::with_capacity(expected.min(MAX_OUTPUT));
+            decoder
+                .take((MAX_OUTPUT + 1) as u64)
+                .read_to_end(&mut out)
+                .map_err(|_| PatchError::BadZip)?;
+            out
+        };
+        if out.len() != expected || crc32fast::hash(&out) != le32(&self.central_raw[16..20])? {
+            return Err(PatchError::BadZip);
         }
-        get(input, self.data_start, self.data_len)
+        Ok(out)
     }
     fn local_replacement(&self, p: &[u8]) -> Result<Vec<u8>, PatchError> {
         let mut h = self.local_head.clone();
@@ -640,7 +750,10 @@ impl ZipEntry {
         let nl = le16(&h[26..28])? as usize;
         let xl = le16(&h[28..30])? as usize;
         let mut out = h;
-        out.extend_from_slice(&self.central_raw[46..46 + nl + xl]);
+        out.extend_from_slice(&self.local_name_extra);
+        if self.local_name_extra.len() != nl + xl {
+            return Err(PatchError::BadZip);
+        }
         out.extend_from_slice(p);
         Ok(out)
     }
@@ -702,6 +815,13 @@ fn safe_pak(s: &str) -> bool {
 }
 fn digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn metadata(v: &[u8]) -> FileMetadata {
+    FileMetadata {
+        size: v.len() as u64,
+        pangya_crc: pangya_crc(v),
+        sha256: hash(v),
+    }
 }
 fn hash(v: &[u8]) -> String {
     format!("{:x}", Sha256::digest(v))
@@ -810,7 +930,10 @@ mod tests {
     #[test]
     fn lz_rejects_a_backreference_before_output() {
         // Retail token layout: /Users/thunderjr/projects/pangya-rs/opensource-references/pangbox--pangfiles/pak/decompress.go:48-63
-        assert!(matches!(decompress(&[1, 0, 0], LZ), Err(PatchError::BadLz)));
+        assert!(matches!(
+            decompress(&[1, 0, 0], LZ, 2),
+            Err(PatchError::BadLz)
+        ));
     }
     #[test]
     fn manifest_rejects_traversal() {
