@@ -247,6 +247,10 @@ pub fn reconstruct(
     payloads: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>, PatchError> {
     validate_manifest(manifest)?;
+    // A signed no-op must not rewrite table/path metadata at all.
+    if manifest.members.is_empty() {
+        return Ok(base.to_vec());
+    }
     if base.len() as u64 != manifest.base_pak.size
         || hash(base) != manifest.base_pak.sha256
         || pangya_crc(base) != manifest.base_pak.pangya_crc
@@ -444,7 +448,12 @@ impl Pak {
             let meta = e.typ & META_MASK;
             let typ = if changing { meta | BASIC } else { e.typ };
             let real = if changing { size } else { e.real };
-            let stored_real = if meta == XOR { real ^ 0x71 } else { real };
+            // reader.go:91-105 treats a zero metadata nibble as legacy XOR too.
+            let stored_real = if meta == 0 || meta == XOR {
+                real ^ 0x71
+            } else {
+                real
+            };
             let mut header = vec![e.path_length, typ];
             header.extend_from_slice(&offset.to_le_bytes());
             header.extend_from_slice(&size.to_le_bytes());
@@ -807,7 +816,9 @@ fn validate_manifest(m: &ReleaseManifest) -> Result<(), PatchError> {
     Ok(())
 }
 fn safe_name(s: &str) -> bool {
-    !s.is_empty() && !s.contains(['/', '\\']) && !s.contains("..") && s.is_ascii()
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 fn safe_pak_path(s: &str) -> bool {
     s.split('/')
@@ -815,7 +826,7 @@ fn safe_pak_path(s: &str) -> bool {
         && !s.contains('\\')
 }
 fn safe_pak(s: &str) -> bool {
-    safe_name(s) && s.to_ascii_lowercase().ends_with(".pak")
+    s == "projectg851gb.pak"
 }
 fn digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())

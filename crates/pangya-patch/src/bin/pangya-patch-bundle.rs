@@ -22,9 +22,6 @@ struct Args {
     /// Identifier matching launcher-pinned public key.
     #[arg(long)]
     key_id: String,
-    /// 32-byte Ed25519 signing seed as hexadecimal. Never persisted by this tool.
-    #[arg(long, env = "PANGYA_PATCH_SIGNING_SEED")]
-    signing_seed: String,
     /// New or empty release directory.
     #[arg(long)]
     output: PathBuf,
@@ -32,7 +29,10 @@ struct Args {
 
 fn main() -> Result<(), String> {
     let args = Args::parse();
-    let seed = decode_seed(&args.signing_seed)?;
+    // Deliberately environment-only: a signing seed in argv leaks through process listings.
+    let seed_text = std::env::var("PANGYA_PATCH_SIGNING_SEED")
+        .map_err(|_| "PANGYA_PATCH_SIGNING_SEED is required".to_owned())?;
+    let seed = decode_seed(&seed_text)?;
     if args.output.exists()
         && std::fs::read_dir(&args.output)
             .map_err(|e| e.to_string())?
