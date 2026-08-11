@@ -508,11 +508,33 @@ Three sources against one, including both 852-targeting servers, say
 confusion survived: upstream's blob happens to be a valid-looking `0x004b` and
 the client does not visibly complain.
 
-This remains **live-capture blocked** for the U.S. 852 client: no capture has
-proven a tutorial interpretation of client `0x000b`, so this PR does not claim
-one or implement the unproven tutorial-start body. The active PacketDoc and
-multi-source server evidence support the equipment handler only; revisit the
-collision when an immutable U.S. capture is available.
+This remains **live-capture blocked** for the U.S. 852 client: no checked-in
+trace proves the `0x000b` body or a tutorial interpretation. The real-client
+Practice report only records that loading sends both `0x000c` and `0x000b`
+(`docs/evidence/REAL_CLIENT_PRACTICE_2026-08-09.md:32-42`); it preserves no
+body bytes, subtype, or matching `0x004b`. The active PacketDoc and multi-source
+server evidence support the equipment handler only. Do not implement a
+tutorial-start body until an immutable U.S. capture supplies those facts.
+
+### 5.1.1 Tutorial implementation hold
+
+Do not derive a U.S. 852 tutorial wire/reward contract from the checked-in K4T
+source. Its enum declares `Advancer = 16128`
+(`opensource-references/K4T--Py_Source_US/Src/Py_Game/Py_Game/Defines/PangyaEnums.cs:3-9`),
+but its mission switch handles only Rookie/NewRookie and Beginner
+(`opensource-references/K4T--Py_Source_US/Src/Py_Game/Py_Game/Functions/TutorialCoreSystem.cs:60-149`).
+Its status writer has distinct 19-byte login and 6-byte completion branches
+(`opensource-references/K4T--Py_Source_US/Src/Py_Game/Py_Game/GameTools/PacketCreator.cs:166-185`),
+without a U.S. capture selecting one in each context. Its reward mapping is
+source behavior, not a client reward catalog
+(`opensource-references/K4T--Py_Source_US/Src/Py_Game/Py_Game/Functions/Mail/MailSender.cs:88-207`).
+
+Before implementation, preserve a redacted U.S. 852 trace for login/bootstrap
+`0x011f`, each Rookie/Beginner/Advancer `0x00ae` mission, and each post-clear
+`0x011f`, including direction, body length, bytes, and order. It must be paired
+with an authoritative per-mission and completion reward matrix. Until then,
+do not add tutorial protocol bytes, reward tables, migrations, or tests that
+encode one of these unsupported choices.
 
 ### 5.2 `0x0065` — time booster body conflict (deferred)
 

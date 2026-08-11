@@ -1069,12 +1069,10 @@ impl RetailCharacterParts {
 
 /// Equipment changes sent by the lobby/room opcodes `0x000b` and `0x000c`.
 ///
-/// Both packets use the leading byte and little-endian scalar bodies. The active packetdoc
-/// `gameservice/client/000b.ksy` resolves the issue-28 collision as equipment (`type 4` followed
-/// by one little-endian roster-slot word); the `pangbox/server` tutorial-start alias has no body
-/// parser and is not selected here. SuperSS-Dev's `requestChangePlayerItemChannel` additionally
-/// handles caddie, ball, and club set (`1`–`4`); `0x000c` additionally has the four-word `7` form.
-/// The channel implementation follows the broader 852-targeting reference.
+/// Both packets use the leading byte and little-endian scalar bodies. PacketDoc documents only
+/// character (`4`) for `0x000b`, while SuperSS-Dev's `requestChangePlayerItemChannel` handles
+/// caddie, ball, club set, and character (`1`–`4`); `0x000c` additionally has the four-word `7`
+/// form. The channel implementation follows the broader 852-targeting reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetailRoomEquipmentUpdate {
     /// Equipped caddie roster slot.
