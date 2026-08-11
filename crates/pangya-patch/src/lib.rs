@@ -232,6 +232,11 @@ pub fn produce_release(
         result_iff_size: result_iff.len() as u64,
         result_pak: metadata(result),
     };
+    // Publishing only changed IFF members is sound only when this library can reproduce the
+    // complete operator result; unrelated PAK changes must be rejected before signing.
+    if reconstruct(base, key, &manifest, &payloads)? != result {
+        return Err(PatchError::DigestMismatch);
+    }
     let signature = signer
         .sign(&manifest.signing_message()?)
         .to_bytes()
