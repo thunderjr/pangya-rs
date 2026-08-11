@@ -2252,6 +2252,20 @@ where
                                 }
                             } else if self.config.retail_bootstrap
                                 && matches!(frame.opcode, RETAIL_C2S_EQUIPMENT_LOBBY | RETAIL_C2S_EQUIPMENT_ROOM)
+                                // In-match 0x000b/0x000c are loading-equipment synchronization,
+                                // explicitly accepted without a reply by the retail match
+                                // allowlist. Let them reach that handler rather than rejecting a
+                                // valid five-byte room body because the actor has entered its
+                                // loading state. PacketDoc `gameservice/client/000c.ksy:24-80`
+                                // and the real-client sequence in
+                                // `docs/evidence/REAL_CLIENT_PRACTICE_2026-08-09.md:32-42`.
+                                && !matches!(
+                                    state,
+                                    GameState::InMatchLoading
+                                        | GameState::InMatch
+                                        | GameState::InStrokeLoading
+                                        | GameState::InStrokeMatch
+                                )
                                 // The existing retail practice start also uses 0x000c with the
                                 // reference-defined type-7 four-word body; preserve that full
                                 // lifecycle path rather than stealing its start frame.

@@ -8284,6 +8284,13 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
+    let wrong_state = create_account(&pool, "PartyChannel", 1, 0x1000_0000).await;
+    let owner_character: i64 =
+        sqlx::query_scalar("SELECT id FROM characters WHERE account_id = $1")
+            .bind(owner.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("owner character");
     sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
         .bind(owner.account.id.get())
         .execute(&pool)
@@ -8368,6 +8375,27 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
 
     let traces = tracing_capture();
     let mut tokens = Vec::new();
+    let (mut wrong_state_stream, wrong_state_key) = join_retail(
+        &pool,
+        address,
+        wrong_state.account.id,
+        "PartyChannel",
+        &mut tokens,
+    )
+    .await;
+    // The PacketDoc 0x000c shape is valid only in a room. Preserve the InChannel rejection
+    // while allowing the same body to become loading-time match traffic below.
+    // `pangbox--packetdoc` `gameservice/client/000c.ksy:24-80`.
+    send_packet(
+        &mut wrong_state_stream,
+        wrong_state_key,
+        3,
+        0x000c,
+        &[3, 0, 0, 0, 0],
+    )
+    .await;
+    assert_closed(&mut wrong_state_stream).await;
+
     let (mut host, host_key) =
         join_retail(&pool, address, owner.account.id, "PartyHost", &mut tokens).await;
 
@@ -8606,8 +8634,27 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         );
     }
 
-    // Both load. The turn opens only once both have, and both are told whose it is.
-    send_packet(&mut host, host_key, 6, 0x0011, &[]).await;
+    // A real client sends its room-equipment syncs after the match intro and before 0x0011;
+    // the accepted match-opcode contract lists both 0x000b and 0x000c for this phase
+    // (`crates/pangya-protocol/src/game.rs:834-849`). PacketDoc defines these two five-byte
+    // 0x000c bodies as ClubSet and Character updates (`gameservice/client/000c.ksy:24-80`),
+    // while the real-client trace records the same loading-time ordering
+    // (`docs/evidence/REAL_CLIENT_PRACTICE_2026-08-09.md:32-42`). They are opaque loading
+    // synchronization, not room mutations after the actor has entered InStrokeLoading.
+    let mut loading_club = vec![3];
+    loading_club.extend_from_slice(&purchased_club_u32.to_le_bytes());
+    let mut loading_character = vec![4];
+    loading_character.extend_from_slice(
+        &u32::try_from(owner_character)
+            .expect("owner character fits retail room-equipment body")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 6, 0x000c, &loading_club).await;
+    send_packet(&mut host, host_key, 7, 0x000c, &loading_character).await;
+
+    // Both load. The turn opens only once both have, and the resulting frames prove both
+    // encrypted sockets survived the duplicated loading equipment synchronization.
+    send_packet(&mut host, host_key, 8, 0x0011, &[]).await;
     let waiting = drain_available(&mut visitor, visitor_key, Duration::from_millis(500)).await;
     assert!(
         waiting.is_empty(),
