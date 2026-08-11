@@ -8004,9 +8004,31 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         "unsupported repeat-hole edit has no misleading acknowledgement"
     );
 
+    // US851 sends STATE_FLAG after the room has been idle. SuperSS-Dev reads its one-byte
+    // value into a one-bit AFK field, but pangya-rs intentionally has no AFK aggregate or wire
+    // response yet. The exact encrypted retail capture is therefore accepted as an ignored
+    // observation, and a following room request proves the TCP session remains usable.
+    send_packet(&mut host, host_key, 12, 0x000a, &[0xff, 0xff, 1, 9, 1]).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(250))
+            .await
+            .is_empty(),
+        "ignored AFK state has no invented acknowledgement"
+    );
+    send_packet(&mut host, host_key, 13, 0x001c, &[0, 0]).await;
+    let after_afk = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        after_afk
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "the exact STATE_FLAG frame does not disconnect the encrypted TCP session"
+    );
+
     // A truncated settings frame is malformed and closes the stream rather than being treated
     // as an empty edit or allowing a partial mutation.
-    send_packet(&mut host, host_key, 12, 0x000a, &[0xff]).await;
+    send_packet(&mut host, host_key, 14, 0x000a, &[0xff]).await;
     assert_closed(&mut host).await;
 
     drop(visitor);

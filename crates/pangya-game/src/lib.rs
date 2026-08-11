@@ -8602,6 +8602,14 @@ where
                         RetailRoomSettingChange::NaturalWind(enabled) => {
                             profile_update.natural_wind = enabled
                         }
+                        RetailRoomSettingChange::StateAfk(_is_afk) => {
+                            // SuperSS-Dev room.cpp:1450-1535 stores STATE_FLAG in its room
+                            // aggregate, but this service has no corresponding aggregate field
+                            // or authoritative response shape. Observe and ignore it rather than
+                            // disconnecting the retail client or claiming the state was applied.
+                            self.observer.unknown(GameUnknownObservation::Ignored);
+                            return Ok(state);
+                        }
                         RetailRoomSettingChange::Artifact(_artifact_id) => {
                             // PacketDoc carries the catalog id, but the checked gameplay
                             // references provide no authoritative effect or reward semantics.
