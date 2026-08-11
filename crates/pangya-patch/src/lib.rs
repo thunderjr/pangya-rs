@@ -368,7 +368,7 @@ impl Pak {
             let path = std::str::from_utf8(&path_bytes)
                 .map_err(|_| PatchError::UnsafePath)?
                 .to_owned();
-            if !safe_name(&path) || !names.insert(path.to_ascii_lowercase()) {
+            if !safe_pak_path(&path) || !names.insert(path.to_ascii_lowercase()) {
                 return Err(PatchError::UnsafePath);
             }
             if payload_type != DIRECTORY {
@@ -813,6 +813,11 @@ fn validate_manifest(m: &ReleaseManifest) -> Result<(), PatchError> {
 fn safe_name(s: &str) -> bool {
     !s.is_empty() && !s.contains(['/', '\\']) && !s.contains("..") && s.is_ascii()
 }
+fn safe_pak_path(s: &str) -> bool {
+    s.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != ".." && part.is_ascii())
+        && !s.contains('\\')
+}
 fn safe_pak(s: &str) -> bool {
     safe_name(s) && s.to_ascii_lowercase().ends_with(".pak")
 }
@@ -938,6 +943,114 @@ mod tests {
             Err(PatchError::BadLz)
         ));
     }
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let crc = crc32fast::hash(data);
+            out.extend_from_slice(&ZIP_LOCAL.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            central.extend_from_slice(&ZIP_CENTRAL.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&ZIP_END.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+    fn basic_pak(iff: &[u8]) -> Vec<u8> {
+        let name = b"data/pangya_gb.iff";
+        let mut out = iff.to_vec();
+        out.push(name.len() as u8);
+        out.push(PLAIN);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(iff.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(iff.len() as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(0);
+        out.extend_from_slice(&(iff.len() as u32).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.push(SIGNATURE);
+        out
+    }
+
+    #[test]
+    fn synthetic_signed_one_and_two_member_releases_reconstruct_and_preserve_unchanged() {
+        let base_iff = stored_zip(&[
+            ("one.iff", b"old-one"),
+            ("two.iff", b"old-two"),
+            ("keep.iff", b"keep"),
+        ]);
+        let one_iff = stored_zip(&[
+            ("one.iff", b"new-one"),
+            ("two.iff", b"old-two"),
+            ("keep.iff", b"keep"),
+        ]);
+        let two_iff = stored_zip(&[
+            ("one.iff", b"new-one"),
+            ("two.iff", b"new-two"),
+            ("keep.iff", b"keep"),
+        ]);
+        let key = [0u32; 4];
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let trust = TrustKey {
+            key_id: "test".into(),
+            public_key: signer
+                .verifying_key()
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        };
+        for (result_iff, count) in [(one_iff, 1usize), (two_iff, 2usize)] {
+            let base = basic_pak(&base_iff);
+            let result = basic_pak(&result_iff);
+            let (manifest, signature, payloads) =
+                produce_release(&base, &result, key, 1, "test".into(), &signer).expect("produce");
+            assert_eq!(manifest.members.len(), count);
+            verify_bundle(&manifest, &signature, &trust, &payloads).expect("signature");
+            assert_eq!(
+                reconstruct(&base, key, &manifest, &payloads).expect("rebuild"),
+                result
+            );
+        }
+    }
+
     #[test]
     fn lz2_and_output_length_are_strict() {
         // LZ2 selector/pad and token lengths: /Users/thunderjr/projects/pangya-rs/opensource-references/pangbox--pangfiles/pak/decompress.go:41-63.
