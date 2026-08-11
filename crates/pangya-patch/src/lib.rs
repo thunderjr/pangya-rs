@@ -939,6 +939,57 @@ mod tests {
         ));
     }
     #[test]
+    fn lz2_and_output_length_are_strict() {
+        // LZ2 selector/pad and token lengths: /Users/thunderjr/projects/pangya-rs/opensource-references/pangbox--pangfiles/pak/decompress.go:41-63.
+        assert!(decompress(&[0xc9, 0, 0], LZ2, 2).is_err());
+        assert!(
+            decompress(&[0, b'a'], LZ, 2).is_err(),
+            "short output must not be accepted"
+        );
+        assert!(
+            decompress(&[0, b'a', b'b'], LZ, 1).is_err(),
+            "oversized output must not be accepted"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_and_case_colliding_members() {
+        let member = |name: &str| MemberChange {
+            name: name.to_owned(),
+            old_sha256: "0".repeat(64),
+            old_length: 1,
+            new_sha256: "1".repeat(64),
+            new_length: 1,
+        };
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            tool_version: "test".into(),
+            release_id: 1,
+            key_id: "key".into(),
+            target_pak: "projectg851gb.pak".into(),
+            base_pak: FileMetadata {
+                size: 1,
+                pangya_crc: 0,
+                sha256: "0".repeat(64),
+            },
+            current_iff_sha256: "0".repeat(64),
+            current_iff_size: 1,
+            members: vec![member("Item.iff"), member("item.iff")],
+            result_iff_sha256: "0".repeat(64),
+            result_iff_size: 1,
+            result_pak: FileMetadata {
+                size: 1,
+                pangya_crc: 0,
+                sha256: "0".repeat(64),
+            },
+        };
+        assert!(matches!(
+            manifest.canonical_json(),
+            Err(PatchError::Manifest)
+        ));
+    }
+
+    #[test]
     fn manifest_rejects_traversal() {
         let m = ReleaseManifest {
             schema_version: 1,
