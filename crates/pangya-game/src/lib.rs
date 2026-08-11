@@ -8427,10 +8427,7 @@ where
                 // overwrite the requested course or hole card.
                 if !matches!(request.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(request.course)
-                    || request.shot_timer_ms == 0
-                    || request.game_timer_ms == 0
-                    || request.shot_timer_ms > 3_600_000
-                    || request.game_timer_ms > 3_600_000
+                    || !retail_room_create_has_valid_timers(&request)
                 {
                     return self.reject_retail_join(framed, state).await;
                 }
@@ -9943,6 +9940,26 @@ fn is_retail_course_value(course: u8) -> bool {
     matches!(course, 0x00..=0x0b | 0x0d..=0x10 | 0x12..=0x14 | 0x7f)
 }
 
+/// Validates the timer which is live for the requested retail room family.
+///
+/// Versus and chat use the shot timer, while tournament-shaped rooms use the whole-game
+/// timer. Both wire fields remain bounded when present; retaining the former requirement for
+/// unknown room types avoids assigning semantics that the profile does not define.
+fn retail_room_create_has_valid_timers(request: &RetailRoomCreate) -> bool {
+    const MAX_RETAIL_ROOM_TIMER_MS: u32 = 3_600_000;
+    let timer_is_bounded = |timer_ms: u32| timer_ms <= MAX_RETAIL_ROOM_TIMER_MS;
+    if !timer_is_bounded(request.shot_timer_ms) || !timer_is_bounded(request.game_timer_ms) {
+        return false;
+    }
+    match RetailRoomType::from_wire(request.room_type) {
+        Some(RetailRoomType::Versus | RetailRoomType::Chat) => request.shot_timer_ms != 0,
+        Some(RetailRoomType::Tournament | RetailRoomType::Battle | RetailRoomType::Practice) => {
+            request.game_timer_ms != 0
+        }
+        None => request.shot_timer_ms != 0 && request.game_timer_ms != 0,
+    }
+}
+
 fn retail_room_wire_modes(semantic_mode: u8) -> (u8, u8) {
     if semantic_mode == RetailRoomType::Practice as u8 {
         (
@@ -10246,6 +10263,62 @@ mod tests {
     };
 
     use super::*;
+
+    /// Decodes the documented `0x0008` layout so timer validation covers the client wire shape,
+    /// rather than a hand-built request.
+    fn decoded_retail_room_create(
+        room_type: RetailRoomType,
+        shot_timer_ms: u32,
+        game_timer_ms: u32,
+    ) -> RetailRoomCreate {
+        let mut writer = PacketWriter::default();
+        writer.u8(0);
+        writer.u32_le(shot_timer_ms);
+        writer.u32_le(game_timer_ms);
+        writer.u8(4);
+        writer.u8(room_type as u8);
+        writer.u8(3);
+        writer.u8(1);
+        writer.bytes(&[0; 5]);
+        writer.pstring(b"Retail Stroke", 64).expect("name");
+        writer.pstring(b"", 64).expect("password");
+        decode_packet_payload::<RetailRoomCreate>(
+            &writer.into_inner(),
+            &CompatibilityProfile::US_852,
+            ServiceKind::Game,
+        )
+        .expect("documented retail room-create layout")
+    }
+
+    #[test]
+    fn retail_room_create_accepts_reference_stroke_without_game_timer() {
+        // `US852_TOURNAMENT_MODE.md` §1.3, citing PacketDoc `client/0008.ksy:28-33`,
+        // identifies shot_timer_ms as the live timer for versus. These are the observed
+        // US852 UI values for a three-hole Stroke room with the 120-second selection.
+        let request = decoded_retail_room_create(RetailRoomType::Versus, 120_000, 0);
+
+        assert!(retail_room_create_has_valid_timers(&request));
+    }
+
+    #[test]
+    fn retail_room_create_rejects_zero_or_out_of_range_live_shot_timer() {
+        for shot_timer_ms in [0, 3_600_001] {
+            let request = decoded_retail_room_create(RetailRoomType::Versus, shot_timer_ms, 0);
+            assert!(
+                !retail_room_create_has_valid_timers(&request),
+                "invalid live shot timer {shot_timer_ms} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn retail_room_create_preserves_tournament_game_timer_requirement() {
+        let valid = decoded_retail_room_create(RetailRoomType::Tournament, 0, 900_000);
+        assert!(retail_room_create_has_valid_timers(&valid));
+
+        let missing_game_timer = decoded_retail_room_create(RetailRoomType::Tournament, 120_000, 0);
+        assert!(!retail_room_create_has_valid_timers(&missing_game_timer));
+    }
 
     #[test]
     fn gm_oid_resolves_authoritative_live_connection_and_cancels_only_that_token() {
