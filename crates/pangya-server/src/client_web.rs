@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use pangya_patch::ReleaseManifest;
 use pangya_updater::{
     EntrySelection, Theme, UpdateListRegion, build_from_directory, encode_translation_catalog,
     extra_contents_xml,
@@ -40,6 +41,11 @@ pub const MAX_THEME_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum bytes read for the translation catalog.
 pub const MAX_TRANSLATION_BYTES: u64 = 4 * 1024 * 1024;
+/// Incremental payloads are changed IFF tables, not archives; cap both one member and release.
+const MAX_INCREMENTAL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INCREMENTAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_INCREMENTAL_MANIFEST_BYTES: u64 = 1024 * 1024;
+const INCREMENTAL_SIGNATURE_BYTES: u64 = 64;
 
 /// Validated client web-service policy.
 #[derive(Clone, Debug)]
@@ -60,6 +66,8 @@ pub struct ClientWebSettings {
     pub translation_catalog: Option<std::path::PathBuf>,
     /// Optional directory holding the theme images.
     pub theme_directory: Option<std::path::PathBuf>,
+    /// Directory produced by pangya-patch-bundle; only metadata/signature/member payloads.
+    pub incremental_release: Option<std::path::PathBuf>,
 }
 
 /// Failures while preparing the client web content.
@@ -80,6 +88,9 @@ pub enum ClientWebError {
     /// The translation catalog could not be read.
     #[error("the configured translation catalog could not be read")]
     TranslationCatalog,
+    /// Incremental release directory is malformed or contains unavailable payloads.
+    #[error("the configured incremental release could not be read")]
+    IncrementalRelease,
 }
 
 /// Everything the routes serve, prepared once.
@@ -100,6 +111,14 @@ struct Prepared {
     extra_contents: String,
     theme_document: String,
     theme_directory: Option<Dir>,
+    incremental: Option<IncrementalRelease>,
+}
+
+struct IncrementalRelease {
+    metadata: ReleaseManifest,
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
+    payloads: HashMap<String, Vec<u8>>,
 }
 
 /// One archive as the launcher sees it.
@@ -164,6 +183,71 @@ fn read_bounded(directory: &Dir, name: &str, limit: u64) -> Option<Vec<u8>> {
 /// lobby wallpapers, and `background_*`/`loading_background` loading wallpapers. Deriving the
 /// theme from the directory rather than a config list means an operator points at the folder the
 /// client already has and gets the same content the retail theme document named.
+fn load_incremental(
+    path: Option<&std::path::Path>,
+) -> Result<Option<IncrementalRelease>, ClientWebError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let manifest_path = path.join("release-manifest.json");
+    if std::fs::metadata(&manifest_path)
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        .len()
+        > MAX_INCREMENTAL_MANIFEST_BYTES
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let manifest = std::fs::read(&manifest_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+    let parsed: ReleaseManifest =
+        serde_json::from_slice(&manifest).map_err(|_| ClientWebError::IncrementalRelease)?;
+    // Re-serialize through the canonical validator before serving anything.
+    if parsed
+        .canonical_json()
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        != manifest
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let signature_path = path.join("release-manifest.json.sig");
+    if std::fs::metadata(&signature_path)
+        .map_err(|_| ClientWebError::IncrementalRelease)?
+        .len()
+        != INCREMENTAL_SIGNATURE_BYTES
+    {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let signature =
+        std::fs::read(signature_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+    if signature.len() != INCREMENTAL_SIGNATURE_BYTES as usize {
+        return Err(ClientWebError::IncrementalRelease);
+    }
+    let mut payloads = HashMap::new();
+    let mut total = 0_u64;
+    for member in parsed.members.clone() {
+        if member.new_length > MAX_INCREMENTAL_MEMBER_BYTES {
+            return Err(ClientWebError::IncrementalRelease);
+        }
+        total = total
+            .checked_add(member.new_length)
+            .filter(|n| *n <= MAX_INCREMENTAL_TOTAL_BYTES)
+            .ok_or(ClientWebError::IncrementalRelease)?;
+        let payload_path = path.join("payload").join(&member.name);
+        let metadata =
+            std::fs::metadata(&payload_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+        if !metadata.is_file() || metadata.len() != member.new_length {
+            return Err(ClientWebError::IncrementalRelease);
+        }
+        let bytes = std::fs::read(payload_path).map_err(|_| ClientWebError::IncrementalRelease)?;
+        payloads.insert(member.name, bytes);
+    }
+    Ok(Some(IncrementalRelease {
+        metadata: parsed,
+        manifest,
+        signature,
+        payloads,
+    }))
+}
+
 fn classify_theme(names: &[String]) -> Theme {
     let mut theme = Theme::default();
     for name in names {
@@ -193,14 +277,39 @@ impl ClientWebState {
         let client_directory =
             Dir::open_ambient_dir(&settings.client_directory, ambient_authority())
                 .map_err(|_| ClientWebError::ClientDirectory)?;
-        let update_list = build_from_directory(
+        let incremental = load_incremental(settings.incremental_release.as_deref())?;
+        let mut update_list = build_from_directory(
             &client_directory,
             settings.entries,
             &settings.patch_version,
             settings.patch_number,
         )?;
+        if let Some(release) = &incremental {
+            let target = &release.metadata.target_pak;
+            let entry = update_list
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name.eq_ignore_ascii_case(target))
+                .ok_or(ClientWebError::IncrementalRelease)?;
+            if entry.size != release.metadata.base_pak.size
+                || entry.checksum != release.metadata.base_pak.pangya_crc
+                || entry.sha256 != release.metadata.base_pak.sha256
+            {
+                return Err(ClientWebError::IncrementalRelease);
+            }
+            entry.size = release.metadata.result_pak.size;
+            entry.checksum = release.metadata.result_pak.pangya_crc;
+            entry.sha256 = release.metadata.result_pak.sha256.clone();
+        }
         let mut patch_files = HashMap::with_capacity(update_list.entries.len());
         for entry in &update_list.entries {
+            if incremental.as_ref().is_some_and(|release| {
+                entry
+                    .name
+                    .eq_ignore_ascii_case(&release.metadata.target_pak)
+            }) {
+                continue;
+            }
             let file = client_directory
                 .open(&entry.name)
                 .map_err(|_| ClientWebError::ClientDirectory)?;
@@ -232,6 +341,11 @@ impl ClientWebState {
             .collect();
         let stat_snapshot = launcher_paks
             .iter()
+            .filter(|pak| {
+                !incremental.as_ref().is_some_and(|release| {
+                    pak.name.eq_ignore_ascii_case(&release.metadata.target_pak)
+                })
+            })
             .map(|pak| {
                 let observed = client_directory.metadata(&pak.name).ok().map(|meta| {
                     (
@@ -317,6 +431,7 @@ impl ClientWebState {
             extra_contents,
             theme_document,
             theme_directory,
+            incremental,
         })))
     }
 
@@ -341,7 +456,16 @@ pub fn client_web_router(state: ClientWebState) -> Router {
     // asks for. Nothing retail requests this; it exists for the launcher.
     let mut router = Router::new()
         .route("/Translation/Read.aspx", get(translation))
-        .route("/launcher/v1/manifest", get(launcher_manifest));
+        .route("/launcher/v1/manifest", get(launcher_manifest))
+        .route(
+            "/launcher/v2/release-manifest.json",
+            get(incremental_manifest),
+        )
+        .route(
+            "/launcher/v2/release-manifest.json.sig",
+            get(incremental_signature),
+        )
+        .route("/launcher/v2/payload/{name}", get(incremental_payload));
     for prefix in PREFIXES {
         router = router
             .route(&format!("{prefix}/updatelist"), get(updatelist))
@@ -404,6 +528,51 @@ async fn launcher_manifest(State(state): State<ClientWebState>) -> Response {
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+async fn incremental_manifest(State(state): State<ClientWebState>) -> Response {
+    state.0.incremental.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |release| {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                release.manifest.clone(),
+            )
+                .into_response()
+        },
+    )
+}
+async fn incremental_signature(State(state): State<ClientWebState>) -> Response {
+    state.0.incremental.as_ref().map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |release| {
+            (
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                release.signature.clone(),
+            )
+                .into_response()
+        },
+    )
+}
+async fn incremental_payload(
+    State(state): State<ClientWebState>,
+    Path(name): Path<String>,
+) -> Response {
+    state
+        .0
+        .incremental
+        .as_ref()
+        .and_then(|release| release.payloads.get(&name))
+        .map_or_else(
+            || StatusCode::NOT_FOUND.into_response(),
+            |payload| {
+                (
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    payload.clone(),
+                )
+                    .into_response()
+            },
+        )
 }
 
 async fn client_web_not_found(uri: Uri) -> StatusCode {
@@ -574,8 +743,137 @@ mod router_tests {
             extra_contents: String::new(),
             theme_document: String::new(),
             theme_directory: None,
+            incremental: None,
         }));
         let _router = client_web_router(state);
+    }
+
+    #[tokio::test]
+    async fn prepare_detaches_only_signed_result_target_and_preserves_legacy() {
+        let root = std::env::temp_dir().join(format!("pangya-detached-{}", std::process::id()));
+        let release = root.join("release");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&release).expect("release");
+        std::fs::write(root.join("projectg851gb.pak"), b"physical-base").expect("pak");
+        let settings = ClientWebSettings {
+            advertise: "127.0.0.1:1".parse().expect("address"),
+            region: UpdateListRegion::Us,
+            client_directory: root.clone(),
+            entries: EntrySelection::PakSeriesOnly,
+            patch_version: "test".into(),
+            patch_number: 851,
+            translation_catalog: None,
+            theme_directory: None,
+            incremental_release: None,
+        };
+        let legacy = ClientWebState::prepare(&settings).expect("legacy");
+        let base = legacy
+            .0
+            .launcher_paks
+            .iter()
+            .find(|pak| pak.name == "projectg851gb.pak")
+            .expect("base")
+            .clone();
+        assert!(legacy.0.patch_files.contains_key("projectg851gb.pak"));
+        let value = serde_json::json!({"schema_version":1,"tool_version":"test","release_id":1,"key_id":"test","target_pak":"projectg851gb.pak","base_pak":{"size":base.size,"pangya_crc":base.pangya_crc,"sha256":base.sha256},"current_iff_sha256":"0000000000000000000000000000000000000000000000000000000000000000","current_iff_size":0,"members":[],"result_iff_sha256":"0000000000000000000000000000000000000000000000000000000000000000","result_iff_size":0,"result_pak":{"size":2,"pangya_crc":7,"sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}});
+        let manifest: ReleaseManifest = serde_json::from_value(value).expect("manifest");
+        std::fs::write(
+            release.join("release-manifest.json"),
+            manifest.canonical_json().expect("canonical"),
+        )
+        .expect("manifest file");
+        std::fs::write(release.join("release-manifest.json.sig"), [0u8; 64]).expect("signature");
+        let mut detached_settings = settings.clone();
+        detached_settings.incremental_release = Some(release);
+        let detached = ClientWebState::prepare(&detached_settings).expect("detached");
+        let target = detached
+            .0
+            .launcher_paks
+            .iter()
+            .find(|pak| pak.name == "projectg851gb.pak")
+            .expect("target");
+        assert_eq!(
+            (target.size, target.pangya_crc, &target.sha256),
+            (2, 7, &"f".repeat(64))
+        );
+        assert!(!detached.0.patch_files.contains_key("projectg851gb.pak"));
+        assert_eq!(
+            patch_file(State(detached), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn incremental_routes_serve_only_declared_metadata_and_payloads() {
+        let manifest = br#"{\"schema_version\":1,\"tool_version\":\"test\",\"release_id\":1,\"key_id\":\"test\",\"target_pak\":\"projectg851gb.pak\",\"base_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"current_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"current_iff_size\":1,\"members\":[],\"result_iff_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"result_iff_size\":1,\"result_pak\":{\"size\":1,\"pangya_crc\":0,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}"#.to_vec();
+        let state = ClientWebState(Arc::new(Prepared {
+            launcher_paks: Vec::new(),
+            stat_snapshot: Vec::new(),
+            patch_version: "test".into(),
+            patch_number: 851,
+            client_directory_path: std::path::PathBuf::new(),
+            update_list: Vec::new(),
+            patch_files: HashMap::new(),
+            translation: String::new(),
+            extra_contents: String::new(),
+            theme_document: String::new(),
+            theme_directory: None,
+            incremental: Some(IncrementalRelease {
+                metadata: serde_json::from_slice(
+                    &manifest
+                        .iter()
+                        .copied()
+                        .filter(|byte| *byte != b'\\')
+                        .collect::<Vec<_>>(),
+                )
+                .expect("metadata"),
+                manifest: manifest.clone(),
+                signature: vec![7; 64],
+                payloads: HashMap::from([("one.iff".into(), b"changed".to_vec())]),
+            }),
+        }));
+        assert_eq!(
+            incremental_manifest(State(state.clone())).await.status(),
+            StatusCode::OK
+        );
+        let signature = incremental_signature(State(state.clone())).await;
+        assert_eq!(signature.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(signature.into_body(), 128)
+                .await
+                .expect("body")
+                .len(),
+            64
+        );
+        assert_eq!(
+            incremental_payload(State(state.clone()), Path("one.iff".into()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            incremental_payload(State(state.clone()), Path("../projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            incremental_payload(State(state.clone()), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "final PAK is never a v2 payload"
+        );
+        assert_eq!(
+            patch_file(State(state), Path("projectg851gb.pak".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "detached target is not served by v1"
+        );
     }
 
     #[tokio::test]
@@ -603,6 +901,7 @@ mod router_tests {
             extra_contents: String::new(),
             theme_document: String::new(),
             theme_directory: None,
+            incremental: None,
         }));
 
         let response = patch_file(

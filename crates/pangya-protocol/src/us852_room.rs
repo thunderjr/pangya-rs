@@ -85,7 +85,10 @@ pub enum RetailHoleProgression {
 /// # Provenance
 ///
 /// The tagged body shapes and valid value sets come from
-/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Types 11 through 13
+/// `pangbox--packetdoc` `gameservice/client/000a.ksy` (ISC). Tag 9 is the one-byte
+/// `RoomInfo::INFO_CHANGE::STATE_FLAG` consumed by SuperSS-Dev
+/// `Server Lib/Game Server/GAME/room.cpp:1450-1535`; its `RoomInfoEx::state_afk` target is a
+/// one-bit field in `Server Lib/Game Server/TYPE/pangya_game_st.h:2472`. Types 11 through 13
 /// are additionally documented by `alter-pangya`
 /// `RoomSettingsUpdatePacketHandler.kt`; their bodies are retained as protocol
 /// facts and explicitly refused by the game service until matching authoritative aggregates
@@ -110,6 +113,11 @@ pub enum RetailRoomSettingChange {
     PlayerCount(u8),
     /// Change the whole-game timer, in minutes.
     GameTimerMinutes(u8),
+    /// Set the room master's AFK state.
+    ///
+    /// The protocol preserves this retail observation, but the game has no authoritative AFK
+    /// aggregate or response wire shape to apply it to.
+    StateAfk(bool),
     /// Change the repeated-hole selector.
     RepeatHole(u8),
     /// Change the fixed repeated-hole selector.
@@ -202,6 +210,11 @@ impl DecodePacket for RetailRoomSettingsUpdate {
                     }
                     RetailRoomSettingChange::GameTimerMinutes(minutes)
                 }
+                9 => match reader.u8()? {
+                    0 => RetailRoomSettingChange::StateAfk(false),
+                    1 => RetailRoomSettingChange::StateAfk(true),
+                    _ => return Err(reader.invalid("invalid room AFK flag")),
+                },
                 11 => RetailRoomSettingChange::RepeatHole(reader.u8()?),
                 12 => RetailRoomSettingChange::FixedRepeatHole(reader.i32_le()?),
                 13 => RetailRoomSettingChange::Artifact(reader.u32_le()?),
@@ -2735,6 +2748,45 @@ mod tests {
                 &payload,
                 &profile(),
                 ServiceKind::Game,
+            )
+            .is_err()
+        );
+    }
+
+    /// SuperSS-Dev `room.cpp:1450-1535` reads STATE_FLAG as a byte and stores it in the
+    /// one-bit `RoomInfoEx::state_afk` field (`pangya_game_st.h:2472`).
+    #[test]
+    fn room_settings_update_decodes_state_afk_as_boolean() {
+        let payload = [0xff, 0xff, 1, 9, 1];
+        let decoded = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &payload,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("state AFK setting");
+        assert_eq!(
+            decoded.changes,
+            vec![RetailRoomSettingChange::StateAfk(true)]
+        );
+
+        let disabled = [0xff, 0xff, 1, 9, 0];
+        let decoded = decode_packet_payload::<RetailRoomSettingsUpdate>(
+            &disabled,
+            &profile(),
+            ServiceKind::Game,
+        )
+        .expect("cleared state AFK setting");
+        assert_eq!(
+            decoded.changes,
+            vec![RetailRoomSettingChange::StateAfk(false)]
+        );
+
+        let invalid = [0xff, 0xff, 1, 9, 2];
+        assert!(
+            decode_packet_payload::<RetailRoomSettingsUpdate>(
+                &invalid,
+                &profile(),
+                ServiceKind::Game
             )
             .is_err()
         );

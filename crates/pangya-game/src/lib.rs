@@ -785,6 +785,60 @@ struct RetailHoleAtmosphere {
     wind: pangya_domain::WindConditions,
 }
 
+/// Connection-local order state for a retail stroke's opaque wire phases.
+///
+/// PacketDoc models `0x0012` as the committed shot (`gameservice/client/0012.ksy:21-64`),
+/// describes `0x001c` after the undocumented `0x001b` sync
+/// (`gameservice/client/001c.ksy:10-40`), and documents `0x0031` as the cumulative hole
+/// statistics submission (`gameservice/client/0031.ksy:10-27`). A real U.S. 851 trace at
+/// `/private/tmp/issue45-server-4f64913-restart.log` reverses the latter two barriers: accepted
+/// `0x0012` at `2026-08-11T13:23:49.906575`, `0x001b` at `13:23:50.206577`, `0x0031` at
+/// `13:23:54.356862`, then `0x001c` at `13:23:59.328564`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetailStrokeSequence {
+    awaiting_result: bool,
+    early_hole_finish: bool,
+}
+
+/// Whether the stroke actor admitted a client `0x0012` as this connection's next action.
+///
+/// A duplicate is a successful idempotence response, not a new action: it must leave any
+/// earlier pending `0x0031` claim intact until the original action's result arrives.
+fn retail_action_is_accepted(routed: &Result<LobbyStrokeRouteResult, StrokeMatchError>) -> bool {
+    matches!(
+        routed,
+        Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Accepted))
+    )
+}
+
+impl RetailStrokeSequence {
+    fn accepted_action(&mut self) {
+        self.awaiting_result = true;
+        self.early_hole_finish = false;
+    }
+
+    fn remember_early_hole_finish(&mut self) -> bool {
+        if !self.awaiting_result {
+            return false;
+        }
+        self.early_hole_finish = true;
+        true
+    }
+
+    fn accepted_result(&mut self) -> bool {
+        if !self.awaiting_result {
+            self.clear();
+            return false;
+        }
+        self.awaiting_result = false;
+        std::mem::take(&mut self.early_hole_finish)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConnectionStrokeContext {
     match_id: MatchId,
@@ -1810,6 +1864,7 @@ where
         let mut social_replays = RetailWireReplayWindow::new();
         // Retail shots are opaque client payloads, so the server counts strokes itself.
         let mut retail_strokes = 0_u32;
+        let mut retail_stroke_sequence = RetailStrokeSequence::default();
         let mut unknown_strikes = 0_u32;
         let (outbound, mut room_events) =
             RoomOutbound::ordered(self.config.limits.outbound_room_event_capacity);
@@ -1906,18 +1961,32 @@ where
                     match handled {
                         Ok(RoomEventEffect::Remain) => {}
                         Ok(RoomEventEffect::EnterChannel) => {
+                            retail_stroke_sequence.clear();
                             state = GameState::InChannel;
                             room_id = None;
                             self.social.set_room(connection_id, None);
                         }
                         Ok(RoomEventEffect::EnterRoom) => {
+                            retail_stroke_sequence.clear();
                             state = GameState::InRoom;
                             match_context = ConnectionMatchContext::default();
                         }
-                        Ok(RoomEventEffect::EnterLoading) => state = GameState::InMatchLoading,
-                        Ok(RoomEventEffect::EnterMatch) => state = GameState::InMatch,
-                        Ok(RoomEventEffect::EnterStrokeLoading) => state = GameState::InStrokeLoading,
-                        Ok(RoomEventEffect::EnterStrokeMatch) => state = GameState::InStrokeMatch,
+                        Ok(RoomEventEffect::EnterLoading) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InMatchLoading;
+                        }
+                        Ok(RoomEventEffect::EnterMatch) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InMatch;
+                        }
+                        Ok(RoomEventEffect::EnterStrokeLoading) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InStrokeLoading;
+                        }
+                        Ok(RoomEventEffect::EnterStrokeMatch) => {
+                            retail_stroke_sequence.clear();
+                            state = GameState::InStrokeMatch;
+                        }
                         Err(error) => break Err(error),
                     }
                 }
@@ -2252,6 +2321,20 @@ where
                                 }
                             } else if self.config.retail_bootstrap
                                 && matches!(frame.opcode, RETAIL_C2S_EQUIPMENT_LOBBY | RETAIL_C2S_EQUIPMENT_ROOM)
+                                // In-match 0x000b/0x000c are loading-equipment synchronization,
+                                // explicitly accepted without a reply by the retail match
+                                // allowlist. Let them reach that handler rather than rejecting a
+                                // valid five-byte room body because the actor has entered its
+                                // loading state. PacketDoc `gameservice/client/000c.ksy:24-80`
+                                // and the real-client sequence in
+                                // `docs/evidence/REAL_CLIENT_PRACTICE_2026-08-09.md:32-42`.
+                                && !matches!(
+                                    state,
+                                    GameState::InMatchLoading
+                                        | GameState::InMatch
+                                        | GameState::InStrokeLoading
+                                        | GameState::InStrokeMatch
+                                )
                                 // The existing retail practice start also uses 0x000c with the
                                 // reference-defined type-7 four-word body; preserve that full
                                 // lifecycle path rather than stealing its start frame.
@@ -2633,6 +2716,7 @@ where
                                         idle_deadline,
                                         &mut shots,
                                         &mut retail_strokes,
+                                        &mut retail_stroke_sequence,
                                         &mut match_context,
                                         frame.opcode,
                                         &frame.payload,
@@ -6451,6 +6535,7 @@ where
         idle_deadline: Instant,
         shots: &mut LocalRateWindow,
         strokes: &mut u32,
+        retail_sequence: &mut RetailStrokeSequence,
         match_context: &mut ConnectionMatchContext,
         opcode: u16,
         payload: &[u8],
@@ -6465,6 +6550,7 @@ where
                 idle_deadline,
                 shots,
                 strokes,
+                retail_sequence,
                 opcode,
                 payload,
             )
@@ -6743,6 +6829,7 @@ where
         idle_deadline: Instant,
         shots: &mut LocalRateWindow,
         strokes: &mut u32,
+        retail_sequence: &mut RetailStrokeSequence,
         opcode: u16,
         payload: &[u8],
     ) -> Result<Option<GameState>, GameRuntimeError> {
@@ -6856,6 +6943,8 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_COMMIT) => {
                 if !self.admit_retail_stroke_shot(shots) {
+                    // A rate-limited/rejected replay must not erase the original accepted
+                    // action's pending early-hole-finish claim.
                     return Ok(Some(state));
                 }
                 // The payload is the client's own shot. It is relayed unchanged and counted as
@@ -6863,22 +6952,21 @@ where
                 let sequence = strokes.saturating_add(1);
                 let action = StrokeShotAction::new(sequence, 0, 1.0, 0.0, 0.0, 0.0)
                     .map_err(|_| GameRuntimeError::Protocol)?;
-                if self
+                let routed = self
                     .lobby
                     .route_stroke(
                         identity.connection_id,
                         LobbyStrokeCommand::ShotAction(action),
                     )
-                    .await
-                    .is_err()
-                {
-                    return Ok(Some(state));
+                    .await;
+                if retail_action_is_accepted(&routed) {
+                    retail_sequence.accepted_action();
+                    self.relay_retail_match_frame(
+                        identity.connection_id,
+                        RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
+                    )
+                    .await;
                 }
-                self.relay_retail_match_frame(
-                    identity.connection_id,
-                    RetailMatchRelay::Shot(retail_shot_announce_payload(payload)?),
-                )
-                .await;
                 Ok(Some(state))
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_SYNC) => {
@@ -6894,6 +6982,7 @@ where
             }
             (GameState::InStrokeMatch, RETAIL_C2S_SHOT_END) => {
                 if !self.admit_retail_stroke_shot(shots) {
+                    retail_sequence.clear();
                     return Ok(Some(state));
                 }
                 // Both clients send this barrier after a shot; only the participant who owns
@@ -6913,42 +7002,66 @@ where
                 {
                     *strokes = sequence;
                     self.observer.stroke_shot(GameShotObservation::Accepted);
+                    if retail_sequence.accepted_result() {
+                        self.complete_retail_stroke_hole(framed, identity.connection_id, strokes)
+                            .await?;
+                    }
+                } else {
+                    // A declined/duplicate result cannot complete an earlier client claim.
+                    retail_sequence.clear();
                 }
                 Ok(Some(state))
             }
             (GameState::InStrokeMatch, RETAIL_C2S_HOLE_FINISH) => {
-                // The holing shot was already counted through the ordinary action/result pair,
-                // so this completes the caller's hole without charging another stroke. The
-                // finish frame precedes the next 0x0053/turn sequence for a multi-hole card.
-                let routed = self
-                    .lobby
-                    .route_stroke(identity.connection_id, LobbyStrokeCommand::HoleOut)
-                    .await;
-                match routed {
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Waiting)) => {
-                        // Each connection's counter mirrors that participant's per-hole sequence;
-                        // finishing this participant's hole resets it even while another
-                        // participant may still be finishing the current card entry.
-                        *strokes = 0;
-                        self.send(framed, &RetailFinishHole).await?;
-                    }
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Settlement(_))) => {
-                        // The terminal room event sends one 0x0065 and one 0x0066 to every
-                        // captured roster member. Sending 0x0065 here as well duplicates the
-                        // final completion for whichever participant triggered settlement.
-                        *strokes = 0;
-                    }
-                    Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Duplicate))
-                    | Err(_) => {
-                        // Replayed 0x0031 is idempotent and has no wire reply. A transport race
-                        // after settlement is handled by the retained terminal room event.
-                    }
-                    Ok(_) => return Err(GameRuntimeError::Protocol),
+                // U.S. 851 may send its cumulative `0x0031` during ball flight, before the
+                // ordinary `0x001c` result barrier. Retain one claim locally until that already
+                // accepted action is actually committed; replayed early claims remain one bit.
+                if retail_sequence.remember_early_hole_finish() {
+                    return Ok(Some(state));
                 }
+                self.complete_retail_stroke_hole(framed, identity.connection_id, strokes)
+                    .await?;
                 Ok(Some(state))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Completes a hole after its ordinary accepted result, regardless of which side of that
+    /// result barrier carried the opaque retail `0x0031` body.
+    async fn complete_retail_stroke_hole(
+        &self,
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        connection_id: PlayerConnectionId,
+        strokes: &mut u32,
+    ) -> Result<(), GameRuntimeError> {
+        // The holing shot was already counted through the ordinary action/result pair, so this
+        // completes the caller's hole without charging another stroke. The finish frame precedes
+        // the next 0x0053/turn sequence for a multi-hole card.
+        let routed = self
+            .lobby
+            .route_stroke(connection_id, LobbyStrokeCommand::HoleOut)
+            .await;
+        match routed {
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Waiting)) => {
+                // Each connection's counter mirrors that participant's per-hole sequence;
+                // finishing this participant resets it while another may still finish this card
+                // entry.
+                *strokes = 0;
+                self.send(framed, &RetailFinishHole).await?;
+            }
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Settlement(_))) => {
+                // The terminal room event sends one 0x0065 and one 0x0066 to every captured
+                // roster member. Sending 0x0065 here would duplicate the final completion.
+                *strokes = 0;
+            }
+            Ok(LobbyStrokeRouteResult::HoleOut(StrokeHoleOutOutcome::Duplicate)) | Err(_) => {
+                // Replayed `0x0031` is idempotent and has no wire reply. A transport race after
+                // settlement is handled by the retained terminal room event.
+            }
+            Ok(_) => return Err(GameRuntimeError::Protocol),
+        }
+        Ok(())
     }
 
     /// Applies the shared shot rate window, reporting a refusal the same way the solo path does.
@@ -7020,12 +7133,13 @@ where
             wind,
         )
         .map_err(|_| GameRuntimeError::InvalidConfig)?;
-        // The room profile is authoritative for both the advertised and enforced deadlines.
-        // Process-wide values remain the loading fallback and stroke-count safety cap; using
-        // those turn/game defaults here made a 0x000a timer edit cosmetic.
+        // The live room timer is authoritative. Versus and chat carry a whole-game timer on
+        // the wire, but PacketDoc identifies it as unused; use the checked stroke configuration
+        // for that actor deadline instead of turning the retained zero wire value into an invalid
+        // duration. Room announcements continue to use the untouched profile value.
         let profile = snapshot.summary().profile();
         let shot_timeout = Duration::from_millis(u64::from(profile.shot_timer_ms));
-        let game_timeout = Duration::from_millis(u64::from(profile.game_timer_ms));
+        let game_timeout = retail_stroke_game_timeout(profile, stroke.game_timeout);
         let plan = StrokeStartPlan::new(
             begin,
             [first.connection_id(), second.connection_id()],
@@ -8413,10 +8527,7 @@ where
                 // overwrite the requested course or hole card.
                 if !matches!(request.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(request.course)
-                    || request.shot_timer_ms == 0
-                    || request.game_timer_ms == 0
-                    || request.shot_timer_ms > 3_600_000
-                    || request.game_timer_ms > 3_600_000
+                    || !retail_room_create_has_valid_timers(&request)
                 {
                     return self.reject_retail_join(framed, state).await;
                 }
@@ -8590,6 +8701,14 @@ where
                         RetailRoomSettingChange::NaturalWind(enabled) => {
                             profile_update.natural_wind = enabled
                         }
+                        RetailRoomSettingChange::StateAfk(_is_afk) => {
+                            // SuperSS-Dev room.cpp:1450-1535 stores STATE_FLAG in its room
+                            // aggregate, but this service has no corresponding aggregate field
+                            // or authoritative response shape. Observe and ignore it rather than
+                            // disconnecting the retail client or claiming the state was applied.
+                            self.observer.unknown(GameUnknownObservation::Ignored);
+                            return Ok(state);
+                        }
                         RetailRoomSettingChange::Artifact(_artifact_id) => {
                             // PacketDoc carries the catalog id, but the checked gameplay
                             // references provide no authoritative effect or reward semantics.
@@ -8610,8 +8729,11 @@ where
                 }
                 if !matches!(profile_update.hole_count, 1 | 3 | 6 | 9 | 18)
                     || !is_retail_course_value(profile_update.course)
-                    || profile_update.shot_timer_ms == 0
-                    || profile_update.game_timer_ms == 0
+                    || !retail_room_has_valid_timers(
+                        profile_update.mode,
+                        profile_update.shot_timer_ms,
+                        profile_update.game_timer_ms,
+                    )
                 {
                     return Err(GameRuntimeError::Protocol);
                 }
@@ -9929,6 +10051,43 @@ fn is_retail_course_value(course: u8) -> bool {
     matches!(course, 0x00..=0x0b | 0x0d..=0x10 | 0x12..=0x14 | 0x7f)
 }
 
+/// Validates the timer which is live for the requested retail room family.
+///
+/// Versus and chat use the shot timer, while tournament-shaped rooms use the whole-game
+/// timer. Both wire fields remain bounded when present; retaining the former requirement for
+/// unknown room types avoids assigning semantics that the profile does not define.
+fn retail_room_create_has_valid_timers(request: &RetailRoomCreate) -> bool {
+    retail_room_has_valid_timers(
+        request.room_type,
+        request.shot_timer_ms,
+        request.game_timer_ms,
+    )
+}
+
+fn retail_room_has_valid_timers(room_type: u8, shot_timer_ms: u32, game_timer_ms: u32) -> bool {
+    const MAX_RETAIL_ROOM_TIMER_MS: u32 = 3_600_000;
+    let timer_is_bounded = |timer_ms: u32| timer_ms <= MAX_RETAIL_ROOM_TIMER_MS;
+    if !timer_is_bounded(shot_timer_ms) || !timer_is_bounded(game_timer_ms) {
+        return false;
+    }
+    match RetailRoomType::from_wire(room_type) {
+        Some(RetailRoomType::Versus | RetailRoomType::Chat) => shot_timer_ms != 0,
+        Some(RetailRoomType::Tournament | RetailRoomType::Battle | RetailRoomType::Practice) => {
+            game_timer_ms != 0
+        }
+        None => shot_timer_ms != 0 && game_timer_ms != 0,
+    }
+}
+
+/// Selects the actor's whole-game deadline without changing the room's announced wire profile.
+fn retail_stroke_game_timeout(profile: RoomProfile, configured_game_timeout: Duration) -> Duration {
+    match RetailRoomType::from_wire(profile.mode) {
+        Some(RetailRoomType::Versus | RetailRoomType::Chat) => configured_game_timeout,
+        Some(RetailRoomType::Tournament | RetailRoomType::Battle | RetailRoomType::Practice)
+        | None => Duration::from_millis(u64::from(profile.game_timer_ms)),
+    }
+}
+
 fn retail_room_wire_modes(semantic_mode: u8) -> (u8, u8) {
     if semantic_mode == RetailRoomType::Practice as u8 {
         (
@@ -10232,6 +10391,165 @@ mod tests {
     };
 
     use super::*;
+
+    /// Decodes the documented `0x0008` layout so timer validation covers the client wire shape,
+    /// rather than a hand-built request.
+    fn decoded_retail_room_create(
+        room_type: RetailRoomType,
+        shot_timer_ms: u32,
+        game_timer_ms: u32,
+    ) -> RetailRoomCreate {
+        let mut writer = PacketWriter::default();
+        writer.u8(0);
+        writer.u32_le(shot_timer_ms);
+        writer.u32_le(game_timer_ms);
+        writer.u8(4);
+        writer.u8(room_type as u8);
+        writer.u8(3);
+        writer.u8(1);
+        writer.bytes(&[0; 5]);
+        writer.pstring(b"Retail Stroke", 64).expect("name");
+        writer.pstring(b"", 64).expect("password");
+        decode_packet_payload::<RetailRoomCreate>(
+            &writer.into_inner(),
+            &CompatibilityProfile::US_852,
+            ServiceKind::Game,
+        )
+        .expect("documented retail room-create layout")
+    }
+
+    #[test]
+    fn retail_stroke_sequence_defers_one_early_hole_finish_until_accepted_result() {
+        let mut sequence = RetailStrokeSequence::default();
+        assert!(!sequence.remember_early_hole_finish());
+
+        sequence.accepted_action();
+        assert!(sequence.remember_early_hole_finish());
+        assert!(
+            sequence.remember_early_hole_finish(),
+            "a duplicate early 0031 remains one pending claim"
+        );
+        assert!(sequence.accepted_result());
+        assert_eq!(sequence, RetailStrokeSequence::default());
+        assert!(
+            !sequence.accepted_result(),
+            "a replayed result cannot complete the remembered claim twice"
+        );
+    }
+
+    #[test]
+    fn retail_stroke_sequence_duplicate_or_foreign_action_preserves_pending_early_finish() {
+        let accepted = Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Accepted));
+        let duplicate = Ok(LobbyStrokeRouteResult::Relay(RelayDisposition::Duplicate));
+        let foreign = Err(StrokeMatchError::InvalidTurn);
+        assert!(retail_action_is_accepted(&accepted));
+        assert!(!retail_action_is_accepted(&duplicate));
+        assert!(!retail_action_is_accepted(&foreign));
+
+        let mut sequence = RetailStrokeSequence::default();
+        sequence.accepted_action();
+        assert!(sequence.remember_early_hole_finish());
+        if retail_action_is_accepted(&duplicate) {
+            sequence.accepted_action();
+        }
+        if retail_action_is_accepted(&foreign) {
+            sequence.accepted_action();
+        }
+        assert!(
+            sequence.accepted_result(),
+            "duplicate/foreign 0012 cannot clear or replace the original early 0031"
+        );
+    }
+
+    #[test]
+    fn retail_stroke_sequence_leaves_post_result_hole_finish_for_normal_routing() {
+        let mut sequence = RetailStrokeSequence::default();
+        sequence.accepted_action();
+        assert!(
+            !sequence.accepted_result(),
+            "without early 0031, the normal post-result 0031 still routes HoleOut"
+        );
+        assert_eq!(sequence, RetailStrokeSequence::default());
+        sequence.accepted_action();
+        sequence.clear();
+        assert_eq!(sequence, RetailStrokeSequence::default());
+    }
+
+    #[test]
+    fn retail_room_create_accepts_reference_stroke_without_game_timer() {
+        // `US852_TOURNAMENT_MODE.md` §1.3, citing PacketDoc `client/0008.ksy:28-33`,
+        // identifies shot_timer_ms as the live timer for versus. These are the observed
+        // US852 UI values for a three-hole Stroke room with the 120-second selection.
+        let request = decoded_retail_room_create(RetailRoomType::Versus, 120_000, 0);
+
+        assert!(retail_room_create_has_valid_timers(&request));
+    }
+
+    #[test]
+    fn retail_room_create_rejects_zero_or_out_of_range_live_shot_timer() {
+        for shot_timer_ms in [0, 3_600_001] {
+            let request = decoded_retail_room_create(RetailRoomType::Versus, shot_timer_ms, 0);
+            assert!(
+                !retail_room_create_has_valid_timers(&request),
+                "invalid live shot timer {shot_timer_ms} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn retail_room_create_preserves_tournament_game_timer_requirement() {
+        let valid = decoded_retail_room_create(RetailRoomType::Tournament, 0, 900_000);
+        assert!(retail_room_create_has_valid_timers(&valid));
+
+        let missing_game_timer = decoded_retail_room_create(RetailRoomType::Tournament, 120_000, 0);
+        assert!(!retail_room_create_has_valid_timers(&missing_game_timer));
+    }
+
+    #[tokio::test]
+    async fn retail_stroke_plan_uses_configured_game_timeout_for_versus_zero_wire_timer() {
+        let profile = RoomProfile {
+            mode: RetailRoomType::Versus as u8,
+            course: 1,
+            hole_count: 3,
+            shot_timer_ms: 120_000,
+            game_timer_ms: 0,
+            ..RoomProfile::default()
+        };
+        assert!(retail_room_has_valid_timers(
+            profile.mode,
+            profile.shot_timer_ms,
+            profile.game_timer_ms,
+        ));
+        let service =
+            test_stroke_service(Arc::new(FakeRepository::default()), Duration::from_secs(1));
+        let stroke = service.config.stroke_two.unwrap_or_else(|| unreachable!());
+        let base = test_stroke_plan(&service, 1);
+        let game_timeout = retail_stroke_game_timeout(profile, stroke.game_timeout);
+        let plan = StrokeStartPlan::new(
+            base.begin().clone(),
+            *base.roster(),
+            base.loading_timeout(),
+            Duration::from_millis(u64::from(profile.shot_timer_ms)),
+            game_timeout,
+            base.max_strokes(),
+        )
+        .expect("real three-hole versus profile prepares with configured game fallback");
+
+        assert_eq!(profile.game_timer_ms, 0, "retained room-announcement value");
+        assert_eq!(plan.turn_timeout(), Duration::from_secs(120));
+        assert_eq!(plan.game_timeout(), stroke.game_timeout);
+
+        let tournament = RoomProfile {
+            mode: RetailRoomType::Tournament as u8,
+            game_timer_ms: 900_000,
+            ..profile
+        };
+        assert_eq!(
+            retail_stroke_game_timeout(tournament, stroke.game_timeout),
+            Duration::from_secs(900),
+            "Tournament retains its live whole-game timer"
+        );
+    }
 
     #[test]
     fn gm_oid_resolves_authoritative_live_connection_and_cancels_only_that_token() {

@@ -584,6 +584,7 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
                     patch_number: settings.patch_number,
                     translation_catalog: settings.translation_catalog.clone(),
                     theme_directory: settings.theme_directory.clone(),
+                    incremental_release: settings.incremental_release.clone(),
                 })?;
                 Ok::<_, client_web::ClientWebError>((settings.bind, state))
             })

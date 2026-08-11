@@ -8004,9 +8004,31 @@ async fn game_retail_rooms_create_join_and_leave_over_tcp(pool: PgPool) {
         "unsupported repeat-hole edit has no misleading acknowledgement"
     );
 
+    // US851 sends STATE_FLAG after the room has been idle. SuperSS-Dev reads its one-byte
+    // value into a one-bit AFK field, but pangya-rs intentionally has no AFK aggregate or wire
+    // response yet. The exact encrypted retail capture is therefore accepted as an ignored
+    // observation, and a following room request proves the TCP session remains usable.
+    send_packet(&mut host, host_key, 12, 0x000a, &[0xff, 0xff, 1, 9, 1]).await;
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(250))
+            .await
+            .is_empty(),
+        "ignored AFK state has no invented acknowledgement"
+    );
+    send_packet(&mut host, host_key, 13, 0x001c, &[0, 0]).await;
+    let after_afk = drain_frames(&mut host, host_key, Duration::from_millis(900)).await;
+    assert_eq!(
+        after_afk
+            .iter()
+            .filter(|(opcode, _)| *opcode == 0x0048)
+            .count(),
+        1,
+        "the exact STATE_FLAG frame does not disconnect the encrypted TCP session"
+    );
+
     // A truncated settings frame is malformed and closes the stream rather than being treated
     // as an empty edit or allowing a partial mutation.
-    send_packet(&mut host, host_key, 12, 0x000a, &[0xff]).await;
+    send_packet(&mut host, host_key, 14, 0x000a, &[0xff]).await;
     assert_closed(&mut host).await;
 
     drop(visitor);
@@ -8284,6 +8306,13 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         .expect("one-hole course");
     let owner = create_account(&pool, "PartyHost", 1, 0x1000_0000).await;
     let guest = create_account(&pool, "PartyGuest", 1, 0x1000_0000).await;
+    let wrong_state = create_account(&pool, "PartyChannel", 1, 0x1000_0000).await;
+    let owner_character: i64 =
+        sqlx::query_scalar("SELECT id FROM characters WHERE account_id = $1")
+            .bind(owner.account.id.get())
+            .fetch_one(&pool)
+            .await
+            .expect("owner character");
     sqlx::query("UPDATE profiles SET pang = 1000 WHERE account_id = $1")
         .bind(owner.account.id.get())
         .execute(&pool)
@@ -8368,6 +8397,27 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
 
     let traces = tracing_capture();
     let mut tokens = Vec::new();
+    let (mut wrong_state_stream, wrong_state_key) = join_retail(
+        &pool,
+        address,
+        wrong_state.account.id,
+        "PartyChannel",
+        &mut tokens,
+    )
+    .await;
+    // The PacketDoc 0x000c shape is valid only in a room. Preserve the InChannel rejection
+    // while allowing the same body to become loading-time match traffic below.
+    // `pangbox--packetdoc` `gameservice/client/000c.ksy:24-80`.
+    send_packet(
+        &mut wrong_state_stream,
+        wrong_state_key,
+        3,
+        0x000c,
+        &[3, 0, 0, 0, 0],
+    )
+    .await;
+    assert_closed(&mut wrong_state_stream).await;
+
     let (mut host, host_key) =
         join_retail(&pool, address, owner.account.id, "PartyHost", &mut tokens).await;
 
@@ -8606,8 +8656,27 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         );
     }
 
-    // Both load. The turn opens only once both have, and both are told whose it is.
-    send_packet(&mut host, host_key, 6, 0x0011, &[]).await;
+    // A real client sends its room-equipment syncs after the match intro and before 0x0011;
+    // the accepted match-opcode contract lists both 0x000b and 0x000c for this phase
+    // (`crates/pangya-protocol/src/game.rs:834-849`). PacketDoc defines these two five-byte
+    // 0x000c bodies as ClubSet and Character updates (`gameservice/client/000c.ksy:24-80`),
+    // while the real-client trace records the same loading-time ordering
+    // (`docs/evidence/REAL_CLIENT_PRACTICE_2026-08-09.md:32-42`). They are opaque loading
+    // synchronization, not room mutations after the actor has entered InStrokeLoading.
+    let mut loading_club = vec![3];
+    loading_club.extend_from_slice(&purchased_club_u32.to_le_bytes());
+    let mut loading_character = vec![4];
+    loading_character.extend_from_slice(
+        &u32::try_from(owner_character)
+            .expect("owner character fits retail room-equipment body")
+            .to_le_bytes(),
+    );
+    send_packet(&mut host, host_key, 6, 0x000c, &loading_club).await;
+    send_packet(&mut host, host_key, 7, 0x000c, &loading_character).await;
+
+    // Both load. The turn opens only once both have, and the resulting frames prove both
+    // encrypted sockets survived the duplicated loading equipment synchronization.
+    send_packet(&mut host, host_key, 8, 0x0011, &[]).await;
     let waiting = drain_available(&mut visitor, visitor_key, Duration::from_millis(500)).await;
     assert!(
         waiting.is_empty(),
@@ -8661,6 +8730,30 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
             );
         }
         salt = salt.wrapping_add(1);
+        if host_shoots {
+            // Real U.S. 851 sends its opaque sync and cumulative hole statistics before the
+            // end-shot barrier: `/private/tmp/issue45-server-4f64913-restart.log`,
+            // 2026-08-11T13:23:49.906575 (0012), 13:23:50.206577 (001b),
+            // 13:23:54.356862 (0031), then 13:23:59.328564 (001c). PacketDoc identifies
+            // 0012/001c/0031 in their respective gameservice client schemas; 001c documents
+            // 001b as its preceding undocumented sync.
+            send_packet(&mut host, host_key, salt, 0x001b, &[0; 54]).await;
+            salt = salt.wrapping_add(1);
+            send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
+            salt = salt.wrapping_add(1);
+            // Replaying 0012 after the early 0031 is an actor-level duplicate, not a new
+            // accepted action: it cannot replace the retained finish or relay a second 0055.
+            let mut duplicate_shot = vec![0, 0];
+            duplicate_shot.extend_from_slice(&[0xab; 62]);
+            send_packet(&mut host, host_key, salt, 0x0012, &duplicate_shot).await;
+            assert!(
+                !drain_available(&mut visitor, visitor_key, Duration::from_millis(400))
+                    .await
+                    .contains(&0x0055),
+                "duplicate 0012 is not relayed as a new accepted action"
+            );
+            salt = salt.wrapping_add(1);
+        }
         {
             let (from, from_key) = if host_shoots {
                 (&mut host, host_key)
@@ -8671,8 +8764,8 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
             send_packet(from, from_key, salt, 0x001c, &[]).await;
             let handover = drain_available(from, from_key, Duration::from_millis(900)).await;
             assert!(
-                handover.contains(&0x00cc) && handover.contains(&0x0063),
-                "the turn ends and the next one starts: {handover:04x?}"
+                handover.contains(&0x0063),
+                "the accepted result advances to the next turn: {handover:04x?}"
             );
         }
         {
@@ -8721,25 +8814,15 @@ async fn game_retail_two_players_play_and_settle_full_card(pool: PgPool) {
         seen.iter().map(|(opcode, _)| *opcode).collect::<Vec<_>>()
     );
 
-    // Both hole out. The second completion advances the card and emits a fresh 0x0053;
-    // only hole 18 settles the two-player match.
+    // The host's early 0031 was committed immediately after its accepted 001c above. Its
+    // replay remains idempotent, while the visitor's ordinary post-result 0031 advances hole 2.
     send_packet(&mut host, host_key, salt, 0x0031, &[]).await;
-    // Drain the first finisher's valid current-hole handover from both sockets before asking the
-    // second player to finish; otherwise it remains queued ahead of hole 2's introduction.
-    let host_waiting = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
-    let visitor_waiting =
-        drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;
-    for (who, frames) in [("host", &host_waiting), ("visitor", &visitor_waiting)] {
-        assert_eq!(
-            frames
-                .iter()
-                .filter(|(opcode, _)| *opcode == 0x0063)
-                .count(),
-            1,
-            "{who} receives one current-hole handover: {frames:04x?}"
-        );
-        assert!(!frames.iter().any(|(opcode, _)| *opcode == 0x0053));
-    }
+    assert!(
+        drain_available(&mut host, host_key, Duration::from_millis(400))
+            .await
+            .is_empty(),
+        "replayed early 0031 has no second completion"
+    );
     send_packet(&mut visitor, visitor_key, salt, 0x0031, &[]).await;
     let first_next = drain_frames(&mut host, host_key, Duration::from_millis(1200)).await;
     let second_next = drain_frames(&mut visitor, visitor_key, Duration::from_millis(1200)).await;

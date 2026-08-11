@@ -19,8 +19,9 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::Parser;
 use pangya_protocol::{
-    CompatibilityProfile, EncodePacket, PacketWriter, ROOM_PLAYER_RECORD_BYTES, RetailGameAuth,
-    RoomPlayerFlags, US852_SERVER_VERSION, encode_packet_payload,
+    CompatibilityProfile, EncodePacket, MAX_BOOTSTRAP_STRING_BYTES, PacketWriter,
+    ROOM_PLAYER_RECORD_BYTES, RetailGameAuth, RoomPlayerFlags, US852_SERVER_VERSION,
+    encode_packet_payload,
 };
 use thiserror::Error;
 use tokio::{
@@ -38,6 +39,24 @@ const MAX_EXPANSION: usize = 128;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long this seat will sit in a room waiting for a person to drive the other one.
 const ROOM_WAIT: Duration = Duration::from_secs(600);
+/// Real-client flight time before the post-shot end barrier.
+///
+/// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
+/// first recorded accepted C2S `0x001b` at `2026-08-11T12:11:41.567841Z` and C2S `0x001c` at
+/// `2026-08-11T12:11:47.206591Z` (5.638750 seconds). The newer Windows trace
+/// `/private/tmp/issue45-server-89400e1.log` shows the real host receive the mirrored shot at
+/// `2026-08-11T13:44:54.198` and finish `0x001c` at `13:44:59.916851Z` (5.718851 seconds),
+/// after the former 5.6-second headless barrier at `13:44:59.801013Z`. The bounded six-second
+/// delay is the smallest round duration above the latest observed real-client flight.
+const RETAIL_SHOT_FLIGHT: Duration = Duration::from_secs(6);
+/// Grace period after the end barrier before an optional hole-finish announcement.
+///
+/// Production log `/private/tmp/issue45-server-4f64913-restart.log` records the headless seat's
+/// C2S `0x001c`/`0x0031` at `2026-08-11T13:14:19.676`, an immediate S2C `0x0063` at
+/// `2026-08-11T13:14:19.676497`, and the real host's mirrored C2S `0x001c` at
+/// `2026-08-11T13:14:19.788706`, 112.275ms after that premature ordering boundary. The bounded
+/// 500ms grace exceeds that observation without claiming it is production-game timing.
+const RETAIL_HOLE_FINISH_GRACE: Duration = Duration::from_millis(500);
 
 /// Retail client opcodes this instrument sends.
 mod client_opcode {
@@ -55,6 +74,8 @@ mod client_opcode {
     pub const HOLE_LOAD_FINISHED: u16 = 0x0011;
     /// Committed shot.
     pub const SHOT_COMMIT: u16 = 0x0012;
+    /// Post-shot ball-state sync.
+    pub const SHOT_SYNC: u16 = 0x001b;
     /// Post-shot barrier that ends a turn.
     pub const SHOT_END: u16 = 0x001c;
     /// This player's ball is in the hole.
@@ -63,6 +84,8 @@ mod client_opcode {
 
 /// Retail server opcodes this instrument reacts to.
 mod server_opcode {
+    /// Full bootstrap handover reply; subtype zero carries this connection's identity.
+    pub const HANDOVER_REPLY: u16 = 0x0044;
     /// Channel entry accepted.
     pub const CHANNEL_JOINED: u16 = 0x004e;
     /// Room join result; the first two bytes are a status word.
@@ -71,6 +94,10 @@ mod server_opcode {
     pub const ROOM_CENSUS: u16 = 0x0048;
     /// Match plan; the hole is loading from here.
     pub const MATCH_INFO: u16 = 0x0052;
+    /// A hole introduction, which also announces the opening player.
+    pub const PLAYER_START_HOLE: u16 = 0x0053;
+    /// Echoed post-shot state.
+    pub const SHOT_SYNC: u16 = 0x0064;
     /// A turn was handed to a player.
     pub const TURN_START: u16 = 0x0063;
     /// The hole finished.
@@ -99,6 +126,8 @@ enum ClientError {
     NoSeat,
     #[error("nobody joined the room")]
     NobodyJoined,
+    #[error("the full bootstrap reply did not contain a complete retail identity")]
+    BootstrapIdentity,
 }
 
 /// A headless retail client that takes the second seat in a versus room.
@@ -130,8 +159,11 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     channel: u8,
     /// Strokes to play before holing out.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, value_parser = parse_strokes)]
     strokes: u8,
+    /// Holes for a hosted room (1, 3, 6, 9, or 18).
+    #[arg(long, default_value_t = 1, value_parser = parse_holes)]
+    holes: u8,
 }
 
 #[tokio::main]
@@ -152,12 +184,276 @@ async fn main() -> Result<(), ClientError> {
             session.join_room(room).await?;
             session.ready().await?;
         }
-        None if args.host => session.host_room(&args.room_name).await?,
+        None if args.host => session.host_room(&args.room_name, args.holes).await?,
         None => return Err(ClientError::NoSeat),
     }
     session.play_hole(args.strokes).await?;
     tracing::info!("the hole settled; this seat is done");
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn checked_transport_pacing_is_bounded() {
+    assert_eq!(RETAIL_SHOT_FLIGHT, Duration::from_secs(6));
+    assert!(RETAIL_SHOT_FLIGHT >= Duration::from_micros(5_718_851));
+    assert_eq!(RETAIL_HOLE_FINISH_GRACE, Duration::from_millis(500));
+    assert!(RETAIL_HOLE_FINISH_GRACE >= Duration::from_micros(112_275));
+    assert!(RETAIL_SHOT_FLIGHT < FRAME_TIMEOUT);
+    assert!(RETAIL_HOLE_FINISH_GRACE < FRAME_TIMEOUT);
+}
+
+#[cfg(test)]
+#[test]
+fn holes_accept_retail_room_lengths_only() {
+    for value in ["1", "3", "6", "9", "18"] {
+        assert!(parse_holes(value).is_ok());
+    }
+    for value in ["0", "2", "19", "abc"] {
+        assert!(parse_holes(value).is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn strokes_reject_zero_at_the_cli_boundary() {
+    let error = Args::try_parse_from([
+        "pangya-test-client",
+        "--game",
+        "127.0.0.1:10101",
+        "--account-id",
+        "1",
+        "--username",
+        "seat",
+        "--handover",
+        "token",
+        "--host",
+        "--strokes",
+        "0",
+    ])
+    .expect_err("zero strokes must be rejected before connecting");
+    assert!(
+        error
+            .to_string()
+            .contains("strokes must be between 1 and 255")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn bootstrap_identity_parser_walks_variable_pstrings_and_rejects_truncation() {
+    let mut body = vec![0];
+    for value in [b"852".as_slice(), b"variable server name".as_slice()] {
+        body.extend_from_slice(
+            &u16::try_from(value.len())
+                .expect("test string")
+                .to_le_bytes(),
+        );
+        body.extend_from_slice(value);
+    }
+    body.extend_from_slice(&0xffff_u16.to_le_bytes());
+    let identity = body.len();
+    body.extend_from_slice(&[0; 265]); // RetailPlayerIdentity's fixed wire layout
+    body[identity + 22 + 22 + 17 + 24..identity + 22 + 22 + 17 + 24 + 4]
+        .copy_from_slice(&0x7856_3412_u32.to_le_bytes());
+    assert_eq!(bootstrap_connection_id(&body), Ok(Some(0x7856_3412)));
+    let mut zero_connection = body.clone();
+    zero_connection[identity + 22 + 22 + 17 + 24..identity + 22 + 22 + 17 + 24 + 4]
+        .copy_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(bootstrap_connection_id(&zero_connection), Err(()));
+    for truncated in 1..body.len() {
+        assert_eq!(bootstrap_connection_id(&body[..truncated]), Err(()));
+    }
+    let mut oversized = vec![0];
+    oversized.extend_from_slice(&129_u16.to_le_bytes());
+    assert_eq!(bootstrap_connection_id(&oversized), Err(()));
+    assert_eq!(bootstrap_connection_id(&[1]), Ok(None));
+}
+
+#[cfg(test)]
+#[test]
+fn turn_announcements_are_exact_four_byte_connection_ids() {
+    assert_eq!(
+        turn_connection_id(&0x7856_3412_u32.to_le_bytes()),
+        Some(0x7856_3412)
+    );
+    for malformed in [&[][..], &[0; 3], &[0; 5]] {
+        assert_eq!(turn_connection_id(malformed), None);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn shot_packets_replay_the_checked_us851_normal_swing_shape() {
+    // Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/
+    // server.jsonl`, 2026-08-11T12:11:41Z: accepted C2S `0x0012` (64 bytes), followed by
+    // `0x001b` (54 bytes) and `0x001c` (`01 00`). The server echoed `0x0055`/`0x0064` and
+    // continued normal processing. The payload below is deliberately byte-for-byte replayed;
+    // PacketDoc `gameservice/client/0012.ksy:21-29` confirms its leading normal-shot subtype.
+    assert_eq!(
+        normal_shot_commit(),
+        [
+            0x00, 0x00, 0x00, 0x00, 0xce, 0x43, 0x00, 0x00, 0x49, 0x43, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00, 0xc0,
+            0x5a, 0x25, 0xbe, 0x4c, 0x74, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x43, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x48, 0xb9, 0x41,
+        ]
+    );
+
+    let sync = shot_sync(0x7856_3412);
+    assert_eq!(sync.len(), 54);
+    // `oid` is the first `u32` of SuperSS-Dev `TYPE/game_type.hpp:222-350`; it names the
+    // current second-seat socket, so it is the one required substitution. No checked evidence
+    // supports changing the captured position or any other client-owned bytes.
+    assert_eq!(
+        sync,
+        [
+            0x12, 0x34, 0x56, 0x78, 0xae, 0x47, 0xc0, 0xc3, 0x8a, 0x98, 0x0c, 0x43, 0xa4, 0xb0,
+            0x64, 0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
+    assert_eq!(SHOT_END_BODY, [1, 0], "checked 001c barrier has no entries");
+}
+
+#[cfg(test)]
+#[test]
+fn hole_result_has_the_exact_cumulative_239_byte_shape() {
+    let result = hole_result(6, 3, 3);
+    assert_eq!(result.len(), 239, "user_course_result_data packed width");
+    assert_eq!(&result[0..4], &6_u32.to_le_bytes(), "cumulative strokes");
+    assert_eq!(&result[4..8], &0_u32.to_le_bytes(), "putts");
+    assert_eq!(&result[16..20], &0.0_f32.to_le_bytes(), "longest drive");
+    assert_eq!(&result[36..40], &3_u32.to_le_bytes(), "holes played");
+    assert_eq!(&result[58..62], &3_u32.to_le_bytes(), "holes completed");
+    assert_eq!(&result[66..70], &0.0_f32.to_le_bytes(), "longest putt");
+    assert_eq!(&result[70..74], &0.0_f32.to_le_bytes(), "longest chip");
+    assert_eq!(&result[74..78], &(-1_i32).to_le_bytes(), "VS unknown_q");
+    assert!(result[78..].iter().all(|byte| *byte == 0));
+}
+
+#[cfg(test)]
+#[test]
+fn one_hole_trace_ignores_foreign_turns_and_holes_out_once() {
+    let mut script = HoleScript::new(1);
+    assert!(
+        script
+            .on_turn(server_opcode::PLAYER_START_HOLE, false)
+            .is_empty()
+    );
+    assert!(script.on_turn(server_opcode::TURN_START, false).is_empty());
+    assert_eq!(
+        script.on_turn(server_opcode::TURN_START, true),
+        vec![ScriptWrite::ShotCommit, ScriptWrite::ShotSync]
+    );
+    assert!(script.on_turn(server_opcode::TURN_START, true).is_empty());
+    assert!(script.on_shot_sync(false).is_empty());
+    assert_eq!(
+        script.on_shot_sync(true),
+        vec![ScriptWrite::ShotEnd, ScriptWrite::HoleFinish]
+    );
+    assert!(script.on_turn(server_opcode::TURN_START, true).is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn opening_and_handoff_turns_only_write_for_the_own_connection() {
+    let writes = vec![ScriptWrite::ShotCommit, ScriptWrite::ShotSync];
+    let mut opening_foreign = HoleScript::new(1);
+    assert!(
+        opening_foreign
+            .on_turn(server_opcode::PLAYER_START_HOLE, false)
+            .is_empty()
+    );
+    let mut opening_own = HoleScript::new(1);
+    assert_eq!(
+        opening_own.on_turn(server_opcode::PLAYER_START_HOLE, true),
+        writes
+    );
+
+    let mut handoff = HoleScript::new(1);
+    assert!(handoff.on_turn(server_opcode::TURN_START, false).is_empty());
+    assert_eq!(handoff.on_turn(server_opcode::TURN_START, true), writes);
+}
+
+#[cfg(test)]
+#[test]
+fn pending_shot_requires_exact_own_sync_before_resync_and_hole_finish() {
+    let mut script = HoleScript::new(1);
+    assert_eq!(
+        script.on_turn(server_opcode::PLAYER_START_HOLE, true),
+        vec![ScriptWrite::ShotCommit, ScriptWrite::ShotSync]
+    );
+    assert!(script.pending_shot);
+    let own_sync = shot_sync(7);
+    assert!(is_own_shot_sync(&own_sync, 7));
+    let mut changed_tail = own_sync;
+    changed_tail[53] ^= 1;
+    assert!(
+        !is_own_shot_sync(&changed_tail, 7),
+        "a local OID alone must not advance the post-shot barrier"
+    );
+    assert!(!is_own_shot_sync(&[0; 37], 7));
+    assert!(!is_own_shot_sync(&[8; 38], 7));
+    assert!(
+        script.on_shot_sync(false).is_empty(),
+        "foreign/malformed sync"
+    );
+    assert!(script.pending_shot);
+    assert!(script.on_turn(server_opcode::TURN_START, true).is_empty());
+    assert_eq!(
+        script.on_shot_sync(true),
+        vec![ScriptWrite::ShotEnd, ScriptWrite::HoleFinish]
+    );
+    assert!(!script.pending_shot);
+    assert!(script.hole_out_sent);
+}
+
+#[cfg(test)]
+#[test]
+fn three_hole_trace_resets_only_on_next_hole_introduction() {
+    let mut script = HoleScript::new(2);
+    let shot = vec![ScriptWrite::ShotCommit, ScriptWrite::ShotSync];
+    let end = vec![ScriptWrite::ShotEnd];
+    let finish = vec![ScriptWrite::ShotEnd, ScriptWrite::HoleFinish];
+    for _ in 0..3 {
+        assert!(
+            script
+                .on_turn(server_opcode::PLAYER_START_HOLE, false)
+                .is_empty()
+        );
+        assert!(script.on_turn(server_opcode::TURN_START, false).is_empty());
+        assert_eq!(script.on_turn(server_opcode::TURN_START, true), shot);
+        assert!(script.on_shot_sync(false).is_empty());
+        assert_eq!(script.on_shot_sync(true), end);
+        assert!(script.on_turn(server_opcode::TURN_START, false).is_empty());
+        assert_eq!(script.on_turn(server_opcode::TURN_START, true), shot);
+        assert_eq!(script.on_shot_sync(true), finish);
+        assert!(script.on_turn(server_opcode::TURN_START, true).is_empty());
+    }
+    assert_eq!(script.match_strokes, 6);
+    assert_eq!(script.holes_played, 3);
+    assert_eq!(script.holes_completed, 3);
+    assert_eq!(&script.hole_result()[0..4], &6_u32.to_le_bytes());
+    assert_eq!(&script.hole_result()[36..40], &3_u32.to_le_bytes());
+    assert_eq!(&script.hole_result()[58..62], &3_u32.to_le_bytes());
+}
+
+fn parse_holes(value: &str) -> Result<u8, String> {
+    match value.parse() {
+        Ok(holes @ (1 | 3 | 6 | 9 | 18)) => Ok(holes),
+        _ => Err("holes must be one of: 1, 3, 6, 9, 18".to_owned()),
+    }
+}
+
+/// A zero-stroke script would send a rejected hole-out before any accepted shot.
+fn parse_strokes(value: &str) -> Result<u8, String> {
+    match value.parse() {
+        Ok(strokes @ 1..) => Ok(strokes),
+        _ => Err("strokes must be between 1 and 255".to_owned()),
+    }
 }
 
 /// Whether a census lists exactly two players and every one of them but the master is ready.
@@ -183,11 +479,199 @@ fn census_is_ready_pair(census: &[u8]) -> bool {
     })
 }
 
+/// Extracts this socket's connection id from a complete `0x0044` subtype-zero body.
+///
+/// The two preceding PStrings are bounded as `HandoverReply` bounds them, then the fixed
+/// `RetailPlayerIdentity` layout is walked through its final account id
+/// (`pangya-protocol/src/us852_bootstrap.rs:1095-1172,1201-1247`). This deliberately does not
+/// rely on bootstrap frame order or a packet-wide fixed offset.
+fn bootstrap_connection_id(body: &[u8]) -> Result<Option<u32>, ()> {
+    if body.first().copied() != Some(0) {
+        return Ok(None);
+    }
+    let mut at = 1_usize;
+    for _ in 0..2 {
+        let length = usize::from(read_u16(body, &mut at)?);
+        if length > MAX_BOOTSTRAP_STRING_BYTES {
+            return Err(());
+        }
+        skip(body, &mut at, length)?;
+    }
+    skip(body, &mut at, 2)?; // room number before RetailPlayerIdentity
+    skip(body, &mut at, 22 + 22 + 17 + 24)?;
+    let connection_id = read_u32(body, &mut at)?;
+    if connection_id == 0 {
+        return Err(());
+    }
+    // Complete the fixed RetailPlayerIdentity layout; accepting a prefix here would make a
+    // truncated handover look authoritative.
+    skip(body, &mut at, 12 + 4 + 4 + 2 + 6 + 16 + 128 + 4)?;
+    Ok(Some(connection_id))
+}
+
+fn skip(bytes: &[u8], at: &mut usize, amount: usize) -> Result<(), ()> {
+    let end = at.checked_add(amount).ok_or(())?;
+    if bytes.get(*at..end).is_none() {
+        return Err(());
+    }
+    *at = end;
+    Ok(())
+}
+
+fn read_u16(bytes: &[u8], at: &mut usize) -> Result<u16, ()> {
+    let value = bytes.get(*at..at.checked_add(2).ok_or(())?).ok_or(())?;
+    *at += 2;
+    Ok(u16::from_le_bytes(value.try_into().map_err(|_| ())?))
+}
+
+fn read_u32(bytes: &[u8], at: &mut usize) -> Result<u32, ()> {
+    let value = bytes.get(*at..at.checked_add(4).ok_or(())?).ok_or(())?;
+    *at += 4;
+    Ok(u32::from_le_bytes(value.try_into().map_err(|_| ())?))
+}
+
+/// Both opening `0x0053` and handoff `0x0063` are exactly a little-endian connection id
+/// (`pangya-protocol/src/us852_match.rs:510-547`).
+fn turn_connection_id(body: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = body.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Script writes emitted in TCP order for one accepted turn or sync acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptWrite {
+    ShotCommit,
+    ShotSync,
+    ShotEnd,
+    HoleFinish,
+}
+
+/// Per-hole and cumulative match state. Only a new `0x0053` resets the per-hole fields.
+#[derive(Debug)]
+struct HoleScript {
+    strokes: u8,
+    played: u8,
+    pending_shot: bool,
+    hole_out_sent: bool,
+    match_strokes: u32,
+    holes_played: u32,
+    holes_completed: u32,
+}
+
+impl HoleScript {
+    const fn new(strokes: u8) -> Self {
+        Self {
+            strokes,
+            played: 0,
+            pending_shot: false,
+            hole_out_sent: false,
+            match_strokes: 0,
+            holes_played: 0,
+            holes_completed: 0,
+        }
+    }
+
+    fn on_turn(&mut self, opcode: u16, is_own_turn: bool) -> Vec<ScriptWrite> {
+        if opcode == server_opcode::PLAYER_START_HOLE {
+            self.played = 0;
+            self.pending_shot = false;
+            self.hole_out_sent = false;
+            self.holes_played = self.holes_played.saturating_add(1);
+        }
+        if !is_own_turn || self.pending_shot || self.hole_out_sent {
+            return Vec::new();
+        }
+        self.played = self.played.saturating_add(1);
+        self.match_strokes = self.match_strokes.saturating_add(1);
+        self.pending_shot = true;
+        vec![ScriptWrite::ShotCommit, ScriptWrite::ShotSync]
+    }
+
+    /// Advances only after the exact echoed `0x0064` for this socket's pending shot.
+    fn on_shot_sync(&mut self, is_own_sync: bool) -> Vec<ScriptWrite> {
+        if !is_own_sync || !self.pending_shot {
+            return Vec::new();
+        }
+        self.pending_shot = false;
+        let mut writes = vec![ScriptWrite::ShotEnd];
+        if self.played == self.strokes {
+            self.hole_out_sent = true;
+            self.holes_completed = self.holes_completed.saturating_add(1);
+            writes.push(ScriptWrite::HoleFinish);
+        }
+        writes
+    }
+
+    fn hole_result(&self) -> [u8; 239] {
+        hole_result(self.match_strokes, self.holes_played, self.holes_completed)
+    }
+}
+
+/// Builds the accepted 64-byte normal `0x0012` capture from the real U.S. 851 client.
+///
+/// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
+/// at `2026-08-11T12:11:41Z` is the only checked source for this revision-specific body.
+/// PacketDoc `gameservice/client/0012.ksy:21-29` independently identifies the leading `u16` as
+/// the normal-shot subtype. Its fields do not contain a connection identity, so every byte is
+/// retained rather than inventing a second-seat substitution.
+const fn normal_shot_commit() -> [u8; 64] {
+    [
+        0x00, 0x00, 0x00, 0x00, 0xce, 0x43, 0x00, 0x00, 0x49, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x04, 0x00, 0x00, 0xc0, 0x5a, 0x25,
+        0xbe, 0x4c, 0x74, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x48, 0xb9, 0x41,
+    ]
+}
+
+/// Builds the 54-byte C2S `0x001b` body accepted in that same real U.S. 851 swing.
+///
+/// SuperSS-Dev `TYPE/game_type.hpp:222-350` identifies the first four bytes as the player's
+/// `oid`; substitute this socket's connection ID so the echoed `0x0064` is attributable to the
+/// second seat. The checked capture supplies no evidence that its position or other opaque,
+/// client-owned fields must vary, so they remain an exact deterministic replay.
+fn shot_sync(connection_id: u32) -> [u8; 54] {
+    let mut body = [
+        0x0f, 0x00, 0x00, 0x00, 0xae, 0x47, 0xc0, 0xc3, 0x8a, 0x98, 0x0c, 0x43, 0xa4, 0xb0, 0x64,
+        0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    body[..4].copy_from_slice(&connection_id.to_le_bytes());
+    body
+}
+
+/// The checked `0x001c` barrier has `unknown_a = 1` and `entry_count = 0`.
+/// PacketDoc `gameservice/client/001c.ksy:35-45` confirms the latter means no collectable entries.
+const SHOT_END_BODY: [u8; 2] = [1, 0];
+
+/// Tests whether an echoed S2C `0x0064` has the exact checked sync shape for this connection.
+fn is_own_shot_sync(body: &[u8], connection_id: u32) -> bool {
+    body == shot_sync(connection_id)
+}
+
+/// Builds PacketDoc's packed, cumulative 239-byte `user_course_result_data` for C2S `0x0031`
+/// (`gameservice/client/0031.ksy`; `common/user_course_result_data.ksy`). `unknown_q` is the
+/// documented `-1` value for versus matches; unclassified fields are zero.
+fn hole_result(strokes: u32, holes_played: u32, holes_completed: u32) -> [u8; 239] {
+    let mut body = [0_u8; 239];
+    body[0..4].copy_from_slice(&strokes.to_le_bytes());
+    // [4..8] putts, [8..16] unknown counters, [16..20] longest drive, and [20..36] opaque
+    // distance fields remain documented zero defaults.
+    body[36..40].copy_from_slice(&holes_played.to_le_bytes());
+    body[58..62].copy_from_slice(&holes_completed.to_le_bytes());
+    // [62..66] completed-by-putting and [66..74] finite longest putt/chip distances are zero.
+    body[74..78].copy_from_slice(&(-1_i32).to_le_bytes());
+    body
+}
+
 /// One encrypted GameService connection and the salt counter its frames carry.
 struct Session {
     stream: TcpStream,
     key: u8,
     salt: u8,
+    /// The GameService connection/object id from this socket's full `0x0044` reply.
+    connection_id: Option<u32>,
 }
 
 impl Session {
@@ -210,6 +694,7 @@ impl Session {
             stream,
             key,
             salt: 1,
+            connection_id: None,
         })
     }
 
@@ -224,19 +709,28 @@ impl Session {
         let payload = encode_packet_payload(&auth, &CompatibilityProfile::US_852)
             .map_err(|_| ClientError::Encode)?;
         self.send(RetailGameAuth::OPCODE, &payload).await?;
-        // The bootstrap is a run of frames the client only has to read. Draining until the
-        // channel-select reply would be wrong — that comes later — so this drains until the
-        // server goes quiet, which is what the bootstrap ending looks like.
-        let frames = self.drain(Duration::from_secs(5)).await?;
-        tracing::info!(frames, "bootstrap received");
-        Ok(())
+        // Bootstrap frames are asynchronous, so locate this socket's full handover structurally
+        // rather than by frame number. Leaving subsequent frames queued is important: a person
+        // can advance the room while this instrument is between phases.
+        loop {
+            let (opcode, body) = self.receive("bootstrap handover").await?;
+            if opcode != server_opcode::HANDOVER_REPLY {
+                continue;
+            }
+            if let Some(connection_id) =
+                bootstrap_connection_id(&body).map_err(|_| ClientError::BootstrapIdentity)?
+            {
+                self.connection_id = Some(connection_id);
+                tracing::info!(connection_id, "bootstrap identity received");
+                return Ok(());
+            }
+        }
     }
 
     async fn enter_channel(&mut self, channel: u8) -> Result<(), ClientError> {
         self.send(client_opcode::SELECT_CHANNEL, &[channel]).await?;
         self.wait_for(server_opcode::CHANNEL_JOINED, "channel entry")
             .await?;
-        let _notice = self.drain(Duration::from_secs(2)).await?;
         tracing::info!("in the channel");
         Ok(())
     }
@@ -268,17 +762,16 @@ impl Session {
 
     /// Opens a two-player versus room, waits for the other seat, and starts the match.
     ///
-    /// One hole and a capacity of two, because that is what this server settles and the smallest
-    /// a real client's Make Room dialog offers. Pressing Start is also what says the master is
+    /// Requested holes and a capacity of two. Pressing Start is also what says the master is
     /// ready — a real client's button reads Start for the master and Ready for everyone else.
-    async fn host_room(&mut self, name: &str) -> Result<(), ClientError> {
+    async fn host_room(&mut self, name: &str, holes: u8) -> Result<(), ClientError> {
         let mut writer = PacketWriter::default();
         writer.u8(0); // room kind: versus
         writer.u32_le(30_000); // shot timer
         writer.u32_le(600_000); // game timer
         writer.u8(2); // capacity
         writer.u8(0); // hole progression
-        writer.u8(1); // holes
+        writer.u8(holes); // holes
         writer.u8(0); // course
         writer.bytes(&[0; 5]);
         writer
@@ -345,35 +838,75 @@ impl Session {
         // after this is server-paced and keeps the ordinary frame timeout.
         self.idle_until(server_opcode::MATCH_INFO, "the match plan", ROOM_WAIT)
             .await?;
-        let _conditions = self.drain(Duration::from_secs(3)).await?;
+        // Do not drain here: the server can already have sent the actionable `0x0053` opening
+        // turn alongside match conditions. `idle_until` consumes only the match plan, and the
+        // following reader preserves every body it sees.
         self.send(client_opcode::HOLE_LOAD_FINISHED, &[]).await?;
         tracing::info!("loaded; waiting for a turn");
 
-        // The turn frames name a connection this seat has not been told is its own, so rather
-        // than guess it plays on every turn it is offered: the aggregate ignores a command from
-        // whoever does not own the turn, so an out-of-turn shot costs nothing but a round trip.
-        let mut played = 0_u8;
+        let connection_id = self.connection_id.ok_or(ClientError::BootstrapIdentity)?;
+        let mut script = HoleScript::new(strokes);
         loop {
-            let opcode = self.next_opcode("a turn").await?;
+            // A person may take minutes on the other seat, so this intentionally has no timeout
+            // on its first byte. Unlike the old opcode-only reader, it retains the turn body.
+            let (opcode, body) = self.next_frame("a turn").await?;
             match opcode {
-                server_opcode::TURN_START => {
-                    if played >= strokes {
-                        self.send(client_opcode::HOLE_FINISH, &[]).await?;
-                        tracing::info!(played, "holed out");
+                server_opcode::TURN_START | server_opcode::PLAYER_START_HOLE => {
+                    let Some(announced) = turn_connection_id(&body) else {
+                        tracing::warn!(opcode = format!("{opcode:#06x}"), "malformed turn body");
                         continue;
-                    }
-                    // The payload is the client's own and nothing reads it here; a real client
-                    // sends its trajectory inputs, which the server relays without interpreting.
-                    self.send(client_opcode::SHOT_COMMIT, &[0; 8]).await?;
-                    self.send(client_opcode::SHOT_END, &[]).await?;
-                    played = played.saturating_add(1);
-                    tracing::info!(played, "played a stroke");
+                    };
+                    let writes = script.on_turn(opcode, announced == connection_id);
+                    self.send_script_writes(&writes, connection_id, &script)
+                        .await?;
+                }
+                server_opcode::SHOT_SYNC => {
+                    let writes = script.on_shot_sync(is_own_shot_sync(&body, connection_id));
+                    self.send_script_writes(&writes, connection_id, &script)
+                        .await?;
                 }
                 server_opcode::FINISH_HOLE => tracing::info!("the hole finished"),
                 server_opcode::MATCH_FINISH => return Ok(()),
                 _ => {}
             }
         }
+    }
+
+    /// Emits a phase transition in wire order. `0x001c` follows only the matching `0x0064`.
+    async fn send_script_writes(
+        &mut self,
+        writes: &[ScriptWrite],
+        connection_id: u32,
+        script: &HoleScript,
+    ) -> Result<(), ClientError> {
+        for write in writes {
+            match write {
+                ScriptWrite::ShotCommit => {
+                    self.send(client_opcode::SHOT_COMMIT, &normal_shot_commit())
+                        .await?;
+                }
+                ScriptWrite::ShotSync => {
+                    self.send(client_opcode::SHOT_SYNC, &shot_sync(connection_id))
+                        .await?;
+                }
+                // `ShotEnd` is emitted only after `on_shot_sync` accepts this socket's exact
+                // echoed `0x0064`. Keep the pure state machine immediate for deterministic unit
+                // tests, but pace the transport before the end barrier like the checked client.
+                ScriptWrite::ShotEnd => {
+                    tokio::time::sleep(RETAIL_SHOT_FLIGHT).await;
+                    self.send(client_opcode::SHOT_END, &SHOT_END_BODY).await?
+                }
+                // `on_shot_sync` emits `ShotEnd` before optional `HoleFinish`; delay only at
+                // transport level so the pure state tests retain that exact command ordering.
+                ScriptWrite::HoleFinish => {
+                    tokio::time::sleep(RETAIL_HOLE_FINISH_GRACE).await;
+                    self.send(client_opcode::HOLE_FINISH, &script.hole_result())
+                        .await?;
+                    tracing::info!(played = script.played, "holed out");
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn send(&mut self, opcode: u16, payload: &[u8]) -> Result<(), ClientError> {
@@ -439,35 +972,36 @@ impl Session {
         Ok((opcode, body))
     }
 
-    async fn next_opcode(&mut self, what: &'static str) -> Result<u16, ClientError> {
-        // A turn can be a long wait — a person is aiming at the other end — so this one step
-        // does not use the ordinary frame timeout.
-        {
-            let mut header = [0_u8; 3];
-            self.stream
-                .read_exact(&mut header)
-                .await
-                .map_err(|_| ClientError::Closed(what))?;
-            let total = usize::from(u16::from_le_bytes([header[1], header[2]])).saturating_add(3);
-            let mut frame = vec![0_u8; total];
-            frame
-                .get_mut(..3)
-                .ok_or(ClientError::Decrypt)?
-                .copy_from_slice(&header);
-            self.stream
-                .read_exact(frame.get_mut(3..).ok_or(ClientError::Decrypt)?)
-                .await
-                .map_err(|_| ClientError::Closed(what))?;
-            let plain =
-                pangya_crypto::server_decrypt(&frame, self.key, MAX_PLAINTEXT, MAX_EXPANSION)
-                    .map_err(|_| ClientError::Decrypt)?;
-            let opcode = u16::from_le_bytes([
-                *plain.first().ok_or(ClientError::Decrypt)?,
-                *plain.get(1).ok_or(ClientError::Decrypt)?,
-            ]);
-            tracing::debug!(direction = "in", opcode = format!("{opcode:#06x}"), "frame");
-            Ok(opcode)
-        }
+    async fn next_frame(&mut self, what: &'static str) -> Result<(u16, Vec<u8>), ClientError> {
+        let mut header = [0_u8; 3];
+        self.stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| ClientError::Closed(what))?;
+        let total = usize::from(u16::from_le_bytes([header[1], header[2]])).saturating_add(3);
+        let mut frame = vec![0_u8; total];
+        frame
+            .get_mut(..3)
+            .ok_or(ClientError::Decrypt)?
+            .copy_from_slice(&header);
+        self.stream
+            .read_exact(frame.get_mut(3..).ok_or(ClientError::Decrypt)?)
+            .await
+            .map_err(|_| ClientError::Closed(what))?;
+        let plain = pangya_crypto::server_decrypt(&frame, self.key, MAX_PLAINTEXT, MAX_EXPANSION)
+            .map_err(|_| ClientError::Decrypt)?;
+        let opcode = u16::from_le_bytes([
+            *plain.first().ok_or(ClientError::Decrypt)?,
+            *plain.get(1).ok_or(ClientError::Decrypt)?,
+        ]);
+        let body = plain.get(2..).unwrap_or_default().to_vec();
+        tracing::debug!(
+            direction = "in",
+            opcode = format!("{opcode:#06x}"),
+            bytes = body.len(),
+            "frame"
+        );
+        Ok((opcode, body))
     }
 
     async fn wait_for(&mut self, opcode: u16, what: &'static str) -> Result<Vec<u8>, ClientError> {
@@ -501,44 +1035,6 @@ impl Session {
             if seen == opcode {
                 return Ok(body);
             }
-        }
-    }
-
-    /// Reads frames until the server goes quiet, returning how many arrived.
-    async fn drain(&mut self, quiet: Duration) -> Result<usize, ClientError> {
-        let mut seen = 0_usize;
-        loop {
-            let mut header = [0_u8; 3];
-            match timeout(quiet, self.stream.read_exact(&mut header)).await {
-                Err(_) => return Ok(seen),
-                Ok(Err(_)) => return Err(ClientError::Closed("a drain")),
-                Ok(Ok(_)) => {}
-            }
-            let total = usize::from(u16::from_le_bytes([header[1], header[2]])).saturating_add(3);
-            let mut frame = vec![0_u8; total];
-            frame
-                .get_mut(..3)
-                .ok_or(ClientError::Decrypt)?
-                .copy_from_slice(&header);
-            timeout(
-                FRAME_TIMEOUT,
-                self.stream
-                    .read_exact(frame.get_mut(3..).ok_or(ClientError::Decrypt)?),
-            )
-            .await
-            .map_err(|_| ClientError::Timeout("a drain"))?
-            .map_err(|_| ClientError::Closed("a drain"))?;
-            let plain =
-                pangya_crypto::server_decrypt(&frame, self.key, MAX_PLAINTEXT, MAX_EXPANSION)
-                    .map_err(|_| ClientError::Decrypt)?;
-            if let (Some(low), Some(high)) = (plain.first(), plain.get(1)) {
-                tracing::debug!(
-                    direction = "in",
-                    opcode = format!("{:#06x}", u16::from_le_bytes([*low, *high])),
-                    "frame"
-                );
-            }
-            seen = seen.saturating_add(1);
         }
     }
 }
