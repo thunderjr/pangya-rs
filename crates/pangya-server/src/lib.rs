@@ -401,7 +401,11 @@ async fn serve(config: AppConfig) -> Result<(), ServerError> {
     let pool = connect_and_migrate(&config).await?;
     // Built before the repository so that every classified storage fault, including any
     // raised during startup recovery and public-bind recording, reaches the exporter.
-    let metrics = Arc::new(M2Metrics::default());
+    let metrics = Arc::new(if config.us852_issue_1_capture {
+        M2Metrics::with_us852_issue_1_capture()
+    } else {
+        M2Metrics::default()
+    });
     let repository = Arc::new(PgRepository::with_observer(
         pool.clone(),
         Arc::clone(&metrics) as Arc<dyn StorageObserver>,

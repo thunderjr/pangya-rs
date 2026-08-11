@@ -37,6 +37,20 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+const US852_ISSUE_1_CAPTURE_MAX_BYTES: usize = 1_024;
+
+/// Lowercase hexadecimal without retaining another copy of the captured body.
+struct HexPayload<'a>(&'a [u8]);
+
+impl std::fmt::Display for HexPayload<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Supported tracing output format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogFormat {
@@ -163,9 +177,22 @@ pub struct M2Metrics {
     game_stroke_commit: [AtomicU64; 6],
     game_stroke_shot: [AtomicU64; 5],
     storage_fault: [AtomicU64; StorageFault::ALL.len()],
+    us852_issue_1_capture: bool,
 }
 
 impl M2Metrics {
+    /// Creates metrics with the explicit, six-frame issue-1 evidence capture enabled.
+    ///
+    /// This is deliberately separate from the rejected general packet-body setting. The runtime
+    /// never calls the capture observer for auth, chat, inventory, or any unlisted opcode.
+    #[must_use]
+    pub fn with_us852_issue_1_capture() -> Self {
+        Self {
+            us852_issue_1_capture: true,
+            ..Self::default()
+        }
+    }
+
     /// Sets the DB readiness gauge to zero or one.
     pub fn set_db_ready(&self, ready: bool) {
         self.db_ready.store(u64::from(ready), Ordering::Relaxed);
@@ -1115,6 +1142,33 @@ impl GameObserver for M2Metrics {
         tracing::debug!(service = "game", direction, opcode, "packet");
     }
 
+    fn capture_us852_issue_1_frame(&self, direction: &'static str, opcode: u16, payload: &[u8]) {
+        if !self.us852_issue_1_capture {
+            return;
+        }
+        if payload.len() > US852_ISSUE_1_CAPTURE_MAX_BYTES {
+            tracing::warn!(
+                service = "game",
+                capture = "us852_issue_1",
+                direction,
+                opcode = format_args!("0x{opcode:04x}"),
+                payload_len = payload.len(),
+                capture_limit = US852_ISSUE_1_CAPTURE_MAX_BYTES,
+                "issue-1 evidence frame exceeds the raw capture limit"
+            );
+            return;
+        }
+        tracing::info!(
+            service = "game",
+            capture = "us852_issue_1",
+            direction,
+            opcode = format_args!("0x{opcode:04x}"),
+            payload_len = payload.len(),
+            payload_hex = %HexPayload(payload),
+            "issue-1 decrypted match frame"
+        );
+    }
+
     fn authentication(&self, outcome: &'static str) {
         match outcome {
             "success" => &self.game_auth_success,
@@ -1533,6 +1587,17 @@ mod tests {
         assert!(!health.ready());
         health.set_game_bound(true);
         assert!(health.ready());
+    }
+
+    #[test]
+    fn issue_one_capture_constructor_is_off_by_default_and_explicit_when_enabled() {
+        assert!(!M2Metrics::default().us852_issue_1_capture);
+        assert!(M2Metrics::with_us852_issue_1_capture().us852_issue_1_capture);
+        assert_eq!(
+            HexPayload(&[0x00, 0x0f, 0xa5]).to_string(),
+            "000fa5",
+            "capture output is deterministic hexadecimal"
+        );
     }
 
     #[test]

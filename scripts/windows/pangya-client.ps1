@@ -56,7 +56,7 @@ public class PangyaClient {
   [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint type);
 
   const uint MOVE=0x0001, LDOWN=0x0002, LUP=0x0004, RDOWN=0x0008, RUP=0x0010;
-  const uint KEYUP=0x0002, SCANCODE=0x0008;
+  const uint EXTENDEDKEY=0x0001, KEYUP=0x0002, SCANCODE=0x0008;
   const uint SWP_NOSIZE=0x0001, SWP_NOZORDER=0x0004;
 
   public static IntPtr Window() { return FindWindow("PangYa", null); }
@@ -124,6 +124,18 @@ public class PangyaClient {
     i[0].type = 1; i[0].ki.wVk = 0; i[0].ki.wScan = scan;
     i[0].ki.dwFlags = SCANCODE | (up ? KEYUP : 0);
     SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
+  }
+
+  // Arrow keys are extended scan codes. This is intentionally separate from Text(), whose
+  // VkKeyScan path cannot express them, so capture runs can create a reproducible shot-arrow
+  // sequence without relying on foreground-window SendKeys.
+  public static void TapExtendedScanCode(ushort scan) {
+    INPUT[] down = new INPUT[1]; down[0].type = 1; down[0].ki.wVk = 0; down[0].ki.wScan = scan;
+    down[0].ki.dwFlags = SCANCODE | EXTENDEDKEY;
+    INPUT[] up = new INPUT[1]; up[0].type = 1; up[0].ki.wVk = 0; up[0].ki.wScan = scan;
+    up[0].ki.dwFlags = SCANCODE | EXTENDEDKEY | KEYUP;
+    SendInput(1, down, Marshal.SizeOf(typeof(INPUT))); Thread.Sleep(60);
+    SendInput(1, up, Marshal.SizeOf(typeof(INPUT))); Thread.Sleep(180);
   }
 
   // Scan-code keystrokes reach the focused in-engine widget; SendKeys does not.
@@ -406,6 +418,17 @@ function Invoke-PangyaDrag {
 }
 
 function Send-PangyaText { param([string]$Text) [PangyaClient]::Text($Text) }
+
+# Sends a physical cursor key through DirectInput. This is for the shot-arrow evidence run;
+# arrow keys are extended scan codes, so Send-PangyaText cannot produce them.
+function Send-PangyaArrow {
+  param([Parameter(Mandatory=$true)][ValidateSet('Up','Down','Left','Right')][string]$Direction)
+  $scan = switch ($Direction) {
+    'Up' { 0x48 }; 'Down' { 0x50 }; 'Left' { 0x4b }; 'Right' { 0x4d }
+  }
+  Confirm-PangyaAnchor
+  [PangyaClient]::TapExtendedScanCode([uint16]$scan)
+}
 
 # ---- Screen recognition -------------------------------------------------------------------
 # Waits are on observed UI state, not fixed sleeps. A sleep is either longer than it needs to be

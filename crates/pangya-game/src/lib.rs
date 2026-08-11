@@ -415,6 +415,13 @@ pub trait GameObserver: Send + Sync + 'static {
     fn closed(&self, _outcome: GameTermination) {}
     /// Packet metadata without bodies or bearer values.
     fn frame(&self, _direction: &'static str, _opcode: u16, _bytes: usize) {}
+    /// Opt-in capture of one of the six fixed, non-credential issue-1 evidence frames.
+    ///
+    /// The runtime invokes this only for the fixed opcode/direction allowlist in
+    /// [`should_capture_us852_issue_1_frame`]; implementations must not treat it as a general
+    /// packet-body logging hook.
+    fn capture_us852_issue_1_frame(&self, _direction: &'static str, _opcode: u16, _payload: &[u8]) {
+    }
     /// Fixed authentication outcome.
     fn authentication(&self, _outcome: &'static str) {}
     /// Fixed rate/resource rejection.
@@ -447,6 +454,18 @@ pub trait GameObserver: Send + Sync + 'static {
     fn shot(&self, _outcome: GameShotObservation) {}
     /// Fixed stroke-two shot outcome.
     fn stroke_shot(&self, _outcome: GameShotObservation) {}
+}
+
+/// Whether a GameService frame belongs to the fixed issue-1 evidence set.
+///
+/// These are match-preview values, never login credentials. C2S calls are additionally
+/// restricted to `InStrokeMatch`. Keep the set small: this is not a replacement for the
+/// deliberately prohibited general packet-body logger.
+const fn should_capture_us852_issue_1_frame(direction: &str, opcode: u16) -> bool {
+    matches!(
+        (direction.as_bytes(), opcode),
+        (b"in", 0x0014 | 0x0015 | 0x0019 | 0x0042) | (b"out", 0x0058 | 0x0060)
+    )
 }
 
 /// No-op GameService observer.
@@ -1330,6 +1349,11 @@ where
                     let bytes = frame.payload.len().saturating_add(2);
                     if let Err(error) = self.admit_packet(&source, &mut local, bytes) {
                         break Err(error);
+                    }
+                    // These four C2S bodies are evidence only while the authenticated player
+                    // is actively taking a stroke. Keep pre-auth/malformed probes metadata-only.
+                    if state == GameState::InStrokeMatch {
+                        self.capture_us852_issue_1_frame("in", frame.opcode, &frame.payload);
                     }
                     self.observer.frame("in", frame.opcode, bytes);
                     match state {
@@ -6404,6 +6428,18 @@ where
         Ok(())
     }
 
+    /// Gives the opt-in evidence observer only the six frames requested for issue #1.
+    ///
+    /// This is deliberately checked at the runtime boundary, before an observer sees a body:
+    /// game authentication and its bearer, chat, account data, and every unlisted opcode remain
+    /// metadata-only even when the operator enables the narrowly-scoped evidence capture.
+    fn capture_us852_issue_1_frame(&self, direction: &'static str, opcode: u16, payload: &[u8]) {
+        if should_capture_us852_issue_1_frame(direction, opcode) {
+            self.observer
+                .capture_us852_issue_1_frame(direction, opcode, payload);
+        }
+    }
+
     /// Sends a pre-encoded body under a runtime-selected opcode.
     async fn send_raw(
         &self,
@@ -6412,6 +6448,7 @@ where
         payload: Vec<u8>,
     ) -> Result<(), GameRuntimeError> {
         let bytes = payload.len().saturating_add(2);
+        self.capture_us852_issue_1_frame("out", opcode, &payload);
         timeout(
             self.config.limits.command_timeout,
             framed.send(OutboundFrame {
@@ -6438,6 +6475,7 @@ where
         let payload = encode_packet_payload(packet, &CompatibilityProfile::US_852)
             .map_err(|_| GameRuntimeError::Protocol)?;
         let bytes = payload.len().saturating_add(2);
+        self.capture_us852_issue_1_frame("out", T::OPCODE, &payload);
         timeout(
             self.config.limits.command_timeout,
             framed.send(OutboundFrame {
@@ -7484,6 +7522,35 @@ mod tests {
             first,
             "an evicted replay key becomes a new bounded command"
         );
+    }
+
+    #[test]
+    fn issue_one_capture_allowlist_excludes_credentials_and_unrelated_frames() {
+        for (direction, opcode) in [
+            ("in", 0x0014),
+            ("in", 0x0015),
+            ("in", 0x0019),
+            ("in", 0x0042),
+            ("out", 0x0058),
+            ("out", 0x0060),
+        ] {
+            assert!(should_capture_us852_issue_1_frame(direction, opcode));
+        }
+        for (direction, opcode) in [
+            ("in", 0x0002), // Game auth carries the handover bearer.
+            ("out", 0x0002),
+            ("in", 0x0003),
+            ("in", 0x0017),
+            ("out", 0x005a),
+            ("out", 0x0066),
+            ("out", 0x0014),
+            ("in", 0x0060),
+        ] {
+            assert!(
+                !should_capture_us852_issue_1_frame(direction, opcode),
+                "{direction} {opcode:#06x}"
+            );
+        }
     }
 
     #[test]

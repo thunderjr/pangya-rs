@@ -212,7 +212,8 @@ section_default!(ProtocolSection {
 section_default!(LoggingSection {
     filter: String = "info".to_owned(),
     format: String = "pretty".to_owned(),
-    packet_bodies: bool = false
+    packet_bodies: bool = false,
+    us852_issue_1_capture: bool = false
 });
 section_default!(SecuritySection {
     credential_concurrency: usize = 2,
@@ -410,6 +411,8 @@ pub struct AppConfig {
     pub logging_format: String,
     /// Raw packet bodies remain disabled for M2.
     pub packet_bodies: bool,
+    /// Explicit capture of six non-credential U.S. 852 issue-1 evidence frames.
+    pub us852_issue_1_capture: bool,
     /// Credential blocking concurrency.
     pub credential_concurrency: usize,
     /// Credential worker queue bound.
@@ -589,6 +592,7 @@ impl fmt::Debug for AppConfig {
             .field("database_url", &self.database_url)
             .field("secret_file", &"[REDACTED]")
             .field("packet_bodies", &self.packet_bodies)
+            .field("us852_issue_1_capture", &self.us852_issue_1_capture)
             .finish_non_exhaustive()
     }
 }
@@ -1689,6 +1693,7 @@ fn validate(
         logging_filter: raw.logging.filter,
         logging_format: raw.logging.format,
         packet_bodies: raw.logging.packet_bodies,
+        us852_issue_1_capture: raw.logging.us852_issue_1_capture,
         credential_concurrency: raw.security.credential_concurrency,
         credential_queue_timeout: required(credential_queue)?,
         credential_operation_timeout: required(credential_operation)?,
@@ -2322,6 +2327,16 @@ mod tests {
         );
         fs::remove_file(path).expect("remove config");
         fs::remove_file(secret).expect("remove secret");
+    }
+
+    #[test]
+    fn issue_one_capture_is_explicit_and_defaults_off() {
+        let defaults = test_load(None, &CliOverrides::default()).expect("defaults");
+        assert!(!defaults.us852_issue_1_capture);
+        let path = file("[logging]\nus852_issue_1_capture=true\n");
+        let configured = test_load(Some(&path), &CliOverrides::default()).expect("configured");
+        assert!(configured.us852_issue_1_capture);
+        fs::remove_file(path).expect("remove config");
     }
 
     #[test]

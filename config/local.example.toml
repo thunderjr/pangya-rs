@@ -146,6 +146,9 @@ unknown_opcode_policy = "disconnect"
 filter = "info,pangya_protocol=debug"
 format = "pretty"
 packet_bodies = false
+# One-off issue-1 evidence only: log the six match-preview payloads named in
+# docs/evidence/US852_ISSUE_1_CAPTURE_PLAN.md. It is not general body logging.
+us852_issue_1_capture = false
 
 [security]
 credential_concurrency = 2

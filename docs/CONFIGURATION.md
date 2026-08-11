@@ -22,7 +22,10 @@ explicit CLI flags`. Nested environment keys use `__`, for example
   still emits the advertised Game endpoint.
 - `login.auto_create_accounts` defaults false and validation rejects it outside
   `server.profile = "local"`.
-- `logging.packet_bodies = true` is rejected in M2. The GameService
+- `logging.packet_bodies = true` is rejected in M2. `logging.us852_issue_1_capture = true`
+  is the sole exception: it logs only the six non-credential match-preview frames listed in
+  [`evidence/US852_ISSUE_1_CAPTURE_PLAN.md`](evidence/US852_ISSUE_1_CAPTURE_PLAN.md), bounded
+  to 1,024 payload bytes, for the one-off #1 evidence run. The GameService
   `protocol.unknown_opcode_policy` accepts `disconnect`, `ignore`, or `capture`;
   capture retains only bounded opcode/state/length metadata and a SHA-256 digest,
   never the raw payload or a public audit record.

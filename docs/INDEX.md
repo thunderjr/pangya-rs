@@ -1,6 +1,6 @@
 # PangYa-RS documentation index
 
-> Last updated: **2026-08-10** — 66 documents across seven directories.
+> Last updated: **2026-08-10** — 67 documents across seven directories.
 
 **This file is navigation plus a status rollup. It is never a source of truth.**
 Every row links out to the document that owns the claim. When this index and a linked
@@ -278,6 +278,7 @@ Newest first. Every claim of real-client acceptance in this repository traces to
 
 | Date | Document | Kind | Establishes |
 |---|---|---|---|
+| planned | [`evidence/US852_ISSUE_1_CAPTURE_PLAN.md`](evidence/US852_ISSUE_1_CAPTURE_PLAN.md) | capture procedure | Opt-in, redacted collection of the three unresolved issue #1 match-frame ambiguities; not protocol evidence |
 | 2026-08-10 | [`evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md`](evidence/REAL_CLIENT_SHOP_FLAG_2026-08-10.md) | real client | Bit `0x20` of the shop flag is what lists a row; `MoneyFlag` is a separate byte at `0x69`; the client ignores an archive past its patch level |
 | 2026-08-09 | [`evidence/ADMIN_PANEL_2026-08-09.md`](evidence/ADMIN_PANEL_2026-08-09.md) | operator surface | Admin sessions, per-request authorisation, append-only audit, account/inventory/equipment control, live shop overlay, catalog names, same-origin panel |
 | 2026-08-09 | [`evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md`](evidence/REAL_CLIENT_EQUIPMENT_2026-08-09.md) | real client | 196-byte inventory rows render; ClubSet + Ball equip commits atomically and survives restart |
