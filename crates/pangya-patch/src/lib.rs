@@ -414,6 +414,9 @@ impl Pak {
             }
             entries.push(entry);
         }
+        if at != bytes.len() - TRAILER {
+            return Err(PatchError::Truncated);
+        }
         ranges.sort_unstable();
         if ranges.windows(2).any(|w| w[0].1 > w[1].0) {
             return Err(PatchError::Overlap);
