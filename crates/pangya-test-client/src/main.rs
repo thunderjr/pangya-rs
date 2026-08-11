@@ -39,6 +39,13 @@ const MAX_EXPANSION: usize = 128;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long this seat will sit in a room waiting for a person to drive the other one.
 const ROOM_WAIT: Duration = Duration::from_secs(600);
+/// Real-client flight time before the post-shot end barrier.
+///
+/// Restricted capture `/private/tmp/pangya-issue45-room-edit-capture-20260811T112509Z/server.jsonl`
+/// records accepted C2S `0x001b` at `2026-08-11T12:11:41.567841Z` and C2S `0x001c` at
+/// `2026-08-11T12:11:47.206591Z`: 5.638750 seconds. The bounded 5.6-second delay deliberately
+/// rounds down to avoid inventing precision while allowing the observed shot flight to complete.
+const RETAIL_SHOT_FLIGHT: Duration = Duration::from_millis(5_600);
 
 /// Retail client opcodes this instrument sends.
 mod client_opcode {
@@ -172,6 +179,13 @@ async fn main() -> Result<(), ClientError> {
     session.play_hole(args.strokes).await?;
     tracing::info!("the hole settled; this seat is done");
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn checked_shot_flight_pacing_is_bounded() {
+    assert_eq!(RETAIL_SHOT_FLIGHT, Duration::from_millis(5_600));
+    assert!(RETAIL_SHOT_FLIGHT < FRAME_TIMEOUT);
 }
 
 #[cfg(test)]
@@ -860,7 +874,13 @@ impl Session {
                     self.send(client_opcode::SHOT_SYNC, &shot_sync(connection_id))
                         .await?;
                 }
-                ScriptWrite::ShotEnd => self.send(client_opcode::SHOT_END, &SHOT_END_BODY).await?,
+                // `ShotEnd` is emitted only after `on_shot_sync` accepts this socket's exact
+                // echoed `0x0064`. Keep the pure state machine immediate for deterministic unit
+                // tests, but pace the transport before the end barrier like the checked client.
+                ScriptWrite::ShotEnd => {
+                    tokio::time::sleep(RETAIL_SHOT_FLIGHT).await;
+                    self.send(client_opcode::SHOT_END, &SHOT_END_BODY).await?
+                }
                 ScriptWrite::HoleFinish => {
                     self.send(client_opcode::HOLE_FINISH, &script.hole_result())
                         .await?;
