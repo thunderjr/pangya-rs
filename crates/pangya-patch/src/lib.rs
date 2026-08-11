@@ -1124,6 +1124,72 @@ mod tests {
         }
     }
 
+    // Metadata/path rules are from pangbox--pangfiles/pak/reader.go:73-127;
+    // literal control bytes follow pangbox--pangfiles/pak/decompress.go:8-74.
+    fn metadata_pak(meta: u8, key: [u32; 4]) -> Vec<u8> {
+        let entries: [(&[u8], u8, &[u8], usize); 4] = [
+            (b"targetaa", BASIC, b"old", 3),
+            (b"basicxxx", BASIC, b"keep", 4),
+            (b"lzxxxxxx", LZ, &[0, b'a', b'b', b'c'], 3),
+            (b"lz2xxxxx", LZ2, &[0xc8, b'a', b'b', b'c'], 3),
+        ];
+        let mut data = Vec::new();
+        let mut table = Vec::new();
+        for (name, kind, packed, real) in entries {
+            let offset = u32::try_from(data.len()).expect("fixture offset");
+            data.extend_from_slice(packed);
+            let mut header = vec![u8::try_from(name.len()).expect("name"), meta | kind];
+            header.extend_from_slice(&offset.to_le_bytes());
+            header.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+            let stored = if meta == 0 || meta == XOR {
+                (real as u32) ^ 0x71
+            } else {
+                real as u32
+            };
+            header.extend_from_slice(&stored.to_le_bytes());
+            let mut path = name.to_vec();
+            if meta == XTEA {
+                let mut block = [0; 8];
+                block[..4].copy_from_slice(&header[2..6]);
+                block[4..].copy_from_slice(&header[10..14]);
+                xtea_encrypt(key, &mut block);
+                header[2..6].copy_from_slice(&block[..4]);
+                header[10..14].copy_from_slice(&block[4..]);
+                xtea_stream(key, &mut path, true);
+            } else if meta == 0 || meta == XOR {
+                for byte in &mut path {
+                    *byte ^= 0x71;
+                }
+                path.push(0);
+            } else {
+                path.push(0);
+            }
+            table.extend_from_slice(&header);
+            table.extend_from_slice(&path);
+        }
+        let table_at = data.len() as u32;
+        data.extend_from_slice(&table);
+        data.extend_from_slice(&table_at.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.push(SIGNATURE);
+        data
+    }
+    #[test]
+    fn metadata_variants_round_trip_basic_lz_and_lz2() {
+        let key = [0; 4];
+        for meta in [0, XOR, XTEA, PLAIN] {
+            let pak = Pak::parse(&metadata_pak(meta, key), key).expect("parse");
+            assert_eq!(pak.read("lzxxxxxx").expect("lz"), b"abc");
+            assert_eq!(pak.read("lz2xxxxx").expect("lz2"), b"abc");
+            let replaced = pak.replace_basic("targetaa", b"new").expect("replace");
+            let checked = Pak::parse(&replaced, key).expect("reparse");
+            assert_eq!(checked.read("targetaa").expect("target"), b"new");
+            assert_eq!(checked.read("basicxxx").expect("basic"), b"keep");
+            assert_eq!(checked.read("lzxxxxxx").expect("lz"), b"abc");
+            assert_eq!(checked.read("lz2xxxxx").expect("lz2"), b"abc");
+        }
+    }
+
     #[test]
     fn noop_release_rejects_mutated_signed_result_metadata() {
         let iff = stored_zip(&[("one.iff", b"same")]);
