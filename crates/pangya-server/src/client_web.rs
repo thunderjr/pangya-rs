@@ -683,6 +683,7 @@ mod router_tests {
             extra_contents: String::new(),
             theme_document: String::new(),
             theme_directory: None,
+            incremental: None,
         }));
         let _router = client_web_router(state);
     }
@@ -712,6 +713,7 @@ mod router_tests {
             extra_contents: String::new(),
             theme_document: String::new(),
             theme_directory: None,
+            incremental: None,
         }));
 
         let response = patch_file(
